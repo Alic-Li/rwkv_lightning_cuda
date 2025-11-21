@@ -1,4 +1,4 @@
-nvcc -o test_wkv test/test_wkv.cpp src/wkv/wkv.cu \
+nvcc -o bin/test_wkv test/test_wkv.cpp src/wkv/wkv.cu \
     -I./src \
     -O3 \
     --use_fast_math \
@@ -8,7 +8,7 @@ nvcc -o test_wkv test/test_wkv.cpp src/wkv/wkv.cu \
     -arch=sm_89 \
     -std=c++17
 
-nvcc -o test_linear test/test_linear.cpp src/module/linear_cublas.cu \
+nvcc -o bin/test_linear test/test_linear.cpp src/module/linear_cublas.cu \
     -I./src \
     -O3 \
     --use_fast_math \
@@ -18,7 +18,7 @@ nvcc -o test_linear test/test_linear.cpp src/module/linear_cublas.cu \
     -lcublas \
     --extra-device-vectorization
 
-nvcc -o test_tensor_utils test/test_tensor_utils.cpp src/module/tensor_utils.cu \
+nvcc -o bin/test_tensor_utils test/test_tensor_utils.cpp src/module/tensor_utils.cu \
     -I./src \
     -O3 \
     --use_fast_math \
@@ -27,7 +27,7 @@ nvcc -o test_tensor_utils test/test_tensor_utils.cpp src/module/tensor_utils.cu 
     -arch=sm_89 \
     -std=c++17
 
-nvcc -o test_load_model test/test_load_model.cpp src/utils/load_model.cu \
+nvcc -o bin/test_load_model test/test_load_model.cpp src/utils/load_model.cu \
     -I./src \
     -O3 \
     --use_fast_math \
@@ -36,7 +36,7 @@ nvcc -o test_load_model test/test_load_model.cpp src/utils/load_model.cu \
     -arch=sm_89 \
     -std=c++17
 
-nvcc -o test_sampler test/test_sampler.cpp src/utils/sampler.cu \
+nvcc -o bin/test_sampler test/test_sampler.cpp src/utils/sampler.cu \
     -I./src \
     -O3 \
     --use_fast_math \
@@ -45,7 +45,7 @@ nvcc -o test_sampler test/test_sampler.cpp src/utils/sampler.cu \
     -arch=sm_89 \
     -std=c++17
 
-nvcc -o test_norm test/test_norm.cpp src/module/norm.cu \
+nvcc -o bin/test_norm test/test_norm.cpp src/module/norm.cu \
     -I./src \
     -O3 \
     --use_fast_math \
@@ -54,12 +54,12 @@ nvcc -o test_norm test/test_norm.cpp src/module/norm.cu \
     -arch=sm_89 \
     -std=c++17
 
-nvcc -o test_tokenizer test/test_tokenizer.cpp src/utils/tokenizer.cu \
+nvcc -o bin/test_tokenizer test/test_tokenizer.cpp src/utils/tokenizer.cu \
     -I./src \
     -O3 \
     -std=c++17
 
-nvcc -o test_Tmix test/test_Tmix.cpp \
+nvcc -o bin/test_Tmix test/test_Tmix.cpp \
     src/Tmix/Tmix.cu \
     src/module/linear_cublas.cu \
     src/module/norm.cu \
@@ -75,7 +75,7 @@ nvcc -o test_Tmix test/test_Tmix.cpp \
     -std=c++17 \
     -lcublas
 
-nvcc -o test_Cmix test/test_Cmix.cpp \
+nvcc -o bin/test_Cmix test/test_Cmix.cpp \
     src/Cmix/Cmix.cu \
     src/module/linear_cublas.cu \
     src/spmv/spmv.cu \
@@ -88,7 +88,7 @@ nvcc -o test_Cmix test/test_Cmix.cpp \
     -std=c++17 \
     -lcublas
 
-nvcc -o benchmark_rwkv benchmark/benchmark.cpp \
+nvcc -o bin/benchmark_rwkv benchmark/benchmark.cpp \
     src/rwkv7.cu \
     src/Tmix/Tmix.cu \
     src/Cmix/Cmix.cu \
