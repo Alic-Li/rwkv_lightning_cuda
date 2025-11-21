@@ -1,0 +1,6 @@
+__pycache__/
+.vscode/
+benchmark.py
+rwkv_batch/
+bak/
+*.st
