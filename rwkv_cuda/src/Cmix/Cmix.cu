@@ -258,15 +258,18 @@ void cmix_seq_batch_fp16(
     // 1. xx = cat([x_prev[1], x[:,:-1]], dim=1) - x
     // 对每个batch处理
     for (int b = 0; b < B; b++) {
-        // 复制 x_prev[1][b] 到 xx[b] 的第一行
+        size_t offset = (size_t)B * C + (size_t)b * C;
+        
+        // 复制 x_prev[1][b] 到 d_xx[b] 的第一行
         CUDA_CHECK(cudaMemcpyAsync(
             d_xx + b * T * C,
-            x_prev + C + b * C,
+            x_prev + offset,
             C * sizeof(half),
             cudaMemcpyDeviceToDevice,
             stream
         ));
-        // 复制 x[b,:-1] 到 xx[b] 的剩余部分
+        
+        // 复制 x[b, :-1, :] 到 d_xx[b] 的剩余部分 (第2到T行)
         if (T > 1) {
             CUDA_CHECK(cudaMemcpyAsync(
                 d_xx + b * T * C + C,
@@ -283,8 +286,10 @@ void cmix_seq_batch_fp16(
     
     // 2. x_prev[1] = x[:,-1]
     for (int b = 0; b < B; b++) {
+        size_t offset = (size_t)B * C + (size_t)b * C;
+
         CUDA_CHECK(cudaMemcpyAsync(
-            x_prev + C + b * C,
+            x_prev + offset, // 使用修正后的 offset
             x + b * T * C + (T - 1) * C,
             C * sizeof(half),
             cudaMemcpyDeviceToDevice,

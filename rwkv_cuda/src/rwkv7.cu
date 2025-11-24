@@ -35,6 +35,19 @@ __global__ void increment_elapsed_kernel(int* elapsed_t, int bsz) {
     }
 }
 
+// 二维矩阵转置 Kernel
+__global__ void transpose_half_kernel(const half* __restrict__ src, half* __restrict__ dst, int rows, int cols) {
+    // 二维矩阵转置: src[rows, cols] -> dst[cols, rows]
+    int x = blockIdx.x * blockDim.x + threadIdx.x; // cols
+    int y = blockIdx.y * blockDim.y + threadIdx.y; // rows
+
+    if (y < rows && x < cols) {
+        // 源数据是行主序 (Row-Major): index = y * cols + x
+        // 目标数据是行主序 (Row-Major): index = x * rows + y
+        dst[x * rows + y] = src[y * cols + x];
+    }
+}
+
 // RWKVModel 构造函数
 RWKVModel::RWKVModel() 
     : n_layer(0), n_embd(0), n_head(0), head_size(64), vocab_size(65536), ffn_dim(0) {
@@ -132,12 +145,13 @@ bool RWKVModel::load_from_safetensors(const std::string& model_path) {
     TensorInfo ffn_key_info;
     if (loader.get_tensor_info("blocks.0.ffn.key.weight", ffn_key_info)) {
         if (ffn_key_info.shape.size() == 2) {
-            ffn_dim = ffn_key_info.shape[1];  // [C, D] -> D
+            // 修改这里：[D, C] -> D 是 shape[0]
+            ffn_dim = ffn_key_info.shape[0]; 
         } else {
-            ffn_dim = n_embd * 4;  // 默认值：通常是 n_embd 的 4 倍
+            ffn_dim = n_embd * 4;
         }
     } else {
-        ffn_dim = n_embd * 4;  // 默认值
+        ffn_dim = n_embd * 4;
     }
     
     printf("Model config: n_layer=%d, n_embd=%d, n_head=%d, head_size=%d\n", 
@@ -149,25 +163,77 @@ bool RWKVModel::load_from_safetensors(const std::string& model_path) {
         if (!loader.get_tensor_info(name, info)) {
             continue;
         }
-        
+
         size_t numel = 1;
         for (int64_t dim : info.shape) {
             numel *= dim;
         }
-        
-        // 分配 GPU 内存
-        half* d_weight = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_weight, numel * sizeof(half)));
-        
-        // 加载到 GPU
-        if (!loader.load_tensor_to_gpu(name, d_weight)) {
-            fprintf(stderr, "Failed to load tensor %s\n", name.c_str());
-            cudaFree(d_weight);
-            continue;
+
+        bool needs_transpose = false;
+        if (name.find("ffn.key.weight") != std::string::npos || 
+            name.find("ffn.value.weight") != std::string::npos) {
+            needs_transpose = true;
         }
-        
-        weights[name] = d_weight;
-        weight_shapes[name] = info.shape;  // 保存形状信息
+
+        if (name.find("att.g1") != std::string::npos || name.find("att.g2") != std::string::npos ||
+            name.find("att.a1") != std::string::npos || name.find("att.a2") != std::string::npos ||
+            name.find("att.w1") != std::string::npos || name.find("att.w2") != std::string::npos ||
+            name.find("att.v1") != std::string::npos || name.find("att.v2") != std::string::npos) {
+            needs_transpose = true;
+        }
+
+        if (needs_transpose && info.shape.size() == 2) {
+            half* d_temp = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_temp, numel * sizeof(half)));
+
+            // 调用 loader 加载原始数据
+            if (!loader.load_tensor_to_gpu(name, d_temp)) {
+                fprintf(stderr, "Failed to load tensor %s for transpose\n", name.c_str());
+                cudaFree(d_temp);
+                continue;
+            }
+
+            // 分配目标显存
+            half* d_transposed = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_transposed, numel * sizeof(half)));
+
+            // 获取维度
+            int rows = info.shape[0]; 
+            int cols = info.shape[1]; 
+
+            // 转置 Kernel
+            dim3 block(32, 32);
+            dim3 grid((cols + 31) / 32, (rows + 31) / 32);
+            transpose_half_kernel<<<grid, block>>>(d_temp, d_transposed, rows, cols);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize()); 
+
+            cudaFree(d_temp);
+
+            // 保存
+            weights[name] = d_transposed;
+
+            // 交换形状信息
+            std::vector<int64_t> new_shape = info.shape;
+            std::swap(new_shape[0], new_shape[1]);
+            weight_shapes[name] = new_shape;
+
+            printf("Loaded and Transposed: %s ([%d, %d] -> [%d, %d])\n", 
+                   name.c_str(), rows, cols, cols, rows);
+        } else {
+            // 普通加载逻辑
+            half* d_weight = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_weight, numel * sizeof(half)));
+
+            if (!loader.load_tensor_to_gpu(name, d_weight)) {
+                fprintf(stderr, "Failed to load tensor %s\n", name.c_str());
+                cudaFree(d_weight);
+                continue;
+            }
+
+            weights[name] = d_weight;
+            weight_shapes[name] = info.shape; 
+        }
     }
     
     // 处理 emb.weight 的 layer norm（使用 blocks.0.ln0）
