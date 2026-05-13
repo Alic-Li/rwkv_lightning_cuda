@@ -1,6 +1,6 @@
 __pycache__/
 .vscode/
-benchmark.py
+rwkv_sessions.db
 rwkv_batch/
 bak/
-*.st
+build/
