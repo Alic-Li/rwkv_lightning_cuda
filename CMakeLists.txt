@@ -10,6 +10,7 @@ endif()
 option(RWKV7_FAST_V4_STATIC_LINK "Link CUDA and C++ runtimes statically when possible" ON)
 option(RWKV7_FAST_V4_GC_SECTIONS "Enable section garbage collection to reduce binary size" ON)
 option(RWKV7_FAST_V4_AUTO_STRIP "Strip the release binary after linking when possible" ON)
+option(RWKV7_FAST_BUILD_TESTS "Build unit tests" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,6 +36,7 @@ set(RWKV7_FAST_SERVER_CORE_SOURCES
   src/rwkv7_fast_v4.cu
   src/pth_archive.cpp
   src/pth_tensor.cpp
+  src/rwkv_tokenizer.cpp
   src/utils/tokenizer.cpp
   src/rwkv_sampler.cpp
   src/rwkv_inference_engine.cpp
@@ -77,6 +79,11 @@ else()
   target_link_libraries(benchmark PRIVATE CUDA::cublas CUDA::cublasLt)
   set_property(TARGET rwkv7_fast_backend_core PROPERTY CUDA_RUNTIME_LIBRARY Shared)
   set_property(TARGET benchmark PROPERTY CUDA_RUNTIME_LIBRARY Shared)
+endif()
+
+if(RWKV7_FAST_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(test)
 endif()
 
 if(MSVC)

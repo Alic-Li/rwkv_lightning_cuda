@@ -1,28 +1,34 @@
 #include "rwkv_tokenizer.hpp"
 
-#include "rwkv_trie.hpp"
+#include "utils/tokenizer.h"
 
 namespace rwkv7_server {
 
-TrieTokenizer::TrieTokenizer() : TokenizerBase(0, 0, 0) {}
+TrieTokenizer::TrieTokenizer() = default;
 
 TrieTokenizer::~TrieTokenizer() {
-  delete tokenizer_;
-  tokenizer_ = nullptr;
+  delete impl_;
+  impl_ = nullptr;
 }
 
 int TrieTokenizer::load(const std::string& vocab_file) {
-  delete tokenizer_;
-  tokenizer_ = new OptimizedTrieTokenizer(vocab_file);
-  return tokenizer_->inited() ? kTokenizerSuccess : kTokenizerError;
+  delete impl_;
+  impl_ = new trie_tokenizer();
+  const int status = impl_->load(vocab_file);
+  if (status != RWKV_SUCCESS) {
+    delete impl_;
+    impl_ = nullptr;
+    return kTokenizerError;
+  }
+  return kTokenizerSuccess;
 }
 
 std::vector<int> TrieTokenizer::encode(std::string_view text) const {
-  return tokenizer_ ? tokenizer_->encode(std::string(text)) : std::vector<int>{};
+  return impl_ ? impl_->encode(text) : std::vector<int>{};
 }
 
 std::string TrieTokenizer::decode(const std::vector<int>& ids) const {
-  return tokenizer_ ? tokenizer_->decode(ids) : std::string{};
+  return impl_ ? impl_->decode(ids) : std::string{};
 }
 
 std::string TrieTokenizer::decode(int id) const {

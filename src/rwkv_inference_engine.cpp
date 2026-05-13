@@ -105,7 +105,7 @@ std::string take_complete_utf8(std::string& pending, bool flush_all) {
 }  // namespace
 
 InferenceEngine::InferenceEngine(
-    std::shared_ptr<ModelBackend> model,
+    std::shared_ptr<IModelBackend> model,
     std::shared_ptr<TrieTokenizer> tokenizer,
     std::string model_name)
     : model_(std::move(model)),
@@ -237,9 +237,11 @@ std::string InferenceEngine::format_openai_prompt(
   if (has_prefix) {
     oss << "\n\n";
   }
-  oss << "Assistant:";
+  oss << "Assistant: ";
   if (enable_think) {
-    oss << " <think>\n</think>\n";
+    oss << "<think";
+  } else {
+    oss << "<think>\n</think>\n";
   }
   return oss.str();
 }

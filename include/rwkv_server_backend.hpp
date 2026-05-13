@@ -16,9 +16,9 @@ struct GenerateOptions {
   std::vector<int64_t> stop_tokens{0, 261, 24281};
   double temperature = 1.0;
   int top_k = 20;
-  double top_p = 0.6;
-  double alpha_presence = 1.0;
-  double alpha_frequency = 0.1;
+  double top_p = 0.3;
+  double alpha_presence = 2.0;
+  double alpha_frequency = 0.2;
   double alpha_decay = 0.996;
 };
 
@@ -47,29 +47,48 @@ struct DeviceLogits {
   DeviceLogits& operator=(DeviceLogits&&) noexcept = default;
 };
 
-class ModelBackend {
+class IModelBackend {
+ public:
+  virtual ~IModelBackend() = default;
+
+  virtual GenerationState create_state(int batch_size) const = 0;
+  virtual void forward_prefill(
+      const std::vector<std::vector<int64_t>>& token_batches,
+      GenerationState& state,
+      DeviceLogits& logits) const = 0;
+  virtual void forward_decode(
+      const std::vector<int64_t>& token_batch,
+      GenerationState& state,
+      DeviceLogits& logits) const = 0;
+
+  virtual int vocab_size() const = 0;
+  virtual const std::string& model_path() const = 0;
+  virtual const std::string& model_name() const = 0;
+};
+
+class ModelBackend final : public IModelBackend {
  public:
   explicit ModelBackend(std::string model_path);
-  ~ModelBackend();
+  ~ModelBackend() override;
 
   ModelBackend(const ModelBackend&) = delete;
   ModelBackend& operator=(const ModelBackend&) = delete;
   ModelBackend(ModelBackend&&) noexcept;
   ModelBackend& operator=(ModelBackend&&) noexcept;
 
-  GenerationState create_state(int batch_size) const;
+  GenerationState create_state(int batch_size) const override;
   void forward_prefill(
       const std::vector<std::vector<int64_t>>& token_batches,
       GenerationState& state,
-      DeviceLogits& logits) const;
+      DeviceLogits& logits) const override;
   void forward_decode(
       const std::vector<int64_t>& token_batch,
       GenerationState& state,
-      DeviceLogits& logits) const;
+      DeviceLogits& logits) const override;
 
-  int vocab_size() const;
-  const std::string& model_path() const;
-  const std::string& model_name() const;
+  int vocab_size() const override;
+  const std::string& model_path() const override;
+  const std::string& model_name() const override;
 
  private:
   struct Impl;

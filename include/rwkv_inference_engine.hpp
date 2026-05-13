@@ -17,7 +17,7 @@ class InferenceEngine {
   using StreamCallback = std::function<bool(int, const std::string&)>;
 
   InferenceEngine(
-      std::shared_ptr<ModelBackend> model,
+      std::shared_ptr<IModelBackend> model,
       std::shared_ptr<TrieTokenizer> tokenizer,
       std::string model_name);
 
@@ -50,7 +50,7 @@ class InferenceEngine {
 
   int count_tokens(const std::string& text) const;
 
- std::shared_ptr<ModelBackend> model() const { return model_; }
+ std::shared_ptr<IModelBackend> model() const { return model_; }
  std::shared_ptr<TrieTokenizer> tokenizer() const { return tokenizer_; }
  const std::string& model_name() const { return model_name_; }
 
@@ -64,7 +64,7 @@ class InferenceEngine {
       int stream_index,
       int chunk_size) const;
 
-  std::shared_ptr<ModelBackend> model_;
+  std::shared_ptr<IModelBackend> model_;
   std::shared_ptr<TrieTokenizer> tokenizer_;
   std::string model_name_;
 };
