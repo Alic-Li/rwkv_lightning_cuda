@@ -753,7 +753,7 @@ void model_forward(const Case& c) {
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, hp(w.att_output_w), lt_workspace.p, lt_workspace.n, att_out);
     if (T == 1) {
       rwkv7_v3a_add_layer_norm_cmix_mix_f16_launch(
-          stream, rows, x_cur, att_out, shift1, hp(w.ln2_w), hp(w.ln2_b), hp(w.ffn_x_k), x_after_att, mixed, 1.0e-5f);
+          stream, rows, C, x_cur, att_out, shift1, hp(w.ln2_w), hp(w.ln2_b), hp(w.ffn_x_k), x_after_att, mixed, 1.0e-5f);
     } else {
       rwkv7_v3a_add_layer_norm_f16_launch(
           stream, rows, C, x_cur, att_out, hp(w.ln2_w), hp(w.ln2_b), x_after_att, ln2_out, 1.0e-5f);
@@ -777,7 +777,7 @@ void model_forward(const Case& c) {
       if (B == 1 && T == 1) {
         half* next_shift0 = shift.p + static_cast<std::size_t>(layer + 1) * 2 * B * C;
         rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
-            stream, rows, x_after_att, cmix_out, next_shift0, hp(next.ln1_w), hp(next.ln1_b),
+            stream, rows, C, x_after_att, cmix_out, next_shift0, hp(next.ln1_w), hp(next.ln1_b),
             hp(next.att_x_r), hp(next.att_x_w), hp(next.att_x_k), hp(next.att_x_v), hp(next.att_x_a), hp(next.att_x_g),
             x_next, xr, xw, xk, xv, xa, xg, 1.0e-5f);
         xx_next = x_next;
@@ -792,7 +792,7 @@ void model_forward(const Case& c) {
         rwkv7_v3a_add_f16_launch(stream, x_after_att, cmix_out, x_next, row_elems);
         rwkv7_v3a_layer_norm_f16_launch(stream, rows, C, x_next, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, 1.0e-5f);
       } else {
-        rwkv7_v3a_add_last_layer_norm_f16_launch(stream, B, T, x_after_att, cmix_out, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, 1.0e-5f);
+        rwkv7_v3a_add_last_layer_norm_f16_launch(stream, B, T, C, x_after_att, cmix_out, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, 1.0e-5f);
       }
     }
     check_cuda(cudaGetLastError(), "launch model forward layer");

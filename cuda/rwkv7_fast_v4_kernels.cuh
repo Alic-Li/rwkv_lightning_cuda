@@ -116,18 +116,18 @@ void rwkv7_v3a_add_layer_norm_f16_launch(
     half* x_out, half* y, float eps);
 
 void rwkv7_v3a_add_last_layer_norm_f16_launch(
-    cudaStream_t stream, int B, int T,
+    cudaStream_t stream, int B, int T, int C,
     const half* x, const half* residual, const half* weight, const half* bias,
     half* y, float eps);
 
 void rwkv7_v3a_add_layer_norm_cmix_mix_f16_launch(
-    cudaStream_t stream, int rows,
+    cudaStream_t stream, int rows, int C,
     const half* x, const half* residual, half* shift_state,
     const half* weight, const half* bias, const half* x_k,
     half* x_out, half* mixed, float eps);
 
 void rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
-    cudaStream_t stream, int rows,
+    cudaStream_t stream, int rows, int C,
     const half* x, const half* residual, half* shift_state,
     const half* weight, const half* bias,
     const half* x_r, const half* x_w, const half* x_k,

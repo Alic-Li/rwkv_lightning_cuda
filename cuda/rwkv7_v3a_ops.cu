@@ -1122,6 +1122,165 @@ __global__ void add_layer_norm_f16_kernel(
   }
 }
 
+__global__ void add_layer_norm_cmix_mix_f16_generic_kernel(
+    int C,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ residual,
+    dtype* __restrict__ shift_state,
+    const dtype* __restrict__ weight,
+    const dtype* __restrict__ bias,
+    const dtype* __restrict__ x_k,
+    dtype* __restrict__ x_out,
+    dtype* __restrict__ mixed,
+    int64_t rows,
+    float eps) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int64_t base = row * static_cast<int64_t>(C);
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+           __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+  }
+  sum = block_sum_t<LN_THREADS>(sum);
+  const float inv_c = 1.0f / static_cast<float>(C);
+  const float mean = sum * inv_c;
+  float sum_var = 0.0f;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+    const float d = v - mean;
+    sum_var += d * d;
+  }
+  sum_var = block_sum_t<LN_THREADS>(sum_var);
+  const float rstd = rsqrtf(sum_var * inv_c + eps);
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+    const float w = __half2float(*reinterpret_cast<const __half*>(weight + c));
+    const float b = __half2float(*reinterpret_cast<const __half*>(bias + c));
+    const float prev = __half2float(*reinterpret_cast<const __half*>(shift_state + base + c));
+    const float mix = __half2float(*reinterpret_cast<const __half*>(x_k + c));
+    const float yv = (v - mean) * rstd * w + b;
+    *reinterpret_cast<__half*>(x_out + base + c) = __float2half_rn(v);
+    *reinterpret_cast<__half*>(mixed + base + c) = __float2half_rn(yv + (prev - yv) * mix);
+    *reinterpret_cast<__half*>(shift_state + base + c) = __float2half_rn(yv);
+  }
+}
+
+__global__ void add_layer_norm_tmix_mix6_f16_generic_kernel(
+    int C,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ residual,
+    dtype* __restrict__ shift_state,
+    const dtype* __restrict__ weight,
+    const dtype* __restrict__ bias,
+    const dtype* __restrict__ x_r,
+    const dtype* __restrict__ x_w,
+    const dtype* __restrict__ x_k,
+    const dtype* __restrict__ x_v,
+    const dtype* __restrict__ x_a,
+    const dtype* __restrict__ x_g,
+    dtype* __restrict__ x_out,
+    dtype* __restrict__ out_r,
+    dtype* __restrict__ out_w,
+    dtype* __restrict__ out_k,
+    dtype* __restrict__ out_v,
+    dtype* __restrict__ out_a,
+    dtype* __restrict__ out_g,
+    int64_t rows,
+    float eps) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int64_t base = row * static_cast<int64_t>(C);
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+           __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+  }
+  sum = block_sum_t<LN_THREADS>(sum);
+  const float inv_c = 1.0f / static_cast<float>(C);
+  const float mean = sum * inv_c;
+  float sum_var = 0.0f;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+    const float d = v - mean;
+    sum_var += d * d;
+  }
+  sum_var = block_sum_t<LN_THREADS>(sum_var);
+  const float rstd = rsqrtf(sum_var * inv_c + eps);
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+    const float w = __half2float(*reinterpret_cast<const __half*>(weight + c));
+    const float b = __half2float(*reinterpret_cast<const __half*>(bias + c));
+    const float prev = __half2float(*reinterpret_cast<const __half*>(shift_state + base + c));
+    const float yv = (v - mean) * rstd * w + b;
+    const float delta = prev - yv;
+    *reinterpret_cast<__half*>(x_out + base + c) = __float2half_rn(v);
+    *reinterpret_cast<__half*>(out_r + base + c) = __float2half_rn(
+        yv + delta * __half2float(*reinterpret_cast<const __half*>(x_r + c)));
+    *reinterpret_cast<__half*>(out_w + base + c) = __float2half_rn(
+        yv + delta * __half2float(*reinterpret_cast<const __half*>(x_w + c)));
+    *reinterpret_cast<__half*>(out_k + base + c) = __float2half_rn(
+        yv + delta * __half2float(*reinterpret_cast<const __half*>(x_k + c)));
+    *reinterpret_cast<__half*>(out_v + base + c) = __float2half_rn(
+        yv + delta * __half2float(*reinterpret_cast<const __half*>(x_v + c)));
+    *reinterpret_cast<__half*>(out_a + base + c) = __float2half_rn(
+        yv + delta * __half2float(*reinterpret_cast<const __half*>(x_a + c)));
+    *reinterpret_cast<__half*>(out_g + base + c) = __float2half_rn(
+        yv + delta * __half2float(*reinterpret_cast<const __half*>(x_g + c)));
+    *reinterpret_cast<__half*>(shift_state + base + c) = __float2half_rn(yv);
+  }
+}
+
+__global__ void add_last_layer_norm_f16_kernel(
+    int C,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ residual,
+    const dtype* __restrict__ weight,
+    const dtype* __restrict__ bias,
+    dtype* __restrict__ y,
+    int64_t B,
+    int64_t T,
+    float eps) {
+  const int64_t bidx = blockIdx.x;
+  if (bidx >= B) {
+    return;
+  }
+  const int64_t src = (bidx * T + (T - 1)) * static_cast<int64_t>(C);
+  const int64_t dst = bidx * static_cast<int64_t>(C);
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    sum += __half2float(*reinterpret_cast<const __half*>(x + src + c)) +
+           __half2float(*reinterpret_cast<const __half*>(residual + src + c));
+  }
+  sum = block_sum_t<LN_THREADS>(sum);
+  const float inv_c = 1.0f / static_cast<float>(C);
+  const float mean = sum * inv_c;
+  float sum_var = 0.0f;
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + src + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + src + c));
+    const float d = v - mean;
+    sum_var += d * d;
+  }
+  sum_var = block_sum_t<LN_THREADS>(sum_var);
+  const float rstd = rsqrtf(sum_var * inv_c + eps);
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + src + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + src + c));
+    const float w = __half2float(*reinterpret_cast<const __half*>(weight + c));
+    const float bb = __half2float(*reinterpret_cast<const __half*>(bias + c));
+    *reinterpret_cast<__half*>(y + dst + c) = __float2half_rn((v - mean) * rstd * w + bb);
+  }
+}
+
 template <int Threads, bool VecStats, bool VecOut>
 __global__ __launch_bounds__(Threads, 1) void layer_norm_f16_small_kernel(
     const dtype* __restrict__ x,
@@ -1682,7 +1841,6 @@ void rwkv7_v4_emb_ln0_bf16_to_f16_launch(
     cudaStream_t stream, int V, int C,
     const uint16_t* emb_bf16, const uint16_t* weight_bf16, const uint16_t* bias_bf16,
     uint16_t* out_f16, float eps) {
-  assert(C == LN_SMALL_C);
   emb_ln0_bf16_to_f16_kernel<<<V, 256, 0, stream>>>(
       V, C, emb_bf16, weight_bf16, bias_bf16, out_f16, eps);
 }
@@ -1752,40 +1910,56 @@ void rwkv7_v3a_add_layer_norm_f16_launch(
 }
 
 void rwkv7_v3a_add_last_layer_norm_f16_launch(
-    cudaStream_t stream, int B, int T,
+    cudaStream_t stream, int B, int T, int C,
     const half* x, const half* residual, const half* weight, const half* bias,
     half* y, float eps) {
-  if (B >= 1024) {
-    add_last_layer_norm_f16_small_kernel<LN_SMALL512_THREADS, true, true><<<B, LN_SMALL512_THREADS, 0, stream>>>(
-        x, residual, weight, bias, y, B, T, eps);
-  } else if (B >= 512) {
-    add_last_layer_norm_f16_small_kernel<LN_SMALL512_THREADS, false, false><<<B, LN_SMALL512_THREADS, 0, stream>>>(
-        x, residual, weight, bias, y, B, T, eps);
-  } else {
-    add_last_layer_norm_f16_small_kernel<LN_SMALL_THREADS, false, false><<<B, LN_SMALL_THREADS, 0, stream>>>(
-        x, residual, weight, bias, y, B, T, eps);
+  if (C == LN_SMALL_C) {
+    if (B >= 1024) {
+      add_last_layer_norm_f16_small_kernel<LN_SMALL512_THREADS, true, true><<<B, LN_SMALL512_THREADS, 0, stream>>>(
+          x, residual, weight, bias, y, B, T, eps);
+    } else if (B >= 512) {
+      add_last_layer_norm_f16_small_kernel<LN_SMALL512_THREADS, false, false><<<B, LN_SMALL512_THREADS, 0, stream>>>(
+          x, residual, weight, bias, y, B, T, eps);
+    } else {
+      add_last_layer_norm_f16_small_kernel<LN_SMALL_THREADS, false, false><<<B, LN_SMALL_THREADS, 0, stream>>>(
+          x, residual, weight, bias, y, B, T, eps);
+    }
+    return;
   }
+  add_last_layer_norm_f16_kernel<<<B, LN_THREADS, 0, stream>>>(
+      C, x, residual, weight, bias, y, B, T, eps);
 }
 
 void rwkv7_v3a_add_layer_norm_cmix_mix_f16_launch(
-    cudaStream_t stream, int rows,
+    cudaStream_t stream, int rows, int C,
     const half* x, const half* residual, half* shift_state,
     const half* weight, const half* bias, const half* x_k,
     half* x_out, half* mixed, float eps) {
-  add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<rows, LN_SMALL_THREADS, 0, stream>>>(
-      x, residual, shift_state, weight, bias, x_k, x_out, mixed, rows, eps);
+  if (C == LN_SMALL_C) {
+    add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<rows, LN_SMALL_THREADS, 0, stream>>>(
+        x, residual, shift_state, weight, bias, x_k, x_out, mixed, rows, eps);
+    return;
+  }
+  add_layer_norm_cmix_mix_f16_generic_kernel<<<rows, LN_THREADS, 0, stream>>>(
+      C, x, residual, shift_state, weight, bias, x_k, x_out, mixed, rows, eps);
 }
 
 void rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
-    cudaStream_t stream, int rows,
+    cudaStream_t stream, int rows, int C,
     const half* x, const half* residual, half* shift_state,
     const half* weight, const half* bias,
     const half* x_r, const half* x_w, const half* x_k,
     const half* x_v, const half* x_a, const half* x_g,
     half* x_out, half* out_r, half* out_w, half* out_k,
     half* out_v, half* out_a, half* out_g, float eps) {
-  add_layer_norm_tmix_mix6_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<rows, LN_SMALL_THREADS, 0, stream>>>(
-      x, residual, shift_state, weight, bias, x_r, x_w, x_k, x_v, x_a, x_g,
+  if (C == LN_SMALL_C) {
+    add_layer_norm_tmix_mix6_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<rows, LN_SMALL_THREADS, 0, stream>>>(
+        x, residual, shift_state, weight, bias, x_r, x_w, x_k, x_v, x_a, x_g,
+        x_out, out_r, out_w, out_k, out_v, out_a, out_g, rows, eps);
+    return;
+  }
+  add_layer_norm_tmix_mix6_f16_generic_kernel<<<rows, LN_THREADS, 0, stream>>>(
+      C, x, residual, shift_state, weight, bias, x_r, x_w, x_k, x_v, x_a, x_g,
       x_out, out_r, out_w, out_k, out_v, out_a, out_g, rows, eps);
 }
 
