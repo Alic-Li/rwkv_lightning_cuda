@@ -31,7 +31,8 @@ void print_server_banner(
       "/state/chat/completions",
       "/state/status",
       "/state/delete",
-      "/v1/chat/completions"};
+      "/v1/chat/completions",
+      "/v1/models"};
 
   std::cout << "rwkv_lighting_cuda model_name=" << model.model_name()
             << " model_path=" << model.model_path() << "\n";

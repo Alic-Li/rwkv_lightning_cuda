@@ -112,14 +112,11 @@ InferenceEngine::InferenceEngine(
       tokenizer_(std::move(tokenizer)),
       model_name_(std::move(model_name)) {}
 
-std::vector<int64_t> InferenceEngine::encode_prompt(const std::string& prompt, bool pad_zero) const {
+std::vector<int64_t> InferenceEngine::encode_prompt(const std::string& prompt) const {
   auto ids = tokenizer_->encode(prompt);
   std::vector<int64_t> out(ids.begin(), ids.end());
-  if (pad_zero) {
-    out.insert(out.begin(), 0);
-  }
   if (out.empty()) {
-    out.push_back(0);
+    throw std::runtime_error("prompt is empty after tokenization");
   }
   return out;
 }
@@ -131,9 +128,10 @@ std::string InferenceEngine::generate_one(
     const StreamCallback* emit,
     int stream_index,
     int chunk_size) const {
-  const auto prompt_ids = encode_prompt(prompt, options.pad_zero);
+  const auto prompt_ids = encode_prompt(prompt);
   std::vector<std::vector<int64_t>> prefill_batch{prompt_ids};
-  auto logits = model_->forward_prefill(prefill_batch, state);
+  DeviceLogits logits;
+  model_->forward_prefill(prefill_batch, state, logits);
 
   std::vector<int> token_buffer;
   std::string utf8_pending;
@@ -146,7 +144,6 @@ std::string InferenceEngine::generate_one(
       break;
     }
 
-    update_sampler_penalties(token, penalties, options);
     token_buffer.push_back(token);
     result += tokenizer_->decode(token);
 
@@ -159,7 +156,7 @@ std::string InferenceEngine::generate_one(
       }
     }
 
-    logits = model_->forward_decode(std::vector<int64_t>{token}, state);
+    model_->forward_decode(std::vector<int64_t>{token}, state, logits);
   }
 
   if (emit != nullptr) {
@@ -225,17 +222,24 @@ std::string InferenceEngine::format_openai_prompt(
     const std::vector<std::pair<std::string, std::string>>& messages,
     bool enable_think) const {
   std::ostringstream oss;
+  bool has_prefix = false;
   if (!system.empty()) {
-    oss << "System: " << system << "\n\n";
+    oss << "System: " << system;
+    has_prefix = true;
   }
   for (const auto& [role, content] : messages) {
-    oss << role << ": " << content << "\n\n";
+    if (has_prefix) {
+      oss << "\n\n";
+    }
+    oss << role << ": " << content;
+    has_prefix = true;
+  }
+  if (has_prefix) {
+    oss << "\n\n";
   }
   oss << "Assistant:";
   if (enable_think) {
     oss << " <think>\n</think>\n";
-  } else {
-    oss << ' ';
   }
   return oss.str();
 }

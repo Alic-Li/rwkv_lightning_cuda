@@ -169,6 +169,16 @@ __global__ void emb_ln0_bf16_to_f16_kernel(
   }
 }
 
+__global__ void f16_to_f32_kernel(
+    const half* __restrict__ src,
+    float* __restrict__ dst,
+    int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    dst[i] = __half2float(src[i]);
+  }
+}
+
 __global__ void add_f16_kernel(
     const dtype* __restrict__ x,
     const dtype* __restrict__ y,
@@ -1675,6 +1685,16 @@ void rwkv7_v4_emb_ln0_bf16_to_f16_launch(
   assert(C == LN_SMALL_C);
   emb_ln0_bf16_to_f16_kernel<<<V, 256, 0, stream>>>(
       V, C, emb_bf16, weight_bf16, bias_bf16, out_f16, eps);
+}
+
+void rwkv7_v4_f16_to_f32_launch(
+    cudaStream_t stream,
+    const half* src_f16,
+    float* dst_f32,
+    long long elems) {
+  constexpr int threads = 256;
+  f16_to_f32_kernel<<<static_cast<int>(ceil_div(elems, threads)), threads, 0, stream>>>(
+      src_f16, dst_f32, elems);
 }
 
 void rwkv7_v3a_add_f16_launch(cudaStream_t stream, const half* x, const half* y, half* out, long long elems) {

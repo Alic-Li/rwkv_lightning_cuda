@@ -171,7 +171,61 @@ std::string block_key(int layer, const char* suffix) {
   return "blocks." + std::to_string(layer) + "." + suffix;
 }
 
+struct RuntimeModelConfig {
+  int layers = 0;
+  int channels = 0;
+  int heads = 0;
+  int head_size = 0;
+  int vocab = 0;
+  int ffn = 0;
+};
+
+RuntimeModelConfig infer_model_config(
+    const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name) {
+  RuntimeModelConfig cfg;
+  for (const auto& [name, rec] : by_name) {
+    if (name == "emb.weight" && rec->shape.size() == 2) {
+      cfg.vocab = static_cast<int>(rec->shape[0]);
+      cfg.channels = static_cast<int>(rec->shape[1]);
+    } else if (name == "blocks.0.att.r_k" && rec->shape.size() == 2) {
+      cfg.heads = static_cast<int>(rec->shape[0]);
+      cfg.head_size = static_cast<int>(rec->shape[1]);
+    } else if (name == "blocks.0.ffn.key.weight" && rec->shape.size() == 2) {
+      cfg.ffn = static_cast<int>(rec->shape[0]);
+    }
+    if (name.rfind("blocks.", 0) == 0) {
+      const char* s = name.c_str() + 7;
+      char* end = nullptr;
+      long layer = std::strtol(s, &end, 10);
+      if (end && *end == '.' && layer >= 0) {
+        cfg.layers = std::max(cfg.layers, static_cast<int>(layer) + 1);
+      }
+    }
+  }
+
+  if (cfg.layers <= 0 || cfg.channels <= 0 || cfg.heads <= 0 ||
+      cfg.head_size <= 0 || cfg.vocab <= 0 || cfg.ffn <= 0) {
+    std::cerr << "error: failed to infer runtime model config"
+              << " L=" << cfg.layers
+              << " C=" << cfg.channels
+              << " H=" << cfg.heads
+              << " N=" << cfg.head_size
+              << " V=" << cfg.vocab
+              << " F=" << cfg.ffn << "\n";
+    std::exit(1);
+  }
+  if (cfg.channels != cfg.heads * cfg.head_size) {
+    std::cerr << "error: invalid model config, channels != heads * head_size"
+              << " C=" << cfg.channels
+              << " H=" << cfg.heads
+              << " N=" << cfg.head_size << "\n";
+    std::exit(1);
+  }
+  return cfg;
+}
+
 struct CudaWeights {
+  RuntimeModelConfig config;
   std::unordered_map<std::string, std::unique_ptr<GpuTensor>> tensors;
   std::vector<LayerWeights> layers;
   const GpuTensor* ln_out_w = nullptr;
@@ -272,6 +326,21 @@ struct CudaWeights {
     ln_out_w = require("ln_out.weight");
     ln_out_b = require("ln_out.bias");
     head_w = require("head.weight");
+    if (head_w->shape.size() != 2 ||
+        static_cast<int>(head_w->shape[0]) != config.vocab ||
+        static_cast<int>(head_w->shape[1]) != config.channels) {
+      std::cerr << "error: head.weight shape mismatch"
+                << " expected=[" << config.vocab << "," << config.channels << "]"
+                << " actual=[";
+      if (!head_w->shape.empty()) {
+        std::cerr << head_w->shape[0];
+        if (head_w->shape.size() > 1) {
+          std::cerr << "," << head_w->shape[1];
+        }
+      }
+      std::cerr << "]\n";
+      std::exit(1);
+    }
   }
 };
 
@@ -294,8 +363,10 @@ void build_cpu_emb_ln0_f16(
   const RawBf16TensorView emb = raw("emb.weight");
   const RawBf16TensorView ln0_w = raw("blocks.0.ln0.weight");
   const RawBf16TensorView ln0_b = raw("blocks.0.ln0.bias");
-  const std::size_t elems = static_cast<std::size_t>(kVocab) * kChannels;
-  if (emb.elems != elems || ln0_w.elems != kChannels || ln0_b.elems != kChannels) {
+  const auto& cfg = weights.config;
+  const std::size_t elems = static_cast<std::size_t>(cfg.vocab) * cfg.channels;
+  if (emb.elems != elems || ln0_w.elems != static_cast<std::uint64_t>(cfg.channels) ||
+      ln0_b.elems != static_cast<std::uint64_t>(cfg.channels)) {
     std::cerr << "error: emb/ln0 shape mismatch for emb+ln0 preprocessing\n";
     std::exit(1);
   }
@@ -314,7 +385,7 @@ void build_cpu_emb_ln0_f16(
   check_cuda(cudaMemcpy(gpu_ln0_b.p, ln0_b.data, ln0_b.elems * sizeof(std::uint16_t), cudaMemcpyHostToDevice),
              "copy raw bf16 ln0 bias");
   rwkv7_v4_emb_ln0_bf16_to_f16_launch(
-      nullptr, kVocab, kChannels, gpu_emb.p, gpu_ln0_w.p, gpu_ln0_b.p, gpu_out.p, kLnEps);
+      nullptr, cfg.vocab, cfg.channels, gpu_emb.p, gpu_ln0_w.p, gpu_ln0_b.p, gpu_out.p, kLnEps);
   check_cuda(cudaGetLastError(), "launch emb+ln0 preprocess");
   weights.cpu_emb_ln0_f16.resize(elems);
   check_cuda(cudaMemcpy(weights.cpu_emb_ln0_f16.data(), gpu_out.p, elems * sizeof(std::uint16_t),
@@ -364,6 +435,8 @@ CudaWeights load_model_weights(
     const llm_infer::PthArchive& archive,
     const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name) {
   CudaWeights weights;
+  weights.config = infer_model_config(by_name);
+  weights.layers.reserve(static_cast<std::size_t>(weights.config.layers));
   auto emb = by_name.find("emb.weight");
   if (emb != by_name.end()) {
     weights.cpu_emb_bytes = numel(emb->second->shape) * sizeof(std::uint16_t);
@@ -372,9 +445,16 @@ CudaWeights load_model_weights(
   weights.load(archive, by_name, "ln_out.weight", true, pipeline);
   weights.load(archive, by_name, "ln_out.bias", true, pipeline);
   weights.load(archive, by_name, "head.weight", true, pipeline);
-  std::cout << "load_model global done gpu_mib=" << mib(weights.bytes())
+  std::cout << "load_model global done"
+            << " L=" << weights.config.layers
+            << " C=" << weights.config.channels
+            << " H=" << weights.config.heads
+            << " N=" << weights.config.head_size
+            << " V=" << weights.config.vocab
+            << " F=" << weights.config.ffn
+            << " gpu_mib=" << mib(weights.bytes())
             << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << "\n";
-  for (int layer = 0; layer < kLayers; ++layer) {
+  for (int layer = 0; layer < weights.config.layers; ++layer) {
     load_layer_into(weights, archive, by_name, layer, pipeline);
     std::cout << "load_model layer=" << layer
               << " done layers=" << weights.layers.size()
@@ -386,7 +466,14 @@ CudaWeights load_model_weights(
   check_cuda(cudaDeviceSynchronize(), "sync model weight load");
   weights.build_global_view();
   build_cpu_emb_ln0_f16(weights, archive, by_name);
-  std::cout << "load_model emb+ln0 done cpu_emb_mib=" << mib(weights.cpu_emb_bytes)
+  std::cout << "load_model emb+ln0 done"
+            << " L=" << weights.config.layers
+            << " C=" << weights.config.channels
+            << " H=" << weights.config.heads
+            << " N=" << weights.config.head_size
+            << " V=" << weights.config.vocab
+            << " F=" << weights.config.ffn
+            << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes)
             << " entries=" << weights.cpu_emb_ln0_f16.size() << "\n";
   return weights;
 }
@@ -565,10 +652,12 @@ CudaWeights load_backend_weights(const std::string& model_path) {
   return load_model_weights(archive.value(), by_name);
 }
 
-std::vector<float> run_backend_forward(
+void run_backend_forward(
     const CudaWeights& weights,
     const std::vector<std::vector<int64_t>>& token_batches,
-    GenerationState& state) {
+    GenerationState& state,
+    DeviceLogits& out) {
+  const auto& cfg = weights.config;
   const int B = static_cast<int>(token_batches.size());
   if (B <= 0) {
     throw std::runtime_error("token_batches must not be empty");
@@ -593,14 +682,16 @@ std::vector<float> run_backend_forward(
   const PathConfig path = select_path(run);
   const int rows = B * T;
   const int output_rows = B;
-  constexpr int C = kChannels;
-  constexpr int H = kHeads;
-  constexpr int N = kHeadSize;
+  const int C = cfg.channels;
+  const int H = cfg.heads;
+  const int N = cfg.head_size;
+  const int V = cfg.vocab;
+  const int F = cfg.ffn;
 
   HalfArena arena;
   arena.allocate(static_cast<std::size_t>(rows) * C * 31 + static_cast<std::size_t>(output_rows) * C +
-                 static_cast<std::size_t>(rows) * kFfn +
-                 static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * kVocab);
+                 static_cast<std::size_t>(rows) * F +
+                 static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * V);
 
   DeviceBuffer<unsigned char> lt_workspace;
   lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc backend cublasLt workspace");
@@ -608,7 +699,7 @@ std::vector<float> run_backend_forward(
   cudaStream_t stream = nullptr;
   check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create backend stream");
 
-  if (weights.cpu_emb_ln0_f16.size() != static_cast<std::size_t>(kVocab) * C) {
+  if (weights.cpu_emb_ln0_f16.size() != static_cast<std::size_t>(V) * C) {
     check_cuda(cudaStreamDestroy(stream), "destroy backend stream");
     throw std::runtime_error("cpu emb+ln0 table is not ready");
   }
@@ -617,7 +708,7 @@ std::vector<float> run_backend_forward(
   for (int b = 0; b < B; ++b) {
     for (int t = 0; t < T; ++t) {
       const int token_id = static_cast<int>(token_batches[static_cast<size_t>(b)][static_cast<size_t>(t)]);
-      if (token_id < 0 || token_id >= kVocab) {
+      if (token_id < 0 || token_id >= V) {
         check_cuda(cudaStreamDestroy(stream), "destroy backend stream");
         throw std::runtime_error("token id out of range");
       }
@@ -660,10 +751,10 @@ std::vector<float> run_backend_forward(
   half* x_after_att = arena.take(row_elems, "x_after_att");
   half* ln2_out = arena.take(row_elems, "ln2_out");
   half* mixed = arena.take(row_elems, "cmix_mixed");
-  half* hid = arena.take(static_cast<std::size_t>(rows) * kFfn, "ffn_hid");
+  half* hid = arena.take(static_cast<std::size_t>(rows) * F, "ffn_hid");
   half* cmix_out = arena.take(row_elems, "cmix_out");
   half* final_x = arena.take(static_cast<std::size_t>(output_rows) * C, "final_x");
-  half* logits = arena.take(static_cast<std::size_t>(output_rows) * kVocab, "logits");
+  half* logits_f16 = arena.take(static_cast<std::size_t>(output_rows) * V, "logits_f16");
 
   check_cuda(cudaMemcpyAsync(x0, host_x.data(), host_x.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice, stream),
              "copy backend emb rows");
@@ -676,7 +767,7 @@ std::vector<float> run_backend_forward(
   half* xx_next = xx1;
   bool pre_mix_ready = false;
 
-  for (int layer = 0; layer < kLayers; ++layer) {
+  for (int layer = 0; layer < cfg.layers; ++layer) {
     const LayerWeights& w = weights.layers[layer];
     const int Rw = static_cast<int>(w.att_w1_t->shape[0]);
     const int Ra = static_cast<int>(w.att_a1_t->shape[0]);
@@ -785,21 +876,21 @@ std::vector<float> run_backend_forward(
       rwkv7_cmix_mix_launch(stream, B, T, C, ln2_out, shift1, hp(w.ffn_x_k), mixed);
     }
 
-    linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, kFfn, mixed, hp(w.ffn_key_w), lt_workspace.p, lt_workspace.n, hid);
+    linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, F, mixed, hp(w.ffn_key_w), lt_workspace.p, lt_workspace.n, hid);
     if (path.cmix == CmixMode::NoFcOne) {
-      rwkv7_cmix_sparse_down_relu_one_launch(stream, C, kFfn, hid, hp(w.ffn_value_w), cmix_out);
+      rwkv7_cmix_sparse_down_relu_one_launch(stream, C, F, hid, hp(w.ffn_value_w), cmix_out);
     } else if (path.cmix == CmixMode::NoFcRows2) {
       if (rows >= 8) {
-        rwkv7_cmix_sparse_down_relu_rows_t512_launch(stream, B, T, C, kFfn, hid, hp(w.ffn_value_w), cmix_out);
+        rwkv7_cmix_sparse_down_relu_rows_t512_launch(stream, B, T, C, F, hid, hp(w.ffn_value_w), cmix_out);
       } else {
-        rwkv7_cmix_sparse_down_relu_rows_launch(stream, B, T, C, kFfn, hid, hp(w.ffn_value_w), cmix_out);
+        rwkv7_cmix_sparse_down_relu_rows_launch(stream, B, T, C, F, hid, hp(w.ffn_value_w), cmix_out);
       }
     } else {
-      rwkv7_relu_square_launch(stream, hid, hid, static_cast<long long>(rows) * kFfn);
-      rwkv7_v3a_linear_f16_launch(stream, rows, kFfn, C, hid, hp(w.ffn_value_w), cmix_out);
+      rwkv7_relu_square_launch(stream, hid, hid, static_cast<long long>(rows) * F);
+      rwkv7_v3a_linear_f16_launch(stream, rows, F, C, hid, hp(w.ffn_value_w), cmix_out);
     }
 
-    if (layer + 1 < kLayers) {
+    if (layer + 1 < cfg.layers) {
       const LayerWeights& next = weights.layers[layer + 1];
       if (B == 1 && T == 1) {
         half* next_shift0 = state.shift.p + static_cast<std::size_t>(layer + 1) * 2 * B * C;
@@ -826,21 +917,26 @@ std::vector<float> run_backend_forward(
   head_path.rows = output_rows;
   head_path.use_batched_rkv = false;
   head_path.cmix = CmixMode::Dense;
-  linear_orig_layout_launch(stream, head_path, LinearGroup::Head, output_rows, C, kVocab, final_x, hp(weights.head_w), lt_workspace.p, lt_workspace.n, logits);
+  linear_orig_layout_launch(
+      stream,
+      head_path,
+      LinearGroup::Head,
+      output_rows,
+      C,
+      V,
+      final_x,
+      hp(weights.head_w),
+      lt_workspace.p,
+      lt_workspace.n,
+      logits_f16);
   check_cuda(cudaGetLastError(), "launch backend head");
+  out.rows = output_rows;
+  out.vocab_size = V;
+  out.values.resize(static_cast<std::size_t>(output_rows) * V, "alloc backend logits f32");
+  rwkv7_v4_f16_to_f32_launch(stream, logits_f16, out.values.p, out.values.n);
+  check_cuda(cudaGetLastError(), "launch backend logits f16->f32");
   check_cuda(cudaStreamSynchronize(stream), "sync backend stream");
-
-  std::vector<half> host_logits(static_cast<std::size_t>(output_rows) * kVocab);
-  check_cuda(
-      cudaMemcpy(host_logits.data(), logits, host_logits.size() * sizeof(half), cudaMemcpyDeviceToHost),
-      "copy backend logits");
   check_cuda(cudaStreamDestroy(stream), "destroy backend stream");
-
-  std::vector<float> out(host_logits.size());
-  for (size_t i = 0; i < host_logits.size(); ++i) {
-    out[i] = __half2float(host_logits[i]);
-  }
-  return out;
 }
 
 }  // namespace
@@ -870,9 +966,10 @@ GenerationState ModelBackend::create_state(int batch_size) const {
   }
   GenerationState state;
   state.batch_size = batch_size;
-  const std::size_t shift_elems = static_cast<std::size_t>(kLayers) * 2 * batch_size * kChannels;
+  const auto& cfg = impl_->weights.config;
+  const std::size_t shift_elems = static_cast<std::size_t>(cfg.layers) * 2 * batch_size * cfg.channels;
   const std::size_t state_elems =
-      static_cast<std::size_t>(kLayers) * batch_size * kHeads * kHeadSize * kHeadSize;
+      static_cast<std::size_t>(cfg.layers) * batch_size * cfg.heads * cfg.head_size * cfg.head_size;
   state.shift.resize(shift_elems, "alloc backend shift state");
   state.wkv_state.resize(state_elems, "alloc backend wkv state");
   state.elapsed.resize(batch_size, "alloc backend elapsed");
@@ -882,25 +979,27 @@ GenerationState ModelBackend::create_state(int batch_size) const {
   return state;
 }
 
-std::vector<float> ModelBackend::forward_prefill(
+void ModelBackend::forward_prefill(
     const std::vector<std::vector<int64_t>>& token_batches,
-    GenerationState& state) const {
-  return run_backend_forward(impl_->weights, token_batches, state);
+    GenerationState& state,
+    DeviceLogits& logits) const {
+  run_backend_forward(impl_->weights, token_batches, state, logits);
 }
 
-std::vector<float> ModelBackend::forward_decode(
+void ModelBackend::forward_decode(
     const std::vector<int64_t>& token_batch,
-    GenerationState& state) const {
+    GenerationState& state,
+    DeviceLogits& logits) const {
   std::vector<std::vector<int64_t>> batch;
   batch.reserve(token_batch.size());
   for (int64_t token : token_batch) {
     batch.push_back({token});
   }
-  return run_backend_forward(impl_->weights, batch, state);
+  run_backend_forward(impl_->weights, batch, state, logits);
 }
 
 int ModelBackend::vocab_size() const {
-  return kVocab;
+  return impl_->weights.config.vocab;
 }
 
 const std::string& ModelBackend::model_path() const {

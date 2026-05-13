@@ -19,6 +19,9 @@ void rwkv7_v4_emb_ln0_bf16_to_f16_launch(
     const uint16_t* emb_bf16, const uint16_t* weight_bf16, const uint16_t* bias_bf16,
     uint16_t* out_f16, float eps);
 
+void rwkv7_v4_f16_to_f32_launch(
+    cudaStream_t stream, const half* src_f16, float* dst_f32, long long elems);
+
 void rwkv7_wkv_fp16_seq_launch(
     cudaStream_t stream, int B, int T, int C, int H,
     half* state, const half* r, const half* w, const half* k, const half* v,

@@ -20,7 +20,6 @@ struct GenerateOptions {
   double alpha_presence = 1.0;
   double alpha_frequency = 0.1;
   double alpha_decay = 0.996;
-  bool pad_zero = true;
 };
 
 struct GenerationState {
@@ -36,6 +35,18 @@ struct GenerationState {
   GenerationState& operator=(GenerationState&&) noexcept = default;
 };
 
+struct DeviceLogits {
+  int rows = 0;
+  int vocab_size = 0;
+  rwkv7_fast_v4::DeviceBuffer<float> values;
+
+  DeviceLogits() = default;
+  DeviceLogits(const DeviceLogits&) = delete;
+  DeviceLogits& operator=(const DeviceLogits&) = delete;
+  DeviceLogits(DeviceLogits&&) noexcept = default;
+  DeviceLogits& operator=(DeviceLogits&&) noexcept = default;
+};
+
 class ModelBackend {
  public:
   explicit ModelBackend(std::string model_path);
@@ -47,12 +58,14 @@ class ModelBackend {
   ModelBackend& operator=(ModelBackend&&) noexcept;
 
   GenerationState create_state(int batch_size) const;
-  std::vector<float> forward_prefill(
+  void forward_prefill(
       const std::vector<std::vector<int64_t>>& token_batches,
-      GenerationState& state) const;
-  std::vector<float> forward_decode(
+      GenerationState& state,
+      DeviceLogits& logits) const;
+  void forward_decode(
       const std::vector<int64_t>& token_batch,
-      GenerationState& state) const;
+      GenerationState& state,
+      DeviceLogits& logits) const;
 
   int vocab_size() const;
   const std::string& model_path() const;

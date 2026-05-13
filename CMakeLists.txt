@@ -35,10 +35,11 @@ set(RWKV7_FAST_SERVER_CORE_SOURCES
   src/rwkv7_fast_v4.cu
   src/pth_archive.cpp
   src/pth_tensor.cpp
-  src/rwkv_tokenizer.cpp
+  src/utils/tokenizer.cpp
   src/rwkv_sampler.cpp
   src/rwkv_inference_engine.cpp
   src/rwkv_state_cache.cpp
+  src/utils/sampling.cu
   cuda/rwkv7_v3a_ops.cu
   cuda/rwkv7_fast_ops_fp16.cu
   cuda/rwkv7_wkv_fp16_v2.cu
@@ -55,7 +56,7 @@ add_executable(benchmark
 
 target_include_directories(rwkv7_fast_backend_core PUBLIC cuda include src)
 target_include_directories(benchmark PRIVATE cuda include src)
-target_compile_definitions(rwkv7_fast_backend_core PRIVATE _IO_FP16_)
+target_compile_definitions(rwkv7_fast_backend_core PRIVATE _IO_FP16_ RWKV_SAMPLING_NO_TORCH)
 target_compile_definitions(benchmark PRIVATE _IO_FP16_)
 if(RWKV7_FAST_V4_STATIC_LINK)
   target_link_libraries(rwkv7_fast_backend_core PUBLIC

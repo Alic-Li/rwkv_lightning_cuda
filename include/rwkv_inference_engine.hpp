@@ -50,12 +50,12 @@ class InferenceEngine {
 
   int count_tokens(const std::string& text) const;
 
-  std::shared_ptr<ModelBackend> model() const { return model_; }
-  std::shared_ptr<TrieTokenizer> tokenizer() const { return tokenizer_; }
+ std::shared_ptr<ModelBackend> model() const { return model_; }
+ std::shared_ptr<TrieTokenizer> tokenizer() const { return tokenizer_; }
  const std::string& model_name() const { return model_name_; }
 
  private:
-  std::vector<int64_t> encode_prompt(const std::string& prompt, bool pad_zero) const;
+  std::vector<int64_t> encode_prompt(const std::string& prompt) const;
   std::string generate_one(
       const std::string& prompt,
       GenerationState& state,
