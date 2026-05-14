@@ -10,9 +10,11 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <stdexcept>
+#include <string>
 
 #include "sampling.h"
 typedef curandStatePhilox4_32_10_t RAND;
+constexpr double kLog2E = 1.44269504088896340736;
 
 template <typename T, typename ReduceOp>
 __device__ __forceinline__ void warpReduceAll(T& val, ReduceOp op) {
@@ -531,7 +533,7 @@ cudaError_t batch_sampling_repetition_temperature_topk_topp_raw(
         static_cast<float>(presence_penalty),
         static_cast<float>(repetition_penalty),
         static_cast<float>(penalty_decay),
-        static_cast<float>(M_LOG2E / temperature),
+        static_cast<float>(kLog2E / temperature),
         top_k,
         static_cast<float>(top_p));
     return cudaGetLastError();
@@ -586,7 +588,7 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
         top_k = 1;
         top_p = 1;
     }
-    double log2e_inv_temp = M_LOG2E / temperature;
+    double log2e_inv_temp = kLog2E / temperature;
     auto stream = at::cuda::getCurrentCUDAStream();
     auto probs = at::empty({B,V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
     if (B*V*4 <= 4194304) {
@@ -891,7 +893,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fl = ((float*)&l4)[j];
-            fl = sf(fl * float(M_LOG2E));
+            fl = sf(fl * static_cast<float>(kLog2E));
             maxu = max(maxu, fl);
         }
         ((float4*)probs)[i] = l4;
@@ -1113,7 +1115,7 @@ at::Tensor batch_sampling_temperature_topk_topp(
         top_k = 1;
         top_p = 1;
     }
-    double log2e_inv_temp = M_LOG2E / temperature;
+    double log2e_inv_temp = kLog2E / temperature;
 
     auto stream = at::cuda::getCurrentCUDAStream();
     auto probs = at::empty({B,V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));

@@ -110,6 +110,7 @@ func (l *launcher) start(req startRequest) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = appDir()
+	cmd.Env = backendProcessEnv(cmd.Dir)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -150,6 +151,51 @@ func (l *launcher) start(req startRequest) error {
 	}()
 
 	return nil
+}
+
+func backendProcessEnv(baseDir string) []string {
+	env := os.Environ()
+	if runtime.GOOS != "windows" {
+		return env
+	}
+
+	libDir := filepath.Join(baseDir, "lib")
+	if st, err := os.Stat(libDir); err != nil || !st.IsDir() {
+		return env
+	}
+
+	oldPath, key := getEnvCaseInsensitive("PATH")
+	newPath := libDir
+	if oldPath != "" {
+		newPath = libDir + ";" + oldPath
+	}
+
+	prefix := key + "="
+	replaced := false
+	for i := range env {
+		if strings.HasPrefix(strings.ToUpper(env[i]), "PATH=") {
+			env[i] = prefix + newPath
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		env = append(env, prefix+newPath)
+	}
+	return env
+}
+
+func getEnvCaseInsensitive(name string) (value string, key string) {
+	for _, e := range os.Environ() {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if strings.EqualFold(parts[0], name) {
+			return parts[1], parts[0]
+		}
+	}
+	return "", name
 }
 
 func pipeScanner(l *launcher, name string, r interface{ Read([]byte) (int, error) }) {

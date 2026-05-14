@@ -8,6 +8,26 @@ if(NOT Drogon_FOUND)
   find_package(Drogon QUIET)
 endif()
 
+# Normalize SQLite target name across CMake/vcpkg variants on Windows.
+if(TARGET SQLite3::SQLite3)
+  set(RWKV_SQLITE_TARGET SQLite3::SQLite3)
+elseif(TARGET SQLite::SQLite3)
+  set(RWKV_SQLITE_TARGET SQLite::SQLite3)
+else()
+  add_library(RWKV_SQLITE_FALLBACK INTERFACE)
+  if(SQLite3_INCLUDE_DIRS)
+    target_include_directories(RWKV_SQLITE_FALLBACK INTERFACE ${SQLite3_INCLUDE_DIRS})
+  endif()
+  if(SQLite3_LIBRARIES)
+    target_link_libraries(RWKV_SQLITE_FALLBACK INTERFACE ${SQLite3_LIBRARIES})
+  elseif(SQLite3_LIBRARY)
+    target_link_libraries(RWKV_SQLITE_FALLBACK INTERFACE ${SQLite3_LIBRARY})
+  else()
+    message(FATAL_ERROR "SQLite3 was found, but no linkable target or library variable was provided.")
+  endif()
+  set(RWKV_SQLITE_TARGET RWKV_SQLITE_FALLBACK)
+endif()
+
 option(RWKV7_FAST_V4_GC_SECTIONS "Enable section garbage collection to reduce binary size" ON)
 option(RWKV7_FAST_V4_AUTO_STRIP "Strip the release binary after linking when possible" ON)
 option(RWKV7_FAST_BUILD_TESTS "Build unit tests" ON)
@@ -88,7 +108,7 @@ target_include_directories(rwkv7_fast_backend_core PUBLIC cuda include src)
 target_include_directories(benchmark PRIVATE cuda include src)
 target_compile_definitions(rwkv7_fast_backend_core PRIVATE _IO_FP16_ RWKV_SAMPLING_NO_TORCH)
 target_compile_definitions(benchmark PRIVATE _IO_FP16_)
-target_link_libraries(rwkv7_fast_backend_core PUBLIC CUDA::cublas CUDA::cublasLt SQLite3::SQLite3)
+target_link_libraries(rwkv7_fast_backend_core PUBLIC CUDA::cublas CUDA::cublasLt ${RWKV_SQLITE_TARGET})
 target_link_libraries(benchmark PRIVATE CUDA::cublas CUDA::cublasLt)
 set_property(TARGET rwkv7_fast_backend_core PROPERTY CUDA_RUNTIME_LIBRARY Shared)
 set_property(TARGET benchmark PROPERTY CUDA_RUNTIME_LIBRARY Shared)
@@ -102,10 +122,12 @@ if(MSVC)
   target_compile_definitions(rwkv7_fast_backend_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
   target_compile_definitions(benchmark PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
   target_compile_options(rwkv7_fast_backend_core PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:/O2 /utf-8 /EHsc>
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /EHsc>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:/O2>
   )
   target_compile_options(benchmark PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:/O2 /utf-8 /EHsc>
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /EHsc>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:/O2>
   )
 else()
   target_compile_options(rwkv7_fast_backend_core PRIVATE
@@ -129,10 +151,10 @@ else()
 endif()
 
 target_compile_options(rwkv7_fast_backend_core PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math --extra-device-vectorization --ptxas-options=-O3>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-O3 --use_fast_math --extra-device-vectorization --ptxas-options=-O3>
 )
 target_compile_options(benchmark PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math --extra-device-vectorization --ptxas-options=-O3>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-O3 --use_fast_math --extra-device-vectorization --ptxas-options=-O3>
 )
 
 if(Drogon_FOUND)
@@ -143,6 +165,7 @@ if(Drogon_FOUND)
   target_link_libraries(rwkv_lighting_cuda PRIVATE rwkv7_fast_backend_core Drogon::Drogon)
   target_include_directories(rwkv_lighting_cuda PRIVATE cuda include src)
   if(MSVC)
+    target_compile_definitions(rwkv_lighting_cuda PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     target_compile_options(rwkv_lighting_cuda PRIVATE /O2 /utf-8 /EHsc)
   else()
     target_compile_options(rwkv_lighting_cuda PRIVATE -O3)

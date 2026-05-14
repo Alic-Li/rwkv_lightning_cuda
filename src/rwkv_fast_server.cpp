@@ -1,10 +1,14 @@
 #include <atomic>
 #include <csignal>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <drogon/drogon.h>
 
@@ -27,9 +31,30 @@ void handle_signal(int) {
   drogon::app().quit();
 }
 
+#ifdef _WIN32
+void configure_windows_dll_search_path() {
+  char exe_path[MAX_PATH] = {0};
+  const DWORD n = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) {
+    return;
+  }
+
+  std::filesystem::path lib_dir = std::filesystem::path(exe_path).parent_path() / "lib";
+  if (!std::filesystem::exists(lib_dir)) {
+    return;
+  }
+
+  // Ensure bundled DLLs in ./lib are discoverable regardless of the launch cwd.
+  SetDllDirectoryA(lib_dir.string().c_str());
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+  configure_windows_dll_search_path();
+#endif
   trantor::Logger::setLogLevel(trantor::Logger::kInfo);
   std::string model_path;
   std::string vocab_path;
