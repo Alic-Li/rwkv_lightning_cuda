@@ -18,7 +18,12 @@ Only Compile Server Backend
 ```bash
 cmake --build ./build -j --target rwkv_lighting_cuda
 ```
+If Want to Compile GUI
 
+```bash
+mkdir ./third_party; cd ./third_party; git clone https://github.com/ocornut/imgui.git;
+cmake --build ./build -j
+```
 ## Run
 
 Run benchmark

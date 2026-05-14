@@ -12,7 +12,7 @@
 namespace rwkv7_server {
 
 struct GenerateOptions {
-  int max_tokens = 1024;
+  int max_tokens = 8192;
   std::vector<int64_t> stop_tokens{0, 261, 24281};
   double temperature = 1.0;
   int top_k = 20;

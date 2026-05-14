@@ -1,6 +1,5 @@
 #include <atomic>
 #include <csignal>
-#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -19,33 +18,6 @@ namespace {
 
 std::atomic<bool> g_shutdown{false};
 
-void print_server_banner(
-    const rwkv7_server::ModelBackend& model,
-    const std::string& vocab_path,
-    const std::string& state_db_path,
-    uint16_t port,
-    const std::optional<std::string>& password) {
-  const std::vector<std::string> endpoints{
-      "/v1/batch/completions",
-      "/translate/v1/batch-translate",
-      "/state/chat/completions",
-      "/state/status",
-      "/state/delete",
-      "/v1/chat/completions",
-      "/v1/models"};
-
-  std::cout << "rwkv_lighting_cuda model_name=" << model.model_name()
-            << " model_path=" << model.model_path() << "\n";
-  std::cout << "rwkv_lighting_cuda vocab_path=" << vocab_path
-            << " state_db_path=" << state_db_path
-            << " port=" << port
-            << " password=" << (password.has_value() ? "enabled" : "disabled") << "\n";
-  std::cout << "rwkv_lighting_cuda api_endpoints:\n";
-  for (const auto& endpoint : endpoints) {
-    std::cout << "  - http://0.0.0.0:" << port << endpoint << "\n";
-  }
-}
-
 void handle_signal(int) {
   g_shutdown = true;
   try {
@@ -58,6 +30,7 @@ void handle_signal(int) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  trantor::Logger::setLogLevel(trantor::Logger::kInfo);
   std::string model_path;
   std::string vocab_path;
   std::string state_db_path = "rwkv_sessions.db";
@@ -107,7 +80,22 @@ int main(int argc, char* argv[]) {
   std::signal(SIGTERM, handle_signal);
 
   rwkv7_server::register_api_routes(engine, password);
-  print_server_banner(*model, vocab_path, state_db_path, port, password);
+  LOG_INFO << "rwkv_lighting_cuda model_name=" << model->model_name()
+           << " model_path=" << model->model_path();
+  LOG_INFO << "rwkv_lighting_cuda vocab_path=" << vocab_path
+           << " state_db_path=" << state_db_path
+           << " port=" << port
+           << " password=" << (password.has_value() ? "enabled" : "disabled");
+  for (const std::string& endpoint : std::vector<std::string>{
+           "/v1/batch/completions",
+           "/translate/v1/batch-translate",
+           "/state/chat/completions",
+           "/state/status",
+           "/state/delete",
+           "/v1/chat/completions",
+           "/v1/models"}) {
+    LOG_INFO << "http://0.0.0.0:" << port << endpoint;
+  }
 
   drogon::app()
       .addListener("0.0.0.0", port)

@@ -4,3 +4,4 @@ rwkv_sessions.db
 rwkv_batch/
 bak/
 build/
+third_party/
