@@ -6,3 +6,4 @@ bak/
 build/
 third_party/
 uploads/
+RWKV_Lightning_CUDA_Launcher/rwkv_launcher
