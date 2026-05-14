@@ -3,7 +3,7 @@
 ```bash
 cmake -S . -B ./build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120" \
+  -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120" \
   -DRWKV7_FAST_V4_STATIC_LINK=ON
 
 cmake --build ./build -j
