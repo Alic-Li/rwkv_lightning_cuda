@@ -15,10 +15,6 @@ cmake -S . -B ./build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="75;
 
 cmake --build ./build --config Release -j --target bundle_rwkv_lighting_cuda
 ```
-Compile Server Bundle
-```bash
-cmake --build ./build -j --target bundle_rwkv_lighting_cuda
-```
 
 Compile Go Web Frontend
 
@@ -47,6 +43,16 @@ Run server
 
 ```bash
 ./build/rwkv_lighting_cuda \
+  --model-path /path/to/model.pth \
+  --vocab-path /path/to/rwkv_vocab_v20230424.txt \
+  --port 8000
+```
+
+If use windows 
+```bash
+cd build\bundle\rwkv_lighting_cuda;
+set "SCRIPT_DIR=%~dp0\";
+.\build/rwkv_lighting_cuda \
   --model-path /path/to/model.pth \
   --vocab-path /path/to/rwkv_vocab_v20230424.txt \
   --port 8000

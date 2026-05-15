@@ -573,7 +573,7 @@ void register_api_routes(
         const auto options = parse_options(*json);
 
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, prompt, options, chunk_size = (*json).get("chunk_size", 8).asInt()](
+          cb(make_sse_response([&engine, prompt, options, chunk_size = (*json).get("chunk_size", 2).asInt()](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
                 std::move(stream),

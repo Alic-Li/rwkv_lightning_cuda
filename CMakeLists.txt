@@ -32,6 +32,24 @@ option(RWKV7_FAST_V4_GC_SECTIONS "Enable section garbage collection to reduce bi
 option(RWKV7_FAST_V4_AUTO_STRIP "Strip the release binary after linking when possible" ON)
 option(RWKV7_FAST_BUILD_TESTS "Build unit tests" ON)
 
+function(rwkv_configure_msvc_optimized_target target_name)
+  target_compile_definitions(${target_name} PRIVATE
+    $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+  )
+  target_compile_options(${target_name} PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /EHsc>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:/O2>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-Xcompiler=/O2>
+  )
+
+  if(RWKV7_FAST_V4_MSVC_LTCG)
+    target_compile_options(${target_name} PRIVATE
+      $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:SHELL:/GL>
+      $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:SHELL:-Xcompiler=/GL>
+    )
+  endif()
+endfunction()
+
 function(rwkv_configure_runtime_bundle target_name)
   if(APPLE)
     set(_rwkv_origin "@loader_path")
@@ -106,6 +124,7 @@ if(MSVC)
     $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /EHsc>
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:/O2>
   )
+  rwkv_configure_msvc_optimized_target(rwkv7_fast_backend_core)
 else()
   target_compile_options(rwkv7_fast_backend_core PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
