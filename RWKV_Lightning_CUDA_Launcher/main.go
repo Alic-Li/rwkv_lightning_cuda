@@ -27,6 +27,7 @@ type startRequest struct {
 	VocabPath string `json:"vocab_path"`
 	Port      string `json:"port"`
 	Password  string `json:"password"`
+	UseWKV32  bool   `json:"use_wkv32"`
 }
 
 type launcher struct {
@@ -105,6 +106,9 @@ func (l *launcher) start(req startRequest) error {
 	}
 	if strings.TrimSpace(req.Password) != "" {
 		args = append(args, "--password", strings.TrimSpace(req.Password))
+	}
+	if req.UseWKV32 {
+		args = append(args, "--wkv32")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -526,6 +530,12 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
       .actions { flex-direction: column; }
       button { width: 100%; }
     }
+	input[type="checkbox"] {
+	  margin-right: 6px;
+	  width: 16px;
+	  height: 16px;
+	  vertical-align: middle;
+	}
   </style>
 </head>
 <body>
@@ -550,12 +560,20 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
           <input id="vocab" value="{{.DefaultVocab}}" />
           <button class="browse" onclick="pickFile('vocab')">Browse</button>
         </div>
-        <div class="row small">
-          <label>Port</label>
-          <input id="port" value="{{.DefaultPort}}" inputmode="numeric" />
-          <label>Password</label>
-          <input id="password" type="password" placeholder="empty = disabled" />
-        </div>
+		<div class="row small">
+		  <label>Port</label>
+		  <input id="port" value="{{.DefaultPort}}" inputmode="numeric" />
+		  <label>Password</label>
+		  <input id="password" type="password" placeholder="empty = disabled" />
+		</div>
+		<div class="row" style="align-items: center;">
+		  <label></label>
+		  <label style="display: flex; align-items: center; font-weight: 500; color: #334155; gap: 8px;">
+		    <input type="checkbox" id="useWkv32" />
+		    Use FP32 WKV (More accurate, Bsz=1 Have almost same speed, High concurrency use more VRAM)
+		  </label>
+		  <label></label>
+		</div>
       </div>
 
       <div class="console-wrap">
@@ -602,6 +620,7 @@ async function startBackend() {
     vocab_path: document.getElementById('vocab').value,
     port: document.getElementById('port').value,
     password: document.getElementById('password').value,
+  	use_wkv32: document.getElementById('useWkv32').checked,
   };
   try {
     const r = await fetch('/api/start', { method: 'POST', body: JSON.stringify(payload) });

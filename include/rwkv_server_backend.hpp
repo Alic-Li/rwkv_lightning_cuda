@@ -24,8 +24,10 @@ struct GenerateOptions {
 
 struct GenerationState {
   int batch_size = 0;
+  bool wkv32 = false;
   rwkv7_fast_v4::DeviceBuffer<half> shift;
   rwkv7_fast_v4::DeviceBuffer<half> wkv_state;
+  rwkv7_fast_v4::DeviceBuffer<float> wkv_state32;
   rwkv7_fast_v4::DeviceBuffer<int> elapsed;
 
   GenerationState() = default;
@@ -68,7 +70,7 @@ class IModelBackend {
 
 class ModelBackend final : public IModelBackend {
  public:
-  explicit ModelBackend(std::string model_path);
+  explicit ModelBackend(std::string model_path, bool use_wkv32 = false);
   ~ModelBackend() override;
 
   ModelBackend(const ModelBackend&) = delete;

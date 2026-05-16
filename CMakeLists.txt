@@ -70,16 +70,6 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
-set(RWKV7_FAST_V4_SOURCES
-  src/rwkv7_fast_v4_org.cu
-  src/pth_archive.cpp
-  src/pth_tensor.cpp
-  cuda/rwkv7_v3a_ops.cu
-  cuda/rwkv7_fast_ops_fp16.cu
-  cuda/rwkv7_wkv_fp16_v2.cu
-  cuda/rwkv7_wkv_fp32_v2.cu
-)
-
 set(RWKV7_FAST_SERVER_CORE_SOURCES
   src/rwkv7_fast_v4.cu
   src/pth_archive.cpp
@@ -100,18 +90,10 @@ add_library(rwkv7_fast_backend_core STATIC
   ${RWKV7_FAST_SERVER_CORE_SOURCES}
 )
 
-add_executable(benchmark
-  ${RWKV7_FAST_V4_SOURCES}
-)
-
 target_include_directories(rwkv7_fast_backend_core PUBLIC cuda include src)
-target_include_directories(benchmark PRIVATE cuda include src)
 target_compile_definitions(rwkv7_fast_backend_core PRIVATE _IO_FP16_ RWKV_SAMPLING_NO_TORCH)
-target_compile_definitions(benchmark PRIVATE _IO_FP16_)
 target_link_libraries(rwkv7_fast_backend_core PUBLIC CUDA::cublas CUDA::cublasLt ${RWKV_SQLITE_TARGET})
-target_link_libraries(benchmark PRIVATE CUDA::cublas CUDA::cublasLt)
 set_property(TARGET rwkv7_fast_backend_core PROPERTY CUDA_RUNTIME_LIBRARY Shared)
-set_property(TARGET benchmark PROPERTY CUDA_RUNTIME_LIBRARY Shared)
 
 if(RWKV7_FAST_BUILD_TESTS)
   enable_testing()
@@ -120,12 +102,7 @@ endif()
 
 if(MSVC)
   target_compile_definitions(rwkv7_fast_backend_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-  target_compile_definitions(benchmark PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
   target_compile_options(rwkv7_fast_backend_core PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /EHsc>
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:/O2>
-  )
-  target_compile_options(benchmark PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /EHsc>
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:/O2>
   )
@@ -133,27 +110,16 @@ else()
   target_compile_options(rwkv7_fast_backend_core PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
   )
-  target_compile_options(benchmark PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O3>
-  )
   if(RWKV7_FAST_V4_GC_SECTIONS)
     target_compile_options(rwkv7_fast_backend_core PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-ffunction-sections -fdata-sections>
       $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffunction-sections,-fdata-sections>
     )
-    target_compile_options(benchmark PRIVATE
-      $<$<COMPILE_LANGUAGE:CXX>:-ffunction-sections -fdata-sections>
-      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffunction-sections,-fdata-sections>
-    )
     target_link_options(rwkv7_fast_backend_core PRIVATE -Wl,--gc-sections)
-    target_link_options(benchmark PRIVATE -Wl,--gc-sections)
   endif()
 endif()
 
 target_compile_options(rwkv7_fast_backend_core PRIVATE
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-O3 --use_fast_math --extra-device-vectorization --ptxas-options=-O3>
-)
-target_compile_options(benchmark PRIVATE
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CONFIG:Debug>>>:-O3 --use_fast_math --extra-device-vectorization --ptxas-options=-O3>
 )
 
@@ -176,13 +142,6 @@ else()
 endif()
 
 if(RWKV7_FAST_V4_AUTO_STRIP AND CMAKE_STRIP AND NOT MSVC)
-  add_custom_command(TARGET benchmark POST_BUILD
-    COMMAND "$<$<CONFIG:Release>:${CMAKE_STRIP}>"
-            "$<$<CONFIG:Release>:--strip-unneeded>"
-            "$<$<CONFIG:Release>:$<TARGET_FILE:benchmark>>"
-    VERBATIM
-    COMMAND_EXPAND_LISTS
-  )
   if(TARGET rwkv_lighting_cuda)
     add_custom_command(TARGET rwkv_lighting_cuda POST_BUILD
       COMMAND "$<$<CONFIG:Release>:${CMAKE_STRIP}>"

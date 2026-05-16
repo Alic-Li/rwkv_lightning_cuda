@@ -162,6 +162,11 @@ void rwkv7_v3a_linear_orig_rows_cfg_f16_launch(
     const half* x, const half* weight_orig,
     int threads, int row_tile, int out_tile, half* y);
 
+void rwkv7_v3a_linear_orig_rows_exact_f16_launch(
+    cudaStream_t stream, int M, int K, int N,
+    const half* x, const half* weight_orig,
+    int threads, int out_tile, bool use4, half* y);
+
 void rwkv7_v3a_linear_t_act_f16_launch(
     cudaStream_t stream, int M, int K, int N,
     const half* x, const half* weight_t, int act, half* y);

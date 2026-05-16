@@ -3,9 +3,9 @@
 ```bash
 cmake -S . -B ./build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120" \
+  -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120"
 
-cmake --build ./build -j
+cmake --build ./build -j --config Release -j --target bundle_rwkv_lighting_cuda
 ```
 
 Windows

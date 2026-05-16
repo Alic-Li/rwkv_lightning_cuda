@@ -2,13 +2,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
-#include <cctype>
-#include <cmath>
 #include <cstdint>
-#include <chrono>
-#include <fstream>
 #include <filesystem>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -18,7 +13,6 @@
 #include <vector>
 
 #include <cuda_fp16.h>
-#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include "pth_archive.hpp"
@@ -38,7 +32,7 @@ struct RawBf16TensorView {
 
 RawBf16TensorView raw_bf16_tensor_view(const llm_infer::PthArchive& archive, const llm_infer::TensorRecord& rec) {
   if (!is_contiguous_shape(rec.shape, rec.stride)) {
-    std::cerr << "error: v4 GPU loader currently requires contiguous tensor: " << rec.name << "\n";
+    std::cerr << "error: v4 GPU loader currently requires contiguous tensor: " << rec.name << std::endl;
     std::exit(1);
   }
   const std::string prefix = archive_prefix(archive);
@@ -48,18 +42,18 @@ RawBf16TensorView raw_bf16_tensor_view(const llm_infer::PthArchive& archive, con
   }
   const auto* entry = archive.find_entry(prefix + "/data/" + rec.storage_key);
   if (!entry) {
-    std::cerr << "error: storage entry not found for tensor: " << rec.name << "\n";
+    std::cerr << "error: storage entry not found for tensor: " << rec.name << std::endl;
     std::exit(1);
   }
   auto view = archive.stored_entry_view(*entry);
   require_result(view.ok(), view.status().message());
   if (rec.storage_size * sizeof(std::uint16_t) != view.value().size) {
-    std::cerr << "error: storage byte size mismatch for tensor: " << rec.name << "\n";
+    std::cerr << "error: storage byte size mismatch for tensor: " << rec.name << std::endl;
     std::exit(1);
   }
   const std::uint64_t n = numel(rec.shape);
   if (rec.storage_offset + n > rec.storage_size) {
-    std::cerr << "error: tensor data range exceeds storage: " << rec.name << "\n";
+    std::cerr << "error: tensor data range exceeds storage: " << rec.name << std::endl;
     std::exit(1);
   }
   RawBf16TensorView out;
@@ -129,7 +123,7 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
   auto it = by_name.find(key);
   if (it == by_name.end()) {
     if (required) {
-      std::cerr << "error: missing tensor: " << key << "\n";
+      std::cerr << "error: missing tensor: " << key << std::endl;
       std::exit(1);
     }
     return nullptr;
@@ -140,7 +134,7 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
   const bool transpose = should_transpose_like_v3a(rec.name);
   if (transpose) {
     if (rec.shape.size() != 2) {
-      std::cerr << "error: v3a transpose rule requires 2D tensor: " << rec.name << "\n";
+      std::cerr << "error: v3a transpose rule requires 2D tensor: " << rec.name << std::endl;
       std::exit(1);
     }
     runtime_shape = {rec.shape[1], rec.shape[0]};
@@ -171,61 +165,8 @@ std::string block_key(int layer, const char* suffix) {
   return "blocks." + std::to_string(layer) + "." + suffix;
 }
 
-struct RuntimeModelConfig {
-  int layers = 0;
-  int channels = 0;
-  int heads = 0;
-  int head_size = 0;
-  int vocab = 0;
-  int ffn = 0;
-};
-
-RuntimeModelConfig infer_model_config(
-    const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name) {
-  RuntimeModelConfig cfg;
-  for (const auto& [name, rec] : by_name) {
-    if (name == "emb.weight" && rec->shape.size() == 2) {
-      cfg.vocab = static_cast<int>(rec->shape[0]);
-      cfg.channels = static_cast<int>(rec->shape[1]);
-    } else if (name == "blocks.0.att.r_k" && rec->shape.size() == 2) {
-      cfg.heads = static_cast<int>(rec->shape[0]);
-      cfg.head_size = static_cast<int>(rec->shape[1]);
-    } else if (name == "blocks.0.ffn.key.weight" && rec->shape.size() == 2) {
-      cfg.ffn = static_cast<int>(rec->shape[0]);
-    }
-    if (name.rfind("blocks.", 0) == 0) {
-      const char* s = name.c_str() + 7;
-      char* end = nullptr;
-      long layer = std::strtol(s, &end, 10);
-      if (end && *end == '.' && layer >= 0) {
-        cfg.layers = std::max(cfg.layers, static_cast<int>(layer) + 1);
-      }
-    }
-  }
-
-  if (cfg.layers <= 0 || cfg.channels <= 0 || cfg.heads <= 0 ||
-      cfg.head_size <= 0 || cfg.vocab <= 0 || cfg.ffn <= 0) {
-    std::cerr << "error: failed to infer runtime model config"
-              << " L=" << cfg.layers
-              << " C=" << cfg.channels
-              << " H=" << cfg.heads
-              << " N=" << cfg.head_size
-              << " V=" << cfg.vocab
-              << " F=" << cfg.ffn << "\n";
-    std::exit(1);
-  }
-  if (cfg.channels != cfg.heads * cfg.head_size) {
-    std::cerr << "error: invalid model config, channels != heads * head_size"
-              << " C=" << cfg.channels
-              << " H=" << cfg.heads
-              << " N=" << cfg.head_size << "\n";
-    std::exit(1);
-  }
-  return cfg;
-}
-
 struct CudaWeights {
-  RuntimeModelConfig config;
+  ModelDims dims;
   std::unordered_map<std::string, std::unique_ptr<GpuTensor>> tensors;
   std::vector<LayerWeights> layers;
   const GpuTensor* ln_out_w = nullptr;
@@ -244,7 +185,7 @@ struct CudaWeights {
   const GpuTensor* require(const std::string& key) const {
     const GpuTensor* t = optional(key);
     if (!t) {
-      std::cerr << "error: tensor view missing: " << key << "\n";
+      std::cerr << "error: tensor view missing: " << key << std::endl;
       std::exit(1);
     }
     return t;
@@ -270,7 +211,7 @@ struct CudaWeights {
     pipeline.sync();
     const GpuTensor* src = require(key);
     if (src->shape.size() != 2) {
-      std::cerr << "error: .t copy requires 2D tensor: " << key << "\n";
+      std::cerr << "error: .t copy requires 2D tensor: " << key << std::endl;
       std::exit(1);
     }
     const int rows = static_cast<int>(src->shape[0]);
@@ -327,10 +268,10 @@ struct CudaWeights {
     ln_out_b = require("ln_out.bias");
     head_w = require("head.weight");
     if (head_w->shape.size() != 2 ||
-        static_cast<int>(head_w->shape[0]) != config.vocab ||
-        static_cast<int>(head_w->shape[1]) != config.channels) {
+        static_cast<int>(head_w->shape[0]) != dims.vocab ||
+        static_cast<int>(head_w->shape[1]) != dims.channels) {
       std::cerr << "error: head.weight shape mismatch"
-                << " expected=[" << config.vocab << "," << config.channels << "]"
+                << " expected=[" << dims.vocab << "," << dims.channels << "]"
                 << " actual=[";
       if (!head_w->shape.empty()) {
         std::cerr << head_w->shape[0];
@@ -346,6 +287,7 @@ struct CudaWeights {
 
 void build_cpu_emb_ln0_f16(
     CudaWeights& weights,
+    const ModelDims& dims,
     const llm_infer::PthArchive& archive,
     const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name) {
   if (weights.layers.empty() || !weights.layers[0].ln0_w || !weights.layers[0].ln0_b) {
@@ -355,7 +297,7 @@ void build_cpu_emb_ln0_f16(
   auto raw = [&](const std::string& key) -> RawBf16TensorView {
     auto it = by_name.find(key);
     if (it == by_name.end()) {
-      std::cerr << "error: missing tensor for emb+ln0 preprocessing: " << key << "\n";
+      std::cerr << "error: missing tensor for emb+ln0 preprocessing: " << key << std::endl;
       std::exit(1);
     }
     return raw_bf16_tensor_view(archive, *it->second);
@@ -363,10 +305,9 @@ void build_cpu_emb_ln0_f16(
   const RawBf16TensorView emb = raw("emb.weight");
   const RawBf16TensorView ln0_w = raw("blocks.0.ln0.weight");
   const RawBf16TensorView ln0_b = raw("blocks.0.ln0.bias");
-  const auto& cfg = weights.config;
-  const std::size_t elems = static_cast<std::size_t>(cfg.vocab) * cfg.channels;
-  if (emb.elems != elems || ln0_w.elems != static_cast<std::uint64_t>(cfg.channels) ||
-      ln0_b.elems != static_cast<std::uint64_t>(cfg.channels)) {
+  const std::size_t elems = static_cast<std::size_t>(dims.vocab) * dims.channels;
+  if (emb.elems != elems || ln0_w.elems != static_cast<std::size_t>(dims.channels) ||
+      ln0_b.elems != static_cast<std::size_t>(dims.channels)) {
     std::cerr << "error: emb/ln0 shape mismatch for emb+ln0 preprocessing\n";
     std::exit(1);
   }
@@ -385,7 +326,7 @@ void build_cpu_emb_ln0_f16(
   check_cuda(cudaMemcpy(gpu_ln0_b.p, ln0_b.data, ln0_b.elems * sizeof(std::uint16_t), cudaMemcpyHostToDevice),
              "copy raw bf16 ln0 bias");
   rwkv7_v4_emb_ln0_bf16_to_f16_launch(
-      nullptr, cfg.vocab, cfg.channels, gpu_emb.p, gpu_ln0_w.p, gpu_ln0_b.p, gpu_out.p, kLnEps);
+      nullptr, dims.vocab, dims.channels, gpu_emb.p, gpu_ln0_w.p, gpu_ln0_b.p, gpu_out.p, kLnEps);
   check_cuda(cudaGetLastError(), "launch emb+ln0 preprocess");
   weights.cpu_emb_ln0_f16.resize(elems);
   check_cuda(cudaMemcpy(weights.cpu_emb_ln0_f16.data(), gpu_out.p, elems * sizeof(std::uint16_t),
@@ -432,11 +373,12 @@ void load_layer_into(
 }
 
 CudaWeights load_model_weights(
+    const ModelDims& dims,
     const llm_infer::PthArchive& archive,
     const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name) {
   CudaWeights weights;
-  weights.config = infer_model_config(by_name);
-  weights.layers.reserve(static_cast<std::size_t>(weights.config.layers));
+  weights.dims = dims;
+  weights.layers.reserve(static_cast<std::size_t>(dims.layers));
   auto emb = by_name.find("emb.weight");
   if (emb != by_name.end()) {
     weights.cpu_emb_bytes = numel(emb->second->shape) * sizeof(std::uint16_t);
@@ -445,36 +387,22 @@ CudaWeights load_model_weights(
   weights.load(archive, by_name, "ln_out.weight", true, pipeline);
   weights.load(archive, by_name, "ln_out.bias", true, pipeline);
   weights.load(archive, by_name, "head.weight", true, pipeline);
-  std::cout << "load_model global done"
-            << " L=" << weights.config.layers
-            << " C=" << weights.config.channels
-            << " H=" << weights.config.heads
-            << " N=" << weights.config.head_size
-            << " V=" << weights.config.vocab
-            << " F=" << weights.config.ffn
-            << " gpu_mib=" << mib(weights.bytes())
-            << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << "\n";
-  for (int layer = 0; layer < weights.config.layers; ++layer) {
+  std::cout << "load_model global done gpu_mib=" << mib(weights.bytes())
+            << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << std::endl;
+  for (int layer = 0; layer < dims.layers; ++layer) {
     load_layer_into(weights, archive, by_name, layer, pipeline);
     std::cout << "load_model layer=" << layer
               << " done layers=" << weights.layers.size()
               << " tensors=" << weights.tensors.size()
               << " t_copies=" << weights.t_copy_count
-              << " gpu_mib=" << mib(weights.bytes()) << "\n";
+              << " gpu_mib=" << mib(weights.bytes()) << std::endl;
   }
   pipeline.sync();
   check_cuda(cudaDeviceSynchronize(), "sync model weight load");
   weights.build_global_view();
-  build_cpu_emb_ln0_f16(weights, archive, by_name);
-  std::cout << "load_model emb+ln0 done"
-            << " L=" << weights.config.layers
-            << " C=" << weights.config.channels
-            << " H=" << weights.config.heads
-            << " N=" << weights.config.head_size
-            << " V=" << weights.config.vocab
-            << " F=" << weights.config.ffn
-            << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes)
-            << " entries=" << weights.cpu_emb_ln0_f16.size() << "\n";
+  build_cpu_emb_ln0_f16(weights, dims, archive, by_name);
+  std::cout << "load_model emb+ln0 done cpu_emb_mib=" << mib(weights.cpu_emb_bytes)
+            << " entries=" << weights.cpu_emb_ln0_f16.size() << std::endl;
   return weights;
 }
 
@@ -497,25 +425,34 @@ void linear_orig_layout_launch(
     std::size_t workspace_bytes,
     half* y) {
   if (path.rows == 1) {
-    const int out_tile = group == LinearGroup::AttC2C ? 4 : 2;
-    rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 1, out_tile, y);
+    if (group == LinearGroup::FfnKey) {
+      if (K == 2560) {
+        rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, true, y);
+        return;
+      }
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, K <= 1024, y);
+    } else {
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, group != LinearGroup::AttC2C || K < 2048, y);
+    }
     return;
   }
   if (path.rows == 2) {
     if (group == LinearGroup::AttC2C) {
-      rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, 4, y);
-    } else {
-      rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 2, 2, y);
-    }
-    return;
-  }
-  if (path.rows == 3) {
-    if (group == LinearGroup::Head) {
-      rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 2, y);
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, true, y);
     } else if (group == LinearGroup::FfnKey) {
-      rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 32, 3, 4, y);
+      if (K == 2560) {
+        rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, false, y);
+        return;
+      }
+      if (K < 4096) {
+        rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, true, y);
+      } else {
+        rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, false, y);
+      }
+    } else if (group == LinearGroup::Head && K == 2560) {
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, false, y);
     } else {
-      rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 3, 4, y);
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, true, y);
     }
     return;
   }
@@ -527,7 +464,108 @@ void linear_orig_layout_launch(
     }
     rwkv7_v3a_linear_f16_orig_lt_cfg_launch(stream, M, K, N, x, weight_orig, workspace, bytes, algo, y);
   };
+  if (path.rows == 3) {
+    if (group == LinearGroup::Head) {
+      if (K <= 2048) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 2, y);
+    } else if (group == LinearGroup::FfnKey) {
+      if (K <= 1024) {
+        rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 3, 4, y);
+        return;
+      }
+      if (K == 2048) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      lt(0, 0);
+    } else {
+      if (K == 768) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 1, 2, y);
+        return;
+      }
+      if (K == 1024) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 2, 2, y);
+        return;
+      }
+      if (K == 2048) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 4, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 2, y);
+        return;
+      }
+      lt(0, 2);
+    }
+    return;
+  }
+  if (path.rows == 4) {
+    if (group == LinearGroup::FfnKey) {
+      if (K <= 1024) {
+        rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, 4, y);
+        return;
+      }
+      if (K == 2048) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      return lt(0, 0);
+    }
+    if (group == LinearGroup::AttC2C) {
+      if (K <= 1024) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 2, 2, y);
+        return;
+      }
+      if (K == 2048) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 4, 2, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 4, 2, y);
+        return;
+      }
+      return lt(0, 2);
+    }
+  }
   if (group == LinearGroup::Head) {
+    if (K == 768) {
+      if (path.rows >= 192 && path.rows < 256) return lt(128, 3);
+      if (path.rows >= 96 && path.rows < 160) return lt(0, 1);
+    }
+    if (K == 1024) {
+      if (path.rows >= 256 && path.rows < 384) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (path.rows >= 192 && path.rows < 256) return lt(0, 2);
+      if (path.rows >= 96 && path.rows < 160) return lt(32, 1);
+    }
+    if (K == 2048) {
+      if (path.rows >= 256 && path.rows < 384) return lt(32, 0);
+      if (path.rows >= 192 && path.rows < 256) return lt(32, 6);
+      if (path.rows >= 128 && path.rows < 160) return lt(0, 1);
+      if (path.rows >= 96 && path.rows < 112) return lt(0, 0);
+    }
+    if (K == 2560) {
+      if (path.rows >= 128 && path.rows < 160) return lt(0, 1);
+      if (path.rows >= 80) return lt(0, 0);
+      if (path.rows >= 72) return lt(32, 1);
+    }
     if (path.rows >= 1024) return lt(128, 0);
     if (path.rows >= 512) return lt(0, 2);
     if (path.rows >= 384) return lt(128, 2);
@@ -540,25 +578,74 @@ void linear_orig_layout_launch(
     if (path.rows >= 80) return lt(32, 2);
     if (path.rows >= 72) return lt(128, 2);
   } else if (group == LinearGroup::AttC2C) {
+    if (K == 768) {
+      if (path.rows >= 256 && path.rows < 384) return lt(128, 1);
+      if (path.rows >= 96 && path.rows < 112) return lt(32, 3);
+    }
+    if (K == 1024) {
+      if (path.rows >= 256 && path.rows < 384) return lt(128, 0);
+      if (path.rows >= 96 && path.rows < 112) return lt(32, 6);
+    }
+    if (K == 2048) {
+      if (path.rows >= 256 && path.rows < 384) return lt(32, 3);
+      if (path.rows >= 192 && path.rows < 256) return lt(128, 0);
+      if (path.rows >= 96 && path.rows < 112) return lt(32, 4);
+    }
+    if (K == 2560) {
+      if (path.rows >= 128 && path.rows < 160) return lt(128, 2);
+      if (path.rows >= 112) return lt(128, 3);
+      if (path.rows >= 72) return lt(128, 2);
+      if (path.rows >= 5) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+    }
     if (path.rows >= 1024) return lt(32, 4);
     if (path.rows >= 768) return lt(32, 0);
     if (path.rows >= 512) return lt(32, 1);
     if (path.rows >= 384) return lt(128, 2);
     if (path.rows >= 256) return lt(128, 0);
-    if (path.rows >= 192) return lt(32, 2);
+    if (path.rows >= 192) return lt(0, 0);
     if (path.rows >= 160) return lt(128, 1);
     if (path.rows >= 128) return lt(128, 0);
     if (path.rows >= 112) {
       rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
       return;
     }
+    if (path.rows >= 96) return lt(0, 5);
     if (path.rows >= 72) return lt(32, 0);
-    if (path.rows >= 64) return lt(128, 2);
-    if (path.rows == 4) {
-      rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, 4, y);
-      return;
-    }
+    if (path.rows >= 48) return lt(32, 6);
+    if (path.rows >= 32) return lt(0, 0);
+    if (path.rows >= 24) return lt(0, 6);
+    if (path.rows >= 12) return lt(0, 0);
+    if (path.rows >= 5) return lt(0, 2);
   } else {
+    if (K == 768) {
+      if (path.rows >= 256 && path.rows < 384) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (path.rows >= 96 && path.rows < 112) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+    }
+    if (K == 1024) {
+      if (path.rows >= 256 && path.rows < 384) return lt(32, 2);
+      if (path.rows >= 192 && path.rows < 256) return lt(0, 0);
+      if (path.rows >= 96 && path.rows < 160) return lt(32, 2);
+    }
+    if (K == 2048 && path.rows >= 128 && path.rows < 160) return lt(0, 3);
+    if (K == 2560) {
+      if (path.rows >= 128 && path.rows < 160) return lt(32, 5);
+      if (path.rows >= 112) return lt(128, 4);
+      if (path.rows >= 80) return lt(0, 3);
+      if (path.rows >= 72) return lt(32, 4);
+      if (path.rows >= 3) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+    }
     if (path.rows >= 1024) return lt(0, 0);
     if (path.rows >= 768) return lt(32, 1);
     if (path.rows >= 512) return lt(128, 3);
@@ -571,6 +658,8 @@ void linear_orig_layout_launch(
     if (path.rows >= 96) return lt(32, 1);
     if (path.rows >= 72) return lt(128, 1);
     if (path.rows >= 64) return lt(0, 0);
+    if (path.rows >= 12) return lt(0, 0);
+    if (path.rows == 5 || path.rows == 6) return lt(0, 1);
   }
   rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
 }
@@ -600,7 +689,7 @@ void linear_rank_out_launch(
     const half* weight,
     const half* weight_t,
     half* y) {
-  if (rows <= kLowrankOutRowsT) {
+  if (rows <= kLowrankOutRowsT && N >= kLowrankFusedMinC) {
     rwkv7_v3a_linear_t_f16_launch(stream, rows, K, N, x, weight_t, y);
   } else {
     rwkv7_v3a_linear_f16_launch(stream, rows, K, N, x, weight, y);
@@ -618,7 +707,7 @@ void linear_rank_out_act_launch(
     int act,
     half* act_scratch,
     half* y) {
-  if (rows <= kLowrankOutRowsT) {
+  if (rows <= kLowrankOutRowsT && N >= kLowrankFusedMinC) {
     rwkv7_v3a_linear_t_act_f16_launch(stream, rows, K, N, x, weight_t, act, y);
     return;
   }
@@ -649,21 +738,26 @@ CudaWeights load_backend_weights(const std::string& model_path) {
   for (const auto& rec : records.value()) {
     by_name.emplace(rec.name, &rec);
   }
-  return load_model_weights(archive.value(), by_name);
+  const ModelDims dims = infer_model_dims(records.value());
+  return load_model_weights(dims, archive.value(), by_name);
 }
 
 void run_backend_forward(
     const CudaWeights& weights,
     const std::vector<std::vector<int64_t>>& token_batches,
+    bool use_wkv32,
     GenerationState& state,
     DeviceLogits& out) {
-  const auto& cfg = weights.config;
+  const auto& dims = weights.dims;
   const int B = static_cast<int>(token_batches.size());
   if (B <= 0) {
     throw std::runtime_error("token_batches must not be empty");
   }
   if (state.batch_size != B) {
     throw std::runtime_error("state batch size mismatch");
+  }
+  if (state.wkv32 != use_wkv32) {
+    throw std::runtime_error("state wkv precision mismatch");
   }
 
   const int T = static_cast<int>(token_batches.front().size());
@@ -679,14 +773,15 @@ void run_backend_forward(
   Case run;
   run.B = B;
   run.T = T;
-  const PathConfig path = select_path(run);
+  run.wkv32 = use_wkv32;
+  const int C = dims.channels;
+  const PathConfig path = select_path(run, C);
   const int rows = B * T;
   const int output_rows = B;
-  const int C = cfg.channels;
-  const int H = cfg.heads;
-  const int N = cfg.head_size;
-  const int V = cfg.vocab;
-  const int F = cfg.ffn;
+  const int H = dims.heads;
+  const int N = dims.head_size;
+  const int V = dims.vocab;
+  const int F = dims.ffn;
 
   HalfArena arena;
   arena.allocate(static_cast<std::size_t>(rows) * C * 31 + static_cast<std::size_t>(output_rows) * C +
@@ -760,14 +855,14 @@ void run_backend_forward(
              "copy backend emb rows");
 
   rwkv7_v3a_layer_norm_f16_launch(
-      stream, rows, C, x0, hp(weights.layers[0].ln1_w), hp(weights.layers[0].ln1_b), xx0, 1.0e-5f);
+      stream, rows, C, x0, hp(weights.layers[0].ln1_w), hp(weights.layers[0].ln1_b), xx0, kLnEps);
   half* x_cur = x0;
   half* xx_cur = xx0;
   half* x_next = x1;
   half* xx_next = xx1;
   bool pre_mix_ready = false;
 
-  for (int layer = 0; layer < cfg.layers; ++layer) {
+  for (int layer = 0; layer < dims.layers; ++layer) {
     const LayerWeights& w = weights.layers[layer];
     const int Rw = static_cast<int>(w.att_w1_t->shape[0]);
     const int Ra = static_cast<int>(w.att_a1_t->shape[0]);
@@ -780,7 +875,13 @@ void run_backend_forward(
 
     half* shift0 = state.shift.p + static_cast<std::size_t>(layer) * 2 * B * C;
     half* shift1 = shift0 + static_cast<std::size_t>(B) * C;
-    half* layer_state = state.wkv_state.p + static_cast<std::size_t>(layer) * B * H * N * N;
+    half* layer_state16 = nullptr;
+    float* layer_state32 = nullptr;
+    if (use_wkv32) {
+      layer_state32 = state.wkv_state32.p + static_cast<std::size_t>(layer) * B * H * N * N;
+    } else {
+      layer_state16 = state.wkv_state.p + static_cast<std::size_t>(layer) * B * H * N * N;
+    }
 
     if (!pre_mix_ready) {
       rwkv7_tmix_mix6_launch(
@@ -812,11 +913,11 @@ void run_backend_forward(
     half* v_use = v_base;
     bool v_done = false;
 
-    if (rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
+    if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
       rwkv7_v3a_linear_wagv_rank_in_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, xw, xa, xg, xv,
           hp(w.att_w1_t), hp(w.att_a1_t), hp(w.att_g1_t), hp(w.att_v1_t), w1, a1, g1, v1);
-    } else if (rows <= kLowrankInRowsT) {
+    } else if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT) {
       rwkv7_v3a_linear_wag_rank_in_f16_launch(
           stream, rows, C, Rw, Ra, Rg, xw, xa, xg, hp(w.att_w1_t), hp(w.att_a1_t), hp(w.att_g1_t), w1, a1, g1);
     } else {
@@ -825,14 +926,14 @@ void run_backend_forward(
       linear_rank_in_launch(stream, rows, C, Rg, xg, hp(w.att_g1), hp(w.att_g1_t), g1);
     }
 
-    if (rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
+    if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
       rwkv7_v3a_linear_wagv_rank_out_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, w1, a1, g1, v1,
           hp(w.att_w2_t), hp(w.att_a2_t), hp(w.att_g2_t), hp(w.att_v2_t),
           v_base, v_first, hp(w.att_v0), w12, a12, g, v_out);
       v_use = v_out;
       v_done = true;
-    } else if (rows <= kLowrankOutRowsT) {
+    } else if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT) {
       rwkv7_v3a_linear_wag_rank_out_f16_launch(
           stream, rows, C, Rw, Ra, Rg, w1, a1, g1, hp(w.att_w2_t), hp(w.att_a2_t), hp(w.att_g2_t), w12, a12, g);
     } else {
@@ -842,9 +943,9 @@ void run_backend_forward(
     }
 
     if (layer == 0) {
-      check_cuda(cudaMemcpyAsync(v_first, v_base, row_elems * sizeof(half), cudaMemcpyDeviceToDevice, stream), "copy backend v_first");
+      check_cuda(cudaMemcpyAsync(v_first, v_base, row_elems * sizeof(half), cudaMemcpyDeviceToDevice, stream), "copy v_first");
     } else if (!v_done) {
-      if (rows <= kLowrankOutRowsT) {
+      if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT) {
         if (rows > kLowrankInRowsT) {
           linear_rank_in_launch(stream, rows, C, Rv, xv, hp(w.att_v1), hp(w.att_v1_t), v1);
         }
@@ -858,21 +959,24 @@ void run_backend_forward(
     }
 
     rwkv7_tmix_kk_a_gate_launch(stream, B, T, C, H, k, hp(w.att_k_k), hp(w.att_a0), a12, hp(w.att_k_a), k2, neg_kk, kka);
-    if (T <= 16) {
-      rwkv7_wkv_fp16_seq_w0_launch(stream, B, T, C, H, layer_state, r, w12, hp(w.att_w0), k2, v_use, neg_kk, kka, y, state.elapsed.p);
+    if (use_wkv32) {
+      rwkv7_add_vec_launch(stream, C, w12, hp(w.att_w0), w_raw, row_elems);
+      rwkv7_wkv_fp32io16_launch(stream, B, T, C, H, 0, layer_state32, r, w_raw, k2, v_use, neg_kk, kka, y);
+    } else if (T <= 16) {
+      rwkv7_wkv_fp16_seq_w0_launch(stream, B, T, C, H, layer_state16, r, w12, hp(w.att_w0), k2, v_use, neg_kk, kka, y, state.elapsed.p);
     } else {
       rwkv7_add_vec_launch(stream, C, w12, hp(w.att_w0), w_raw, row_elems);
-      rwkv7_wkv_fp16_seq_launch(stream, B, T, C, H, layer_state, r, w_raw, k2, v_use, neg_kk, kka, y, state.elapsed.p);
+      rwkv7_wkv_fp16_seq_launch(stream, B, T, C, H, layer_state16, r, w_raw, k2, v_use, neg_kk, kka, y, state.elapsed.p);
     }
 
     rwkv7_tmix_lnx_rkvres_xg_launch(stream, B, T, C, H, y, r, k2, v_use, hp(w.att_r_k), hp(w.att_ln_x_w), hp(w.att_ln_x_b), g, y2);
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, hp(w.att_output_w), lt_workspace.p, lt_workspace.n, att_out);
     if (T == 1) {
       rwkv7_v3a_add_layer_norm_cmix_mix_f16_launch(
-          stream, rows, C, x_cur, att_out, shift1, hp(w.ln2_w), hp(w.ln2_b), hp(w.ffn_x_k), x_after_att, mixed, 1.0e-5f);
+          stream, rows, C, x_cur, att_out, shift1, hp(w.ln2_w), hp(w.ln2_b), hp(w.ffn_x_k), x_after_att, mixed, kLnEps);
     } else {
       rwkv7_v3a_add_layer_norm_f16_launch(
-          stream, rows, C, x_cur, att_out, hp(w.ln2_w), hp(w.ln2_b), x_after_att, ln2_out, 1.0e-5f);
+          stream, rows, C, x_cur, att_out, hp(w.ln2_w), hp(w.ln2_b), x_after_att, ln2_out, kLnEps);
       rwkv7_cmix_mix_launch(stream, B, T, C, ln2_out, shift1, hp(w.ffn_x_k), mixed);
     }
 
@@ -890,24 +994,24 @@ void run_backend_forward(
       rwkv7_v3a_linear_f16_launch(stream, rows, F, C, hid, hp(w.ffn_value_w), cmix_out);
     }
 
-    if (layer + 1 < cfg.layers) {
+    if (layer + 1 < dims.layers) {
       const LayerWeights& next = weights.layers[layer + 1];
       if (B == 1 && T == 1) {
         half* next_shift0 = state.shift.p + static_cast<std::size_t>(layer + 1) * 2 * B * C;
         rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
             stream, rows, C, x_after_att, cmix_out, next_shift0, hp(next.ln1_w), hp(next.ln1_b),
             hp(next.att_x_r), hp(next.att_x_w), hp(next.att_x_k), hp(next.att_x_v), hp(next.att_x_a), hp(next.att_x_g),
-            x_next, xr, xw, xk, xv, xa, xg, 1.0e-5f);
+            x_next, xr, xw, xk, xv, xa, xg, kLnEps);
         xx_next = x_next;
         pre_mix_ready = true;
       } else {
-        rwkv7_v3a_add_layer_norm_f16_launch(stream, rows, C, x_after_att, cmix_out, hp(next.ln1_w), hp(next.ln1_b), x_next, xx_next, 1.0e-5f);
+        rwkv7_v3a_add_layer_norm_f16_launch(stream, rows, C, x_after_att, cmix_out, hp(next.ln1_w), hp(next.ln1_b), x_next, xx_next, kLnEps);
       }
       std::swap(x_cur, x_next);
       std::swap(xx_cur, xx_next);
     } else {
       rwkv7_v3a_add_last_layer_norm_f16_launch(
-          stream, B, T, C, x_after_att, cmix_out, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, 1.0e-5f);
+          stream, B, T, C, x_after_att, cmix_out, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, kLnEps);
     }
     check_cuda(cudaGetLastError(), "launch backend layer");
   }
@@ -942,17 +1046,20 @@ void run_backend_forward(
 }  // namespace
 
 struct ModelBackend::Impl {
-  explicit Impl(std::string path)
+  explicit Impl(std::string path, bool use_wkv32_)
       : model_path(std::move(path)),
         model_name(basename_without_extension(model_path)),
+        use_wkv32(use_wkv32_),
         weights(load_backend_weights(model_path)) {}
 
   std::string model_path;
   std::string model_name;
+  bool use_wkv32 = false;
   CudaWeights weights;
 };
 
-ModelBackend::ModelBackend(std::string model_path) : impl_(std::make_unique<Impl>(std::move(model_path))) {}
+ModelBackend::ModelBackend(std::string model_path, bool use_wkv32)
+    : impl_(std::make_unique<Impl>(std::move(model_path), use_wkv32)) {}
 
 ModelBackend::~ModelBackend() = default;
 
@@ -966,15 +1073,24 @@ GenerationState ModelBackend::create_state(int batch_size) const {
   }
   GenerationState state;
   state.batch_size = batch_size;
-  const auto& cfg = impl_->weights.config;
-  const std::size_t shift_elems = static_cast<std::size_t>(cfg.layers) * 2 * batch_size * cfg.channels;
+  state.wkv32 = impl_->use_wkv32;
+  const auto& dims = impl_->weights.dims;
+  const std::size_t shift_elems = static_cast<std::size_t>(dims.layers) * 2 * batch_size * dims.channels;
   const std::size_t state_elems =
-      static_cast<std::size_t>(cfg.layers) * batch_size * cfg.heads * cfg.head_size * cfg.head_size;
+      static_cast<std::size_t>(dims.layers) * batch_size * dims.heads * dims.head_size * dims.head_size;
   state.shift.resize(shift_elems, "alloc backend shift state");
-  state.wkv_state.resize(state_elems, "alloc backend wkv state");
+  if (impl_->use_wkv32) {
+    state.wkv_state32.resize(state_elems, "alloc backend wkv32 state");
+  } else {
+    state.wkv_state.resize(state_elems, "alloc backend wkv state");
+  }
   state.elapsed.resize(batch_size, "alloc backend elapsed");
   state.shift.zero("zero backend shift");
-  state.wkv_state.zero("zero backend wkv");
+  if (impl_->use_wkv32) {
+    check_cuda(cudaMemset(state.wkv_state32.p, 0, state.wkv_state32.n * sizeof(float)), "zero backend wkv32");
+  } else {
+    state.wkv_state.zero("zero backend wkv");
+  }
   check_cuda(cudaMemset(state.elapsed.p, 0, static_cast<std::size_t>(batch_size) * sizeof(int)), "zero backend elapsed");
   return state;
 }
@@ -983,7 +1099,7 @@ void ModelBackend::forward_prefill(
     const std::vector<std::vector<int64_t>>& token_batches,
     GenerationState& state,
     DeviceLogits& logits) const {
-  run_backend_forward(impl_->weights, token_batches, state, logits);
+  run_backend_forward(impl_->weights, token_batches, impl_->use_wkv32, state, logits);
 }
 
 void ModelBackend::forward_decode(
@@ -995,11 +1111,11 @@ void ModelBackend::forward_decode(
   for (int64_t token : token_batch) {
     batch.push_back({token});
   }
-  run_backend_forward(impl_->weights, batch, state, logits);
+  run_backend_forward(impl_->weights, batch, impl_->use_wkv32, state, logits);
 }
 
 int ModelBackend::vocab_size() const {
-  return impl_->weights.config.vocab;
+  return impl_->weights.dims.vocab;
 }
 
 const std::string& ModelBackend::model_path() const {

@@ -569,6 +569,7 @@ void register_api_routes(
         }
 
         const auto prompt = format_openai_prompt(*json, engine);
+        // std::cout << prompt << std::endl; // Debug Prompt
         const auto options = parse_options(*json);
 
         if ((*json).get("stream", false).asBool()) {

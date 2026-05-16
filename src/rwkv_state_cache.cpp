@@ -22,6 +22,16 @@ std::vector<uint16_t> copy_half_buffer_to_host(const rwkv7_fast_v4::DeviceBuffer
   return host;
 }
 
+std::vector<float> copy_float_buffer_to_host(const rwkv7_fast_v4::DeviceBuffer<float>& buffer) {
+  std::vector<float> host(buffer.n);
+  if (buffer.n > 0) {
+    check_cuda(
+        cudaMemcpy(host.data(), buffer.p, buffer.n * sizeof(float), cudaMemcpyDeviceToHost),
+        "copy float buffer to host");
+  }
+  return host;
+}
+
 void copy_half_buffer_to_device(
     const std::vector<uint16_t>& host,
     rwkv7_fast_v4::DeviceBuffer<half>& buffer,
@@ -30,6 +40,18 @@ void copy_half_buffer_to_device(
   if (!host.empty()) {
     check_cuda(
         cudaMemcpy(buffer.p, host.data(), host.size() * sizeof(uint16_t), cudaMemcpyHostToDevice),
+        label);
+  }
+}
+
+void copy_float_buffer_to_device(
+    const std::vector<float>& host,
+    rwkv7_fast_v4::DeviceBuffer<float>& buffer,
+    const char* label) {
+  buffer.resize(host.size(), label);
+  if (!host.empty()) {
+    check_cuda(
+        cudaMemcpy(buffer.p, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice),
         label);
   }
 }
@@ -87,6 +109,7 @@ void StateCacheManager::init_db() {
       "batch_size INTEGER NOT NULL,"
       "shift_blob BLOB NOT NULL,"
       "wkv_blob BLOB NOT NULL,"
+      "wkv32 INTEGER NOT NULL DEFAULT 0,"
       "elapsed_blob BLOB NOT NULL,"
       "last_updated REAL NOT NULL"
       ")";
@@ -96,13 +119,26 @@ void StateCacheManager::init_db() {
     sqlite3_free(err);
     throw std::runtime_error("failed to initialize sqlite schema: " + msg);
   }
+  err = nullptr;
+  if (sqlite3_exec(db_, "ALTER TABLE sessions ADD COLUMN wkv32 INTEGER NOT NULL DEFAULT 0", nullptr, nullptr, &err) != SQLITE_OK) {
+    const std::string msg = err ? err : "";
+    sqlite3_free(err);
+    if (msg.find("duplicate column name") == std::string::npos) {
+      throw std::runtime_error("failed to migrate sqlite schema: " + msg);
+    }
+  }
 }
 
 StateCacheManager::HostState StateCacheManager::copy_to_host(const GenerationState& state) const {
   HostState host;
   host.batch_size = state.batch_size;
+  host.wkv32 = state.wkv32;
   host.shift = copy_half_buffer_to_host(state.shift);
-  host.wkv_state = copy_half_buffer_to_host(state.wkv_state);
+  if (state.wkv32) {
+    host.wkv_state32 = copy_float_buffer_to_host(state.wkv_state32);
+  } else {
+    host.wkv_state16 = copy_half_buffer_to_host(state.wkv_state);
+  }
   host.elapsed.resize(state.elapsed.n);
   if (state.elapsed.n > 0) {
     check_cuda(
@@ -119,8 +155,13 @@ StateCacheManager::HostState StateCacheManager::copy_to_host(const GenerationSta
 GenerationState StateCacheManager::copy_to_device(const HostState& state) const {
   GenerationState device;
   device.batch_size = state.batch_size;
+  device.wkv32 = state.wkv32;
   copy_half_buffer_to_device(state.shift, device.shift, "copy shift to device");
-  copy_half_buffer_to_device(state.wkv_state, device.wkv_state, "copy wkv state to device");
+  if (state.wkv32) {
+    copy_float_buffer_to_device(state.wkv_state32, device.wkv_state32, "copy wkv32 state to device");
+  } else {
+    copy_half_buffer_to_device(state.wkv_state16, device.wkv_state, "copy wkv state to device");
+  }
   device.elapsed.resize(state.elapsed.size(), "alloc elapsed from host");
   if (!state.elapsed.empty()) {
     check_cuda(
@@ -137,15 +178,30 @@ GenerationState StateCacheManager::copy_to_device(const HostState& state) const 
 std::shared_ptr<GenerationState> StateCacheManager::clone_device_state(const GenerationState& state) const {
   auto clone = std::make_shared<GenerationState>();
   clone->batch_size = state.batch_size;
+  clone->wkv32 = state.wkv32;
   clone->shift.resize(state.shift.n, "clone shift");
-  clone->wkv_state.resize(state.wkv_state.n, "clone wkv");
+  if (state.wkv32) {
+    clone->wkv_state32.resize(state.wkv_state32.n, "clone wkv32");
+  } else {
+    clone->wkv_state.resize(state.wkv_state.n, "clone wkv");
+  }
   clone->elapsed.resize(state.elapsed.n, "clone elapsed");
   if (state.shift.n > 0) {
     check_cuda(
         cudaMemcpy(clone->shift.p, state.shift.p, state.shift.n * sizeof(half), cudaMemcpyDeviceToDevice),
         "clone shift memcpy");
   }
-  if (state.wkv_state.n > 0) {
+  if (state.wkv32) {
+    if (state.wkv_state32.n > 0) {
+      check_cuda(
+          cudaMemcpy(
+              clone->wkv_state32.p,
+              state.wkv_state32.p,
+              state.wkv_state32.n * sizeof(float),
+              cudaMemcpyDeviceToDevice),
+          "clone wkv32 memcpy");
+    }
+  } else if (state.wkv_state.n > 0) {
     check_cuda(
         cudaMemcpy(
             clone->wkv_state.p,
@@ -213,18 +269,24 @@ void StateCacheManager::persist_state_locked(const std::string& session_id, cons
   sqlite3_stmt* stmt = nullptr;
   const char* sql =
       "INSERT OR REPLACE INTO sessions "
-      "(session_id, batch_size, shift_blob, wkv_blob, elapsed_blob, last_updated) "
-      "VALUES (?, ?, ?, ?, ?, ?)";
+      "(session_id, batch_size, shift_blob, wkv_blob, wkv32, elapsed_blob, last_updated) "
+      "VALUES (?, ?, ?, ?, ?, ?, ?)";
   sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
   sqlite3_bind_text(stmt, 1, session_id.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int(stmt, 2, state.batch_size);
   sqlite3_bind_blob(
       stmt, 3, state.shift.data(), static_cast<int>(state.shift.size() * sizeof(uint16_t)), SQLITE_TRANSIENT);
+  if (state.wkv32) {
+    sqlite3_bind_blob(
+        stmt, 4, state.wkv_state32.data(), static_cast<int>(state.wkv_state32.size() * sizeof(float)), SQLITE_TRANSIENT);
+  } else {
+    sqlite3_bind_blob(
+        stmt, 4, state.wkv_state16.data(), static_cast<int>(state.wkv_state16.size() * sizeof(uint16_t)), SQLITE_TRANSIENT);
+  }
+  sqlite3_bind_int(stmt, 5, state.wkv32 ? 1 : 0);
   sqlite3_bind_blob(
-      stmt, 4, state.wkv_state.data(), static_cast<int>(state.wkv_state.size() * sizeof(uint16_t)), SQLITE_TRANSIENT);
-  sqlite3_bind_blob(
-      stmt, 5, state.elapsed.data(), static_cast<int>(state.elapsed.size() * sizeof(int)), SQLITE_TRANSIENT);
-  sqlite3_bind_double(stmt, 6, static_cast<double>(time(nullptr)));
+      stmt, 6, state.elapsed.data(), static_cast<int>(state.elapsed.size() * sizeof(int)), SQLITE_TRANSIENT);
+  sqlite3_bind_double(stmt, 7, static_cast<double>(time(nullptr)));
   sqlite3_step(stmt);
   sqlite3_finalize(stmt);
 }
@@ -233,7 +295,7 @@ std::optional<StateCacheManager::HostState> StateCacheManager::load_state_locked
   sqlite3_stmt* stmt = nullptr;
   sqlite3_prepare_v2(
       db_,
-      "SELECT batch_size, shift_blob, wkv_blob, elapsed_blob FROM sessions WHERE session_id = ?",
+      "SELECT batch_size, shift_blob, wkv_blob, wkv32, elapsed_blob FROM sessions WHERE session_id = ?",
       -1,
       &stmt,
       nullptr);
@@ -242,16 +304,23 @@ std::optional<StateCacheManager::HostState> StateCacheManager::load_state_locked
   if (sqlite3_step(stmt) == SQLITE_ROW) {
     state.batch_size = sqlite3_column_int(stmt, 0);
     const auto* shift_blob = static_cast<const uint16_t*>(sqlite3_column_blob(stmt, 1));
-    const auto* wkv_blob = static_cast<const uint16_t*>(sqlite3_column_blob(stmt, 2));
-    const auto* elapsed_blob = static_cast<const int*>(sqlite3_column_blob(stmt, 3));
+    const void* wkv_blob = sqlite3_column_blob(stmt, 2);
+    state.wkv32 = sqlite3_column_int(stmt, 3) != 0;
+    const auto* elapsed_blob = static_cast<const int*>(sqlite3_column_blob(stmt, 4));
     const int shift_bytes = sqlite3_column_bytes(stmt, 1);
     const int wkv_bytes = sqlite3_column_bytes(stmt, 2);
-    const int elapsed_bytes = sqlite3_column_bytes(stmt, 3);
+    const int elapsed_bytes = sqlite3_column_bytes(stmt, 4);
     if (shift_blob != nullptr && shift_bytes > 0) {
       state.shift.assign(shift_blob, shift_blob + shift_bytes / static_cast<int>(sizeof(uint16_t)));
     }
     if (wkv_blob != nullptr && wkv_bytes > 0) {
-      state.wkv_state.assign(wkv_blob, wkv_blob + wkv_bytes / static_cast<int>(sizeof(uint16_t)));
+      if (state.wkv32) {
+        const auto* wkv32_blob = static_cast<const float*>(wkv_blob);
+        state.wkv_state32.assign(wkv32_blob, wkv32_blob + wkv_bytes / static_cast<int>(sizeof(float)));
+      } else {
+        const auto* wkv16_blob = static_cast<const uint16_t*>(wkv_blob);
+        state.wkv_state16.assign(wkv16_blob, wkv16_blob + wkv_bytes / static_cast<int>(sizeof(uint16_t)));
+      }
     }
     if (elapsed_blob != nullptr && elapsed_bytes > 0) {
       state.elapsed.assign(elapsed_blob, elapsed_blob + elapsed_bytes / static_cast<int>(sizeof(int)));

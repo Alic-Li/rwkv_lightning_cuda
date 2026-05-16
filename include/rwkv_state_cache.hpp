@@ -41,8 +41,10 @@ class StateCacheManager {
 
   struct HostState {
     int batch_size = 0;
+    bool wkv32 = false;
     std::vector<uint16_t> shift;
-    std::vector<uint16_t> wkv_state;
+    std::vector<uint16_t> wkv_state16;
+    std::vector<float> wkv_state32;
     std::vector<int> elapsed;
   };
 

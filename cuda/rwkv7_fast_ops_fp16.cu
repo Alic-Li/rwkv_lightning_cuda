@@ -13,7 +13,8 @@ namespace {
 
 constexpr int HEAD_SIZE = 64;
 constexpr int WARPS_PER_BLOCK = 4;
-constexpr float NORM_EPS = 1.0e-12f;
+constexpr float KK_NORMALIZE_EPS = 1.0e-12f;
+constexpr float TMIX_LN_X_EPS = 64.0e-5f;
 constexpr int FFN_SPMV_THREADS = 128;
 constexpr int FFN_TILE = 128;
 
@@ -142,7 +143,7 @@ __global__ void tmix_kk_a_gate_kernel(
   float sum_sq = u0 * u0 + u1 * u1;
   sum_sq = warp_sum(sum_sq);
   const float total = __shfl_sync(0xffffffffu, sum_sq, 0);
-  const float inv_d = 1.0f / fmaxf(sqrtf(total), NORM_EPS);
+  const float inv_d = 1.0f / fmaxf(sqrtf(total), KK_NORMALIZE_EPS);
   const float kk0 = u0 * inv_d;
   const float kk1 = u1 * inv_d;
 
@@ -201,7 +202,7 @@ __global__ void tmix_lnx_rkvres_xg_kernel(
   }
   __syncthreads();
   const float var = (partial[0] + partial[1]) * (1.0f / 64.0f);
-  const float rstd = rsqrtf(var + 64.0e-5f);
+  const float rstd = rsqrtf(var + TMIX_LN_X_EPS);
   __syncthreads();
 
   const float rv = load_h1(r + idx);
@@ -233,7 +234,7 @@ __global__ void tmix_vres_gate_kernel(
   if (idx >= total) {
     return;
   }
-  const int c = static_cast<int>(idx & (static_cast<int64_t>(C) - 1));
+  const int c = static_cast<int>(idx % static_cast<int64_t>(C));
   const float vv = load_h1(v + idx);
   const float gate = sigmoid_fast(load_h1(v0 + c) + load_h1(v12 + idx));
   store_h1(out + idx, fmaf(load_h1(v_first + idx) - vv, gate, vv));
@@ -463,6 +464,14 @@ __global__ void add_vec_kernel(
   const float2 xv = __half22float2(load_h2(x + idx));
   const float2 vv = __half22float2(load_h2(vec + c));
   store_h2(out + idx, xv.x + vv.x, xv.y + vv.y);
+}
+
+__global__ void f16_to_f32_kernel(const dtype* __restrict__ src, float* __restrict__ dst, int64_t elems) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= elems) {
+    return;
+  }
+  dst[idx] = load_h1(src + idx);
 }
 
 __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_one_kernel(
@@ -1027,4 +1036,11 @@ void rwkv7_add_vec_launch(
   const int64_t total_pairs = elems / 2;
   add_vec_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
       C, x, vec, out, total_pairs);
+}
+
+void rwkv7_v4_f16_to_f32_launch(
+    cudaStream_t stream, const half* src_f16, float* dst_f32, long long elems) {
+  constexpr int threads = 256;
+  f16_to_f32_kernel<<<static_cast<int>(ceil_div(elems, static_cast<int64_t>(threads))), threads, 0, stream>>>(
+      src_f16, dst_f32, elems);
 }
