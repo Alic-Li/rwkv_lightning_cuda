@@ -1114,6 +1114,119 @@ void ModelBackend::forward_decode(
   run_backend_forward(impl_->weights, batch, impl_->use_wkv32, state, logits);
 }
 
+void ModelBackend::copy_state_slice(
+    const GenerationState& src,
+    int src_offset,
+    GenerationState& dst,
+    int dst_offset,
+    int count) const {
+  if (src_offset < 0 || dst_offset < 0 || count <= 0) {
+    throw std::runtime_error("invalid backend state slice range");
+  }
+  if (src.batch_size <= 0 || dst.batch_size <= 0) {
+    throw std::runtime_error("state slice requires non-empty source and destination");
+  }
+  if (src.wkv32 != dst.wkv32 || src.wkv32 != impl_->use_wkv32) {
+    throw std::runtime_error("state slice wkv precision mismatch");
+  }
+  if (src_offset + count > src.batch_size || dst_offset + count > dst.batch_size) {
+    throw std::runtime_error("state slice range exceeds batch size");
+  }
+
+  const auto& dims = impl_->weights.dims;
+  const std::size_t shift_lane_elems = static_cast<std::size_t>(dims.channels);
+  const std::size_t wkv_lane_elems =
+      static_cast<std::size_t>(dims.heads) * dims.head_size * dims.head_size;
+
+  for (int layer = 0; layer < dims.layers; ++layer) {
+    half* src_shift0 = src.shift.p + static_cast<std::size_t>(layer) * 2 * src.batch_size * dims.channels +
+                       static_cast<std::size_t>(src_offset) * dims.channels;
+    half* src_shift1 = src.shift.p + static_cast<std::size_t>(layer) * 2 * src.batch_size * dims.channels +
+                       static_cast<std::size_t>(src.batch_size + src_offset) * dims.channels;
+    half* dst_shift0 = dst.shift.p + static_cast<std::size_t>(layer) * 2 * dst.batch_size * dims.channels +
+                       static_cast<std::size_t>(dst_offset) * dims.channels;
+    half* dst_shift1 = dst.shift.p + static_cast<std::size_t>(layer) * 2 * dst.batch_size * dims.channels +
+                       static_cast<std::size_t>(dst.batch_size + dst_offset) * dims.channels;
+
+    check_cuda(
+        cudaMemcpy(
+            dst_shift0,
+            src_shift0,
+            static_cast<std::size_t>(count) * shift_lane_elems * sizeof(half),
+            cudaMemcpyDeviceToDevice),
+        "copy backend state slice shift0");
+    check_cuda(
+        cudaMemcpy(
+            dst_shift1,
+            src_shift1,
+            static_cast<std::size_t>(count) * shift_lane_elems * sizeof(half),
+            cudaMemcpyDeviceToDevice),
+        "copy backend state slice shift1");
+
+    if (impl_->use_wkv32) {
+      float* src_wkv = src.wkv_state32.p + static_cast<std::size_t>(layer) * src.batch_size * wkv_lane_elems +
+                       static_cast<std::size_t>(src_offset) * wkv_lane_elems;
+      float* dst_wkv = dst.wkv_state32.p + static_cast<std::size_t>(layer) * dst.batch_size * wkv_lane_elems +
+                       static_cast<std::size_t>(dst_offset) * wkv_lane_elems;
+      check_cuda(
+          cudaMemcpy(
+              dst_wkv,
+              src_wkv,
+              static_cast<std::size_t>(count) * wkv_lane_elems * sizeof(float),
+              cudaMemcpyDeviceToDevice),
+          "copy backend state slice wkv32");
+    } else {
+      half* src_wkv = src.wkv_state.p + static_cast<std::size_t>(layer) * src.batch_size * wkv_lane_elems +
+                      static_cast<std::size_t>(src_offset) * wkv_lane_elems;
+      half* dst_wkv = dst.wkv_state.p + static_cast<std::size_t>(layer) * dst.batch_size * wkv_lane_elems +
+                      static_cast<std::size_t>(dst_offset) * wkv_lane_elems;
+      check_cuda(
+          cudaMemcpy(
+              dst_wkv,
+              src_wkv,
+              static_cast<std::size_t>(count) * wkv_lane_elems * sizeof(half),
+              cudaMemcpyDeviceToDevice),
+          "copy backend state slice wkv16");
+    }
+  }
+
+  check_cuda(
+      cudaMemcpy(
+          dst.elapsed.p + dst_offset,
+          src.elapsed.p + src_offset,
+          static_cast<std::size_t>(count) * sizeof(int),
+          cudaMemcpyDeviceToDevice),
+      "copy backend state slice elapsed");
+}
+
+void ModelBackend::copy_logits_slice(
+    const DeviceLogits& src,
+    int src_offset,
+    DeviceLogits& dst,
+    int dst_offset,
+    int count) const {
+  if (src_offset < 0 || dst_offset < 0 || count <= 0) {
+    throw std::runtime_error("invalid backend logits slice range");
+  }
+  if (src.rows <= 0 || src.vocab_size <= 0 || src.values.p == nullptr) {
+    throw std::runtime_error("logits slice requires non-empty source");
+  }
+  if (dst.rows <= 0 || dst.vocab_size != src.vocab_size || dst.values.p == nullptr) {
+    throw std::runtime_error("logits slice destination shape mismatch");
+  }
+  if (src_offset + count > src.rows || dst_offset + count > dst.rows) {
+    throw std::runtime_error("logits slice range exceeds row count");
+  }
+
+  check_cuda(
+      cudaMemcpy(
+          dst.values.p + static_cast<std::size_t>(dst_offset) * dst.vocab_size,
+          src.values.p + static_cast<std::size_t>(src_offset) * src.vocab_size,
+          static_cast<std::size_t>(count) * src.vocab_size * sizeof(float),
+          cudaMemcpyDeviceToDevice),
+      "copy backend logits slice");
+}
+
 int ModelBackend::vocab_size() const {
   return impl_->weights.dims.vocab;
 }

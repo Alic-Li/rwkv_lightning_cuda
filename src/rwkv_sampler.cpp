@@ -20,38 +20,45 @@ std::uint64_t make_sampler_seed() {
 
 }  // namespace
 
-SamplerPenaltyState make_sampler_penalties(int vocab_size) {
+SamplerPenaltyState make_sampler_penalties(int vocab_size, int batch_size) {
   if (vocab_size <= 0) {
     throw std::runtime_error("invalid sampler vocab size");
   }
+  if (batch_size <= 0) {
+    throw std::runtime_error("invalid sampler batch size");
+  }
 
   SamplerPenaltyState state;
+  state.batch_size = batch_size;
   state.vocab_size = vocab_size;
-  state.penalties.resize(static_cast<std::size_t>(vocab_size), "alloc sampler penalties");
-  state.probs.resize(static_cast<std::size_t>(vocab_size), "alloc sampler probs");
-  state.outputs.resize(1, "alloc sampler outputs");
-  state.rand_states.resize(rwkv_sampling::rand_state_bytes(1), "alloc sampler rand states");
+  state.penalties.resize(static_cast<std::size_t>(batch_size) * vocab_size, "alloc sampler penalties");
+  state.probs.resize(static_cast<std::size_t>(batch_size) * vocab_size, "alloc sampler probs");
+  state.outputs.resize(batch_size, "alloc sampler outputs");
+  state.rand_states.resize(rwkv_sampling::rand_state_bytes(batch_size), "alloc sampler rand states");
   state.penalties.zero("zero sampler penalties");
 
   rwkv7_fast_v4::check_cuda(
-      rwkv_sampling::setup_rand_raw(state.rand_states.p, make_sampler_seed(), 1, 0),
+      rwkv_sampling::setup_rand_raw(state.rand_states.p, make_sampler_seed(), batch_size, 0),
       "setup sampler rand state");
   rwkv7_fast_v4::check_cuda(cudaStreamSynchronize(0), "sync sampler rand state");
   return state;
 }
 
-int sample_repetition_temperature_topk_topp(
+std::vector<int> sample_batch_repetition_temperature_topk_topp(
     const DeviceLogits& logits,
     SamplerPenaltyState& penalties,
     const GenerateOptions& options) {
-  if (logits.rows != 1) {
-    throw std::runtime_error("sampler currently expects a single logits row");
+  if (logits.rows <= 0) {
+    throw std::runtime_error("sampler expects at least one logits row");
   }
   if (logits.vocab_size <= 0 || logits.values.p == nullptr) {
     throw std::runtime_error("empty device logits");
   }
   if (penalties.vocab_size != logits.vocab_size) {
     throw std::runtime_error("sampler logits size does not match sampler state");
+  }
+  if (penalties.batch_size != logits.rows) {
+    throw std::runtime_error("sampler batch size does not match logits rows");
   }
 
   rwkv7_fast_v4::check_cuda(
@@ -61,7 +68,7 @@ int sample_repetition_temperature_topk_topp(
           penalties.outputs.p,
           penalties.rand_states.p,
           penalties.probs.p,
-          1,
+          logits.rows,
           1,
           logits.vocab_size,
           options.alpha_presence,
@@ -73,11 +80,25 @@ int sample_repetition_temperature_topk_topp(
           0),
       "launch sampler kernel");
 
-  int token = 0;
+  std::vector<int> tokens(static_cast<std::size_t>(logits.rows));
   rwkv7_fast_v4::check_cuda(
-      cudaMemcpy(&token, penalties.outputs.p, sizeof(token), cudaMemcpyDeviceToHost),
-      "copy sampled token to host");
-  return token;
+      cudaMemcpy(
+          tokens.data(),
+          penalties.outputs.p,
+          static_cast<std::size_t>(logits.rows) * sizeof(int),
+          cudaMemcpyDeviceToHost),
+      "copy sampled tokens to host");
+  return tokens;
+}
+
+int sample_repetition_temperature_topk_topp(
+    const DeviceLogits& logits,
+    SamplerPenaltyState& penalties,
+    const GenerateOptions& options) {
+  if (logits.rows != 1) {
+    throw std::runtime_error("sampler currently expects a single logits row");
+  }
+  return sample_batch_repetition_temperature_topk_topp(logits, penalties, options).front();
 }
 
 }  // namespace rwkv7_server

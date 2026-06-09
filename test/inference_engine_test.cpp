@@ -88,6 +88,23 @@ int main() {
                std::vector<int64_t>(prompt_ids.begin(), prompt_ids.end()));
     TEST_EQ(fake_backend->decode_tokens().size(), answer_ids.size());
 
+    auto batch_backend = std::make_shared<rwkv_test::FakeModelBackend>(
+        build_logits_steps(answer_ids, vocab_size),
+        "fake-backend-batch");
+    rwkv7_server::InferenceEngine batch_engine(batch_backend, tokenizer, batch_backend->model_name());
+    const std::string longer_prompt = prompt + "\nextra";
+    const auto batch_outputs = batch_engine.batch_generate({prompt, longer_prompt}, options);
+    TEST_EQ(batch_outputs.size(), static_cast<std::size_t>(2));
+    TEST_EQ(batch_outputs[0], answer);
+    TEST_EQ(batch_outputs[1], answer);
+    TEST_EQ(batch_backend->prefill_batches().size(), static_cast<std::size_t>(2));
+    TEST_EQ(batch_backend->prefill_batches()[0].size(), static_cast<std::size_t>(2));
+    TEST_EQ(batch_backend->prefill_batches()[1].size(), static_cast<std::size_t>(1));
+    TEST_EQ(batch_backend->decode_tokens().size(), answer_ids.size());
+    for (const auto& decode_step : batch_backend->decode_tokens()) {
+      TEST_EQ(decode_step.size(), static_cast<std::size_t>(2));
+    }
+
     auto stream_backend = std::make_shared<rwkv_test::FakeModelBackend>(
         build_logits_steps(answer_ids, vocab_size),
         "fake-backend-stream");
@@ -108,6 +125,26 @@ int main() {
     for (int index : stream_indices) {
       TEST_EQ(index, 0);
     }
+
+    auto batch_stream_backend = std::make_shared<rwkv_test::FakeModelBackend>(
+        build_logits_steps(answer_ids, vocab_size),
+        "fake-backend-stream-batch");
+    rwkv7_server::InferenceEngine batch_stream_engine(
+        batch_stream_backend, tokenizer, batch_stream_backend->model_name());
+    std::vector<std::string> streamed_batch(2);
+    batch_stream_engine.batch_generate_stream(
+        {prompt, longer_prompt},
+        options,
+        1,
+        [&](int index, const std::string& chunk) {
+          streamed_batch.at(static_cast<std::size_t>(index)) += chunk;
+          return true;
+        });
+    TEST_EQ(streamed_batch[0], answer);
+    TEST_EQ(streamed_batch[1], answer);
+    TEST_EQ(batch_stream_backend->prefill_batches().size(), static_cast<std::size_t>(2));
+    TEST_EQ(batch_stream_backend->prefill_batches()[0].size(), static_cast<std::size_t>(2));
+    TEST_EQ(batch_stream_backend->prefill_batches()[1].size(), static_cast<std::size_t>(1));
 
     std::cout << "rwkv_inference_engine_test passed\n";
     return 0;

@@ -56,6 +56,13 @@ class InferenceEngine {
 
  private:
   std::vector<int64_t> encode_prompt(const std::string& prompt) const;
+  std::vector<std::vector<int64_t>> encode_prompts_sorted(
+      const std::vector<std::string>& prompts,
+      std::vector<size_t>& sorted_to_original) const;
+  void prefill_batch_chunked(
+      const std::vector<std::vector<int64_t>>& sorted_prompt_ids,
+      GenerationState& state,
+      DeviceLogits& logits) const;
   std::string generate_one(
       const std::string& prompt,
       GenerationState& state,

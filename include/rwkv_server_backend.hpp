@@ -62,6 +62,18 @@ class IModelBackend {
       const std::vector<int64_t>& token_batch,
       GenerationState& state,
       DeviceLogits& logits) const = 0;
+  virtual void copy_state_slice(
+      const GenerationState& src,
+      int src_offset,
+      GenerationState& dst,
+      int dst_offset,
+      int count) const = 0;
+  virtual void copy_logits_slice(
+      const DeviceLogits& src,
+      int src_offset,
+      DeviceLogits& dst,
+      int dst_offset,
+      int count) const = 0;
 
   virtual int vocab_size() const = 0;
   virtual const std::string& model_path() const = 0;
@@ -87,6 +99,18 @@ class ModelBackend final : public IModelBackend {
       const std::vector<int64_t>& token_batch,
       GenerationState& state,
       DeviceLogits& logits) const override;
+  void copy_state_slice(
+      const GenerationState& src,
+      int src_offset,
+      GenerationState& dst,
+      int dst_offset,
+      int count) const override;
+  void copy_logits_slice(
+      const DeviceLogits& src,
+      int src_offset,
+      DeviceLogits& dst,
+      int dst_offset,
+      int count) const override;
 
   int vocab_size() const override;
   const std::string& model_path() const override;

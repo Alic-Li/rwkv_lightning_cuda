@@ -8,6 +8,7 @@
 namespace rwkv7_server {
 
 struct SamplerPenaltyState {
+  int batch_size = 0;
   int vocab_size = 0;
   rwkv7_fast_v4::DeviceBuffer<float> penalties;
   rwkv7_fast_v4::DeviceBuffer<float> probs;
@@ -15,9 +16,14 @@ struct SamplerPenaltyState {
   rwkv7_fast_v4::DeviceBuffer<std::uint8_t> rand_states;
 };
 
-SamplerPenaltyState make_sampler_penalties(int vocab_size);
+SamplerPenaltyState make_sampler_penalties(int vocab_size, int batch_size = 1);
 
 int sample_repetition_temperature_topk_topp(
+    const DeviceLogits& logits,
+    SamplerPenaltyState& penalties,
+    const GenerateOptions& options);
+
+std::vector<int> sample_batch_repetition_temperature_topk_topp(
     const DeviceLogits& logits,
     SamplerPenaltyState& penalties,
     const GenerateOptions& options);
