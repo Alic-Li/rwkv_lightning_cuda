@@ -121,6 +121,11 @@ int main(int argc, char* argv[]) {
            "/state/chat/completions",
            "/state/status",
            "/state/delete",
+           "/v1/server/status",
+           "/v1/server/stop",
+           "/v1/server/pause",
+           "/v1/server/resume",
+           "/v1/tokens/count",
            "/v1/chat/completions",
            "/v1/models"}) {
       std::cout << "||      http://0.0.0.0:" << port << endpoint << std::endl;

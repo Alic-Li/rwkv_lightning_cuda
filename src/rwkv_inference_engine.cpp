@@ -1,6 +1,7 @@
 #include "rwkv_inference_engine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -217,14 +218,13 @@ void InferenceEngine::prefill_batch_chunked(
 std::string InferenceEngine::generate_one(
     const std::string& prompt,
     GenerationState& state,
-    const GenerateOptions& options,
-    const StreamCallback* emit,
-    int stream_index,
-    int chunk_size) const {
-  const auto prompt_ids = encode_prompt(prompt);
-  std::vector<std::vector<int64_t>> prefill_batch{prompt_ids};
+      const GenerateOptions& options,
+      const StreamCallback* emit,
+      int stream_index,
+      int chunk_size,
+      const ControlCallback& should_stop) const {
   DeviceLogits logits;
-  model_->forward_prefill(prefill_batch, state, logits);
+  prefill_prompt(prompt, state, logits);
 
   std::vector<int> token_buffer;
   std::string utf8_pending;
@@ -232,6 +232,9 @@ std::string InferenceEngine::generate_one(
 
   auto penalties = make_sampler_penalties(model_->vocab_size());
   for (int step = 0; step < options.max_tokens; ++step) {
+    if (should_stop && should_stop()) {
+      break;
+    }
     const int token = sample_repetition_temperature_topk_topp(logits, penalties, options);
     if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
       break;
@@ -327,14 +330,15 @@ std::vector<std::string> InferenceEngine::batch_generate_state(
   if (prompts.size() != 1 || state.batch_size != 1) {
     throw std::runtime_error("stateful generation only supports single prompt batch");
   }
-  return {generate_one(prompts.front(), state, options, nullptr, 0, 0)};
+  return {generate_one(prompts.front(), state, options, nullptr, 0, 0, {})};
 }
 
 void InferenceEngine::batch_generate_stream(
     const std::vector<std::string>& prompts,
     const GenerateOptions& options,
     int chunk_size,
-    const StreamCallback& emit) const {
+    const StreamCallback& emit,
+    const ControlCallback& should_stop) const {
   if (prompts.empty()) {
     return;
   }
@@ -356,6 +360,9 @@ void InferenceEngine::batch_generate_stream(
   int active = batch_size;
 
   for (int step = 0; step < options.max_tokens && active > 0; ++step) {
+    if (should_stop && should_stop()) {
+      break;
+    }
     const auto sampled_tokens = sample_batch_repetition_temperature_topk_topp(logits, penalties, options);
     for (size_t i = 0; i < sampled_tokens.size(); ++i) {
       if (finished[i]) {
@@ -415,11 +422,81 @@ void InferenceEngine::batch_generate_state_stream(
     GenerationState& state,
     const GenerateOptions& options,
     int chunk_size,
-    const StreamCallback& emit) const {
+    const StreamCallback& emit,
+    const ControlCallback& should_stop) const {
   if (prompts.size() != 1 || state.batch_size != 1) {
     throw std::runtime_error("stateful generation only supports single prompt batch");
   }
-  generate_one(prompts.front(), state, options, &emit, 0, chunk_size);
+  generate_one(prompts.front(), state, options, &emit, 0, chunk_size, should_stop);
+}
+
+int InferenceEngine::prefill_prompt(
+    const std::string& prompt,
+    GenerationState& state,
+    DeviceLogits& logits) const {
+  const auto prompt_ids = encode_prompt(prompt);
+  std::vector<std::vector<int64_t>> prefill_batch{prompt_ids};
+  model_->forward_prefill(prefill_batch, state, logits);
+  return static_cast<int>(prompt_ids.size());
+}
+
+InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
+    GenerationState& state,
+    DeviceLogits& logits,
+    const GenerateOptions& options,
+    int chunk_size,
+    const StreamCallback& emit,
+    const ControlCallback& should_stop) const {
+  if (state.batch_size != 1 || logits.rows != 1) {
+    throw std::runtime_error("logit continuation only supports single prompt batch");
+  }
+
+  GenerationStats stats;
+  std::vector<int> token_buffer;
+  std::string utf8_pending;
+  auto penalties = make_sampler_penalties(model_->vocab_size());
+  const auto decode_begin = std::chrono::steady_clock::now();
+
+  for (int step = 0; step < options.max_tokens; ++step) {
+    if (should_stop && should_stop()) {
+      stats.stopped = true;
+      break;
+    }
+
+    const int token = sample_repetition_temperature_topk_topp(logits, penalties, options);
+    if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
+      stats.stop_token = true;
+      break;
+    }
+
+    ++stats.generated_tokens;
+    token_buffer.push_back(token);
+
+    if (chunk_size > 0 && token_buffer.size() >= static_cast<size_t>(chunk_size)) {
+      utf8_pending += tokenizer_->decode(token_buffer);
+      token_buffer.clear();
+      const std::string chunk = take_complete_utf8(utf8_pending, false);
+      if (!chunk.empty() && !emit(0, chunk)) {
+        stats.stopped = true;
+        break;
+      }
+    }
+
+    model_->forward_decode(std::vector<int64_t>{token}, state, logits);
+  }
+
+  if (!token_buffer.empty()) {
+    utf8_pending += tokenizer_->decode(token_buffer);
+    token_buffer.clear();
+  }
+  const std::string tail = take_complete_utf8(utf8_pending, true);
+  if (!tail.empty() && !emit(0, tail)) {
+    stats.stopped = true;
+  }
+
+  const auto decode_end = std::chrono::steady_clock::now();
+  stats.decode_seconds = std::chrono::duration<double>(decode_end - decode_begin).count();
+  return stats;
 }
 
 std::string InferenceEngine::format_openai_prompt(

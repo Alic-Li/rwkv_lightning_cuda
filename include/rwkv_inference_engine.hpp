@@ -15,6 +15,16 @@ namespace rwkv7_server {
 class InferenceEngine {
  public:
   using StreamCallback = std::function<bool(int, const std::string&)>;
+  using ControlCallback = std::function<bool()>;
+
+  struct GenerationStats {
+    int prompt_tokens = 0;
+    int generated_tokens = 0;
+    double prefill_seconds = 0.0;
+    double decode_seconds = 0.0;
+    bool stopped = false;
+    bool stop_token = false;
+  };
 
   InferenceEngine(
       std::shared_ptr<IModelBackend> model,
@@ -34,14 +44,29 @@ class InferenceEngine {
       const std::vector<std::string>& prompts,
       const GenerateOptions& options,
       int chunk_size,
-      const StreamCallback& emit) const;
+      const StreamCallback& emit,
+      const ControlCallback& should_stop = {}) const;
 
   void batch_generate_state_stream(
       const std::vector<std::string>& prompts,
       GenerationState& state,
       const GenerateOptions& options,
       int chunk_size,
-      const StreamCallback& emit) const;
+      const StreamCallback& emit,
+      const ControlCallback& should_stop = {}) const;
+
+  int prefill_prompt(
+      const std::string& prompt,
+      GenerationState& state,
+      DeviceLogits& logits) const;
+
+  GenerationStats generate_from_logits_stream(
+      GenerationState& state,
+      DeviceLogits& logits,
+      const GenerateOptions& options,
+      int chunk_size,
+      const StreamCallback& emit,
+      const ControlCallback& should_stop = {}) const;
 
   std::string format_openai_prompt(
       const std::string& system,
@@ -69,7 +94,8 @@ class InferenceEngine {
       const GenerateOptions& options,
       const StreamCallback* emit,
       int stream_index,
-      int chunk_size) const;
+      int chunk_size,
+      const ControlCallback& should_stop) const;
 
   std::shared_ptr<IModelBackend> model_;
   std::shared_ptr<TrieTokenizer> tokenizer_;
