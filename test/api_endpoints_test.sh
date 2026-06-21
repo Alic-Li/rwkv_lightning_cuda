@@ -248,6 +248,7 @@ log "POST /v1/chat/completions non-stream"
 request POST "/v1/chat/completions" '{
   "model":"api-test",
   "messages":[{"role":"user","content":"Say hello in one short sentence."}],
+  "think_type":"en_short",
   "stream":false,
   "max_tokens":8,
   "temperature":1.0,
@@ -265,6 +266,7 @@ log "POST /v1/chat/completions stream"
 stream_request "/v1/chat/completions" '{
   "model":"api-test",
   "messages":[{"role":"user","content":"Say hello in one short sentence."}],
+  "think_type":"fast",
   "stream":true,
   "max_tokens":8,
   "temperature":1.0,

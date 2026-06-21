@@ -71,6 +71,11 @@ class InferenceEngine {
   std::string format_openai_prompt(
       const std::string& system,
       const std::vector<std::pair<std::string, std::string>>& messages,
+      ThinkType think_type) const;
+
+  std::string format_openai_prompt(
+      const std::string& system,
+      const std::vector<std::pair<std::string, std::string>>& messages,
       bool enable_think) const;
 
   int count_tokens(const std::string& text) const;

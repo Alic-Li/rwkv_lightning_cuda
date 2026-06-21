@@ -120,6 +120,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/chat/completions" \
   --data '{
     "model":"api-test",
     "messages":[{"role":"user","content":"Say hello in one short sentence."}],
+    "think_type":"fast",
     "stream":false,
     "max_tokens":8,
     "temperature":1.0,
@@ -133,6 +134,14 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/chat/completions" \
   }'
 ```
 
+`think_type` controls the assistant think prefix for chat-message prompts:
+`fast`, `free`, `preferChinese`, `en`, `enShort`/`en_short`, and
+`enLong`/`en_long`. `fast` uses a short closed think prefix and does not force
+reasoning. The other modes force reasoning by masking tokens `111` and `754`
+on the second and third generated tokens. If `think_type` is omitted,
+`enable_think:true` or `think:true` maps to `free`; otherwise the default is
+`fast`.
+
 Use `stream:true` for SSE chunks. The stream ends with `data: [DONE]`.
 
 ```bash
@@ -141,6 +150,7 @@ curl -sS -N -X POST "http://127.0.0.1:8000/v1/chat/completions" \
   --data '{
     "model":"api-test",
     "messages":[{"role":"user","content":"Say hello in one short sentence."}],
+    "think_type":"fast",
     "stream":true,
     "max_tokens":8,
     "temperature":1.0,

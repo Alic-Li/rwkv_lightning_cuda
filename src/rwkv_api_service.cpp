@@ -229,6 +229,39 @@ bool check_password(
   return false;
 }
 
+ThinkType parse_think_type(const Json::Value& body) {
+  if (body.isMember("think_type")) {
+    const auto value = body.get("think_type", "").asString();
+    if (value == "fast") {
+      return ThinkType::Fast;
+    }
+    if (value == "free") {
+      return ThinkType::Free;
+    }
+    if (value == "preferChinese" || value == "prefer_chinese") {
+      return ThinkType::PreferChinese;
+    }
+    if (value == "en") {
+      return ThinkType::En;
+    }
+    if (value == "enShort" || value == "en_short") {
+      return ThinkType::EnShort;
+    }
+    if (value == "enLong" || value == "en_long") {
+      return ThinkType::EnLong;
+    }
+  }
+  if (body.isMember("think") ? body.get("think", false).asBool()
+                             : body.get("enable_think", false).asBool()) {
+    return ThinkType::Free;
+  }
+  return ThinkType::Fast;
+}
+
+bool force_reasoning_for_think_type(ThinkType think_type) {
+  return think_type != ThinkType::Fast;
+}
+
 GenerateOptions parse_options(const Json::Value& body, GenerateOptions options = {}) {
   options.max_tokens = body.get("max_tokens", options.max_tokens).asInt();
   options.temperature = body.get("temperature", options.temperature).asDouble();
@@ -237,6 +270,7 @@ GenerateOptions parse_options(const Json::Value& body, GenerateOptions options =
   options.alpha_presence = body.get("alpha_presence", options.alpha_presence).asDouble();
   options.alpha_frequency = body.get("alpha_frequency", options.alpha_frequency).asDouble();
   options.alpha_decay = body.get("alpha_decay", options.alpha_decay).asDouble();
+  options.force_reasoning = body.get("force_reasoning", options.force_reasoning).asBool();
 
   const auto& stop_tokens = body["stop_tokens"];
   if (stop_tokens.isArray()) {
@@ -438,7 +472,7 @@ std::string format_openai_prompt(const Json::Value& body, const InferenceEngine&
       system += part;
     }
   }
-  return engine.format_openai_prompt(system, dialogue_messages, body.get("enable_think", false).asBool());
+  return engine.format_openai_prompt(system, dialogue_messages, parse_think_type(body));
 }
 
 Json::Value build_openai_response(
@@ -485,7 +519,7 @@ Json::Value build_status_response(const InferenceEngine& engine) {
   Json::Value resp;
   resp["status"] = "running";
   resp["api_version"] = "1.0";
-  resp["engine_version"] = "albatross-1.0.0";
+  resp["engine_version"] = "albatross-1.0.1";
   resp["model"]["id"] = engine.model_name();
   resp["model"]["name"] = engine.model_name();
   resp["model"]["path"] = engine.model()->model_path();
@@ -498,6 +532,7 @@ Json::Value build_status_response(const InferenceEngine& engine) {
   resp["capabilities"]["metrics"] = true;
   resp["capabilities"]["session_cache"] = true;
   resp["capabilities"]["pause_resume"] = true;
+  resp["capabilities"]["think_type"] = true;
   resp["active_request"] = RequestRegistry::instance().active_json();
   resp["paused_requests"] = RequestRegistry::instance().paused_json();
   return resp;
@@ -516,6 +551,7 @@ Json::Value build_options_debug(const InferenceEngine& engine, const GenerateOpt
   out["alpha_presence"] = options.alpha_presence;
   out["alpha_frequency"] = options.alpha_frequency;
   out["alpha_decay"] = options.alpha_decay;
+  out["force_reasoning"] = options.force_reasoning;
   out["stop_tokens"] = Json::arrayValue;
   out["stop_texts"] = Json::arrayValue;
   for (const auto token : options.stop_tokens) {
@@ -532,7 +568,7 @@ void print_chat_context_debug(
     int prompt_tokens,
     const GenerateOptions& options) {
   std::printf(
-      "[debug_context] endpoint=%s session_id=%s prompt_tokens=%d max_tokens=%d temperature=%.4f top_k=%d top_p=%.4f alpha_presence=%.4f alpha_frequency=%.4f alpha_decay=%.4f stop_tokens=",
+      "[debug_context] endpoint=%s session_id=%s prompt_tokens=%d max_tokens=%d temperature=%.4f top_k=%d top_p=%.4f alpha_presence=%.4f alpha_frequency=%.4f alpha_decay=%.4f force_reasoning=%s stop_tokens=",
       endpoint,
       session_id.empty() ? "<none>" : session_id.c_str(),
       prompt_tokens,
@@ -542,7 +578,8 @@ void print_chat_context_debug(
       options.top_p,
       options.alpha_presence,
       options.alpha_frequency,
-      options.alpha_decay);
+      options.alpha_decay,
+      options.force_reasoning ? "true" : "false");
   if (options.stop_tokens.empty()) {
     std::printf("[]\n");
   } else {
@@ -670,6 +707,7 @@ void register_api_routes(
         }
 
         GenerateOptions options = paused->options;
+        options.force_reasoning_token_offset = paused->generated_tokens;
         if (!(*json).isMember("max_tokens")) {
           options.max_tokens = std::max(0, paused->options.max_tokens - paused->generated_tokens);
         }
@@ -1069,7 +1107,10 @@ void register_api_routes(
 
         const auto prompt = format_openai_prompt(*json, engine);
         // std::cout << prompt << std::endl; // Debug Prompt
-        const auto options = parse_options(*json);
+        auto options = parse_options(*json);
+        if ((*json).isMember("think_type") || (*json).isMember("think") || (*json).isMember("enable_think")) {
+          options.force_reasoning = force_reasoning_for_think_type(parse_think_type(*json));
+        }
         const int prompt_tokens = engine.count_tokens(prompt);
         const auto model = (*json).get("model", engine.model_name()).asString();
         auto active = RequestRegistry::instance().start(

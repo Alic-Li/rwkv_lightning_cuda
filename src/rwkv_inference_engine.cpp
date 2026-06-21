@@ -2,14 +2,125 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+
+#include <cuda_runtime.h>
 
 namespace rwkv7_server {
 namespace {
 
 constexpr int kPrefillChunkSize = 256;
+constexpr int kForceReasoningMaskStartStep = 1;
+constexpr int kForceReasoningMaskEndStep = 2;
+constexpr int kForceReasoningDenyTokenA = 111;
+constexpr int kForceReasoningDenyTokenB = 754;
+constexpr float kMaskedLogit = -1.0e30f;
+
+struct ThinkPromptConfig {
+  const char* header = "<think>\n</think";
+  const char* user_msg_footer = "";
+  bool force_reasoning = false;
+};
+
+ThinkPromptConfig think_prompt_config(ThinkType think_type) {
+  switch (think_type) {
+    case ThinkType::Fast:
+      return {"<think>\n</think", "", false};
+    case ThinkType::Free:
+      return {"<think", "", true};
+    case ThinkType::PreferChinese:
+      return {"<think>\xE5\x97\xAF", "", true};
+    case ThinkType::En:
+      return {"<think", " (think)", true};
+    case ThinkType::EnShort:
+      return {"<think", " (think a bit)", true};
+    case ThinkType::EnLong:
+      return {"<think", " (think a lot)", true};
+  }
+  return {"<think>\n</think", "", false};
+}
+
+bool should_force_reasoning_mask(const GenerateOptions& options, int generated_step) {
+  const int total_generated_step = options.force_reasoning_token_offset + generated_step;
+  return options.force_reasoning &&
+         total_generated_step >= kForceReasoningMaskStartStep &&
+         total_generated_step <= kForceReasoningMaskEndStep;
+}
+
+class ScopedLogitMask {
+ public:
+  ScopedLogitMask(DeviceLogits& logits, const std::vector<int>& tokens) : logits_(logits) {
+    if (logits_.rows <= 0 || logits_.vocab_size <= 0 || logits_.values.p == nullptr) {
+      return;
+    }
+    for (int row = 0; row < logits_.rows; ++row) {
+      for (int token : tokens) {
+        if (token < 0 || token >= logits_.vocab_size) {
+          continue;
+        }
+        const std::size_t index =
+            static_cast<std::size_t>(row) * static_cast<std::size_t>(logits_.vocab_size) +
+            static_cast<std::size_t>(token);
+        Entry entry;
+        entry.index = index;
+        rwkv7_fast_v4::check_cuda(
+            cudaMemcpy(&entry.original, logits_.values.p + index, sizeof(float), cudaMemcpyDeviceToHost),
+            "copy original masked logit");
+        const float masked = kMaskedLogit;
+        rwkv7_fast_v4::check_cuda(
+            cudaMemcpy(logits_.values.p + index, &masked, sizeof(float), cudaMemcpyHostToDevice),
+            "write masked logit");
+        entries_.push_back(entry);
+      }
+    }
+  }
+
+  ScopedLogitMask(const ScopedLogitMask&) = delete;
+  ScopedLogitMask& operator=(const ScopedLogitMask&) = delete;
+
+  ~ScopedLogitMask() {
+    for (const auto& entry : entries_) {
+      rwkv7_fast_v4::check_cuda(
+          cudaMemcpy(logits_.values.p + entry.index, &entry.original, sizeof(float), cudaMemcpyHostToDevice),
+          "restore masked logit");
+    }
+  }
+
+ private:
+  struct Entry {
+    std::size_t index = 0;
+    float original = 0.0f;
+  };
+
+  DeviceLogits& logits_;
+  std::vector<Entry> entries_;
+};
+
+std::vector<int> sample_batch_with_options_mask(
+    DeviceLogits& logits,
+    SamplerPenaltyState& penalties,
+    const GenerateOptions& options,
+    int generated_step) {
+  if (should_force_reasoning_mask(options, generated_step)) {
+    ScopedLogitMask mask(logits, {kForceReasoningDenyTokenA, kForceReasoningDenyTokenB});
+    return sample_batch_repetition_temperature_topk_topp(logits, penalties, options);
+  }
+  return sample_batch_repetition_temperature_topk_topp(logits, penalties, options);
+}
+
+int sample_with_options_mask(
+    DeviceLogits& logits,
+    SamplerPenaltyState& penalties,
+    const GenerateOptions& options,
+    int generated_step) {
+  if (logits.rows != 1) {
+    throw std::runtime_error("sampler currently expects a single logits row");
+  }
+  return sample_batch_with_options_mask(logits, penalties, options, generated_step).front();
+}
 
 bool is_utf8_continuation(unsigned char byte) {
   return (byte & 0xC0u) == 0x80u;
@@ -235,7 +346,7 @@ std::string InferenceEngine::generate_one(
     if (should_stop && should_stop()) {
       break;
     }
-    const int token = sample_repetition_temperature_topk_topp(logits, penalties, options);
+    const int token = sample_with_options_mask(logits, penalties, options, step);
     if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
       break;
     }
@@ -291,7 +402,7 @@ std::vector<std::string> InferenceEngine::batch_generate(
   int active = batch_size;
 
   for (int step = 0; step < options.max_tokens && active > 0; ++step) {
-    const auto sampled_tokens = sample_batch_repetition_temperature_topk_topp(logits, penalties, options);
+    const auto sampled_tokens = sample_batch_with_options_mask(logits, penalties, options, step);
     for (size_t i = 0; i < sampled_tokens.size(); ++i) {
       if (finished[i]) {
         decode_batch[i] = fallback_token;
@@ -363,7 +474,7 @@ void InferenceEngine::batch_generate_stream(
     if (should_stop && should_stop()) {
       break;
     }
-    const auto sampled_tokens = sample_batch_repetition_temperature_topk_topp(logits, penalties, options);
+    const auto sampled_tokens = sample_batch_with_options_mask(logits, penalties, options, step);
     for (size_t i = 0; i < sampled_tokens.size(); ++i) {
       if (finished[i]) {
         decode_batch[i] = fallback_token;
@@ -463,7 +574,7 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
       break;
     }
 
-    const int token = sample_repetition_temperature_topk_topp(logits, penalties, options);
+    const int token = sample_with_options_mask(logits, penalties, options, step);
     if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
       stats.stop_token = true;
       break;
@@ -502,30 +613,48 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
 std::string InferenceEngine::format_openai_prompt(
     const std::string& system,
     const std::vector<std::pair<std::string, std::string>>& messages,
-    bool enable_think) const {
+    ThinkType think_type) const {
+  const auto think_config = think_prompt_config(think_type);
+  size_t footer_index = messages.size();
+  if (think_config.user_msg_footer[0] != '\0') {
+    for (size_t i = messages.size(); i > 0; --i) {
+      if (messages[i - 1].first == "User") {
+        footer_index = i - 1;
+        break;
+      }
+    }
+  }
+
   std::ostringstream oss;
   bool has_prefix = false;
   if (!system.empty()) {
     oss << "System: " << system;
     has_prefix = true;
   }
-  for (const auto& [role, content] : messages) {
+  for (size_t i = 0; i < messages.size(); ++i) {
+    const auto& [role, content] = messages[i];
     if (has_prefix) {
       oss << "\n\n";
     }
     oss << role << ": " << content;
+    if (i == footer_index) {
+      oss << think_config.user_msg_footer;
+    }
     has_prefix = true;
   }
   if (has_prefix) {
     oss << "\n\n";
   }
   oss << "Assistant: ";
-  if (enable_think) {
-    oss << "<think";
-  } else {
-    oss << "<think>\n</think>\n";
-  }
+  oss << think_config.header;
   return oss.str();
+}
+
+std::string InferenceEngine::format_openai_prompt(
+    const std::string& system,
+    const std::vector<std::pair<std::string, std::string>>& messages,
+    bool enable_think) const {
+  return format_openai_prompt(system, messages, enable_think ? ThinkType::Free : ThinkType::Fast);
 }
 
 int InferenceEngine::count_tokens(const std::string& text) const {

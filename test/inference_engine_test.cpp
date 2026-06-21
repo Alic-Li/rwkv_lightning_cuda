@@ -22,6 +22,24 @@ std::vector<std::vector<float>> build_logits_steps(
   return steps;
 }
 
+std::vector<std::vector<float>> build_force_reasoning_logits_steps() {
+  const int vocab_size = 755;
+  std::vector<std::vector<float>> steps;
+  for (size_t i = 0; i < 3; ++i) {
+    std::vector<float> logits(static_cast<std::size_t>(vocab_size), -100.0f);
+    logits[112 + i] = 90.0f;
+    if (i == 1) {
+      logits[111] = 100.0f;
+    }
+    if (i == 2) {
+      logits[754] = 100.0f;
+    }
+    steps.push_back(std::move(logits));
+  }
+  steps.push_back(rwkv_test::one_hot_logits(vocab_size, 0));
+  return steps;
+}
+
 }  // namespace
 
 int main() {
@@ -49,10 +67,13 @@ int main() {
             "SYS",
             {{"User", "Q1"}, {"Assistant", "A1"}, {"User", "Q2"}},
             false),
-        std::string("System: SYS\n\nUser: Q1\n\nAssistant: A1\n\nUser: Q2\n\nAssistant: <think>\n</think>\n"));
+        std::string("System: SYS\n\nUser: Q1\n\nAssistant: A1\n\nUser: Q2\n\nAssistant: <think>\n</think"));
     TEST_EQ(
         engine.format_openai_prompt("SYS", {{"User", "Q"}}, true),
         std::string("System: SYS\n\nUser: Q\n\nAssistant: <think"));
+    TEST_EQ(
+        engine.format_openai_prompt("SYS", {{"User", "Q"}}, rwkv7_server::ThinkType::EnShort),
+        std::string("System: SYS\n\nUser: Q (think a bit)\n\nAssistant: <think"));
     TEST_EQ(engine.count_tokens(answer), static_cast<int>(answer_ids.size()));
 
     rwkv7_server::GenerationState invalid_state;
@@ -87,6 +108,17 @@ int main() {
                    fake_backend->prefill_batches().front().front().end()) ==
                std::vector<int64_t>(prompt_ids.begin(), prompt_ids.end()));
     TEST_EQ(fake_backend->decode_tokens().size(), answer_ids.size());
+
+    auto force_backend = std::make_shared<rwkv_test::FakeModelBackend>(
+        build_force_reasoning_logits_steps(),
+        "fake-backend-force");
+    rwkv7_server::InferenceEngine force_engine(force_backend, tokenizer, force_backend->model_name());
+    rwkv7_server::GenerateOptions force_options = options;
+    force_options.max_tokens = 4;
+    force_options.force_reasoning = true;
+    const auto force_outputs = force_engine.batch_generate({prompt}, force_options);
+    TEST_EQ(force_outputs.size(), static_cast<std::size_t>(1));
+    TEST_EQ(force_outputs.front(), std::string("opq"));
 
     auto batch_backend = std::make_shared<rwkv_test::FakeModelBackend>(
         build_logits_steps(answer_ids, vocab_size),

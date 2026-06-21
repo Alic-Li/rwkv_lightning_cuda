@@ -11,6 +11,15 @@
 
 namespace rwkv7_server {
 
+enum class ThinkType {
+  Fast,
+  Free,
+  PreferChinese,
+  En,
+  EnShort,
+  EnLong,
+};
+
 struct GenerateOptions {
   int max_tokens = 8192;
   std::vector<int64_t> stop_tokens{0, 261, 24281};
@@ -20,6 +29,8 @@ struct GenerateOptions {
   double alpha_presence = 2.0;
   double alpha_frequency = 0.2;
   double alpha_decay = 0.996;
+  bool force_reasoning = false;
+  int force_reasoning_token_offset = 0;
 };
 
 struct GenerationState {
