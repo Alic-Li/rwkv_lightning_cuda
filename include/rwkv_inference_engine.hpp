@@ -40,7 +40,7 @@ class InferenceEngine {
       GenerationState& state,
       const GenerateOptions& options) const;
 
-  void batch_generate_stream(
+  GenerationStats batch_generate_stream(
       const std::vector<std::string>& prompts,
       const GenerateOptions& options,
       int chunk_size,

@@ -295,6 +295,17 @@ void update_decode_metrics(
   }
 }
 
+void record_generation_stats(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    const InferenceEngine::GenerationStats& stats) {
+  active->prefilled_tokens.store(stats.prompt_tokens);
+  active->prefill_progress.store(1.0);
+  if (stats.prefill_seconds > 0.0) {
+    active->prefill_speed.store(stats.prompt_tokens / stats.prefill_seconds);
+  }
+  update_decode_metrics(active, stats.generated_tokens, stats.decode_seconds);
+}
+
 Json::Value make_error(const std::string& message) {
   Json::Value out;
   out["error"] = message;
@@ -971,7 +982,7 @@ void register_api_routes(
                 model,
                 static_cast<int>(prompts.size()),
                 [&, active, prompts, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
-                  engine.batch_generate_stream(
+                  const auto stats = engine.batch_generate_stream(
                       prompts,
                       options,
                       chunk_size,
@@ -982,6 +993,7 @@ void register_api_routes(
                       [active]() {
                         return active->stop_requested.load() || active->pause_requested.load();
                       });
+                  record_generation_stats(active, stats);
                 },
                 [active]() {
                   RequestRegistry::instance().finish(active);
@@ -994,7 +1006,22 @@ void register_api_routes(
         resp["id"] = "rwkv7-fast-batch";
         resp["object"] = "chat.completion";
         resp["model"] = model;
-        resp["choices"] = build_choices(engine.batch_generate(prompts, options));
+        std::vector<std::string> results(prompts.size());
+        const auto stats = engine.batch_generate_stream(
+            prompts,
+            options,
+            parse_chunk_size(*json, 0),
+            [&](int index, const std::string& chunk) {
+              if (index >= 0 && index < static_cast<int>(results.size())) {
+                results[static_cast<size_t>(index)] += chunk;
+              }
+              return true;
+            },
+            [active]() {
+              return active->stop_requested.load() || active->pause_requested.load();
+            });
+        record_generation_stats(active, stats);
+        resp["choices"] = build_choices(results);
         RequestRegistry::instance().finish(active);
         cb(json_response(std::move(resp)));
       },
