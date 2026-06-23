@@ -449,7 +449,8 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream(
     const GenerateOptions& options,
     int chunk_size,
     const StreamCallback& emit,
-    const ControlCallback& should_stop) const {
+    const ControlCallback& should_stop,
+    const StatsCallback& on_prefill_complete) const {
   GenerationStats stats;
   if (prompts.empty()) {
     return stats;
@@ -468,6 +469,9 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream(
   prefill_batch_chunked(sorted_prompt_ids, state, logits);
   const auto prefill_end = std::chrono::steady_clock::now();
   stats.prefill_seconds = std::chrono::duration<double>(prefill_end - prefill_begin).count();
+  if (on_prefill_complete) {
+    on_prefill_complete(stats);
+  }
 
   const int fallback_token = options.stop_tokens.empty() ? 0 : static_cast<int>(options.stop_tokens.front());
   auto penalties = make_sampler_penalties(model_->vocab_size(), batch_size);

@@ -992,6 +992,9 @@ void register_api_routes(
                       },
                       [active]() {
                         return active->stop_requested.load() || active->pause_requested.load();
+                      },
+                      [active](const InferenceEngine::GenerationStats& stats) {
+                        record_generation_stats(active, stats);
                       });
                   record_generation_stats(active, stats);
                 },
@@ -1019,6 +1022,9 @@ void register_api_routes(
             },
             [active]() {
               return active->stop_requested.load() || active->pause_requested.load();
+            },
+            [active](const InferenceEngine::GenerationStats& stats) {
+              record_generation_stats(active, stats);
             });
         record_generation_stats(active, stats);
         resp["choices"] = build_choices(results);

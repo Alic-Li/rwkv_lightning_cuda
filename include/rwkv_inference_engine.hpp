@@ -26,6 +26,8 @@ class InferenceEngine {
     bool stop_token = false;
   };
 
+  using StatsCallback = std::function<void(const GenerationStats&)>;
+
   InferenceEngine(
       std::shared_ptr<IModelBackend> model,
       std::shared_ptr<TrieTokenizer> tokenizer,
@@ -45,7 +47,8 @@ class InferenceEngine {
       const GenerateOptions& options,
       int chunk_size,
       const StreamCallback& emit,
-      const ControlCallback& should_stop = {}) const;
+      const ControlCallback& should_stop = {},
+      const StatsCallback& on_prefill_complete = {}) const;
 
   void batch_generate_state_stream(
       const std::vector<std::string>& prompts,
