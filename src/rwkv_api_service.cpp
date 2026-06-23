@@ -38,8 +38,28 @@ class RequestRegistry {
     std::atomic<int> generated_tokens{0};
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> pause_requested{false};
+    std::atomic<int> prefilled_tokens{0};
+    std::atomic<double> prefill_progress{0.0};
     std::atomic<double> prefill_speed{0.0};
     std::atomic<double> decode_speed{0.0};
+  };
+
+  struct RequestSnapshot {
+    std::string id;
+    std::string endpoint;
+    std::string model;
+    std::string state_key;
+    Json::Int64 created = 0;
+    Json::Int64 finished = 0;
+    int prompt_tokens = 0;
+    int prefilled_tokens = 0;
+    int generated_tokens = 0;
+    int max_tokens = 0;
+    bool stop_requested = false;
+    bool pause_requested = false;
+    double prefill_progress = 0.0;
+    double prefill_speed = 0.0;
+    double decode_speed = 0.0;
   };
 
   struct PausedRequest {
@@ -108,6 +128,8 @@ class RequestRegistry {
   void finish(const std::shared_ptr<ActiveRequest>& active) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_ == active) {
+      last_ = snapshot_request(*active);
+      last_->finished = now_seconds();
       active_.reset();
     }
   }
@@ -139,16 +161,26 @@ class RequestRegistry {
     out["model"] = active->model;
     out["created"] = active->created;
     out["prompt_tokens"] = active->prompt_tokens;
+    out["prefilled_tokens"] = active->prefilled_tokens.load();
     out["generated_tokens"] = active->generated_tokens.load();
     out["max_tokens"] = active->max_tokens;
     out["stop_requested"] = active->stop_requested.load();
     out["pause_requested"] = active->pause_requested.load();
+    out["prefill_progress"] = active->prefill_progress.load();
     out["prefill_speed"] = active->prefill_speed.load();
     out["decode_speed"] = active->decode_speed.load();
     if (!active->state_key.empty()) {
       out["state_key"] = active->state_key;
     }
     return out;
+  }
+
+  Json::Value last_json() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!last_.has_value()) {
+      return Json::Value(Json::nullValue);
+    }
+    return snapshot_json(*last_);
   }
 
   Json::Value paused_json() const {
@@ -178,11 +210,101 @@ class RequestRegistry {
     return oss.str();
   }
 
+  static RequestSnapshot snapshot_request(const ActiveRequest& active) {
+    RequestSnapshot snapshot;
+    snapshot.id = active.id;
+    snapshot.endpoint = active.endpoint;
+    snapshot.model = active.model;
+    snapshot.state_key = active.state_key;
+    snapshot.created = active.created;
+    snapshot.prompt_tokens = active.prompt_tokens;
+    snapshot.prefilled_tokens = active.prefilled_tokens.load();
+    snapshot.generated_tokens = active.generated_tokens.load();
+    snapshot.max_tokens = active.max_tokens;
+    snapshot.stop_requested = active.stop_requested.load();
+    snapshot.pause_requested = active.pause_requested.load();
+    snapshot.prefill_progress = active.prefill_progress.load();
+    snapshot.prefill_speed = active.prefill_speed.load();
+    snapshot.decode_speed = active.decode_speed.load();
+    return snapshot;
+  }
+
+  static Json::Value snapshot_json(const RequestSnapshot& snapshot) {
+    Json::Value out;
+    out["id"] = snapshot.id;
+    out["endpoint"] = snapshot.endpoint;
+    out["model"] = snapshot.model;
+    out["created"] = snapshot.created;
+    if (snapshot.finished > 0) {
+      out["finished"] = snapshot.finished;
+    }
+    out["prompt_tokens"] = snapshot.prompt_tokens;
+    out["prefilled_tokens"] = snapshot.prefilled_tokens;
+    out["generated_tokens"] = snapshot.generated_tokens;
+    out["max_tokens"] = snapshot.max_tokens;
+    out["stop_requested"] = snapshot.stop_requested;
+    out["pause_requested"] = snapshot.pause_requested;
+    out["prefill_progress"] = snapshot.prefill_progress;
+    out["prefill_speed"] = snapshot.prefill_speed;
+    out["decode_speed"] = snapshot.decode_speed;
+    if (!snapshot.state_key.empty()) {
+      out["state_key"] = snapshot.state_key;
+    }
+    return out;
+  }
+
   mutable std::mutex mutex_;
   std::shared_ptr<ActiveRequest> active_;
+  std::optional<RequestSnapshot> last_;
   std::unordered_map<std::string, PausedRequest> paused_;
   Json::UInt64 next_id_ = 0;
 };
+
+void record_prefill_metrics(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    int prefill_tokens,
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end) {
+  active->prefilled_tokens.store(prefill_tokens);
+  active->prefill_progress.store(1.0);
+  const double prefill_seconds = std::chrono::duration<double>(end - begin).count();
+  if (prefill_seconds > 0.0) {
+    active->prefill_speed.store(prefill_tokens / prefill_seconds);
+  }
+}
+
+void update_decode_metrics(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    int generated_tokens,
+    double decode_seconds) {
+  if (generated_tokens > 0) {
+    active->generated_tokens.store(generated_tokens);
+  }
+  if (decode_seconds > 0.0 && active->generated_tokens.load() > 0) {
+    active->decode_speed.store(active->generated_tokens.load() / decode_seconds);
+  }
+}
+
+void update_decode_metrics(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    std::chrono::steady_clock::time_point begin) {
+  const double decode_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+  if (decode_seconds > 0.0 && active->generated_tokens.load() > 0) {
+    active->decode_speed.store(active->generated_tokens.load() / decode_seconds);
+  }
+}
+
+void record_generation_stats(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    const InferenceEngine::GenerationStats& stats) {
+  active->prefilled_tokens.store(stats.prompt_tokens);
+  active->prefill_progress.store(1.0);
+  if (stats.prefill_seconds > 0.0) {
+    active->prefill_speed.store(stats.prompt_tokens / stats.prefill_seconds);
+  }
+  update_decode_metrics(active, stats.generated_tokens, stats.decode_seconds);
+}
 
 Json::Value make_error(const std::string& message) {
   Json::Value out;
@@ -284,6 +406,14 @@ GenerateOptions parse_options(const Json::Value& body, GenerateOptions options =
 
 int parse_chunk_size(const Json::Value& body, int fallback) {
   return std::max(1, body.get("chunk_size", fallback).asInt());
+}
+
+bool parse_metrics_requested(const Json::Value& body) {
+  const auto read_flag = [&body](const char* key) {
+    const auto& value = body[key];
+    return value.isBool() && value.asBool();
+  };
+  return read_flag("metrics") || read_flag("report_metrics") || read_flag("include_metrics");
 }
 
 std::string normalize_content(const Json::Value& content) {
@@ -534,6 +664,7 @@ Json::Value build_status_response(const InferenceEngine& engine) {
   resp["capabilities"]["pause_resume"] = true;
   resp["capabilities"]["think_type"] = true;
   resp["active_request"] = RequestRegistry::instance().active_json();
+  resp["last_request"] = RequestRegistry::instance().last_json();
   resp["paused_requests"] = RequestRegistry::instance().paused_json();
   return resp;
 }
@@ -835,9 +966,12 @@ void register_api_routes(
           return;
         }
         const auto options = parse_options(*json);
+        const bool metrics_requested = parse_metrics_requested(*json);
         int prompt_tokens = 0;
-        for (const auto& prompt : prompts) {
-          prompt_tokens += engine.count_tokens(prompt);
+        if (metrics_requested) {
+          for (const auto& prompt : prompts) {
+            prompt_tokens += engine.count_tokens(prompt);
+          }
         }
         const auto model = (*json).get("model", engine.model_name()).asString();
         auto active = RequestRegistry::instance().start(
@@ -850,7 +984,7 @@ void register_api_routes(
           return;
         }
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, active, prompts, options, model,
+          cb(make_sse_response([&engine, active, prompts, options, model, metrics_requested,
                                 chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
@@ -858,18 +992,30 @@ void register_api_routes(
                 active->id,
                 model,
                 static_cast<int>(prompts.size()),
-                [&, active, prompts, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
-                  engine.batch_generate_stream(
+                [&, active, prompts, options, chunk_size, metrics_requested](const InferenceEngine::StreamCallback& emit) {
+                  InferenceEngine::StatsCallback on_prefill_complete;
+                  if (metrics_requested) {
+                    on_prefill_complete = [active](const InferenceEngine::GenerationStats& stats) {
+                      record_generation_stats(active, stats);
+                    };
+                  }
+                  const auto stats = engine.batch_generate_stream(
                       prompts,
                       options,
                       chunk_size,
-                      [&](int index, const std::string& chunk) {
-                        active->generated_tokens.fetch_add(engine.count_tokens(chunk));
+                      [&, metrics_requested](int index, const std::string& chunk) {
+                        if (metrics_requested) {
+                          active->generated_tokens.fetch_add(engine.count_tokens(chunk));
+                        }
                         return emit(index, chunk);
                       },
                       [active]() {
                         return active->stop_requested.load() || active->pause_requested.load();
-                      });
+                      },
+                      on_prefill_complete);
+                  if (metrics_requested) {
+                    record_generation_stats(active, stats);
+                  }
                 },
                 [active]() {
                   RequestRegistry::instance().finish(active);
@@ -882,7 +1028,24 @@ void register_api_routes(
         resp["id"] = "rwkv7-fast-batch";
         resp["object"] = "chat.completion";
         resp["model"] = model;
-        resp["choices"] = build_choices(engine.batch_generate(prompts, options));
+        std::vector<std::string> results(prompts.size());
+        const auto stats = engine.batch_generate_stream(
+            prompts,
+            options,
+            parse_chunk_size(*json, 0),
+            [&](int index, const std::string& chunk) {
+              if (index >= 0 && index < static_cast<int>(results.size())) {
+                results[static_cast<size_t>(index)] += chunk;
+              }
+              return true;
+            },
+            [active]() {
+              return active->stop_requested.load() || active->pause_requested.load();
+            });
+        if (metrics_requested) {
+          record_generation_stats(active, stats);
+        }
+        resp["choices"] = build_choices(results);
         RequestRegistry::instance().finish(active);
         cb(json_response(std::move(resp)));
       },
@@ -1139,27 +1302,24 @@ void register_api_routes(
                   const auto prefill_begin = std::chrono::steady_clock::now();
                   const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
                   const auto prefill_end = std::chrono::steady_clock::now();
-                  const double prefill_seconds =
-                      std::chrono::duration<double>(prefill_end - prefill_begin).count();
-                  if (prefill_seconds > 0.0) {
-                    active->prefill_speed.store(prefill_tokens / prefill_seconds);
-                  }
+                  record_prefill_metrics(active, prefill_tokens, prefill_begin, prefill_end);
 
+                  const auto decode_begin = std::chrono::steady_clock::now();
                   const auto stats = engine.generate_from_logits_stream(
                       *state_ptr,
                       *logits_ptr,
                       options,
                       chunk_size,
                       [&](int index, const std::string& chunk) {
-                        active->generated_tokens.fetch_add(engine.count_tokens(chunk));
+                        const int tokens = engine.count_tokens(chunk);
+                        active->generated_tokens.fetch_add(tokens);
+                        update_decode_metrics(active, decode_begin);
                         return emit(index, chunk);
                       },
                       [active]() {
                         return active->stop_requested.load() || active->pause_requested.load();
                       });
-                  if (stats.decode_seconds > 0.0) {
-                    active->decode_speed.store(stats.generated_tokens / stats.decode_seconds);
-                  }
+                  update_decode_metrics(active, stats.generated_tokens, stats.decode_seconds);
                   if (active->pause_requested.load()) {
                     RequestRegistry::PausedRequest paused;
                     paused.id = active->id;
@@ -1182,10 +1342,49 @@ void register_api_routes(
           return;
         }
 
-        const auto texts = engine.batch_generate({prompt}, options);
+        auto state_ptr = std::make_shared<GenerationState>(engine.model()->create_state(1));
+        auto logits_ptr = std::make_shared<DeviceLogits>();
+        std::string completion;
+
+        const auto prefill_begin = std::chrono::steady_clock::now();
+        const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
+        const auto prefill_end = std::chrono::steady_clock::now();
+        record_prefill_metrics(active, prefill_tokens, prefill_begin, prefill_end);
+
+        const auto decode_begin = std::chrono::steady_clock::now();
+        const auto stats = engine.generate_from_logits_stream(
+            *state_ptr,
+            *logits_ptr,
+            options,
+            parse_chunk_size(*json, 2),
+            [&](int, const std::string& chunk) {
+              completion += chunk;
+              const int tokens = engine.count_tokens(chunk);
+              active->generated_tokens.fetch_add(tokens);
+              update_decode_metrics(active, decode_begin);
+              return true;
+            },
+            [active]() {
+              return active->stop_requested.load() || active->pause_requested.load();
+            });
+        update_decode_metrics(active, stats.generated_tokens, stats.decode_seconds);
+        if (active->pause_requested.load()) {
+          RequestRegistry::PausedRequest paused;
+          paused.id = active->id;
+          paused.endpoint = active->endpoint;
+          paused.model = active->model;
+          paused.created = active->created;
+          paused.generated_tokens = active->generated_tokens.load();
+          paused.chunk_size = parse_chunk_size(*json, 2);
+          paused.options = options;
+          paused.state = state_ptr;
+          paused.logits = logits_ptr;
+          StateCacheManager::instance().put_state(paused.id, *state_ptr);
+          RequestRegistry::instance().put_paused(std::move(paused));
+        }
         RequestRegistry::instance().finish(active);
 
-        cb(json_response(build_openai_response(engine, *json, prompt, texts.empty() ? std::string{} : texts.front())));
+        cb(json_response(build_openai_response(engine, *json, prompt, completion)));
       },
       {Post});
 

@@ -444,23 +444,34 @@ std::vector<std::string> InferenceEngine::batch_generate_state(
   return {generate_one(prompts.front(), state, options, nullptr, 0, 0, {})};
 }
 
-void InferenceEngine::batch_generate_stream(
+InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream(
     const std::vector<std::string>& prompts,
     const GenerateOptions& options,
     int chunk_size,
     const StreamCallback& emit,
-    const ControlCallback& should_stop) const {
+    const ControlCallback& should_stop,
+    const StatsCallback& on_prefill_complete) const {
+  GenerationStats stats;
   if (prompts.empty()) {
-    return;
+    return stats;
   }
 
   std::vector<size_t> sorted_to_original;
   const auto sorted_prompt_ids = encode_prompts_sorted(prompts, sorted_to_original);
+  for (const auto& prompt_ids : sorted_prompt_ids) {
+    stats.prompt_tokens += static_cast<int>(prompt_ids.size());
+  }
 
   const int batch_size = static_cast<int>(prompts.size());
   auto state = model_->create_state(batch_size);
   DeviceLogits logits;
+  const auto prefill_begin = std::chrono::steady_clock::now();
   prefill_batch_chunked(sorted_prompt_ids, state, logits);
+  const auto prefill_end = std::chrono::steady_clock::now();
+  stats.prefill_seconds = std::chrono::duration<double>(prefill_end - prefill_begin).count();
+  if (on_prefill_complete) {
+    on_prefill_complete(stats);
+  }
 
   const int fallback_token = options.stop_tokens.empty() ? 0 : static_cast<int>(options.stop_tokens.front());
   auto penalties = make_sampler_penalties(model_->vocab_size(), batch_size);
@@ -469,9 +480,11 @@ void InferenceEngine::batch_generate_stream(
   std::vector<std::vector<int>> token_buffers(prompts.size());
   std::vector<std::string> utf8_pending(prompts.size());
   int active = batch_size;
+  const auto decode_begin = std::chrono::steady_clock::now();
 
   for (int step = 0; step < options.max_tokens && active > 0; ++step) {
     if (should_stop && should_stop()) {
+      stats.stopped = true;
       break;
     }
     const auto sampled_tokens = sample_batch_with_options_mask(logits, penalties, options, step);
@@ -484,6 +497,7 @@ void InferenceEngine::batch_generate_stream(
       const int token = sampled_tokens[i];
       if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
         finished[i] = true;
+        stats.stop_token = true;
         decode_batch[i] = fallback_token;
         --active;
         if (!token_buffers[i].empty()) {
@@ -492,11 +506,15 @@ void InferenceEngine::batch_generate_stream(
         }
         const std::string tail = take_complete_utf8(utf8_pending[i], true);
         if (!tail.empty() && !emit(static_cast<int>(sorted_to_original[i]), tail)) {
-          return;
+          stats.stopped = true;
+          stats.decode_seconds =
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_begin).count();
+          return stats;
         }
         continue;
       }
 
+      ++stats.generated_tokens;
       decode_batch[i] = token;
       token_buffers[i].push_back(token);
 
@@ -505,7 +523,10 @@ void InferenceEngine::batch_generate_stream(
         token_buffers[i].clear();
         const std::string chunk = take_complete_utf8(utf8_pending[i], false);
         if (!chunk.empty() && !emit(static_cast<int>(sorted_to_original[i]), chunk)) {
-          return;
+          stats.stopped = true;
+          stats.decode_seconds =
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_begin).count();
+          return stats;
         }
       }
     }
@@ -523,9 +544,14 @@ void InferenceEngine::batch_generate_stream(
     }
     const std::string tail = take_complete_utf8(utf8_pending[i], true);
     if (!tail.empty() && !emit(static_cast<int>(sorted_to_original[i]), tail)) {
-      return;
+      stats.stopped = true;
+      stats.decode_seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_begin).count();
+      return stats;
     }
   }
+  stats.decode_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_begin).count();
+  return stats;
 }
 
 void InferenceEngine::batch_generate_state_stream(
