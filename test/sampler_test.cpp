@@ -39,6 +39,23 @@ int main() {
 
     {
       auto state = rwkv7_server::make_sampler_penalties(4);
+      auto logits = make_logits({0.25f, 3.0f, 1.0f, -1.0f});
+      rwkv7_server::GenerateOptions options;
+      options.top_k = 0;
+      options.top_p = 0.0;
+      options.temperature = 1.0;
+      options.alpha_presence = 0.0;
+      options.alpha_frequency = 0.0;
+
+      TEST_EQ(rwkv7_server::sample_repetition_temperature_topk_topp(logits, state, options), 1);
+      auto penalties = copy_penalties(state);
+      for (float penalty : penalties) {
+        TEST_NEAR(penalty, 0.0, 1e-6);
+      }
+    }
+
+    {
+      auto state = rwkv7_server::make_sampler_penalties(4);
       auto logits = make_logits({100.0f, 0.0f, 0.0f, 0.0f});
       rwkv7_server::GenerateOptions options;
       options.top_k = 0;

@@ -1069,6 +1069,81 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     if (t==0) *outputs = idn;
 }
 
+namespace rwkv_sampling {
+
+cudaError_t batch_sampling_temperature_topk_topp_raw(
+    const float* logits,
+    int* outputs,
+    void* states,
+    float* probs,
+    int batch_size,
+    int time_steps,
+    int vocab_size,
+    double temperature,
+    int top_k,
+    double top_p,
+    cudaStream_t stream
+) {
+    if (!(vocab_size > 0 && vocab_size <= 1048576 && vocab_size % 4 == 0)) {
+        throw std::invalid_argument(
+            "Vocabulary size must be multiple of 4, and no larger than 1048576, got " +
+            std::to_string(vocab_size) + " !\n");
+    }
+    if (!(batch_size > 0 && time_steps > 0)) {
+        throw std::invalid_argument(
+            "B and T must be positive, got B=" + std::to_string(batch_size) +
+            ", T=" + std::to_string(time_steps) + " !\n");
+    }
+    if (!(temperature >= 0.001 && temperature <= 1000)) {
+        throw std::invalid_argument(
+            "Temperature outside range, got " + std::to_string(temperature) +
+            ", expect [0.001, 1000]!\n");
+    }
+    if (top_k <= 0 || top_k > vocab_size) top_k = vocab_size;
+    if (top_p < 0 || top_p > 1) top_p = 1;
+    if (top_p == 0) {
+        top_k = 1;
+        top_p = 1;
+    }
+
+    if (batch_size * vocab_size * 4 <= 4194304) {
+        cudaStreamAttrValue stream_attribute;
+        stream_attribute.accessPolicyWindow.base_ptr = probs;
+        stream_attribute.accessPolicyWindow.num_bytes = batch_size * vocab_size * 4;
+        stream_attribute.accessPolicyWindow.hitRatio = 1;
+        stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+    }
+
+    if (temperature == 1 && top_k == vocab_size) {
+        batch_sampling_topp_kernel<<<batch_size, 1024, 0, stream>>>(
+            batch_size,
+            time_steps,
+            vocab_size,
+            logits,
+            outputs,
+            reinterpret_cast<RAND*>(states),
+            probs,
+            static_cast<float>(top_p));
+    } else {
+        batch_sampling_temperature_topk_topp_kernel<<<batch_size, 1024, 0, stream>>>(
+            batch_size,
+            time_steps,
+            vocab_size,
+            logits,
+            outputs,
+            reinterpret_cast<RAND*>(states),
+            probs,
+            static_cast<float>(kLog2E / temperature),
+            top_k,
+            static_cast<float>(top_p));
+    }
+    return cudaGetLastError();
+}
+
+}  // namespace rwkv_sampling
+
 
 
 #ifndef RWKV_SAMPLING_NO_TORCH

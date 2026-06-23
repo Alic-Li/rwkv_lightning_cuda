@@ -61,24 +61,43 @@ std::vector<int> sample_batch_repetition_temperature_topk_topp(
     throw std::runtime_error("sampler batch size does not match logits rows");
   }
 
-  rwkv7_fast_v4::check_cuda(
-      rwkv_sampling::batch_sampling_repetition_temperature_topk_topp_raw(
-          logits.values.p,
-          penalties.penalties.p,
-          penalties.outputs.p,
-          penalties.rand_states.p,
-          penalties.probs.p,
-          logits.rows,
-          1,
-          logits.vocab_size,
-          options.alpha_presence,
-          options.alpha_frequency,
-          options.alpha_decay,
-          options.temperature,
-          options.top_k,
-          options.top_p,
-          0),
-      "launch sampler kernel");
+  const bool use_repetition_penalty =
+      options.alpha_presence != 0.0 || options.alpha_frequency != 0.0;
+  if (use_repetition_penalty) {
+    rwkv7_fast_v4::check_cuda(
+        rwkv_sampling::batch_sampling_repetition_temperature_topk_topp_raw(
+            logits.values.p,
+            penalties.penalties.p,
+            penalties.outputs.p,
+            penalties.rand_states.p,
+            penalties.probs.p,
+            logits.rows,
+            1,
+            logits.vocab_size,
+            options.alpha_presence,
+            options.alpha_frequency,
+            options.alpha_decay,
+            options.temperature,
+            options.top_k,
+            options.top_p,
+            0),
+        "launch sampler repetition kernel");
+  } else {
+    rwkv7_fast_v4::check_cuda(
+        rwkv_sampling::batch_sampling_temperature_topk_topp_raw(
+            logits.values.p,
+            penalties.outputs.p,
+            penalties.rand_states.p,
+            penalties.probs.p,
+            logits.rows,
+            1,
+            logits.vocab_size,
+            options.temperature,
+            options.top_k,
+            options.top_p,
+            0),
+        "launch sampler kernel");
+  }
 
   std::vector<int> tokens(static_cast<std::size_t>(logits.rows));
   rwkv7_fast_v4::check_cuda(

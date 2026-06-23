@@ -32,4 +32,17 @@ cudaError_t batch_sampling_repetition_temperature_topk_topp_raw(
     double top_p,
     cudaStream_t stream);
 
+cudaError_t batch_sampling_temperature_topk_topp_raw(
+    const float* logits,
+    int* outputs,
+    void* states,
+    float* probs,
+    int batch_size,
+    int time_steps,
+    int vocab_size,
+    double temperature,
+    int top_k,
+    double top_p,
+    cudaStream_t stream);
+
 }  // namespace rwkv_sampling
