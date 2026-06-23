@@ -408,6 +408,14 @@ int parse_chunk_size(const Json::Value& body, int fallback) {
   return std::max(1, body.get("chunk_size", fallback).asInt());
 }
 
+bool parse_metrics_requested(const Json::Value& body) {
+  const auto read_flag = [&body](const char* key) {
+    const auto& value = body[key];
+    return value.isBool() && value.asBool();
+  };
+  return read_flag("metrics") || read_flag("report_metrics") || read_flag("include_metrics");
+}
+
 std::string normalize_content(const Json::Value& content) {
   if (content.isString()) {
     return content.asString();
@@ -958,9 +966,12 @@ void register_api_routes(
           return;
         }
         const auto options = parse_options(*json);
+        const bool metrics_requested = parse_metrics_requested(*json);
         int prompt_tokens = 0;
-        for (const auto& prompt : prompts) {
-          prompt_tokens += engine.count_tokens(prompt);
+        if (metrics_requested) {
+          for (const auto& prompt : prompts) {
+            prompt_tokens += engine.count_tokens(prompt);
+          }
         }
         const auto model = (*json).get("model", engine.model_name()).asString();
         auto active = RequestRegistry::instance().start(
@@ -973,7 +984,7 @@ void register_api_routes(
           return;
         }
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, active, prompts, options, model,
+          cb(make_sse_response([&engine, active, prompts, options, model, metrics_requested,
                                 chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
@@ -981,22 +992,30 @@ void register_api_routes(
                 active->id,
                 model,
                 static_cast<int>(prompts.size()),
-                [&, active, prompts, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
+                [&, active, prompts, options, chunk_size, metrics_requested](const InferenceEngine::StreamCallback& emit) {
+                  InferenceEngine::StatsCallback on_prefill_complete;
+                  if (metrics_requested) {
+                    on_prefill_complete = [active](const InferenceEngine::GenerationStats& stats) {
+                      record_generation_stats(active, stats);
+                    };
+                  }
                   const auto stats = engine.batch_generate_stream(
                       prompts,
                       options,
                       chunk_size,
-                      [&](int index, const std::string& chunk) {
-                        active->generated_tokens.fetch_add(engine.count_tokens(chunk));
+                      [&, metrics_requested](int index, const std::string& chunk) {
+                        if (metrics_requested) {
+                          active->generated_tokens.fetch_add(engine.count_tokens(chunk));
+                        }
                         return emit(index, chunk);
                       },
                       [active]() {
                         return active->stop_requested.load() || active->pause_requested.load();
                       },
-                      [active](const InferenceEngine::GenerationStats& stats) {
-                        record_generation_stats(active, stats);
-                      });
-                  record_generation_stats(active, stats);
+                      on_prefill_complete);
+                  if (metrics_requested) {
+                    record_generation_stats(active, stats);
+                  }
                 },
                 [active]() {
                   RequestRegistry::instance().finish(active);
@@ -1022,11 +1041,10 @@ void register_api_routes(
             },
             [active]() {
               return active->stop_requested.load() || active->pause_requested.load();
-            },
-            [active](const InferenceEngine::GenerationStats& stats) {
-              record_generation_stats(active, stats);
             });
-        record_generation_stats(active, stats);
+        if (metrics_requested) {
+          record_generation_stats(active, stats);
+        }
         resp["choices"] = build_choices(results);
         RequestRegistry::instance().finish(active);
         cb(json_response(std::move(resp)));
