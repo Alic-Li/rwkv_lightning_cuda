@@ -1092,6 +1092,7 @@ GenerationState ModelBackend::create_state(int batch_size) const {
     state.wkv_state.zero("zero backend wkv");
   }
   check_cuda(cudaMemset(state.elapsed.p, 0, static_cast<std::size_t>(batch_size) * sizeof(int)), "zero backend elapsed");
+  check_cuda(cudaDeviceSynchronize(), "sync backend state init");
   return state;
 }
 

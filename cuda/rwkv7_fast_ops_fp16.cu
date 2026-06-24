@@ -54,7 +54,7 @@ __global__ void tmix_mix6_kernel(
     int T,
     int C,
     const dtype* __restrict__ x,
-    dtype* __restrict__ shift_state,
+    const dtype* __restrict__ shift_state,
     const dtype* __restrict__ x_r,
     const dtype* __restrict__ x_w,
     const dtype* __restrict__ x_k,
@@ -106,10 +106,24 @@ __global__ void tmix_mix6_kernel(
   store_h2(out_v + idx, cur.x + dx0 * xv.x, cur.y + dx1 * xv.y);
   store_h2(out_a + idx, cur.x + dx0 * xa.x, cur.y + dx1 * xa.y);
   store_h2(out_g + idx, cur.x + dx0 * xg.x, cur.y + dx1 * xg.y);
+}
 
-  if (t == T - 1) {
-    *reinterpret_cast<__half2*>(shift_state + static_cast<int64_t>(b) * C + c) = cur2;
+__global__ void update_shift_state_last_kernel(
+    int T,
+    int C,
+    const dtype* __restrict__ x,
+    dtype* __restrict__ shift_state,
+    int64_t total_pairs) {
+  const int64_t pair_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (pair_idx >= total_pairs) {
+    return;
   }
+
+  const int c_pairs = C >> 1;
+  const int b = static_cast<int>(pair_idx / c_pairs);
+  const int c = static_cast<int>(pair_idx - static_cast<int64_t>(b) * c_pairs) << 1;
+  const int64_t src_idx = (static_cast<int64_t>(b) * T + (T - 1)) * C + c;
+  *reinterpret_cast<__half2*>(shift_state + static_cast<int64_t>(b) * C + c) = load_h2(x + src_idx);
 }
 
 __global__ void tmix_kk_a_gate_kernel(
@@ -380,7 +394,7 @@ __global__ void cmix_mix_kernel(
     int T,
     int C,
     const dtype* __restrict__ x,
-    dtype* __restrict__ shift_state,
+    const dtype* __restrict__ shift_state,
     const dtype* __restrict__ x_k,
     dtype* __restrict__ out,
     int64_t total_pairs) {
@@ -402,10 +416,6 @@ __global__ void cmix_mix_kernel(
   const float2 prev = __half22float2(prev2);
   const float2 mix = __half22float2(load_h2(x_k + c));
   store_h2(out + idx, cur.x + (prev.x - cur.x) * mix.x, cur.y + (prev.y - cur.y) * mix.y);
-
-  if (t == T - 1) {
-    *reinterpret_cast<__half2*>(shift_state + static_cast<int64_t>(b) * C + c) = cur2;
-  }
 }
 
 __global__ void relu_square_kernel(
@@ -844,6 +854,9 @@ void rwkv7_tmix_mix6_launch(
       x, shift_state, x_r, x_w, x_k, x_v, x_a, x_g,
       out_r, out_w, out_k, out_v, out_a, out_g,
       total_pairs);
+  const int64_t state_pairs = static_cast<int64_t>(B) * (C / 2);
+  update_shift_state_last_kernel<<<static_cast<int>(ceil_div(state_pairs, threads)), threads, 0, stream>>>(
+      T, C, x, shift_state, state_pairs);
 }
 
 void rwkv7_tmix_kk_a_gate_launch(
@@ -1007,6 +1020,9 @@ void rwkv7_cmix_mix_launch(
   const int64_t total_pairs = static_cast<int64_t>(B) * T * (C / 2);
   cmix_mix_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
       T, C, x, shift_state, x_k, out, total_pairs);
+  const int64_t state_pairs = static_cast<int64_t>(B) * (C / 2);
+  update_shift_state_last_kernel<<<static_cast<int>(ceil_div(state_pairs, threads)), threads, 0, stream>>>(
+      T, C, x, shift_state, state_pairs);
 }
 
 void rwkv7_relu_square_launch(cudaStream_t stream, const half* x, half* out, long long elems) {
