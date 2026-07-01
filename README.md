@@ -45,6 +45,7 @@ Run server
 ./build/rwkv_lighting_cuda \
   --model-path /path/to/model.pth \
   --vocab-path /path/to/rwkv_vocab_v20230424.txt \
+  --host 127.0.0.1 \
   --port 8000
 ```
 
@@ -55,8 +56,12 @@ set "SCRIPT_DIR=%~dp0\";
 .\build/rwkv_lighting_cuda \
   --model-path /path/to/model.pth \
   --vocab-path /path/to/rwkv_vocab_v20230424.txt \
+  --host 127.0.0.1 \
   --port 8000
 ```
+
+The server binds to `127.0.0.1` by default. Use `--host 0.0.0.0` only when
+you intentionally want to listen on all IPv4 interfaces.
 
 ## HTTP API examples
 

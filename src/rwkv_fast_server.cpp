@@ -1,6 +1,10 @@
 #include <atomic>
+#include <cstdlib>
 #include <csignal>
+#include <cstdint>
 #include <filesystem>
+#include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -21,6 +25,46 @@
 namespace {
 
 std::atomic<bool> g_shutdown{false};
+
+constexpr const char* kDefaultHost = "127.0.0.1";
+
+void print_usage(const char* program) {
+  std::cout
+      << "Usage: " << program << " --model-path <path> --vocab-path <path> [options]\n"
+      << "\n"
+      << "Options:\n"
+      << "  --model-path <path>     Path to the RWKV .pth model file. Required.\n"
+      << "  --vocab-path <path>     Path to rwkv_vocab_v20230424.txt. Required.\n"
+      << "  --host <addr>           Host/interface to bind. Default: 127.0.0.1.\n"
+      << "                          Use 0.0.0.0 explicitly to listen on all IPv4 interfaces.\n"
+      << "  --port <port>           TCP port to bind. Default: 8000.\n"
+      << "  --state-db-path <path>  SQLite state cache path. Default: rwkv_sessions.db.\n"
+      << "  --password <token>      Require a bearer token or JSON password field.\n"
+      << "  --wkv32                 Use fp32 WKV state with fp16 IO.\n"
+      << "  --help, -h              Show this help text.\n";
+}
+
+uint16_t parse_port(const std::string& value) {
+  std::size_t parsed = 0;
+  int port = 0;
+  try {
+    port = std::stoi(value, &parsed);
+  } catch (const std::exception&) {
+    throw std::runtime_error("invalid value for --port: " + value);
+  }
+  if (parsed != value.size() || port < 1 || port > std::numeric_limits<uint16_t>::max()) {
+    throw std::runtime_error("invalid value for --port: " + value);
+  }
+  return static_cast<uint16_t>(port);
+}
+
+std::string format_url_host(const std::string& host) {
+  if (host.find(':') != std::string::npos &&
+      !(host.size() >= 2 && host.front() == '[' && host.back() == ']')) {
+    return "[" + host + "]";
+  }
+  return host;
+}
 
 void handle_signal(int) {
   g_shutdown = true;
@@ -51,13 +95,14 @@ void configure_windows_dll_search_path() {
 
 }  // namespace
 
-int main(int argc, char* argv[]) {
+int run_server(int argc, char* argv[]) {
 #ifdef _WIN32
   configure_windows_dll_search_path();
 #endif
   trantor::Logger::setLogLevel(trantor::Logger::kInfo);
   std::string model_path;
   std::string vocab_path;
+  std::string host = kDefaultHost;
   std::string state_db_path = "rwkv_sessions.db";
   uint16_t port = 8000;
   bool use_wkv32 = false;
@@ -75,14 +120,19 @@ int main(int argc, char* argv[]) {
       model_path = require_value(arg);
     } else if (arg == "--vocab-path") {
       vocab_path = require_value(arg);
+    } else if (arg == "--host") {
+      host = require_value(arg);
     } else if (arg == "--state-db-path") {
       state_db_path = require_value(arg);
     } else if (arg == "--port") {
-      port = static_cast<uint16_t>(std::stoi(require_value(arg)));
+      port = parse_port(require_value(arg));
     } else if (arg == "--password") {
       password = require_value(arg);
     } else if (arg == "--wkv32") {
       use_wkv32 = true;
+    } else if (arg == "--help" || arg == "-h") {
+      print_usage(argv[0]);
+      return 0;
     } else {
       throw std::runtime_error("unknown argument: " + arg);
     }
@@ -93,6 +143,9 @@ int main(int argc, char* argv[]) {
   }
   if (vocab_path.empty()) {
     throw std::runtime_error("--vocab-path is required");
+  }
+  if (host.empty()) {
+    throw std::runtime_error("--host must not be empty");
   }
 
   auto model = std::make_shared<rwkv7_server::ModelBackend>(model_path, use_wkv32);
@@ -112,9 +165,11 @@ int main(int argc, char* argv[]) {
             << " model_path=" << model->model_path() << std::endl;
   std::cout << "rwkv_lighting_cuda vocab_path=" << vocab_path
             << " state_db_path=" << state_db_path
+            << " host=" << host
             << " port=" << port
             << " wkv=" << (use_wkv32 ? "fp32io16" : "fp16")
             << " password=" << (password.has_value() ? "enabled" : "disabled") << std::endl;
+  const std::string url_host = format_url_host(host);
   for (const std::string& endpoint : std::vector<std::string>{
            "/v1/batch/completions",
            "/translate/v1/batch-translate",
@@ -128,17 +183,28 @@ int main(int argc, char* argv[]) {
            "/v1/tokens/count",
            "/v1/chat/completions",
            "/v1/models"}) {
-      std::cout << "||      http://0.0.0.0:" << port << endpoint << std::endl;
+      std::cout << "||      http://" << url_host << ":" << port << endpoint << std::endl;
   }
+  std::cout << "listening on " << host << ":" << port << std::endl;
   std::cout << "Mamba Out!!! Nvidia Fuck You !!!" << std::endl;
   std::cout << "ROCm RWKV Is All You Need !!!" << std::endl;
   std::cout << "Boom Has Been Planted !!!" << std::endl;
 
   drogon::app()
-      .addListener("0.0.0.0", port)
+      .addListener(host, port)
       .setThreadNum(4)
       .run();
 
   rwkv7_server::StateCacheManager::instance().shutdown();
   return 0;
+}
+
+int main(int argc, char* argv[]) {
+  try {
+    return run_server(argc, argv);
+  } catch (const std::exception& error) {
+    std::cerr << "rwkv_lighting_cuda: " << error.what() << std::endl;
+    std::cerr << "Try '--help' for usage." << std::endl;
+    return EXIT_FAILURE;
+  }
 }
