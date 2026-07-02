@@ -163,15 +163,20 @@ $env:PATH = "$PWD\lib;$env:PATH"
 .\rwkv_lighting_cuda.exe `
   --model-path E:\rwkv7-g1g-2.9b-20260526-ctx8192.pth `
   --vocab-path .\rwkv_vocab_v20230424.txt `
+  --host 127.0.0.1 `
   --port 8000
 ```
 
 Optional arguments:
 
 ```powershell
+--host 127.0.0.1
 --password your-password
 --wkv32
 ```
+
+The backend binds to `127.0.0.1` by default. Use `--host 0.0.0.0` only when
+you intentionally want to listen on all IPv4 interfaces.
 
 ## Verify the server
 
