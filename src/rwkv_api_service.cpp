@@ -84,40 +84,50 @@ class RequestRegistry {
       std::string model,
       int max_tokens,
       int prompt_tokens = 0,
-      std::string state_key = {}) {
+      std::string state_key = {},
+      std::string request_id = {}) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (active_) {
-      return nullptr;
-    }
-
     auto active = std::make_shared<ActiveRequest>();
-    active->id = make_id_locked();
+    active->id = request_id.empty() ? make_id_locked() : std::move(request_id);
     active->endpoint = std::move(endpoint);
     active->model = std::move(model);
     active->state_key = std::move(state_key);
     active->created = now_seconds();
     active->prompt_tokens = prompt_tokens;
     active->max_tokens = max_tokens;
-    active_ = active;
+    active_.push_back(active);
     return active;
   }
 
-  std::shared_ptr<ActiveRequest> active() const {
+  std::shared_ptr<ActiveRequest> active(const std::string& request_id = {}) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return active_;
-  }
-
-  bool stop_active() {
-    const auto active = this->active();
-    if (!active) {
-      return false;
+    if (request_id.empty()) {
+      return active_.empty() ? nullptr : active_.back();
     }
-    active->stop_requested.store(true);
-    return true;
+    const auto it = std::find_if(active_.rbegin(), active_.rend(), [&](const auto& item) {
+      return item->id == request_id;
+    });
+    return it == active_.rend() ? nullptr : *it;
   }
 
-  std::optional<std::string> pause_active() {
-    const auto active = this->active();
+  bool stop_active(const std::string& request_id = {}) {
+    if (!request_id.empty()) {
+      const auto target = active(request_id);
+      if (!target) {
+        return false;
+      }
+      target->stop_requested.store(true);
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& item : active_) {
+      item->stop_requested.store(true);
+    }
+    return !active_.empty();
+  }
+
+  std::optional<std::string> pause_active(const std::string& request_id = {}) {
+    const auto active = this->active(request_id);
     if (!active) {
       return std::nullopt;
     }
@@ -127,10 +137,12 @@ class RequestRegistry {
 
   void finish(const std::shared_ptr<ActiveRequest>& active) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (active_ == active) {
-      last_ = snapshot_request(*active);
-      last_->finished = now_seconds();
-      active_.reset();
+    const auto it = std::find(active_.begin(), active_.end(), active);
+    if (it != active_.end()) {
+      auto snapshot = snapshot_request(**it);
+      snapshot.finished = now_seconds();
+      last_ = std::move(snapshot);
+      active_.erase(it);
     }
   }
 
@@ -155,22 +167,18 @@ class RequestRegistry {
     if (!active) {
       return Json::Value(Json::nullValue);
     }
-    Json::Value out;
-    out["id"] = active->id;
-    out["endpoint"] = active->endpoint;
-    out["model"] = active->model;
-    out["created"] = active->created;
-    out["prompt_tokens"] = active->prompt_tokens;
-    out["prefilled_tokens"] = active->prefilled_tokens.load();
-    out["generated_tokens"] = active->generated_tokens.load();
-    out["max_tokens"] = active->max_tokens;
-    out["stop_requested"] = active->stop_requested.load();
-    out["pause_requested"] = active->pause_requested.load();
-    out["prefill_progress"] = active->prefill_progress.load();
-    out["prefill_speed"] = active->prefill_speed.load();
-    out["decode_speed"] = active->decode_speed.load();
-    if (!active->state_key.empty()) {
-      out["state_key"] = active->state_key;
+    return active_request_json(*active);
+  }
+
+  Json::Value active_requests_json() const {
+    std::vector<std::shared_ptr<ActiveRequest>> active;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      active = active_;
+    }
+    Json::Value out = Json::arrayValue;
+    for (const auto& item : active) {
+      out.append(active_request_json(*item));
     }
     return out;
   }
@@ -253,8 +261,29 @@ class RequestRegistry {
     return out;
   }
 
+  static Json::Value active_request_json(const ActiveRequest& active) {
+    Json::Value out;
+    out["id"] = active.id;
+    out["endpoint"] = active.endpoint;
+    out["model"] = active.model;
+    out["created"] = active.created;
+    out["prompt_tokens"] = active.prompt_tokens;
+    out["prefilled_tokens"] = active.prefilled_tokens.load();
+    out["generated_tokens"] = active.generated_tokens.load();
+    out["max_tokens"] = active.max_tokens;
+    out["stop_requested"] = active.stop_requested.load();
+    out["pause_requested"] = active.pause_requested.load();
+    out["prefill_progress"] = active.prefill_progress.load();
+    out["prefill_speed"] = active.prefill_speed.load();
+    out["decode_speed"] = active.decode_speed.load();
+    if (!active.state_key.empty()) {
+      out["state_key"] = active.state_key;
+    }
+    return out;
+  }
+
   mutable std::mutex mutex_;
-  std::shared_ptr<ActiveRequest> active_;
+  std::vector<std::shared_ptr<ActiveRequest>> active_;
   std::optional<RequestSnapshot> last_;
   std::unordered_map<std::string, PausedRequest> paused_;
   Json::UInt64 next_id_ = 0;
@@ -663,14 +692,14 @@ Json::Value build_status_response(const InferenceEngine& engine) {
   resp["capabilities"]["session_cache"] = true;
   resp["capabilities"]["pause_resume"] = true;
   resp["capabilities"]["think_type"] = true;
+  resp["capabilities"]["concurrent_generation"] = true;
+  resp["capabilities"]["chunk_prefill"] = true;
+  resp["prefill_chunk_size"] = engine.prefill_chunk_size();
   resp["active_request"] = RequestRegistry::instance().active_json();
+  resp["active_requests"] = RequestRegistry::instance().active_requests_json();
   resp["last_request"] = RequestRegistry::instance().last_json();
   resp["paused_requests"] = RequestRegistry::instance().paused_json();
   return resp;
-}
-
-Json::Value active_conflict_response() {
-  return make_error("Another generation is active");
 }
 
 Json::Value build_options_debug(const InferenceEngine& engine, const GenerateOptions& options) {
@@ -775,7 +804,8 @@ void register_api_routes(
           return;
         }
 
-        const bool stopped = RequestRegistry::instance().stop_active();
+        const auto request_id = body.get("request_id", "").asString();
+        const bool stopped = RequestRegistry::instance().stop_active(request_id);
         Json::Value resp;
         resp["ok"] = true;
         resp["stopped"] = stopped;
@@ -795,7 +825,8 @@ void register_api_routes(
           return;
         }
 
-        const auto request_id = RequestRegistry::instance().pause_active();
+        const auto target_id = body.get("request_id", "").asString();
+        const auto request_id = RequestRegistry::instance().pause_active(target_id);
         Json::Value resp;
         resp["ok"] = true;
         resp["paused"] = request_id.has_value();
@@ -851,13 +882,8 @@ void register_api_routes(
             model,
             options.max_tokens,
             0,
+            request_id,
             request_id);
-        if (!active) {
-          RequestRegistry::instance().put_paused(std::move(*paused));
-          cb(json_response(active_conflict_response(), k409Conflict));
-          return;
-        }
-        active->id = request_id;
         active->generated_tokens.store(paused->generated_tokens);
 
         auto state_ptr = paused->state;
@@ -979,10 +1005,6 @@ void register_api_routes(
             model,
             options.max_tokens,
             prompt_tokens);
-        if (!active) {
-          cb(json_response(active_conflict_response(), k409Conflict));
-          return;
-        }
         if ((*json).get("stream", false).asBool()) {
           cb(make_sse_response([&engine, active, prompts, options, model, metrics_requested,
                                 chunk_size = parse_chunk_size(*json, 8)](
@@ -1135,10 +1157,6 @@ void register_api_routes(
             options.max_tokens,
             prompt_tokens,
             session_id);
-        if (!active) {
-          cb(json_response(active_conflict_response(), k409Conflict));
-          return;
-        }
         if ((*json).get("stream", false).asBool()) {
           auto state_ptr = std::make_shared<GenerationState>(std::move(state));
           cb(make_sse_response([&engine, session_id, state_ptr, prompts, options,
@@ -1281,10 +1299,6 @@ void register_api_routes(
             model,
             options.max_tokens,
             prompt_tokens);
-        if (!active) {
-          cb(json_response(active_conflict_response(), k409Conflict));
-          return;
-        }
 
         if ((*json).get("stream", false).asBool()) {
           cb(make_sse_response([&engine, prompt, options, active, model,

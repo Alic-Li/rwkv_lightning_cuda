@@ -12,7 +12,6 @@
 namespace rwkv7_server {
 namespace {
 
-constexpr int kPrefillChunkSize = 256;
 constexpr int kForceReasoningMaskStartStep = 1;
 constexpr int kForceReasoningMaskEndStep = 2;
 constexpr int kForceReasoningDenyTokenA = 111;
@@ -222,10 +221,16 @@ std::string take_complete_utf8(std::string& pending, bool flush_all) {
 InferenceEngine::InferenceEngine(
     std::shared_ptr<IModelBackend> model,
     std::shared_ptr<TrieTokenizer> tokenizer,
-    std::string model_name)
+    std::string model_name,
+    int prefill_chunk_size)
     : model_(std::move(model)),
       tokenizer_(std::move(tokenizer)),
-      model_name_(std::move(model_name)) {}
+      model_name_(std::move(model_name)),
+      prefill_chunk_size_(prefill_chunk_size) {
+  if (prefill_chunk_size_ <= 0) {
+    throw std::runtime_error("prefill chunk size must be positive");
+  }
+}
 
 std::vector<int64_t> InferenceEngine::encode_prompt(const std::string& prompt) const {
   auto ids = tokenizer_->encode(prompt);
@@ -293,7 +298,7 @@ void InferenceEngine::prefill_batch_chunked(
     for (int i = 1; i < active_count; ++i) {
       step = std::min(step, lengths[static_cast<size_t>(i)] - pos[static_cast<size_t>(i)]);
     }
-    step = std::min(step, kPrefillChunkSize);
+    step = std::min(step, prefill_chunk_size_);
 
     std::vector<std::vector<int64_t>> chunk_tokens;
     chunk_tokens.reserve(static_cast<size_t>(active_count));

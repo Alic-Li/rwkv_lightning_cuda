@@ -103,6 +103,7 @@ func (l *launcher) start(req startRequest) error {
 		"--model-path", modelPath,
 		"--vocab-path", vocabPath,
 		"--port", port,
+		"--chunk-size", "128",
 	}
 	if strings.TrimSpace(req.Password) != "" {
 		args = append(args, "--password", strings.TrimSpace(req.Password))

@@ -164,13 +164,15 @@ $env:PATH = "$PWD\lib;$env:PATH"
   --model-path E:\rwkv7-g1g-2.9b-20260526-ctx8192.pth `
   --vocab-path .\rwkv_vocab_v20230424.txt `
   --host 127.0.0.1 `
-  --port 8000
+  --port 8000 `
+  --chunk-size 128
 ```
 
 Optional arguments:
 
 ```powershell
 --host 127.0.0.1
+--chunk-size 128
 --password your-password
 --wkv32
 ```

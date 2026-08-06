@@ -46,8 +46,13 @@ Run server
   --model-path /path/to/model.pth \
   --vocab-path /path/to/rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 \
-  --port 8000
+  --port 8000 \
+  --chunk-size 128
 ```
+
+`--chunk-size` controls prompt prefill chunking and defaults to `128` when omitted.
+Multiple generation requests may run concurrently; `/v1/server/status` reports them in
+`active_requests` while retaining `active_request` for compatibility.
 
 If use windows 
 ```bash

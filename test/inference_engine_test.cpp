@@ -61,6 +61,8 @@ int main() {
         build_logits_steps(answer_ids, vocab_size),
         "fake-backend");
     rwkv7_server::InferenceEngine engine(fake_backend, tokenizer, fake_backend->model_name());
+    TEST_EQ(engine.prefill_chunk_size(), 128);
+    TEST_THROW(rwkv7_server::InferenceEngine(fake_backend, tokenizer, "invalid-chunk", 0));
 
     TEST_EQ(
         engine.format_openai_prompt(
@@ -98,6 +100,23 @@ int main() {
 
     const std::string prompt = "System: test\n\nUser: hi\n\nAssistant:";
     const auto prompt_ids = tokenizer->encode(prompt);
+
+    auto chunk_backend = std::make_shared<rwkv_test::FakeModelBackend>(
+        build_logits_steps(answer_ids, vocab_size),
+        "fake-backend-chunk-prefill");
+    rwkv7_server::InferenceEngine chunk_engine(
+        chunk_backend, tokenizer, chunk_backend->model_name(), 3);
+    auto chunk_state = chunk_backend->create_state(1);
+    rwkv7_server::DeviceLogits chunk_logits;
+    const std::string chunk_prompt = prompt + prompt + prompt;
+    const int chunk_prompt_tokens = chunk_engine.prefill_prompt(chunk_prompt, chunk_state, chunk_logits);
+    TEST_CHECK(chunk_prompt_tokens > 3);
+    TEST_CHECK(chunk_backend->prefill_batches().size() > 1);
+    for (const auto& batch : chunk_backend->prefill_batches()) {
+      TEST_EQ(batch.size(), static_cast<std::size_t>(1));
+      TEST_CHECK(batch.front().size() <= static_cast<std::size_t>(3));
+    }
+
     const auto outputs = engine.batch_generate({prompt}, options);
     TEST_EQ(outputs.size(), static_cast<std::size_t>(1));
     TEST_EQ(outputs.front(), answer);

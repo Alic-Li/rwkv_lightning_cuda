@@ -31,7 +31,8 @@ class InferenceEngine {
   InferenceEngine(
       std::shared_ptr<IModelBackend> model,
       std::shared_ptr<TrieTokenizer> tokenizer,
-      std::string model_name);
+      std::string model_name,
+      int prefill_chunk_size = 128);
 
   std::vector<std::string> batch_generate(
       const std::vector<std::string>& prompts,
@@ -86,6 +87,7 @@ class InferenceEngine {
  std::shared_ptr<IModelBackend> model() const { return model_; }
  std::shared_ptr<TrieTokenizer> tokenizer() const { return tokenizer_; }
  const std::string& model_name() const { return model_name_; }
+ int prefill_chunk_size() const { return prefill_chunk_size_; }
 
  private:
   std::vector<int64_t> encode_prompt(const std::string& prompt) const;
@@ -108,6 +110,7 @@ class InferenceEngine {
   std::shared_ptr<IModelBackend> model_;
   std::shared_ptr<TrieTokenizer> tokenizer_;
   std::string model_name_;
+  int prefill_chunk_size_ = 128;
 };
 
 }  // namespace rwkv7_server

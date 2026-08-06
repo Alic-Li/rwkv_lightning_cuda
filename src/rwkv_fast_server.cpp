@@ -38,6 +38,7 @@ void print_usage(const char* program) {
       << "  --host <addr>           Host/interface to bind. Default: 127.0.0.1.\n"
       << "                          Use 0.0.0.0 explicitly to listen on all IPv4 interfaces.\n"
       << "  --port <port>           TCP port to bind. Default: 8000.\n"
+      << "  --chunk-size <tokens>   Prefill chunk size. Default: 128.\n"
       << "  --state-db-path <path>  SQLite state cache path. Default: rwkv_sessions.db.\n"
       << "  --password <token>      Require a bearer token or JSON password field.\n"
       << "  --wkv32                 Use fp32 WKV state with fp16 IO.\n"
@@ -56,6 +57,20 @@ uint16_t parse_port(const std::string& value) {
     throw std::runtime_error("invalid value for --port: " + value);
   }
   return static_cast<uint16_t>(port);
+}
+
+int parse_positive_int(const std::string& option, const std::string& value) {
+  std::size_t parsed = 0;
+  int result = 0;
+  try {
+    result = std::stoi(value, &parsed);
+  } catch (const std::exception&) {
+    throw std::runtime_error("invalid value for " + option + ": " + value);
+  }
+  if (parsed != value.size() || result <= 0) {
+    throw std::runtime_error("invalid value for " + option + ": " + value);
+  }
+  return result;
 }
 
 std::string format_url_host(const std::string& host) {
@@ -105,6 +120,7 @@ int run_server(int argc, char* argv[]) {
   std::string host = kDefaultHost;
   std::string state_db_path = "rwkv_sessions.db";
   uint16_t port = 8000;
+  int prefill_chunk_size = 128;
   bool use_wkv32 = false;
   std::optional<std::string> password;
 
@@ -126,6 +142,8 @@ int run_server(int argc, char* argv[]) {
       state_db_path = require_value(arg);
     } else if (arg == "--port") {
       port = parse_port(require_value(arg));
+    } else if (arg == "--chunk-size") {
+      prefill_chunk_size = parse_positive_int(arg, require_value(arg));
     } else if (arg == "--password") {
       password = require_value(arg);
     } else if (arg == "--wkv32") {
@@ -154,7 +172,7 @@ int run_server(int argc, char* argv[]) {
     throw std::runtime_error("failed to load tokenizer vocab: " + vocab_path);
   }
 
-  rwkv7_server::InferenceEngine engine(model, tokenizer, model->model_name());
+  rwkv7_server::InferenceEngine engine(model, tokenizer, model->model_name(), prefill_chunk_size);
   rwkv7_server::StateCacheManager::instance().initialize(16, 32, state_db_path);
 
   std::signal(SIGINT, handle_signal);
@@ -167,6 +185,7 @@ int run_server(int argc, char* argv[]) {
             << " state_db_path=" << state_db_path
             << " host=" << host
             << " port=" << port
+            << " prefill_chunk_size=" << prefill_chunk_size
             << " wkv=" << (use_wkv32 ? "fp32io16" : "fp16")
             << " password=" << (password.has_value() ? "enabled" : "disabled") << std::endl;
   const std::string url_host = format_url_host(host);
