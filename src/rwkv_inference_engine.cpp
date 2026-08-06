@@ -578,7 +578,7 @@ int InferenceEngine::prefill_prompt(
     DeviceLogits& logits) const {
   const auto prompt_ids = encode_prompt(prompt);
   std::vector<std::vector<int64_t>> prefill_batch{prompt_ids};
-  model_->forward_prefill(prefill_batch, state, logits);
+  prefill_batch_chunked(prefill_batch, state, logits);
   return static_cast<int>(prompt_ids.size());
 }
 
