@@ -646,7 +646,7 @@ Authorization: Bearer your-password
 
 | `think_type` | Prompt 尾部行为 | 强制 reasoning mask |
 |---|---|---:|
-| `fast` | `Assistant: <think>\n</think` | 否 |
+| `fast` | `Assistant: <think></think` | 否 |
 | `free` | `Assistant: <think` | 是 |
 | `preferChinese` / `prefer_chinese` | `Assistant: <think>嗯` | 是 |
 | `en` | 在最后用户消息添加 `(think)` | 是 |
