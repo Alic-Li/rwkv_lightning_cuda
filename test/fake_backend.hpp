@@ -90,6 +90,12 @@ class FakeModelBackend final : public rwkv7_server::IModelBackend {
     copy_host_to_device(dst_host, dst.values, "alloc fake merged logits", "copy fake merged logits");
   }
 
+  rwkv7_server::PrefillCapacity query_prefill_capacity(int) const override {
+    rwkv7_server::PrefillCapacity capacity;
+    capacity.max_batch_size = 1024;
+    return capacity;
+  }
+
   int vocab_size() const override {
     return vocab_size_;
   }

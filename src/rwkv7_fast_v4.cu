@@ -1228,6 +1228,54 @@ void ModelBackend::copy_logits_slice(
       "copy backend logits slice");
 }
 
+PrefillCapacity ModelBackend::query_prefill_capacity(int prefill_chunk_size) const {
+  if (prefill_chunk_size <= 0) {
+    throw std::runtime_error("prefill chunk size must be positive");
+  }
+
+  PrefillCapacity capacity;
+  check_cuda(
+      cudaMemGetInfo(&capacity.free_vram_bytes, &capacity.total_vram_bytes),
+      "query prefill CUDA memory");
+
+  const auto& dims = impl_->weights.dims;
+  const std::size_t layers = static_cast<std::size_t>(dims.layers);
+  const std::size_t channels = static_cast<std::size_t>(dims.channels);
+  const std::size_t heads = static_cast<std::size_t>(dims.heads);
+  const std::size_t head_size = static_cast<std::size_t>(dims.head_size);
+  const std::size_t vocab = static_cast<std::size_t>(dims.vocab);
+  const std::size_t ffn = static_cast<std::size_t>(dims.ffn);
+  const std::size_t tokens = static_cast<std::size_t>(prefill_chunk_size);
+
+  const std::size_t shift_bytes = layers * 2 * channels * sizeof(half);
+  const std::size_t wkv_bytes =
+      layers * heads * head_size * head_size *
+      (impl_->use_wkv32 ? sizeof(float) : sizeof(half));
+  const std::size_t state_bytes = shift_bytes + wkv_bytes + sizeof(int);
+
+  // Match the peak allocations in run_backend_forward for one batch lane.
+  const std::size_t arena_half_elements =
+      tokens * channels * 31 + channels + tokens * ffn +
+      tokens * static_cast<std::size_t>(kLowrankMax) * 4 + vocab;
+  const std::size_t arena_bytes = arena_half_elements * sizeof(half);
+  const std::size_t logits_bytes = vocab * sizeof(float);
+  capacity.bytes_per_batch = state_bytes + arena_bytes + logits_bytes;
+
+  constexpr std::size_t kMinimumReserveBytes = static_cast<std::size_t>(512) << 20;
+  constexpr std::size_t kCublasLtWorkspaceBytes = static_cast<std::size_t>(128) << 20;
+  capacity.reserve_vram_bytes = std::max(kMinimumReserveBytes, capacity.free_vram_bytes / 10);
+  const std::size_t unavailable = capacity.reserve_vram_bytes + kCublasLtWorkspaceBytes;
+  const std::size_t usable = capacity.free_vram_bytes > unavailable
+      ? capacity.free_vram_bytes - unavailable
+      : 0;
+  const std::size_t max_batch = capacity.bytes_per_batch > 0
+      ? usable / capacity.bytes_per_batch
+      : 0;
+  capacity.max_batch_size = static_cast<int>(
+      std::min<std::size_t>(max_batch, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+  return capacity;
+}
+
 int ModelBackend::vocab_size() const {
   return impl_->weights.dims.vocab;
 }

@@ -96,6 +96,7 @@ set(RWKV7_FAST_SERVER_CORE_SOURCES
   src/utils/tokenizer.cpp
   src/rwkv_sampler.cpp
   src/rwkv_inference_engine.cpp
+  src/rwkv_prefill_admission.cpp
   src/rwkv_state_cache.cpp
   src/utils/sampling.cu
   cuda/rwkv7_v3a_ops.cu

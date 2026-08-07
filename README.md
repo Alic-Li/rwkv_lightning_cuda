@@ -27,18 +27,6 @@ go build -trimpath -ldflags="-s -w" -o .\rwkv_launcher.exe .\main.go
 ```
 ## Run
 
-Run benchmark
-
-```bash
-./build/benchmark \
-  --model /dev/shm/rwkv7-g1f-7.2b-20260414-ctx8192.pth \
-  --model-forward \
-  --cases '1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16' \
-  --graph-bench \
-  --warmup 3 \
-  --iters 10
-```
-
 Run server
 
 ```bash
@@ -51,8 +39,10 @@ Run server
 ```
 
 `--chunk-size` controls prompt prefill chunking and defaults to `128` when omitted.
-Multiple generation requests may run concurrently; `/v1/server/status` reports them in
-`active_requests` while retaining `active_request` for compatibility.
+Generation requests enter a FIFO admission queue. The server dynamically refreshes the
+available prefill batch-size limit from free VRAM and admits requests when capacity is
+available. `/v1/server/status` reports `prefill_queue` and all `active_requests` while
+retaining `active_request` for compatibility.
 
 If use windows 
 ```bash

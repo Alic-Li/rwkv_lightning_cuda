@@ -18,6 +18,7 @@
 #include <drogon/drogon.h>
 
 #include "rwkv_inference_engine.hpp"
+#include "rwkv_prefill_admission.hpp"
 #include "rwkv_state_cache.hpp"
 
 namespace rwkv7_server {
@@ -341,6 +342,14 @@ Json::Value make_error(const std::string& message) {
   return out;
 }
 
+Json::Value prefill_limit_error(const PrefillBatchLimitExceeded& error) {
+  Json::Value out;
+  out["error"] = error.what();
+  out["request_bsz"] = error.request_batch_size();
+  out["max_bsz"] = error.max_batch_size();
+  return out;
+}
+
 HttpResponsePtr json_response(Json::Value payload, HttpStatusCode code = k200OK) {
   Json::StreamWriterBuilder builder;
   builder["emitUTF8"] = true;
@@ -573,6 +582,10 @@ void start_streaming_task(
     try {
       task(emit);
       send_finish_chunk(stream, id, model, std::max(1, choice_count));
+    } catch (const PrefillBatchLimitExceeded& e) {
+      Json::StreamWriterBuilder builder;
+      builder["indentation"] = "";
+      stream->send("data: " + Json::writeString(builder, prefill_limit_error(e)) + "\n\n");
     } catch (const std::exception& e) {
       Json::Value err;
       err["error"] = e.what();
@@ -674,7 +687,9 @@ Json::Value build_models_response(const InferenceEngine& engine) {
   return resp;
 }
 
-Json::Value build_status_response(const InferenceEngine& engine) {
+Json::Value build_status_response(
+    const InferenceEngine& engine,
+    PrefillAdmissionController& admission) {
   Json::Value resp;
   resp["status"] = "running";
   resp["api_version"] = "1.0";
@@ -695,6 +710,17 @@ Json::Value build_status_response(const InferenceEngine& engine) {
   resp["capabilities"]["concurrent_generation"] = true;
   resp["capabilities"]["chunk_prefill"] = true;
   resp["prefill_chunk_size"] = engine.prefill_chunk_size();
+  const auto queue = admission.snapshot();
+  resp["prefill_queue"]["hard_max_bsz"] = queue.hard_max_batch_size;
+  resp["prefill_queue"]["dynamic_max_bsz"] = queue.dynamic_max_batch_size;
+  resp["prefill_queue"]["reserved_bsz"] = queue.reserved_batch_size;
+  resp["prefill_queue"]["available_bsz"] =
+      std::max(0, queue.dynamic_max_batch_size - queue.reserved_batch_size);
+  resp["prefill_queue"]["queued_requests"] = static_cast<Json::UInt64>(queue.queued_requests);
+  resp["prefill_queue"]["free_vram_bytes"] = static_cast<Json::UInt64>(queue.capacity.free_vram_bytes);
+  resp["prefill_queue"]["total_vram_bytes"] = static_cast<Json::UInt64>(queue.capacity.total_vram_bytes);
+  resp["prefill_queue"]["reserve_vram_bytes"] = static_cast<Json::UInt64>(queue.capacity.reserve_vram_bytes);
+  resp["prefill_queue"]["bytes_per_bsz"] = static_cast<Json::UInt64>(queue.capacity.bytes_per_batch);
   resp["active_request"] = RequestRegistry::instance().active_json();
   resp["active_requests"] = RequestRegistry::instance().active_requests_json();
   resp["last_request"] = RequestRegistry::instance().last_json();
@@ -758,6 +784,9 @@ void register_api_routes(
     InferenceEngine& engine,
     const std::optional<std::string>& password) {
   auto& app = drogon::app();
+  auto admission = std::make_shared<PrefillAdmissionController>([&engine]() {
+    return engine.model()->query_prefill_capacity(engine.prefill_chunk_size());
+  });
   app.registerPostHandlingAdvice([](const HttpRequestPtr&, const HttpResponsePtr& resp) {
     resp->addHeader("Access-Control-Allow-Origin", "*");
     resp->addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
@@ -788,8 +817,8 @@ void register_api_routes(
 
   app.registerHandler(
       "/v1/server/status",
-      [&engine](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
-        cb(json_response(build_status_response(engine)));
+      [&engine, admission](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
+        cb(json_response(build_status_response(engine, *admission)));
       },
       {Get});
 
@@ -840,7 +869,7 @@ void register_api_routes(
 
   app.registerHandler(
       "/v1/server/resume",
-      [&engine, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
@@ -889,15 +918,21 @@ void register_api_routes(
         auto state_ptr = paused->state;
         auto logits_ptr = paused->logits;
         const auto saved_generated_tokens = paused->generated_tokens;
-        cb(make_sse_response([&engine, active, state_ptr, logits_ptr, options, chunk_size, request_id, model,
+        cb(make_sse_response([&engine, admission, active, state_ptr, logits_ptr, options, chunk_size, request_id, model,
                               saved_generated_tokens](ResponseStreamPtr stream) {
           start_streaming_task(
               std::move(stream),
               request_id,
               model,
               1,
-              [&, active, state_ptr, logits_ptr, options, chunk_size, saved_generated_tokens](
+              [&, admission, active, state_ptr, logits_ptr, options, chunk_size, saved_generated_tokens](
                   const InferenceEngine::StreamCallback& emit) {
+                auto permit = admission->acquire(1, "server.resume", [active]() {
+                  return active->stop_requested.load() || active->pause_requested.load();
+                });
+                if (!permit.has_value()) {
+                  return;
+                }
                 const auto stats = engine.generate_from_logits_stream(
                     *state_ptr,
                     *logits_ptr,
@@ -974,7 +1009,7 @@ void register_api_routes(
 
   app.registerHandler(
       "/v1/batch/completions",
-      [&engine, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
@@ -1006,7 +1041,7 @@ void register_api_routes(
             options.max_tokens,
             prompt_tokens);
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, active, prompts, options, model, metrics_requested,
+          cb(make_sse_response([&engine, admission, active, prompts, options, model, metrics_requested,
                                 chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
@@ -1014,7 +1049,16 @@ void register_api_routes(
                 active->id,
                 model,
                 static_cast<int>(prompts.size()),
-                [&, active, prompts, options, chunk_size, metrics_requested](const InferenceEngine::StreamCallback& emit) {
+                [&, admission, active, prompts, options, chunk_size, metrics_requested](const InferenceEngine::StreamCallback& emit) {
+                  auto permit = admission->acquire(
+                      static_cast<int>(prompts.size()),
+                      "batch.completions",
+                      [active]() {
+                        return active->stop_requested.load() || active->pause_requested.load();
+                      });
+                  if (!permit.has_value()) {
+                    return;
+                  }
                   InferenceEngine::StatsCallback on_prefill_complete;
                   if (metrics_requested) {
                     on_prefill_complete = [active](const InferenceEngine::GenerationStats& stats) {
@@ -1050,6 +1094,24 @@ void register_api_routes(
         resp["id"] = "rwkv7-fast-batch";
         resp["object"] = "chat.completion";
         resp["model"] = model;
+        std::optional<PrefillAdmissionController::Permit> permit;
+        try {
+          permit = admission->acquire(
+              static_cast<int>(prompts.size()),
+              "batch.completions",
+              [active]() {
+                return active->stop_requested.load() || active->pause_requested.load();
+              });
+        } catch (const PrefillBatchLimitExceeded& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(prefill_limit_error(error), k400BadRequest));
+          return;
+        }
+        if (!permit.has_value()) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error("Request cancelled"), k409Conflict));
+          return;
+        }
         std::vector<std::string> results(prompts.size());
         const auto stats = engine.batch_generate_stream(
             prompts,
@@ -1075,7 +1137,7 @@ void register_api_routes(
 
   app.registerHandler(
       "/translate/v1/batch-translate",
-      [&engine](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+      [&engine, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
@@ -1108,6 +1170,15 @@ void register_api_routes(
         options.alpha_frequency = 0.0;
         options.stop_tokens = {0};
 
+        std::optional<PrefillAdmissionController::Permit> permit;
+        try {
+          permit = admission->acquire(
+              static_cast<int>(prompts.size()),
+              "batch.translate");
+        } catch (const PrefillBatchLimitExceeded& error) {
+          cb(json_response(prefill_limit_error(error), k400BadRequest));
+          return;
+        }
         const auto results = engine.batch_generate(prompts, options);
         Json::Value resp;
         resp["translations"] = Json::arrayValue;
@@ -1123,7 +1194,7 @@ void register_api_routes(
 
   app.registerHandler(
       "/state/chat/completions",
-      [&engine, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
@@ -1146,8 +1217,6 @@ void register_api_routes(
           return;
         }
 
-        auto& manager = StateCacheManager::instance();
-        auto state = manager.get_state(session_id).value_or(engine.model()->create_state(1));
         const auto options = parse_options(*json);
         const int prompt_tokens = engine.count_tokens(prompts.front());
         const auto model = (*json).get("model", engine.model_name()).asString();
@@ -1158,8 +1227,7 @@ void register_api_routes(
             prompt_tokens,
             session_id);
         if ((*json).get("stream", false).asBool()) {
-          auto state_ptr = std::make_shared<GenerationState>(std::move(state));
-          cb(make_sse_response([&engine, session_id, state_ptr, prompts, options,
+          cb(make_sse_response([&engine, admission, session_id, prompts, options,
                                 active, model, chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
@@ -1167,8 +1235,19 @@ void register_api_routes(
                 active->id,
                 model,
                 1,
-                [&, active, session_id, state_ptr, prompts, options, chunk_size](
+                [&, admission, active, session_id, prompts, options, chunk_size](
                     const InferenceEngine::StreamCallback& emit) {
+                  auto permit = admission->acquire(1, "state.chat.completions", [active]() {
+                    return active->stop_requested.load() || active->pause_requested.load();
+                  });
+                  if (!permit.has_value()) {
+                    return;
+                  }
+                  auto cached_state = StateCacheManager::instance().get_state(session_id);
+                  auto state = cached_state.has_value()
+                      ? std::move(*cached_state)
+                      : engine.model()->create_state(1);
+                  auto state_ptr = std::make_shared<GenerationState>(std::move(state));
                   engine.batch_generate_state_stream(
                       prompts,
                       *state_ptr,
@@ -1190,6 +1269,26 @@ void register_api_routes(
           return;
         }
 
+        std::optional<PrefillAdmissionController::Permit> permit;
+        try {
+          permit = admission->acquire(1, "state.chat.completions", [active]() {
+            return active->stop_requested.load() || active->pause_requested.load();
+          });
+        } catch (const PrefillBatchLimitExceeded& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(prefill_limit_error(error), k400BadRequest));
+          return;
+        }
+        if (!permit.has_value()) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error("Request cancelled"), k409Conflict));
+          return;
+        }
+        auto& manager = StateCacheManager::instance();
+        auto cached_state = manager.get_state(session_id);
+        auto state = cached_state.has_value()
+            ? std::move(*cached_state)
+            : engine.model()->create_state(1);
         auto texts = engine.batch_generate_state(prompts, state, options);
         manager.put_state(session_id, state);
         Json::Value resp;
@@ -1274,7 +1373,7 @@ void register_api_routes(
 
   app.registerHandler(
       "/v1/chat/completions",
-      [&engine, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
@@ -1301,18 +1400,24 @@ void register_api_routes(
             prompt_tokens);
 
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, prompt, options, active, model,
+          cb(make_sse_response([&engine, admission, prompt, options, active, model,
                                 chunk_size = parse_chunk_size(*json, 2)](
                                    ResponseStreamPtr stream) {
-            auto state_ptr = std::make_shared<GenerationState>(engine.model()->create_state(1));
-            auto logits_ptr = std::make_shared<DeviceLogits>();
             start_streaming_task(
                 std::move(stream),
                 active->id,
                 model,
                 1,
-                [&, active, state_ptr, logits_ptr, prompt, options, chunk_size](
+                [&, admission, active, prompt, options, chunk_size](
                     const InferenceEngine::StreamCallback& emit) {
+                  auto permit = admission->acquire(1, "chat.completions", [active]() {
+                    return active->stop_requested.load() || active->pause_requested.load();
+                  });
+                  if (!permit.has_value()) {
+                    return;
+                  }
+                  auto state_ptr = std::make_shared<GenerationState>(engine.model()->create_state(1));
+                  auto logits_ptr = std::make_shared<DeviceLogits>();
                   const auto prefill_begin = std::chrono::steady_clock::now();
                   const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
                   const auto prefill_end = std::chrono::steady_clock::now();
@@ -1356,6 +1461,21 @@ void register_api_routes(
           return;
         }
 
+        std::optional<PrefillAdmissionController::Permit> permit;
+        try {
+          permit = admission->acquire(1, "chat.completions", [active]() {
+            return active->stop_requested.load() || active->pause_requested.load();
+          });
+        } catch (const PrefillBatchLimitExceeded& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(prefill_limit_error(error), k400BadRequest));
+          return;
+        }
+        if (!permit.has_value()) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error("Request cancelled"), k409Conflict));
+          return;
+        }
         auto state_ptr = std::make_shared<GenerationState>(engine.model()->create_state(1));
         auto logits_ptr = std::make_shared<DeviceLogits>();
         std::string completion;

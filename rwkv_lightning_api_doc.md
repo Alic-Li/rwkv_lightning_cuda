@@ -899,8 +899,24 @@ SQLite 中的条目还会包含 `timestamp`。
 ### 11. 服务控制与并发请求
 
 服务允许多个 generation 同时运行，不再因已有请求而返回
-`{"error":"Another generation is active"}`。并发数量没有软件硬上限，但实际受 GPU 显存、
-CUDA workspace、模型大小和请求 batch size 限制。
+`{"error":"Another generation is active"}`。所有生成请求会先进入 FIFO admission queue：
+
+- 模型加载完成后根据当时空闲显存记录 `hard_max_bsz`，单个请求永远不能超过该上限；
+- FIFO 队首在等待期间每 100ms 重新读取空闲 VRAM，动态计算 `dynamic_max_bsz`；
+- permit 释放时立即刷新容量并唤醒等待请求；
+- 动态估算包含 recurrent state、按 `--chunk-size` 计算的 prefill 激活、logits、128 MiB
+  cuBLASLt workspace，并保留 `max(512 MiB, free VRAM 的 10%)` 安全空间；
+- 流式请求在队列中被 stop/pause 后会取消等待，不再占用 permit。
+
+单个 batch 超过硬上限时，非流式接口返回 HTTP `400`；已建立的 SSE 返回一个 error event：
+
+```json
+{
+  "error":"bsz overflow, Max bsz=16",
+  "request_bsz":32,
+  "max_bsz":16
+}
+```
 
 #### `GET /v1/server/status`
 
@@ -913,6 +929,7 @@ CUDA workspace、模型大小和请求 batch size 限制。
 | `model` | 已加载模型 ID、名称和文件路径。 |
 | `capabilities` | stream、session cache、pause/resume、chunk prefill、concurrent generation 等能力。 |
 | `prefill_chunk_size` | 启动时设置的 prefill 分块大小。 |
+| `prefill_queue` | 当前硬/动态 bsz 上限、已预留 bsz、排队请求数及显存估算数据。 |
 | `active_request` | 最近启动且仍活动的请求，保留用于兼容旧客户端；无请求时为 `null`。 |
 | `active_requests` | 所有活动请求数组。 |
 | `last_request` | 最近完成的请求快照。 |
@@ -921,6 +938,11 @@ CUDA workspace、模型大小和请求 batch size 限制。
 活动请求包含 `id`、`endpoint`、`model`、`created`、`prompt_tokens`、
 `prefilled_tokens`、`generated_tokens`、`max_tokens`、停止/暂停标记、prefill/decode
 速度和进度；stateful 请求还包含 `state_key`。
+
+`prefill_queue` 包含 `hard_max_bsz`、`dynamic_max_bsz`、`reserved_bsz`、`available_bsz`、
+`queued_requests`、`free_vram_bytes`、`total_vram_bytes`、`reserve_vram_bytes` 和
+`bytes_per_bsz`。动态上限随其他进程、state cache 和活动推理占用的显存变化，因此客户端
+不应缓存该值作为长期常量。
 
 #### `POST /v1/server/stop`
 

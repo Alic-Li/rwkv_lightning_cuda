@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -10,6 +11,14 @@
 #include "rwkv7_fast_v4_common.hpp"
 
 namespace rwkv7_server {
+
+struct PrefillCapacity {
+  std::size_t free_vram_bytes = 0;
+  std::size_t total_vram_bytes = 0;
+  std::size_t reserve_vram_bytes = 0;
+  std::size_t bytes_per_batch = 0;
+  int max_batch_size = 0;
+};
 
 enum class ThinkType {
   Fast,
@@ -85,6 +94,7 @@ class IModelBackend {
       DeviceLogits& dst,
       int dst_offset,
       int count) const = 0;
+  virtual PrefillCapacity query_prefill_capacity(int prefill_chunk_size) const = 0;
 
   virtual int vocab_size() const = 0;
   virtual const std::string& model_path() const = 0;
@@ -122,6 +132,7 @@ class ModelBackend final : public IModelBackend {
       DeviceLogits& dst,
       int dst_offset,
       int count) const override;
+  PrefillCapacity query_prefill_capacity(int prefill_chunk_size) const override;
 
   int vocab_size() const override;
   const std::string& model_path() const override;
