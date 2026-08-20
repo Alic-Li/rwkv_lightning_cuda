@@ -511,16 +511,6 @@ cudaError_t batch_sampling_repetition_temperature_topk_topp_raw(
         top_p = 1;
     }
 
-    if (batch_size * vocab_size * 4 <= 4194304) {
-        cudaStreamAttrValue stream_attribute;
-        stream_attribute.accessPolicyWindow.base_ptr = probs;
-        stream_attribute.accessPolicyWindow.num_bytes = batch_size * vocab_size * 4;
-        stream_attribute.accessPolicyWindow.hitRatio = 1;
-        stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-        stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
-    }
-
     batch_sampling_repetition_temperature_topk_topp_kernel<<<batch_size, 1024, 0, stream>>>(
         batch_size,
         time_steps,
@@ -1104,16 +1094,6 @@ cudaError_t batch_sampling_temperature_topk_topp_raw(
     if (top_p == 0) {
         top_k = 1;
         top_p = 1;
-    }
-
-    if (batch_size * vocab_size * 4 <= 4194304) {
-        cudaStreamAttrValue stream_attribute;
-        stream_attribute.accessPolicyWindow.base_ptr = probs;
-        stream_attribute.accessPolicyWindow.num_bytes = batch_size * vocab_size * 4;
-        stream_attribute.accessPolicyWindow.hitRatio = 1;
-        stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-        stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
     }
 
     if (temperature == 1 && top_k == vocab_size) {
