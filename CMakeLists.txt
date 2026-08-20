@@ -147,6 +147,7 @@ if(Drogon_FOUND)
   add_executable(rwkv_lighting_cuda
     src/rwkv_fast_server.cpp
     src/rwkv_api_service.cpp
+    src/rwkv_model_router.cpp
   )
   target_link_libraries(rwkv_lighting_cuda PRIVATE rwkv7_fast_backend_core Drogon::Drogon)
   target_include_directories(rwkv_lighting_cuda PRIVATE cuda include src)

@@ -23,11 +23,12 @@ const defaultVocabPath = "./rwkv_vocab_v20230424.txt"
 const listenAddr = "127.0.0.1:8088"
 
 type startRequest struct {
-	ModelPath string `json:"model_path"`
-	VocabPath string `json:"vocab_path"`
-	Port      string `json:"port"`
-	Password  string `json:"password"`
-	UseWKV32  bool   `json:"use_wkv32"`
+	ModelPath            string `json:"model_path"`
+	VocabPath            string `json:"vocab_path"`
+	Port                 string `json:"port"`
+	Password             string `json:"password"`
+	UseWKV32             bool   `json:"use_wkv32"`
+	EnableDynamicLoading bool   `json:"enable_dynamic_loading"`
 }
 
 type launcher struct {
@@ -110,6 +111,9 @@ func (l *launcher) start(req startRequest) error {
 	}
 	if req.UseWKV32 {
 		args = append(args, "--wkv32")
+	}
+	if req.EnableDynamicLoading {
+		args = append(args, "--enable-dynamic-loading")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -573,6 +577,10 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 		    <input type="checkbox" id="useWkv32" />
 		    Use FP32 WKV (More accurate, Bsz=1 Have almost same speed, High concurrency use more VRAM)
 		  </label>
+		  <label style="display: flex; align-items: center; font-weight: 500; color: #334155; gap: 8px;">
+		    <input type="checkbox" id="enableDynamicLoading" />
+		    Enable dynamic model loading (Model Path must be a directory)
+		  </label>
 		  <label></label>
 		</div>
       </div>
@@ -622,6 +630,7 @@ async function startBackend() {
     port: document.getElementById('port').value,
     password: document.getElementById('password').value,
   	use_wkv32: document.getElementById('useWkv32').checked,
+		enable_dynamic_loading: document.getElementById('enableDynamicLoading').checked,
   };
   try {
     const r = await fetch('/api/start', { method: 'POST', body: JSON.stringify(payload) });

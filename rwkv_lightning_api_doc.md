@@ -550,6 +550,15 @@ OpenAI API 完全等价。
   --password your-password
 ```
 
+动态模型加载使用同一启动程序，但 `--model-path` 改为包含模型文件的目录：
+
+```bash
+./rwkv_lighting_cuda \
+  --model-path /path/to/models \
+  --enable-dynamic-loading \
+  --vocab-path /path/to/rwkv_vocab_v20230424.txt
+```
+
 | 启动参数 | 必需 | 默认值 | 说明 |
 |---|---:|---|---|
 | `--model-path` | 是 | 无 | RWKV `.pth` 模型路径。 |
@@ -560,6 +569,7 @@ OpenAI API 完全等价。
 | `--state-db-path` | 否 | `rwkv_sessions.db` | 会话状态 SQLite 数据库。 |
 | `--password` | 否 | 禁用鉴权 | 启用 Bearer token 或 JSON `password` 鉴权。 |
 | `--wkv32` | 否 | 关闭 | 使用 FP32 WKV state 和 FP16 IO。 |
+| `--enable-dynamic-loading` | 否 | 关闭 | 启用按需模型加载。启用后 `--model-path` 必须是目录；目录一级中的 `.pth` 文件为可加载模型。未启用时保持原有单 `.pth` 模型启动逻辑。 |
 
 所有 JSON 请求都必须带：
 
@@ -603,7 +613,8 @@ Authorization: Bearer your-password
 
 | Method | Path | 用途 | 支持流式 |
 |---|---|---|---:|
-| `GET` | `/v1/models` | 查询已加载模型 | 否 |
+| `GET` | `/v1/models` | 查询已加载和可加载模型 | 否 |
+| `POST` | `/v1/model/load` | 显式加载或切换模型（仅动态模式） | 否 |
 | `POST` | `/v1/tokens/count` | 计算 token 数 | 否 |
 | `POST` | `/v1/chat/completions` | OpenAI 风格单请求聊天补全 | 是 |
 | `POST` | `/v1/batch/completions` | 多 prompt 批量补全 | 是 |
@@ -616,6 +627,10 @@ Authorization: Bearer your-password
 | `POST` | `/v1/server/pause` | 暂停一个活动生成 | 否 |
 | `POST` | `/v1/server/resume` | 恢复可续推的聊天流 | 固定为 SSE |
 
+> 动态加载模式当前注册 `/v1/models`、`/v1/model/load`、`/v1/tokens/count`、
+> `/v1/chat/completions`、`/v1/batch/completions` 和 `/v1/server/status`。其余路由保持
+> 单模型启动模式下的现有行为。
+
 ### 4. 通用生成参数
 
 以下参数适用于 `/v1/chat/completions`、`/v1/batch/completions` 和
@@ -623,7 +638,7 @@ Authorization: Bearer your-password
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `model` | string | 已加载模型名 | 作为响应中的模型标签；当前不会动态切换模型。 |
+| `model` | string | 已加载模型名 | 兼容 OpenAI 客户端的字段。推理始终使用当前已加载模型；该字段不会触发加载或切换，也不会改变实际推理模型。 |
 | `max_tokens` | integer | `8192` | 最多生成的 token 数。 |
 | `temperature` | number | `1.0` | 采样温度。 |
 | `top_k` | integer | `20` | Top-K 采样参数。 |
@@ -882,19 +897,59 @@ SQLite 中的条目还会包含 `timestamp`。
 
 #### `GET /v1/models`
 
+普通单模型模式下，`data` 只包含启动时加载的模型。使用
+`--enable-dynamic-loading` 时，响应还包含：
+
+- `loaded`：当前驻留在显存中的模型 ID；服务启动后尚未调用加载接口时为 `null`；
+- `available`：`--model-path` 目录中可加载的全部模型 ID；
+- `data[].status`：当前模型为 `loaded`，其余模型为 `available`。
+
 ```json
 {
   "object": "list",
+  "loaded": "rwkv7-g1i-7.2b-20260805-ctx16384",
+  "available": [
+    "rwkv7-g1d-0.4b-20260210-ctx8192",
+    "rwkv7-g1i-7.2b-20260805-ctx16384"
+  ],
   "data": [
     {
-      "id": "loaded-model-name",
+      "id": "rwkv7-g1i-7.2b-20260805-ctx16384",
       "object": "model",
       "created": 1785945600,
-      "owned_by": "rwkv_lighting_cuda"
+      "owned_by": "rwkv_lighting_cuda",
+      "status": "loaded"
     }
   ]
 }
 ```
+
+#### `POST /v1/model/load`
+
+仅在使用 `--enable-dynamic-loading` 启动时可用。请求体中的 `model` 必须是
+`GET /v1/models` 返回的 `available` ID：
+
+```bash
+curl -sS -X POST 'http://127.0.0.1:8000/v1/model/load' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer your-password' \
+  --data '{"model":"rwkv7-g1i-7.2b-20260805-ctx16384"}'
+```
+
+成功响应：
+
+```json
+{
+  "object": "model",
+  "id": "rwkv7-g1i-7.2b-20260805-ctx16384",
+  "loaded": true
+}
+```
+
+模型切换按请求到达顺序（FIFO）排队。切换任务会等待当前模型的所有推理请求结束，释放旧
+模型显存后加载新模型。多个推理请求可并发共享同一个已加载模型；推理请求中的 `model`
+字段不会自动触发加载或模型切换。动态模式中尚未加载模型时，推理请求返回 HTTP `400`，
+提示先调用此接口。
 
 ### 11. 服务控制与并发请求
 

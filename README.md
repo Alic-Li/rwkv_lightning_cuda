@@ -44,6 +44,35 @@ available prefill batch-size limit from free VRAM and admits requests when capac
 available. `/v1/server/status` reports `prefill_queue` and all `active_requests` while
 retaining `active_request` for compatibility.
 
+### Dynamic model loading
+
+By default, `--model-path` remains the path to one `.pth` file and the original
+single-model startup behavior is unchanged. To load models on demand, make it a
+directory and add `--enable-dynamic-loading`:
+
+```bash
+./build/rwkv_lighting_cuda \
+  --model-path /path/to/models \
+  --enable-dynamic-loading \
+  --vocab-path /path/to/rwkv_vocab_v20230424.txt
+```
+
+The directory's top-level `.pth` files are exposed by `GET /v1/models`; their
+file names without `.pth` are the model IDs. The response identifies the current
+`loaded` model and every `available` model. Load or switch models explicitly:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/model/load" \
+  -H "Content-Type: application/json" \
+  --data '{"model":"rwkv7-g1i-7.2b-20260805-ctx16384"}'
+```
+
+Inference requests always use the already loaded model: their `model` field is
+kept only for OpenAI compatibility and does not trigger a load or switch.
+Concurrent inference shares that loaded model. Different load requests are FIFO
+queued; a switch waits for active inference to finish, releases the old model
+from VRAM, and then loads the selected model.
+
 If use windows 
 ```bash
 cd build\bundle\rwkv_lighting_cuda;

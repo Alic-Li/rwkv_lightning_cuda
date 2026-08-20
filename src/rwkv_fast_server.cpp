@@ -18,6 +18,7 @@
 
 #include "rwkv_api_service.hpp"
 #include "rwkv_inference_engine.hpp"
+#include "rwkv_model_router.hpp"
 #include "rwkv_server_backend.hpp"
 #include "rwkv_state_cache.hpp"
 #include "rwkv_tokenizer.hpp"
@@ -42,6 +43,7 @@ void print_usage(const char* program) {
       << "  --state-db-path <path>  SQLite state cache path. Default: rwkv_sessions.db.\n"
       << "  --password <token>      Require a bearer token or JSON password field.\n"
       << "  --wkv32                 Use fp32 WKV state with fp16 IO.\n"
+      << "  --enable-dynamic-loading Treat --model-path as a directory of .pth models.\n"
       << "  --help, -h              Show this help text.\n";
 }
 
@@ -122,6 +124,7 @@ int run_server(int argc, char* argv[]) {
   uint16_t port = 8000;
   int prefill_chunk_size = 128;
   bool use_wkv32 = false;
+  bool enable_dynamic_loading = false;
   std::optional<std::string> password;
 
   for (int i = 1; i < argc; ++i) {
@@ -148,6 +151,8 @@ int run_server(int argc, char* argv[]) {
       password = require_value(arg);
     } else if (arg == "--wkv32") {
       use_wkv32 = true;
+    } else if (arg == "--enable-dynamic-loading") {
+      enable_dynamic_loading = true;
     } else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       return 0;
@@ -166,27 +171,38 @@ int run_server(int argc, char* argv[]) {
     throw std::runtime_error("--host must not be empty");
   }
 
-  auto model = std::make_shared<rwkv7_server::ModelBackend>(model_path, use_wkv32);
   auto tokenizer = std::make_shared<rwkv7_server::TrieTokenizer>();
   if (tokenizer->load(vocab_path) != rwkv7_server::kTokenizerSuccess) {
     throw std::runtime_error("failed to load tokenizer vocab: " + vocab_path);
   }
 
-  rwkv7_server::InferenceEngine engine(model, tokenizer, model->model_name(), prefill_chunk_size);
+  std::unique_ptr<rwkv7_server::ModelRouter> models;
+  if (enable_dynamic_loading) {
+    models = std::make_unique<rwkv7_server::ModelRouter>(model_path, tokenizer, prefill_chunk_size, use_wkv32);
+  } else {
+    auto model = std::make_shared<rwkv7_server::ModelBackend>(model_path, use_wkv32);
+    auto engine = std::make_shared<rwkv7_server::InferenceEngine>(model, tokenizer, model->model_name(), prefill_chunk_size);
+    models = std::make_unique<rwkv7_server::ModelRouter>(std::move(engine));
+  }
   rwkv7_server::StateCacheManager::instance().initialize(16, 32, state_db_path);
 
   std::signal(SIGINT, handle_signal);
   std::signal(SIGTERM, handle_signal);
 
-  rwkv7_server::register_api_routes(engine, password);
-  std::cout << "rwkv_lighting_cuda model_name=" << model->model_name()
-            << " model_path=" << model->model_path() << std::endl;
+  rwkv7_server::register_api_routes(*models, password);
+  if (enable_dynamic_loading) {
+    std::cout << "rwkv_lighting_cuda dynamic_model_directory=" << model_path << std::endl;
+  } else {
+    std::cout << "rwkv_lighting_cuda model_name=" << models->current_model_id()
+              << " model_path=" << model_path << std::endl;
+  }
   std::cout << "rwkv_lighting_cuda vocab_path=" << vocab_path
             << " state_db_path=" << state_db_path
             << " host=" << host
             << " port=" << port
             << " prefill_chunk_size=" << prefill_chunk_size
             << " wkv=" << (use_wkv32 ? "fp32io16" : "fp16")
+            << " dynamic_loading=" << (enable_dynamic_loading ? "enabled" : "disabled")
             << " password=" << (password.has_value() ? "enabled" : "disabled") << std::endl;
   const std::string url_host = format_url_host(host);
   for (const std::string& endpoint : std::vector<std::string>{

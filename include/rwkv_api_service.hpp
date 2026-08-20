@@ -5,10 +5,10 @@
 
 namespace rwkv7_server {
 
-class InferenceEngine;
+class ModelRouter;
 
 void register_api_routes(
-    InferenceEngine& engine,
+    ModelRouter& models,
     const std::optional<std::string>& password);
 
 }  // namespace rwkv7_server
