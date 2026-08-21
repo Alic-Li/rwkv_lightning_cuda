@@ -100,6 +100,23 @@ __global__ void bf16_to_f16_transpose_kernel(
   }
 }
 
+__global__ void bf16_to_f16_transpose_rows_kernel(
+    const uint16_t* __restrict__ src,
+    uint16_t* __restrict__ dst,
+    int chunk_rows,
+    int cols,
+    int total_rows,
+    int row_offset) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  if (r < chunk_rows && c < cols) {
+    const half h = __float2half_rn(
+        bf16_bits_to_float_dev(src[static_cast<int64_t>(r) * cols + c]));
+    dst[static_cast<int64_t>(c) * total_rows + row_offset + r] =
+        *reinterpret_cast<const uint16_t*>(&h);
+  }
+}
+
 __global__ void f16_transpose_kernel(
     const uint16_t* __restrict__ src,
     uint16_t* __restrict__ dst,
@@ -2056,6 +2073,22 @@ void rwkv7_v4_bf16_to_f16_transpose_launch(
   dim3 block(16, 16);
   dim3 grid(static_cast<unsigned>(ceil_div(cols, block.x)), static_cast<unsigned>(ceil_div(rows, block.y)));
   bf16_to_f16_transpose_kernel<<<grid, block, 0, stream>>>(src_bf16, dst_f16, rows, cols);
+}
+
+void rwkv7_v4_bf16_to_f16_transpose_rows_launch(
+    cudaStream_t stream,
+    const uint16_t* src_bf16,
+    uint16_t* dst_f16,
+    int chunk_rows,
+    int cols,
+    int total_rows,
+    int row_offset) {
+  dim3 block(16, 16);
+  dim3 grid(
+      static_cast<unsigned>(ceil_div(cols, block.x)),
+      static_cast<unsigned>(ceil_div(chunk_rows, block.y)));
+  bf16_to_f16_transpose_rows_kernel<<<grid, block, 0, stream>>>(
+      src_bf16, dst_f16, chunk_rows, cols, total_rows, row_offset);
 }
 
 void rwkv7_v4_f16_transpose_launch(

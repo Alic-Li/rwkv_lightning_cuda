@@ -249,6 +249,38 @@ int main() {
     }
 
     {
+      const int rows = 7;
+      const int cols = 11;
+      std::vector<float> input(static_cast<std::size_t>(rows) * cols);
+      for (std::size_t i = 0; i < input.size(); ++i) {
+        input[i] = pattern_value(static_cast<int>(i), 0.3f, -0.1f);
+      }
+      DeviceBuffer<std::uint16_t> input_bf16;
+      DeviceBuffer<std::uint16_t> full_output;
+      DeviceBuffer<std::uint16_t> chunked_output;
+      copy_bf16_to_device(input, input_bf16, "alloc transpose input", "copy transpose input");
+      full_output.resize(input.size(), "alloc full transpose output");
+      chunked_output.resize(input.size(), "alloc chunked transpose output");
+      rwkv7_v4_bf16_to_f16_transpose_launch(
+          nullptr, input_bf16.p, full_output.p, rows, cols);
+      for (int row_offset = 0; row_offset < rows; row_offset += 3) {
+        const int chunk_rows = std::min(3, rows - row_offset);
+        rwkv7_v4_bf16_to_f16_transpose_rows_launch(
+            nullptr,
+            input_bf16.p + static_cast<std::size_t>(row_offset) * cols,
+            chunked_output.p,
+            chunk_rows,
+            cols,
+            rows,
+            row_offset);
+      }
+      rwkv_test::require_cuda(cudaDeviceSynchronize(), "sync chunked transpose test");
+      TEST_CHECK(
+          rwkv_test::copy_device_buffer(full_output, "copy full transpose output") ==
+          rwkv_test::copy_device_buffer(chunked_output, "copy chunked transpose output"));
+    }
+
+    {
       const int rows = 3;
       std::vector<float> x(rows * kChannels);
       std::vector<float> residual(rows * kChannels);

@@ -35,9 +35,9 @@ ModelRouter::ModelRouter(std::shared_ptr<InferenceEngine> engine)
 
 ModelRouter::ModelRouter(std::filesystem::path model_directory,
                          std::shared_ptr<TrieTokenizer> tokenizer,
-                         int prefill_chunk_size, bool use_wkv32)
+                         int prefill_chunk_size, bool use_wkv32, bool chunk_load)
     : dynamic_(true), tokenizer_(std::move(tokenizer)), prefill_chunk_size_(prefill_chunk_size),
-      use_wkv32_(use_wkv32) {
+      use_wkv32_(use_wkv32), chunk_load_(chunk_load) {
   if (!std::filesystem::is_directory(model_directory)) {
     throw std::runtime_error("--model-path must be a directory when --enable-dynamic-loading is set: " +
                              model_directory.string());
@@ -98,7 +98,8 @@ void ModelRouter::load(const std::string& requested_model) {
   lock.unlock();
   std::shared_ptr<InferenceEngine> loaded;
   try {
-    auto backend = std::make_shared<ModelBackend>(model_paths_.at(id).string(), use_wkv32_);
+    auto backend = std::make_shared<ModelBackend>(
+        model_paths_.at(id).string(), use_wkv32_, chunk_load_);
     loaded = std::make_shared<InferenceEngine>(backend, tokenizer_, backend->model_name(), prefill_chunk_size_);
   } catch (...) {
     lock.lock();

@@ -35,10 +35,16 @@ Run server
   --vocab-path /path/to/rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 \
   --port 8000 \
-  --chunk-size 128
+  --chunk-size 128 \
+  --chunk-load
 ```
 
 `--chunk-size` controls prompt prefill chunking and defaults to `128` when omitted.
+`--chunk-load` avoids reading the complete `.pth` file or a complete large tensor into
+host memory before the CUDA upload. It uses a persistent model-file stream and two
+reusable 32 MiB pinned buffers to overlap disk reads, CUDA copies, and preprocessing.
+On Linux, consumed file-cache pages are marked reclaimable after each read. Omit the
+flag to keep the original whole-file loading behavior.
 Generation requests enter a FIFO admission queue. The server dynamically refreshes the
 available prefill batch-size limit from free VRAM and admits requests when capacity is
 available. `/v1/server/status` reports `prefill_queue` and all `active_requests` while
@@ -54,6 +60,7 @@ directory and add `--enable-dynamic-loading`:
 ./build/rwkv_lighting_cuda \
   --model-path /path/to/models \
   --enable-dynamic-loading \
+  --chunk-load \
   --vocab-path /path/to/rwkv_vocab_v20230424.txt
 ```
 

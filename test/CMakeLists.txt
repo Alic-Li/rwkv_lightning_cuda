@@ -16,6 +16,7 @@ function(rwkv_add_unit_test target_name source_file)
 endfunction()
 
 rwkv_add_unit_test(rwkv_tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tokenizer_test.cpp)
+rwkv_add_unit_test(rwkv_pth_archive_test ${CMAKE_CURRENT_SOURCE_DIR}/pth_archive_test.cpp)
 rwkv_add_unit_test(rwkv_sampler_test ${CMAKE_CURRENT_SOURCE_DIR}/sampler_test.cpp)
 rwkv_add_unit_test(rwkv_state_cache_test ${CMAKE_CURRENT_SOURCE_DIR}/state_cache_test.cpp)
 rwkv_add_unit_test(rwkv_inference_engine_test ${CMAKE_CURRENT_SOURCE_DIR}/inference_engine_test.cpp)

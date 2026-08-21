@@ -103,7 +103,10 @@ class IModelBackend {
 
 class ModelBackend final : public IModelBackend {
  public:
-  explicit ModelBackend(std::string model_path, bool use_wkv32 = false);
+  explicit ModelBackend(
+      std::string model_path,
+      bool use_wkv32 = false,
+      bool chunk_load = false);
   ~ModelBackend() override;
 
   ModelBackend(const ModelBackend&) = delete;

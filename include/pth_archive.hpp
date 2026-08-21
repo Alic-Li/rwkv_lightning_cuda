@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,7 +31,7 @@ struct PthEntryView {
 
 class PthArchive {
 public:
-  static Result<PthArchive> open(const std::string& path);
+  static Result<PthArchive> open(const std::string& path, bool chunk_load = false);
 
   const std::string& path() const {
     return path_;
@@ -40,15 +41,28 @@ public:
     return entries_;
   }
 
+  bool chunk_load() const {
+    return chunk_load_;
+  }
+
   const PthEntry* find_entry(const std::string& name) const;
 
   Result<std::vector<std::uint8_t>> read_stored_entry(const PthEntry& entry) const;
+  Status read_stored_entry_range(
+      const PthEntry& entry,
+      std::uint64_t entry_offset,
+      void* destination,
+      std::size_t size) const;
   Result<PthEntryView> stored_entry_view(const PthEntry& entry) const;
 
 private:
+  struct StreamReader;
   std::string path_;
+  std::uint64_t file_size_ = 0;
+  bool chunk_load_ = false;
   std::vector<std::uint8_t> bytes_;
   std::vector<PthEntry> entries_;
+  std::shared_ptr<StreamReader> stream_reader_;
 };
 
 }  // namespace llm_infer

@@ -42,7 +42,7 @@ class ModelRouter {
   explicit ModelRouter(std::shared_ptr<InferenceEngine> engine);
   // In dynamic mode model_directory contains the selectable .pth files.
   ModelRouter(std::filesystem::path model_directory, std::shared_ptr<class TrieTokenizer> tokenizer,
-              int prefill_chunk_size, bool use_wkv32);
+              int prefill_chunk_size, bool use_wkv32, bool chunk_load = false);
 
   // Pins the currently loaded model for a request. Request model IDs are not
   // routing directives: switching is exclusively done by load().
@@ -60,6 +60,7 @@ class ModelRouter {
   std::shared_ptr<class TrieTokenizer> tokenizer_;
   int prefill_chunk_size_ = 128;
   bool use_wkv32_ = false;
+  bool chunk_load_ = false;
   std::unordered_map<std::string, std::filesystem::path> model_paths_;
 
   mutable std::mutex mutex_;

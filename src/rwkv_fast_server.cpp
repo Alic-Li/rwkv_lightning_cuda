@@ -43,6 +43,7 @@ void print_usage(const char* program) {
       << "  --state-db-path <path>  SQLite state cache path. Default: rwkv_sessions.db.\n"
       << "  --password <token>      Require a bearer token or JSON password field.\n"
       << "  --wkv32                 Use fp32 WKV state with fp16 IO.\n"
+      << "  --chunk-load            Stream model tensors from disk while loading.\n"
       << "  --enable-dynamic-loading Treat --model-path as a directory of .pth models.\n"
       << "  --help, -h              Show this help text.\n";
 }
@@ -124,6 +125,7 @@ int run_server(int argc, char* argv[]) {
   uint16_t port = 8000;
   int prefill_chunk_size = 128;
   bool use_wkv32 = false;
+  bool chunk_load = false;
   bool enable_dynamic_loading = false;
   std::optional<std::string> password;
 
@@ -151,6 +153,8 @@ int run_server(int argc, char* argv[]) {
       password = require_value(arg);
     } else if (arg == "--wkv32") {
       use_wkv32 = true;
+    } else if (arg == "--chunk-load") {
+      chunk_load = true;
     } else if (arg == "--enable-dynamic-loading") {
       enable_dynamic_loading = true;
     } else if (arg == "--help" || arg == "-h") {
@@ -178,9 +182,11 @@ int run_server(int argc, char* argv[]) {
 
   std::unique_ptr<rwkv7_server::ModelRouter> models;
   if (enable_dynamic_loading) {
-    models = std::make_unique<rwkv7_server::ModelRouter>(model_path, tokenizer, prefill_chunk_size, use_wkv32);
+    models = std::make_unique<rwkv7_server::ModelRouter>(
+        model_path, tokenizer, prefill_chunk_size, use_wkv32, chunk_load);
   } else {
-    auto model = std::make_shared<rwkv7_server::ModelBackend>(model_path, use_wkv32);
+    auto model = std::make_shared<rwkv7_server::ModelBackend>(
+        model_path, use_wkv32, chunk_load);
     auto engine = std::make_shared<rwkv7_server::InferenceEngine>(model, tokenizer, model->model_name(), prefill_chunk_size);
     models = std::make_unique<rwkv7_server::ModelRouter>(std::move(engine));
   }
@@ -202,6 +208,7 @@ int run_server(int argc, char* argv[]) {
             << " port=" << port
             << " prefill_chunk_size=" << prefill_chunk_size
             << " wkv=" << (use_wkv32 ? "fp32io16" : "fp16")
+            << " chunk_load=" << (chunk_load ? "enabled" : "disabled")
             << " dynamic_loading=" << (enable_dynamic_loading ? "enabled" : "disabled")
             << " password=" << (password.has_value() ? "enabled" : "disabled") << std::endl;
   const std::string url_host = format_url_host(host);

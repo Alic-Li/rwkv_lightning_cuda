@@ -28,6 +28,7 @@ type startRequest struct {
 	Port                 string `json:"port"`
 	Password             string `json:"password"`
 	UseWKV32             bool   `json:"use_wkv32"`
+	ChunkLoad            bool   `json:"chunk_load"`
 	EnableDynamicLoading bool   `json:"enable_dynamic_loading"`
 }
 
@@ -111,6 +112,9 @@ func (l *launcher) start(req startRequest) error {
 	}
 	if req.UseWKV32 {
 		args = append(args, "--wkv32")
+	}
+	if req.ChunkLoad {
+		args = append(args, "--chunk-load")
 	}
 	if req.EnableDynamicLoading {
 		args = append(args, "--enable-dynamic-loading")
@@ -578,6 +582,10 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 		    Use FP32 WKV (More accurate, Bsz=1 Have almost same speed, High concurrency use more VRAM)
 		  </label>
 		  <label style="display: flex; align-items: center; font-weight: 500; color: #334155; gap: 8px;">
+		    <input type="checkbox" id="chunkLoad" />
+		    Chunk-load model weights (lower host RAM during loading)
+		  </label>
+		  <label style="display: flex; align-items: center; font-weight: 500; color: #334155; gap: 8px;">
 		    <input type="checkbox" id="enableDynamicLoading" />
 		    Enable dynamic model loading (Model Path must be a directory)
 		  </label>
@@ -630,6 +638,7 @@ async function startBackend() {
     port: document.getElementById('port').value,
     password: document.getElementById('password').value,
   	use_wkv32: document.getElementById('useWkv32').checked,
+		chunk_load: document.getElementById('chunkLoad').checked,
 		enable_dynamic_loading: document.getElementById('enableDynamicLoading').checked,
   };
   try {

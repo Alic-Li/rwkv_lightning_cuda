@@ -11,6 +11,15 @@ void rwkv7_v4_bf16_to_f16_launch(
 void rwkv7_v4_bf16_to_f16_transpose_launch(
     cudaStream_t stream, const uint16_t* src_bf16, uint16_t* dst_f16, int rows, int cols);
 
+void rwkv7_v4_bf16_to_f16_transpose_rows_launch(
+    cudaStream_t stream,
+    const uint16_t* src_bf16,
+    uint16_t* dst_f16,
+    int chunk_rows,
+    int cols,
+    int total_rows,
+    int row_offset);
+
 void rwkv7_v4_f16_transpose_launch(
     cudaStream_t stream, const uint16_t* src_f16, uint16_t* dst_f16, int rows, int cols);
 

@@ -25,12 +25,17 @@ namespace {
 
 using namespace rwkv7_fast_v4;
 
-struct RawBf16TensorView {
-  const std::uint16_t* data = nullptr;
+constexpr std::size_t kWeightLoadChunkBytes = 32u << 20;
+
+struct TensorStorageSource {
+  const llm_infer::PthEntry* entry = nullptr;
+  std::uint64_t byte_offset = 0;
   std::uint64_t elems = 0;
 };
 
-RawBf16TensorView raw_bf16_tensor_view(const llm_infer::PthArchive& archive, const llm_infer::TensorRecord& rec) {
+TensorStorageSource tensor_storage_source(
+    const llm_infer::PthArchive& archive,
+    const llm_infer::TensorRecord& rec) {
   if (!is_contiguous_shape(rec.shape, rec.stride)) {
     std::cerr << "error: v4 GPU loader currently requires contiguous tensor: " << rec.name << std::endl;
     std::exit(1);
@@ -45,9 +50,11 @@ RawBf16TensorView raw_bf16_tensor_view(const llm_infer::PthArchive& archive, con
     std::cerr << "error: storage entry not found for tensor: " << rec.name << std::endl;
     std::exit(1);
   }
-  auto view = archive.stored_entry_view(*entry);
-  require_result(view.ok(), view.status().message());
-  if (rec.storage_size * sizeof(std::uint16_t) != view.value().size) {
+  if (!entry->is_stored()) {
+    std::cerr << "error: compressed tensor storage is unsupported: " << rec.name << std::endl;
+    std::exit(1);
+  }
+  if (rec.storage_size * sizeof(std::uint16_t) != entry->uncompressed_size) {
     std::cerr << "error: storage byte size mismatch for tensor: " << rec.name << std::endl;
     std::exit(1);
   }
@@ -56,11 +63,48 @@ RawBf16TensorView raw_bf16_tensor_view(const llm_infer::PthArchive& archive, con
     std::cerr << "error: tensor data range exceeds storage: " << rec.name << std::endl;
     std::exit(1);
   }
-  RawBf16TensorView out;
-  out.data = reinterpret_cast<const std::uint16_t*>(view.value().data + rec.storage_offset * sizeof(std::uint16_t));
-  out.elems = n;
-  return out;
+  return {entry, rec.storage_offset * sizeof(std::uint16_t), n};
 }
+
+struct RawBf16TensorView {
+  const std::uint16_t* data = nullptr;
+  std::uint64_t elems = 0;
+};
+
+RawBf16TensorView raw_bf16_tensor_view(const llm_infer::PthArchive& archive, const llm_infer::TensorRecord& rec) {
+  const TensorStorageSource source = tensor_storage_source(archive, rec);
+  auto view = archive.stored_entry_view(*source.entry);
+  require_result(view.ok(), view.status().message());
+  return {
+      reinterpret_cast<const std::uint16_t*>(view.value().data + source.byte_offset),
+      source.elems};
+}
+
+struct PinnedHostBuffer {
+  std::uint8_t* p = nullptr;
+  std::size_t n = 0;
+
+  PinnedHostBuffer() = default;
+  PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+  PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+  ~PinnedHostBuffer() {
+    release();
+  }
+
+  void release() {
+    if (p) cudaFreeHost(p);
+    p = nullptr;
+    n = 0;
+  }
+
+  void resize(std::size_t bytes) {
+    if (bytes <= n) return;
+    if (p) check_cuda(cudaFreeHost(p), "free chunk-load host buffer");
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&p), bytes, cudaHostAllocPortable),
+               "alloc chunk-load host buffer");
+    n = bytes;
+  }
+};
 
 struct WeightLoadPipeline {
   struct Slot {
@@ -70,17 +114,21 @@ struct WeightLoadPipeline {
     cudaEvent_t copied = nullptr;
     cudaEvent_t done = nullptr;
     bool in_flight = false;
+    PinnedHostBuffer host;
   };
 
   Slot slots[2];
   int next = 0;
 
-  WeightLoadPipeline() {
+  explicit WeightLoadPipeline(bool chunk_load) {
     for (auto& s : slots) {
       check_cuda(cudaStreamCreateWithFlags(&s.copy, cudaStreamNonBlocking), "create weight copy stream");
       check_cuda(cudaStreamCreateWithFlags(&s.compute, cudaStreamNonBlocking), "create weight compute stream");
       check_cuda(cudaEventCreateWithFlags(&s.copied, cudaEventDisableTiming), "create weight copied event");
       check_cuda(cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming), "create weight done event");
+      if (chunk_load) {
+        s.host.resize(kWeightLoadChunkBytes);
+      }
     }
   }
 
@@ -104,12 +152,25 @@ struct WeightLoadPipeline {
     return s;
   }
 
+  Slot& acquire_chunk(std::size_t bytes) {
+    Slot& s = acquire((bytes + sizeof(std::uint16_t) - 1) / sizeof(std::uint16_t));
+    s.host.resize(bytes);
+    return s;
+  }
+
   void sync() {
     for (auto& s : slots) {
       if (s.in_flight) {
         check_cuda(cudaEventSynchronize(s.done), "sync weight load");
         s.in_flight = false;
       }
+    }
+  }
+
+  void release_host_buffers() {
+    sync();
+    for (auto& s : slots) {
+      s.host.release();
     }
   }
 };
@@ -129,7 +190,7 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
     return nullptr;
   }
   const auto& rec = *it->second;
-  const RawBf16TensorView raw = raw_bf16_tensor_view(archive, rec);
+  const TensorStorageSource source = tensor_storage_source(archive, rec);
   std::vector<std::int64_t> runtime_shape = rec.shape;
   const bool transpose = should_transpose_like_v3a(rec.name);
   if (transpose) {
@@ -142,22 +203,78 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
   auto tensor = std::make_unique<GpuTensor>();
   tensor->name = rec.name;
   tensor->shape = std::move(runtime_shape);
-  tensor->f16.resize(static_cast<std::size_t>(raw.elems), "alloc weight tensor");
-  auto& slot = pipeline.acquire(static_cast<std::size_t>(raw.elems));
-  check_cuda(cudaMemcpyAsync(slot.staging.p, raw.data, raw.elems * sizeof(std::uint16_t),
-                             cudaMemcpyHostToDevice, slot.copy), "copy raw bf16 weight");
-  check_cuda(cudaEventRecord(slot.copied, slot.copy), "record raw bf16 copied");
-  check_cuda(cudaStreamWaitEvent(slot.compute, slot.copied, 0), "wait raw bf16 copied");
-  if (transpose) {
-    rwkv7_v4_bf16_to_f16_transpose_launch(
-        slot.compute, slot.staging.p, tensor->f16.p,
-        static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
+  tensor->f16.resize(static_cast<std::size_t>(source.elems), "alloc weight tensor");
+  if (archive.chunk_load()) {
+    if (transpose) {
+      const int rows = static_cast<int>(rec.shape[0]);
+      const int cols = static_cast<int>(rec.shape[1]);
+      const std::size_t row_bytes = static_cast<std::size_t>(cols) * sizeof(std::uint16_t);
+      const int rows_per_chunk = static_cast<int>(
+          std::max<std::size_t>(1, kWeightLoadChunkBytes / row_bytes));
+      for (int row_offset = 0; row_offset < rows; row_offset += rows_per_chunk) {
+        const int chunk_rows = std::min(rows_per_chunk, rows - row_offset);
+        const std::size_t chunk_bytes = static_cast<std::size_t>(chunk_rows) * row_bytes;
+        auto& slot = pipeline.acquire_chunk(chunk_bytes);
+        const auto status = archive.read_stored_entry_range(
+            *source.entry,
+            source.byte_offset + static_cast<std::uint64_t>(row_offset) * row_bytes,
+            slot.host.p,
+            chunk_bytes);
+        require_result(status.ok_status(), status.message());
+        check_cuda(cudaMemcpyAsync(slot.staging.p, slot.host.p, chunk_bytes,
+                                   cudaMemcpyHostToDevice, slot.copy), "copy bf16 weight chunk");
+        check_cuda(cudaEventRecord(slot.copied, slot.copy), "record bf16 chunk copied");
+        check_cuda(cudaStreamWaitEvent(slot.compute, slot.copied, 0), "wait bf16 chunk copied");
+        rwkv7_v4_bf16_to_f16_transpose_rows_launch(
+            slot.compute, slot.staging.p, tensor->f16.p,
+            chunk_rows, cols, rows, row_offset);
+        check_cuda(cudaGetLastError(), "launch chunked bf16 transpose");
+        check_cuda(cudaEventRecord(slot.done, slot.compute), "record chunk preprocess done");
+        slot.in_flight = true;
+      }
+    } else {
+      const std::size_t max_chunk_elems = kWeightLoadChunkBytes / sizeof(std::uint16_t);
+      for (std::uint64_t elem_offset = 0; elem_offset < source.elems;) {
+        const std::size_t chunk_elems = static_cast<std::size_t>(
+            std::min<std::uint64_t>(max_chunk_elems, source.elems - elem_offset));
+        const std::size_t chunk_bytes = chunk_elems * sizeof(std::uint16_t);
+        auto& slot = pipeline.acquire_chunk(chunk_bytes);
+        const auto status = archive.read_stored_entry_range(
+            *source.entry,
+            source.byte_offset + elem_offset * sizeof(std::uint16_t),
+            slot.host.p,
+            chunk_bytes);
+        require_result(status.ok_status(), status.message());
+        check_cuda(cudaMemcpyAsync(slot.staging.p, slot.host.p, chunk_bytes,
+                                   cudaMemcpyHostToDevice, slot.copy), "copy bf16 weight chunk");
+        check_cuda(cudaEventRecord(slot.copied, slot.copy), "record bf16 chunk copied");
+        check_cuda(cudaStreamWaitEvent(slot.compute, slot.copied, 0), "wait bf16 chunk copied");
+        rwkv7_v4_bf16_to_f16_launch(
+            slot.compute, slot.staging.p, tensor->f16.p + elem_offset, chunk_elems);
+        check_cuda(cudaGetLastError(), "launch chunked bf16 preprocess");
+        check_cuda(cudaEventRecord(slot.done, slot.compute), "record chunk preprocess done");
+        slot.in_flight = true;
+        elem_offset += chunk_elems;
+      }
+    }
   } else {
-    rwkv7_v4_bf16_to_f16_launch(slot.compute, slot.staging.p, tensor->f16.p, raw.elems);
+    const RawBf16TensorView raw = raw_bf16_tensor_view(archive, rec);
+    auto& slot = pipeline.acquire(static_cast<std::size_t>(raw.elems));
+    check_cuda(cudaMemcpyAsync(slot.staging.p, raw.data, raw.elems * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, slot.copy), "copy raw bf16 weight");
+    check_cuda(cudaEventRecord(slot.copied, slot.copy), "record raw bf16 copied");
+    check_cuda(cudaStreamWaitEvent(slot.compute, slot.copied, 0), "wait raw bf16 copied");
+    if (transpose) {
+      rwkv7_v4_bf16_to_f16_transpose_launch(
+          slot.compute, slot.staging.p, tensor->f16.p,
+          static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
+    } else {
+      rwkv7_v4_bf16_to_f16_launch(slot.compute, slot.staging.p, tensor->f16.p, raw.elems);
+    }
+    check_cuda(cudaGetLastError(), "launch bf16 weight preprocess");
+    check_cuda(cudaEventRecord(slot.done, slot.compute), "record weight preprocess done");
+    slot.in_flight = true;
   }
-  check_cuda(cudaGetLastError(), "launch bf16 weight preprocess");
-  check_cuda(cudaEventRecord(slot.done, slot.compute), "record weight preprocess done");
-  slot.in_flight = true;
   return tensor;
 }
 
@@ -294,18 +411,92 @@ void build_cpu_emb_ln0_f16(
     std::cerr << "error: layer0 ln0 weights are required before emb+ln0 preprocessing\n";
     std::exit(1);
   }
-  auto raw = [&](const std::string& key) -> RawBf16TensorView {
+  auto record = [&](const std::string& key) -> const llm_infer::TensorRecord& {
     auto it = by_name.find(key);
     if (it == by_name.end()) {
       std::cerr << "error: missing tensor for emb+ln0 preprocessing: " << key << std::endl;
       std::exit(1);
     }
-    return raw_bf16_tensor_view(archive, *it->second);
+    return *it->second;
   };
-  const RawBf16TensorView emb = raw("emb.weight");
-  const RawBf16TensorView ln0_w = raw("blocks.0.ln0.weight");
-  const RawBf16TensorView ln0_b = raw("blocks.0.ln0.bias");
+  const auto& emb_rec = record("emb.weight");
+  const auto& ln0_w_rec = record("blocks.0.ln0.weight");
+  const auto& ln0_b_rec = record("blocks.0.ln0.bias");
   const std::size_t elems = static_cast<std::size_t>(dims.vocab) * dims.channels;
+
+  if (archive.chunk_load()) {
+    const TensorStorageSource emb = tensor_storage_source(archive, emb_rec);
+    const TensorStorageSource ln0_w = tensor_storage_source(archive, ln0_w_rec);
+    const TensorStorageSource ln0_b = tensor_storage_source(archive, ln0_b_rec);
+    if (emb.elems != elems || ln0_w.elems != static_cast<std::size_t>(dims.channels) ||
+        ln0_b.elems != static_cast<std::size_t>(dims.channels)) {
+      std::cerr << "error: emb/ln0 shape mismatch for chunked emb+ln0 preprocessing\n";
+      std::exit(1);
+    }
+
+    PinnedHostBuffer host;
+    host.resize(kWeightLoadChunkBytes);
+    DeviceBuffer<std::uint16_t> gpu_emb;
+    DeviceBuffer<std::uint16_t> gpu_ln0_w;
+    DeviceBuffer<std::uint16_t> gpu_ln0_b;
+    DeviceBuffer<std::uint16_t> gpu_out;
+    gpu_ln0_w.resize(ln0_w.elems, "alloc raw bf16 ln0 weight");
+    gpu_ln0_b.resize(ln0_b.elems, "alloc raw bf16 ln0 bias");
+
+    auto load_small = [&](const TensorStorageSource& source, std::uint16_t* destination,
+                          const char* copy_label) {
+      const std::size_t bytes = static_cast<std::size_t>(source.elems) * sizeof(std::uint16_t);
+      host.resize(bytes);
+      const auto status = archive.read_stored_entry_range(
+          *source.entry, source.byte_offset, host.p, bytes);
+      require_result(status.ok_status(), status.message());
+      check_cuda(cudaMemcpy(destination, host.p, bytes, cudaMemcpyHostToDevice), copy_label);
+    };
+    load_small(ln0_w, gpu_ln0_w.p, "copy raw bf16 ln0 weight");
+    load_small(ln0_b, gpu_ln0_b.p, "copy raw bf16 ln0 bias");
+
+    const std::size_t row_bytes = static_cast<std::size_t>(dims.channels) * sizeof(std::uint16_t);
+    const int rows_per_chunk = static_cast<int>(
+        std::max<std::size_t>(1, kWeightLoadChunkBytes / row_bytes));
+    const std::size_t max_chunk_elems =
+        static_cast<std::size_t>(std::min(rows_per_chunk, dims.vocab)) * dims.channels;
+    gpu_emb.resize(max_chunk_elems, "alloc chunked raw bf16 emb");
+    gpu_out.resize(max_chunk_elems, "alloc chunked emb+ln0 output");
+    weights.cpu_emb_ln0_f16.resize(elems);
+    for (int row_offset = 0; row_offset < dims.vocab; row_offset += rows_per_chunk) {
+      const int chunk_rows = std::min(rows_per_chunk, dims.vocab - row_offset);
+      const std::size_t chunk_elems = static_cast<std::size_t>(chunk_rows) * dims.channels;
+      const std::size_t chunk_bytes = chunk_elems * sizeof(std::uint16_t);
+      host.resize(chunk_bytes);
+      const auto status = archive.read_stored_entry_range(
+          *emb.entry,
+          emb.byte_offset + static_cast<std::uint64_t>(row_offset) * row_bytes,
+          host.p,
+          chunk_bytes);
+      require_result(status.ok_status(), status.message());
+      check_cuda(cudaMemcpy(gpu_emb.p, host.p, chunk_bytes, cudaMemcpyHostToDevice),
+                 "copy chunked raw bf16 emb");
+      rwkv7_v4_emb_ln0_bf16_to_f16_launch(
+          nullptr, chunk_rows, dims.channels,
+          gpu_emb.p, gpu_ln0_w.p, gpu_ln0_b.p, gpu_out.p, kLnEps);
+      check_cuda(cudaGetLastError(), "launch chunked emb+ln0 preprocess");
+      check_cuda(cudaMemcpy(
+          weights.cpu_emb_ln0_f16.data() + static_cast<std::size_t>(row_offset) * dims.channels,
+          gpu_out.p,
+          chunk_bytes,
+          cudaMemcpyDeviceToHost),
+          "copy chunked emb+ln0 to CPU");
+    }
+    weights.cpu_emb_bytes = weights.cpu_emb_ln0_f16.size() * sizeof(std::uint16_t);
+    return;
+  }
+
+  auto raw = [&](const std::string& key) -> RawBf16TensorView {
+    return raw_bf16_tensor_view(archive, record(key));
+  };
+  RawBf16TensorView emb = raw("emb.weight");
+  RawBf16TensorView ln0_w = raw("blocks.0.ln0.weight");
+  RawBf16TensorView ln0_b = raw("blocks.0.ln0.bias");
   if (emb.elems != elems || ln0_w.elems != static_cast<std::size_t>(dims.channels) ||
       ln0_b.elems != static_cast<std::size_t>(dims.channels)) {
     std::cerr << "error: emb/ln0 shape mismatch for emb+ln0 preprocessing\n";
@@ -383,12 +574,17 @@ CudaWeights load_model_weights(
   if (emb != by_name.end()) {
     weights.cpu_emb_bytes = numel(emb->second->shape) * sizeof(std::uint16_t);
   }
-  WeightLoadPipeline pipeline;
-  weights.load(archive, by_name, "ln_out.weight", true, pipeline);
-  weights.load(archive, by_name, "ln_out.bias", true, pipeline);
-  weights.load(archive, by_name, "head.weight", true, pipeline);
-  std::cout << "load_model global done gpu_mib=" << mib(weights.bytes())
-            << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << std::endl;
+  WeightLoadPipeline pipeline(archive.chunk_load());
+  auto load_globals = [&]() {
+    weights.load(archive, by_name, "ln_out.weight", true, pipeline);
+    weights.load(archive, by_name, "ln_out.bias", true, pipeline);
+    weights.load(archive, by_name, "head.weight", true, pipeline);
+    std::cout << "load_model global done gpu_mib=" << mib(weights.bytes())
+              << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << std::endl;
+  };
+  if (!archive.chunk_load()) {
+    load_globals();
+  }
   for (int layer = 0; layer < dims.layers; ++layer) {
     load_layer_into(weights, archive, by_name, layer, pipeline);
     std::cout << "load_model layer=" << layer
@@ -397,7 +593,11 @@ CudaWeights load_model_weights(
               << " t_copies=" << weights.t_copy_count
               << " gpu_mib=" << mib(weights.bytes()) << std::endl;
   }
+  if (archive.chunk_load()) {
+    load_globals();
+  }
   pipeline.sync();
+  pipeline.release_host_buffers();
   check_cuda(cudaDeviceSynchronize(), "sync model weight load");
   weights.build_global_view();
   build_cpu_emb_ln0_f16(weights, dims, archive, by_name);
@@ -729,8 +929,14 @@ std::string basename_without_extension(const std::string& path) {
   return fs_path.stem().string();
 }
 
-CudaWeights load_backend_weights(const std::string& model_path) {
-  auto archive = llm_infer::PthArchive::open(model_path);
+CudaWeights load_backend_weights(const std::string& model_path, bool chunk_load) {
+  std::cout << "load_model mode=" << (chunk_load ? "chunked" : "whole-file");
+  if (chunk_load) {
+    std::cout << " chunk_mib=" << mib(kWeightLoadChunkBytes)
+              << " host_buffers=2";
+  }
+  std::cout << std::endl;
+  auto archive = llm_infer::PthArchive::open(model_path, chunk_load);
   require_result(archive.ok(), archive.status().message());
   auto records = llm_infer::parse_pth_tensor_records(archive.value());
   require_result(records.ok(), records.status().message());
@@ -1046,20 +1252,22 @@ void run_backend_forward(
 }  // namespace
 
 struct ModelBackend::Impl {
-  explicit Impl(std::string path, bool use_wkv32_)
+  explicit Impl(std::string path, bool use_wkv32_, bool chunk_load_)
       : model_path(std::move(path)),
         model_name(basename_without_extension(model_path)),
         use_wkv32(use_wkv32_),
-        weights(load_backend_weights(model_path)) {}
+        chunk_load(chunk_load_),
+        weights(load_backend_weights(model_path, chunk_load)) {}
 
   std::string model_path;
   std::string model_name;
   bool use_wkv32 = false;
+  bool chunk_load = false;
   CudaWeights weights;
 };
 
-ModelBackend::ModelBackend(std::string model_path, bool use_wkv32)
-    : impl_(std::make_unique<Impl>(std::move(model_path), use_wkv32)) {}
+ModelBackend::ModelBackend(std::string model_path, bool use_wkv32, bool chunk_load)
+    : impl_(std::make_unique<Impl>(std::move(model_path), use_wkv32, chunk_load)) {}
 
 ModelBackend::~ModelBackend() = default;
 
