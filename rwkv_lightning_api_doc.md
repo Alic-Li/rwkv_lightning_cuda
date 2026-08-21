@@ -571,7 +571,7 @@ OpenAI API 完全等价。
 | `--state-db-path` | 否 | `rwkv_sessions.db` | 会话状态 SQLite 数据库。 |
 | `--password` | 否 | 禁用鉴权 | 启用 Bearer token 或 JSON `password` 鉴权。 |
 | `--wkv32` | 否 | 关闭 | 使用 FP32 WKV state 和 FP16 IO。 |
-| `--chunk-load` | 否 | 关闭 | 使用持久文件流和两个可复用的 32 MiB pinned 缓冲分块读取、上传和预处理权重；不会将整个 `.pth` 或整个大张量载入内存。Linux 下每次读取后还会提示内核回收对应文件缓存。动态加载模式同样生效。 |
+| `--chunk-load` | 否 | 关闭 | 使用持久文件流和两个可复用的 32 MiB pinned 缓冲分块读取、上传和预处理权重；每批完整载入并完成 4 层后再同步，不会将整个 `.pth` 或整个大张量载入内存。Linux 下每次读取后还会提示内核回收对应文件缓存。动态加载模式同样生效。 |
 | `--enable-dynamic-loading` | 否 | 关闭 | 启用按需模型加载。启用后 `--model-path` 必须是目录；目录一级中的 `.pth` 文件为可加载模型。未启用时保持原有单 `.pth` 模型启动逻辑。 |
 
 所有 JSON 请求都必须带：

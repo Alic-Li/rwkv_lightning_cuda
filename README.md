@@ -43,8 +43,9 @@ Run server
 `--chunk-load` avoids reading the complete `.pth` file or a complete large tensor into
 host memory before the CUDA upload. It uses a persistent model-file stream and two
 reusable 32 MiB pinned buffers to overlap disk reads, CUDA copies, and preprocessing.
-On Linux, consumed file-cache pages are marked reclaimable after each read. Omit the
-flag to keep the original whole-file loading behavior.
+Four complete transformer layers are uploaded and finalized as one batch, reducing
+load-time synchronization. On Linux, consumed file-cache pages are marked reclaimable
+after each read. Omit the flag to keep the original whole-file loading behavior.
 Generation requests enter a FIFO admission queue. The server dynamically refreshes the
 available prefill batch-size limit from free VRAM and admits requests when capacity is
 available. `/v1/server/status` reports `prefill_queue` and all `active_requests` while

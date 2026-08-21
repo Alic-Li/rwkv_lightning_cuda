@@ -26,6 +26,7 @@ namespace {
 using namespace rwkv7_fast_v4;
 
 constexpr std::size_t kWeightLoadChunkBytes = 32u << 20;
+constexpr int kChunkLoadLayerBatch = 4;
 
 struct TensorStorageSource {
   const llm_infer::PthEntry* entry = nullptr;
@@ -128,6 +129,9 @@ struct WeightLoadPipeline {
       check_cuda(cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming), "create weight done event");
       if (chunk_load) {
         s.host.resize(kWeightLoadChunkBytes);
+        s.staging.resize(
+            kWeightLoadChunkBytes / sizeof(std::uint16_t),
+            "alloc chunk-load device staging");
       }
     }
   }
@@ -167,20 +171,19 @@ struct WeightLoadPipeline {
     }
   }
 
-  void release_host_buffers() {
+  void release_buffers() {
     sync();
     for (auto& s : slots) {
       s.host.release();
+      s.staging = DeviceBuffer<std::uint16_t>{};
     }
   }
 };
 
-std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
-    const llm_infer::PthArchive& archive,
+std::unique_ptr<GpuTensor> allocate_tensor_f16_like_v3a(
     const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name,
     const std::string& key,
-    bool required,
-    WeightLoadPipeline& pipeline) {
+    bool required) {
   auto it = by_name.find(key);
   if (it == by_name.end()) {
     if (required) {
@@ -190,7 +193,6 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
     return nullptr;
   }
   const auto& rec = *it->second;
-  const TensorStorageSource source = tensor_storage_source(archive, rec);
   std::vector<std::int64_t> runtime_shape = rec.shape;
   const bool transpose = should_transpose_like_v3a(rec.name);
   if (transpose) {
@@ -203,7 +205,17 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
   auto tensor = std::make_unique<GpuTensor>();
   tensor->name = rec.name;
   tensor->shape = std::move(runtime_shape);
-  tensor->f16.resize(static_cast<std::size_t>(source.elems), "alloc weight tensor");
+  tensor->f16.resize(static_cast<std::size_t>(numel(rec.shape)), "alloc weight tensor");
+  return tensor;
+}
+
+void upload_tensor_f16_like_v3a(
+    const llm_infer::PthArchive& archive,
+    const llm_infer::TensorRecord& rec,
+    GpuTensor& tensor,
+    WeightLoadPipeline& pipeline) {
+  const TensorStorageSource source = tensor_storage_source(archive, rec);
+  const bool transpose = should_transpose_like_v3a(rec.name);
   if (archive.chunk_load()) {
     if (transpose) {
       const int rows = static_cast<int>(rec.shape[0]);
@@ -226,7 +238,7 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
         check_cuda(cudaEventRecord(slot.copied, slot.copy), "record bf16 chunk copied");
         check_cuda(cudaStreamWaitEvent(slot.compute, slot.copied, 0), "wait bf16 chunk copied");
         rwkv7_v4_bf16_to_f16_transpose_rows_launch(
-            slot.compute, slot.staging.p, tensor->f16.p,
+            slot.compute, slot.staging.p, tensor.f16.p,
             chunk_rows, cols, rows, row_offset);
         check_cuda(cudaGetLastError(), "launch chunked bf16 transpose");
         check_cuda(cudaEventRecord(slot.done, slot.compute), "record chunk preprocess done");
@@ -250,7 +262,7 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
         check_cuda(cudaEventRecord(slot.copied, slot.copy), "record bf16 chunk copied");
         check_cuda(cudaStreamWaitEvent(slot.compute, slot.copied, 0), "wait bf16 chunk copied");
         rwkv7_v4_bf16_to_f16_launch(
-            slot.compute, slot.staging.p, tensor->f16.p + elem_offset, chunk_elems);
+            slot.compute, slot.staging.p, tensor.f16.p + elem_offset, chunk_elems);
         check_cuda(cudaGetLastError(), "launch chunked bf16 preprocess");
         check_cuda(cudaEventRecord(slot.done, slot.compute), "record chunk preprocess done");
         slot.in_flight = true;
@@ -266,16 +278,15 @@ std::unique_ptr<GpuTensor> load_tensor_f16_like_v3a(
     check_cuda(cudaStreamWaitEvent(slot.compute, slot.copied, 0), "wait raw bf16 copied");
     if (transpose) {
       rwkv7_v4_bf16_to_f16_transpose_launch(
-          slot.compute, slot.staging.p, tensor->f16.p,
+          slot.compute, slot.staging.p, tensor.f16.p,
           static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
     } else {
-      rwkv7_v4_bf16_to_f16_launch(slot.compute, slot.staging.p, tensor->f16.p, raw.elems);
+      rwkv7_v4_bf16_to_f16_launch(slot.compute, slot.staging.p, tensor.f16.p, raw.elems);
     }
     check_cuda(cudaGetLastError(), "launch bf16 weight preprocess");
     check_cuda(cudaEventRecord(slot.done, slot.compute), "record weight preprocess done");
     slot.in_flight = true;
   }
-  return tensor;
 }
 
 std::string block_key(int layer, const char* suffix) {
@@ -308,24 +319,50 @@ struct CudaWeights {
     return t;
   }
 
+  GpuTensor* require_mutable(const std::string& key) {
+    auto it = tensors.find(key);
+    if (it == tensors.end()) {
+      std::cerr << "error: mutable tensor view missing: " << key << std::endl;
+      std::exit(1);
+    }
+    return it->second.get();
+  }
+
+  bool allocate(
+      const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name,
+      const std::string& key,
+      bool required) {
+    auto tensor = allocate_tensor_f16_like_v3a(by_name, key, required);
+    if (!tensor) return false;
+    tensors.emplace(key, std::move(tensor));
+    if (!required) ++optional_loaded;
+    return true;
+  }
+
+  void upload(
+      const llm_infer::PthArchive& archive,
+      const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name,
+      const std::string& key,
+      WeightLoadPipeline& pipeline) {
+    auto it = by_name.find(key);
+    if (it == by_name.end()) {
+      std::cerr << "error: tensor record missing during upload: " << key << std::endl;
+      std::exit(1);
+    }
+    upload_tensor_f16_like_v3a(archive, *it->second, *require_mutable(key), pipeline);
+  }
+
   void load(
       const llm_infer::PthArchive& archive,
       const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name,
       const std::string& key,
       bool required,
       WeightLoadPipeline& pipeline) {
-    auto tensor = load_tensor_f16_like_v3a(archive, by_name, key, required, pipeline);
-    if (!tensor) {
-      return;
-    }
-    tensors.emplace(key, std::move(tensor));
-    if (!required) {
-      ++optional_loaded;
-    }
+    if (!allocate(by_name, key, required)) return;
+    upload(archive, by_name, key, pipeline);
   }
 
-  void add_t_copy(const std::string& key, WeightLoadPipeline& pipeline) {
-    pipeline.sync();
+  void allocate_t_copy(const std::string& key) {
     const GpuTensor* src = require(key);
     if (src->shape.size() != 2) {
       std::cerr << "error: .t copy requires 2D tensor: " << key << std::endl;
@@ -337,10 +374,18 @@ struct CudaWeights {
     tensor->name = key + ".t";
     tensor->shape = {cols, rows};
     tensor->f16.resize(static_cast<std::size_t>(rows) * cols, "alloc .t tensor");
-    rwkv7_v4_f16_transpose_launch(nullptr, src->f16.p, tensor->f16.p, rows, cols);
-    check_cuda(cudaGetLastError(), "launch .t transpose");
-    tensors.emplace(tensor->name, std::move(tensor));
+    const std::string tensor_name = tensor->name;
+    tensors.emplace(tensor_name, std::move(tensor));
     ++t_copy_count;
+  }
+
+  void launch_t_copy(const std::string& key) {
+    const GpuTensor* src = require(key);
+    const GpuTensor* dst = require(key + ".t");
+    const int rows = static_cast<int>(src->shape[0]);
+    const int cols = static_cast<int>(src->shape[1]);
+    rwkv7_v4_f16_transpose_launch(nullptr, src->f16.p, dst->f16.p, rows, cols);
+    check_cuda(cudaGetLastError(), "launch .t transpose");
   }
 
   std::size_t bytes() const {
@@ -526,12 +571,8 @@ void build_cpu_emb_ln0_f16(
   weights.cpu_emb_bytes = weights.cpu_emb_ln0_f16.size() * sizeof(std::uint16_t);
 }
 
-void load_layer_into(
-    CudaWeights& weights,
-    const llm_infer::PthArchive& archive,
-    const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name,
-    int layer,
-    WeightLoadPipeline& pipeline) {
+template <typename Fn>
+void for_each_layer_source_tensor(int layer, Fn&& fn) {
   const char* required[] = {
       "ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias",
       "att.x_r", "att.x_w", "att.x_k", "att.x_v", "att.x_a", "att.x_g",
@@ -541,26 +582,49 @@ void load_layer_into(
       "ffn.x_k", "ffn.key.weight", "ffn.value.weight",
   };
   if (layer == 0) {
-    weights.load(archive, by_name, block_key(layer, "ln0.weight"), true, pipeline);
-    weights.load(archive, by_name, block_key(layer, "ln0.bias"), true, pipeline);
+    fn(block_key(layer, "ln0.weight"));
+    fn(block_key(layer, "ln0.bias"));
   }
   for (const char* suffix : required) {
-    weights.load(archive, by_name, block_key(layer, suffix), true, pipeline);
+    fn(block_key(layer, suffix));
   }
   if (layer > 0) {
-    weights.load(archive, by_name, block_key(layer, "att.v0"), true, pipeline);
-    weights.load(archive, by_name, block_key(layer, "att.v1"), true, pipeline);
-    weights.load(archive, by_name, block_key(layer, "att.v2"), true, pipeline);
+    fn(block_key(layer, "att.v0"));
+    fn(block_key(layer, "att.v1"));
+    fn(block_key(layer, "att.v2"));
   }
+}
+
+void allocate_layer_tensors(
+    CudaWeights& weights,
+    const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name,
+    int layer) {
+  for_each_layer_source_tensor(layer, [&](const std::string& key) {
+    weights.allocate(by_name, key, true);
+  });
+}
+
+void upload_layer_tensors(
+    CudaWeights& weights,
+    const llm_infer::PthArchive& archive,
+    const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name,
+    int layer,
+    WeightLoadPipeline& pipeline) {
+  for_each_layer_source_tensor(layer, [&](const std::string& key) {
+    weights.upload(archive, by_name, key, pipeline);
+  });
+}
+
+template <typename Fn>
+void for_each_layer_t_copy(int layer, Fn&& fn) {
   const char* lowrank_t[] = {"att.w1", "att.w2", "att.a1", "att.a2", "att.g1", "att.g2"};
   for (const char* suffix : lowrank_t) {
-    weights.add_t_copy(block_key(layer, suffix), pipeline);
+    fn(block_key(layer, suffix));
   }
   if (layer > 0) {
-    weights.add_t_copy(block_key(layer, "att.v1"), pipeline);
-    weights.add_t_copy(block_key(layer, "att.v2"), pipeline);
+    fn(block_key(layer, "att.v1"));
+    fn(block_key(layer, "att.v2"));
   }
-  weights.layers.push_back(weights.layer_view(layer));
 }
 
 CudaWeights load_model_weights(
@@ -576,18 +640,48 @@ CudaWeights load_model_weights(
   }
   WeightLoadPipeline pipeline(archive.chunk_load());
   auto load_globals = [&]() {
-    weights.load(archive, by_name, "ln_out.weight", true, pipeline);
-    weights.load(archive, by_name, "ln_out.bias", true, pipeline);
-    weights.load(archive, by_name, "head.weight", true, pipeline);
+    const char* globals[] = {"ln_out.weight", "ln_out.bias", "head.weight"};
+    if (archive.chunk_load()) {
+      for (const char* key : globals) weights.allocate(by_name, key, true);
+      for (const char* key : globals) weights.upload(archive, by_name, key, pipeline);
+    } else {
+      for (const char* key : globals) weights.load(archive, by_name, key, true, pipeline);
+    }
     std::cout << "load_model global done gpu_mib=" << mib(weights.bytes())
               << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << std::endl;
   };
   if (!archive.chunk_load()) {
     load_globals();
   }
-  for (int layer = 0; layer < dims.layers; ++layer) {
-    load_layer_into(weights, archive, by_name, layer, pipeline);
-    std::cout << "load_model layer=" << layer
+  const int layers_per_batch = archive.chunk_load() ? kChunkLoadLayerBatch : 1;
+  for (int first_layer = 0; first_layer < dims.layers; first_layer += layers_per_batch) {
+    const int last_layer = std::min(first_layer + layers_per_batch, dims.layers);
+    for (int layer = first_layer; layer < last_layer; ++layer) {
+      allocate_layer_tensors(weights, by_name, layer);
+    }
+    for (int layer = first_layer; layer < last_layer; ++layer) {
+      upload_layer_tensors(weights, archive, by_name, layer, pipeline);
+    }
+
+    // All source weights for this batch must be resident before allocating and
+    // launching the derived transpose copies. Allocate every destination first
+    // so cudaMalloc cannot serialize the transpose kernels one by one.
+    pipeline.sync();
+    for (int layer = first_layer; layer < last_layer; ++layer) {
+      for_each_layer_t_copy(layer, [&](const std::string& key) {
+        weights.allocate_t_copy(key);
+      });
+    }
+    for (int layer = first_layer; layer < last_layer; ++layer) {
+      for_each_layer_t_copy(layer, [&](const std::string& key) {
+        weights.launch_t_copy(key);
+      });
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync layer load batch");
+    for (int layer = first_layer; layer < last_layer; ++layer) {
+      weights.layers.push_back(weights.layer_view(layer));
+    }
+    std::cout << "load_model layer_batch=" << first_layer << "-" << (last_layer - 1)
               << " done layers=" << weights.layers.size()
               << " tensors=" << weights.tensors.size()
               << " t_copies=" << weights.t_copy_count
@@ -597,7 +691,7 @@ CudaWeights load_model_weights(
     load_globals();
   }
   pipeline.sync();
-  pipeline.release_host_buffers();
+  pipeline.release_buffers();
   check_cuda(cudaDeviceSynchronize(), "sync model weight load");
   weights.build_global_view();
   build_cpu_emb_ln0_f16(weights, dims, archive, by_name);
@@ -933,7 +1027,8 @@ CudaWeights load_backend_weights(const std::string& model_path, bool chunk_load)
   std::cout << "load_model mode=" << (chunk_load ? "chunked" : "whole-file");
   if (chunk_load) {
     std::cout << " chunk_mib=" << mib(kWeightLoadChunkBytes)
-              << " host_buffers=2";
+              << " host_buffers=2"
+              << " layer_batch=" << kChunkLoadLayerBatch;
   }
   std::cout << std::endl;
   auto archive = llm_infer::PthArchive::open(model_path, chunk_load);
