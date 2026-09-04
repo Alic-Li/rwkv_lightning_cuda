@@ -1872,15 +1872,18 @@ void run_backend_forward(
   const int V = dims.vocab;
   const int F = dims.ffn;
 
-  static thread_local ForwardResources resources;
-  resources.arena.allocate(static_cast<std::size_t>(rows) * C * 31 + static_cast<std::size_t>(output_rows) * C +
-                           static_cast<std::size_t>(rows) * F +
-                           static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * V);
-  resources.lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc backend cublasLt workspace");
-  resources.ensure_stream();
-  HalfArena& arena = resources.arena;
-  DeviceBuffer<unsigned char>& lt_workspace = resources.lt_workspace;
-  cudaStream_t stream = resources.stream;
+  if (!out.backend_workspace) {
+    out.backend_workspace = std::make_shared<ForwardResources>();
+  }
+  auto resources = std::static_pointer_cast<ForwardResources>(out.backend_workspace);
+  resources->arena.allocate(static_cast<std::size_t>(rows) * C * 31 + static_cast<std::size_t>(output_rows) * C +
+                            static_cast<std::size_t>(rows) * F +
+                            static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * V);
+  resources->lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc backend cublasLt workspace");
+  resources->ensure_stream();
+  HalfArena& arena = resources->arena;
+  DeviceBuffer<unsigned char>& lt_workspace = resources->lt_workspace;
+  cudaStream_t stream = resources->stream;
   BackendProfile profiler(std::getenv("RWKV_PROFILE") != nullptr);
 
   if (weights.cpu_emb_ln0_f16.size() != static_cast<std::size_t>(V) * C) {

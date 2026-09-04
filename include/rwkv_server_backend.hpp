@@ -61,6 +61,9 @@ struct DeviceLogits {
   int rows = 0;
   int vocab_size = 0;
   rwkv7_fast_v4::DeviceBuffer<float> values;
+  // Backend-owned scratch follows the logits/request lifetime. This keeps
+  // prefill/decode reuse without leaving a high-water allocation per worker.
+  std::shared_ptr<void> backend_workspace;
 
   DeviceLogits() = default;
   DeviceLogits(const DeviceLogits&) = delete;
