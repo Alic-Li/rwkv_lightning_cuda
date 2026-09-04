@@ -2,12 +2,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
+#include <random>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -17,6 +22,7 @@
 
 #include "pth_archive.hpp"
 #include "pth_tensor.hpp"
+#include "rwkv_quantized.hpp"
 #include "rwkv_server_backend.hpp"
 #include "rwkv7_fast_v4_common.hpp"
 #include "rwkv7_fast_v4_kernels.cuh"
@@ -27,6 +33,7 @@ using namespace rwkv7_fast_v4;
 
 constexpr std::size_t kWeightLoadChunkBytes = 32u << 20;
 constexpr int kChunkLoadLayerBatch = 4;
+constexpr int kDefaultQuantizedCmixSparseMaxRows = 32;
 
 struct TensorStorageSource {
   const llm_infer::PthEntry* entry = nullptr;
@@ -294,6 +301,24 @@ std::string block_key(int layer, const char* suffix) {
 }
 
 struct CudaWeights {
+  struct CmixStatsBuffers {
+    bool enabled = false;
+    DeviceBuffer<unsigned long long> nonzero;
+    DeviceBuffer<unsigned long long> total;
+    DeviceBuffer<unsigned int> max_bits;
+
+    void initialize(int layers) {
+      enabled = true;
+      nonzero.resize(static_cast<std::size_t>(layers), "alloc cmix stats nonzero");
+      total.resize(static_cast<std::size_t>(layers), "alloc cmix stats total");
+      max_bits.resize(static_cast<std::size_t>(layers), "alloc cmix stats max");
+      nonzero.zero("zero cmix stats nonzero");
+      total.zero("zero cmix stats total");
+      max_bits.zero("zero cmix stats max");
+      check_cuda(cudaDeviceSynchronize(), "sync cmix stats init");
+    }
+  };
+
   ModelDims dims;
   std::unordered_map<std::string, std::unique_ptr<GpuTensor>> tensors;
   std::vector<LayerWeights> layers;
@@ -304,6 +329,9 @@ struct CudaWeights {
   int t_copy_count = 0;
   std::size_t cpu_emb_bytes = 0;
   std::vector<std::uint16_t> cpu_emb_ln0_f16;
+  CmixStatsBuffers cmix_stats;
+  int cmix_sparse_max_rows = kDefaultQuantizedCmixSparseMaxRows;
+  std::vector<int> cmix_sparse_max_rows_by_layer;
 
   const GpuTensor* optional(const std::string& key) const {
     auto it = tensors.find(key);
@@ -447,6 +475,69 @@ struct CudaWeights {
   }
 };
 
+struct BackendProfile {
+  struct Event {
+    std::string name;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+  };
+
+  explicit BackendProfile(bool enabled_) : enabled(enabled_) {}
+
+  int begin(cudaStream_t stream, const char* name) {
+    if (!enabled) return -1;
+    Event event;
+    event.name = name;
+    check_cuda(cudaEventCreate(&event.start), "create profile start event");
+    check_cuda(cudaEventCreate(&event.stop), "create profile stop event");
+    check_cuda(cudaEventRecord(event.start, stream), "record profile start event");
+    events.push_back(std::move(event));
+    return static_cast<int>(events.size() - 1);
+  }
+
+  void end(cudaStream_t stream, int index) {
+    if (index < 0) return;
+    check_cuda(cudaEventRecord(events[static_cast<std::size_t>(index)].stop, stream), "record profile stop event");
+  }
+
+  void report() {
+    if (!enabled) return;
+    std::unordered_map<std::string, double> totals;
+    for (auto& event : events) {
+      float elapsed = 0.0f;
+      check_cuda(cudaEventElapsedTime(&elapsed, event.start, event.stop), "profile event elapsed");
+      totals[event.name] += elapsed;
+      cudaEventDestroy(event.start);
+      cudaEventDestroy(event.stop);
+    }
+    for (const auto& item : totals) {
+      std::cout << "profile kernel=" << item.first << " ms=" << item.second << "\n";
+    }
+    events.clear();
+  }
+
+  bool enabled = false;
+  std::vector<Event> events;
+};
+
+struct ForwardResources {
+  HalfArena arena;
+  DeviceBuffer<unsigned char> lt_workspace;
+  cudaStream_t stream = nullptr;
+
+  ~ForwardResources() {
+    if (stream != nullptr) {
+      cudaStreamDestroy(stream);
+    }
+  }
+
+  void ensure_stream() {
+    if (stream == nullptr) {
+      check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create backend stream");
+    }
+  }
+};
+
 void build_cpu_emb_ln0_f16(
     CudaWeights& weights,
     const ModelDims& dims,
@@ -568,6 +659,56 @@ void build_cpu_emb_ln0_f16(
   check_cuda(cudaMemcpy(weights.cpu_emb_ln0_f16.data(), gpu_out.p, elems * sizeof(std::uint16_t),
                         cudaMemcpyDeviceToHost), "copy emb+ln0 to CPU");
   check_cuda(cudaDeviceSynchronize(), "sync emb+ln0 preprocess");
+  weights.cpu_emb_bytes = weights.cpu_emb_ln0_f16.size() * sizeof(std::uint16_t);
+}
+
+void build_cpu_emb_ln0_f16_quantized(
+    CudaWeights& weights,
+    const ModelDims& dims,
+    const llm_infer::QuantizedArchive& archive) {
+  const auto* emb = archive.find("emb.weight");
+  const auto* ln0_w = archive.find("blocks.0.ln0.weight");
+  const auto* ln0_b = archive.find("blocks.0.ln0.bias");
+  if (!emb || !ln0_w || !ln0_b) {
+    std::cerr << "error: quantized model is missing emb/ln0 tensors\n";
+    std::exit(1);
+  }
+  if (emb->dtype == llm_infer::QuantizedDType::kInt8 ||
+      ln0_w->dtype == llm_infer::QuantizedDType::kInt8 ||
+      ln0_b->dtype == llm_infer::QuantizedDType::kInt8) {
+    std::cerr << "error: emb/ln0 tensors must remain floating point in quantized model\n";
+    std::exit(1);
+  }
+  const std::size_t elems = static_cast<std::size_t>(dims.vocab) * dims.channels;
+  std::vector<std::uint8_t> emb_data, w_data, b_data;
+  require_result(archive.read_data(*emb, &emb_data).ok_status(), "read quantized emb");
+  require_result(archive.read_data(*ln0_w, &w_data).ok_status(), "read quantized ln0 weight");
+  require_result(archive.read_data(*ln0_b, &b_data).ok_status(), "read quantized ln0 bias");
+  if (emb_data.size() != elems * 2 || w_data.size() != static_cast<std::size_t>(dims.channels) * 2 ||
+      b_data.size() != static_cast<std::size_t>(dims.channels) * 2) {
+    std::cerr << "error: quantized emb/ln0 shape mismatch\n";
+    std::exit(1);
+  }
+  DeviceBuffer<std::uint16_t> gpu_emb, gpu_w, gpu_b, gpu_out;
+  gpu_emb.resize(elems, "alloc quantized emb");
+  gpu_w.resize(dims.channels, "alloc quantized ln0 weight");
+  gpu_b.resize(dims.channels, "alloc quantized ln0 bias");
+  gpu_out.resize(elems, "alloc quantized emb output");
+  check_cuda(cudaMemcpy(gpu_emb.p, emb_data.data(), emb_data.size(), cudaMemcpyHostToDevice), "copy quantized emb");
+  check_cuda(cudaMemcpy(gpu_w.p, w_data.data(), w_data.size(), cudaMemcpyHostToDevice), "copy quantized ln0 weight");
+  check_cuda(cudaMemcpy(gpu_b.p, b_data.data(), b_data.size(), cudaMemcpyHostToDevice), "copy quantized ln0 bias");
+  if (emb->dtype == llm_infer::QuantizedDType::kBFloat16) {
+    rwkv7_v4_emb_ln0_bf16_to_f16_launch(nullptr, dims.vocab, dims.channels,
+                                         gpu_emb.p, gpu_w.p, gpu_b.p, gpu_out.p, kLnEps);
+  } else {
+    std::cerr << "error: float16 emb preprocessing is not supported\n";
+    std::exit(1);
+  }
+  check_cuda(cudaGetLastError(), "launch quantized emb+ln0 preprocess");
+  weights.cpu_emb_ln0_f16.resize(elems);
+  check_cuda(cudaMemcpy(weights.cpu_emb_ln0_f16.data(), gpu_out.p, elems * sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToHost), "copy quantized emb+ln0");
+  check_cuda(cudaDeviceSynchronize(), "sync quantized emb+ln0 preprocess");
   weights.cpu_emb_bytes = weights.cpu_emb_ln0_f16.size() * sizeof(std::uint16_t);
 }
 
@@ -697,6 +838,159 @@ CudaWeights load_model_weights(
   build_cpu_emb_ln0_f16(weights, dims, archive, by_name);
   std::cout << "load_model emb+ln0 done cpu_emb_mib=" << mib(weights.cpu_emb_bytes)
             << " entries=" << weights.cpu_emb_ln0_f16.size() << std::endl;
+  if (std::getenv("RWKV_CMIX_STATS") != nullptr) weights.cmix_stats.initialize(dims.layers);
+  return weights;
+}
+
+ModelDims infer_quantized_model_dims(const llm_infer::QuantizedArchive& archive) {
+  ModelDims dimensions;
+  for (const auto& rec : archive.records()) {
+    if (rec.name == "emb.weight" && rec.shape.size() == 2) {
+      dimensions.vocab = static_cast<int>(rec.shape[0]);
+      dimensions.channels = static_cast<int>(rec.shape[1]);
+    } else if (rec.name == "blocks.0.att.r_k" && rec.shape.size() == 2) {
+      dimensions.heads = static_cast<int>(rec.shape[0]);
+      dimensions.head_size = static_cast<int>(rec.shape[1]);
+    } else if (rec.name == "blocks.0.ffn.key.weight" && rec.shape.size() == 2) {
+      dimensions.ffn = static_cast<int>(rec.shape[0]);
+    }
+    if (rec.name.rfind("blocks.", 0) == 0) {
+      const char* begin = rec.name.c_str() + 7;
+      char* end = nullptr;
+      const long layer = std::strtol(begin, &end, 10);
+      if (end && *end == '.' && layer >= 0) {
+        dimensions.layers = std::max(dimensions.layers, static_cast<int>(layer) + 1);
+      }
+    }
+  }
+  require_result(dimensions.layers > 0 && dimensions.channels > 0 && dimensions.heads > 0 &&
+                     dimensions.head_size > 0 && dimensions.vocab > 0 && dimensions.ffn > 0,
+                 "could not infer model dimensions from quantized model");
+  require_result(dimensions.channels == dimensions.heads * dimensions.head_size, "C must equal H*N");
+  require_result(dimensions.head_size == 64, "current kernels require head size 64");
+  return dimensions;
+}
+
+void load_quantized_tensor(
+    const llm_infer::QuantizedArchive& archive,
+    const llm_infer::QuantizedTensorRecord& rec,
+    GpuTensor* tensor) {
+  std::vector<std::uint8_t> data;
+  require_result(archive.read_data(rec, &data).ok_status(), "read quantized tensor " + rec.name);
+  if (rec.dtype == llm_infer::QuantizedDType::kInt8) {
+    tensor->dtype = GpuTensor::DType::I8;
+    tensor->i8.resize(static_cast<std::size_t>(rec.numel), "alloc int8 weight");
+    tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int8 scales");
+    std::vector<std::uint16_t> scales;
+    require_result(archive.read_scales(rec, &scales).ok_status(), "read quantized scales");
+    const bool transpose = should_transpose_like_v3a(rec.name);
+    if (transpose) {
+      DeviceBuffer<std::int8_t> staging;
+      staging.resize(static_cast<std::size_t>(rec.numel), "alloc quantized int8 staging");
+      check_cuda(cudaMemcpy(staging.p, data.data(), data.size(), cudaMemcpyHostToDevice), "copy int8 weight staging");
+      rwkv7_v4_i8_transpose_launch(nullptr, staging.p, tensor->i8.p,
+                                    static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
+      check_cuda(cudaGetLastError(), "launch quantized int8 transpose");
+      check_cuda(cudaDeviceSynchronize(), "sync quantized int8 transpose");
+      tensor->i8_transposed = true;
+    } else {
+      DeviceBuffer<std::int8_t> staging;
+      staging.resize(static_cast<std::size_t>(rec.numel), "alloc quantized int8 staging");
+      check_cuda(cudaMemcpy(staging.p, data.data(), data.size(), cudaMemcpyHostToDevice), "copy int8 weight staging");
+      require_result(rec.shape.size() == 2, "packed int8 weight must be rank-2: " + rec.name);
+      const int compute_major = rwkv7_w8a16_device_info().compute_major;
+      if (compute_major >= 8) {
+        rwkv7_v4_i8_pack_launch(nullptr, staging.p, tensor->i8.p,
+                                static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
+        check_cuda(cudaGetLastError(), "launch quantized int8 pack");
+        check_cuda(cudaDeviceSynchronize(), "sync quantized int8 pack");
+        tensor->i8_packed = true;
+      } else {
+        check_cuda(cudaMemcpy(tensor->i8.p, staging.p, data.size(), cudaMemcpyDeviceToDevice),
+                   "copy raw int8 weight");
+      }
+    }
+    check_cuda(cudaMemcpy(tensor->scale.p, scales.data(), scales.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice),
+               "copy int8 scales");
+    return;
+  }
+  tensor->dtype = GpuTensor::DType::F16;
+  tensor->f16.resize(static_cast<std::size_t>(rec.numel), "alloc floating weight");
+  DeviceBuffer<std::uint16_t> staging;
+  staging.resize(static_cast<std::size_t>(rec.numel), "alloc quantized staging");
+  check_cuda(cudaMemcpy(staging.p, data.data(), data.size(), cudaMemcpyHostToDevice), "copy floating weight");
+  const bool transpose = should_transpose_like_v3a(rec.name);
+  if (rec.dtype == llm_infer::QuantizedDType::kFloat16 && transpose) {
+    rwkv7_v4_f16_transpose_launch(nullptr, staging.p, tensor->f16.p,
+                                   static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
+  } else if (rec.dtype == llm_infer::QuantizedDType::kFloat16) {
+    check_cuda(cudaMemcpy(tensor->f16.p, staging.p, data.size(), cudaMemcpyDeviceToDevice),
+               "copy quantized f16 weight");
+  } else if (transpose) {
+    rwkv7_v4_bf16_to_f16_transpose_launch(nullptr, staging.p, tensor->f16.p,
+                                           static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
+  } else {
+    rwkv7_v4_bf16_to_f16_launch(nullptr, staging.p, tensor->f16.p, static_cast<long long>(rec.numel));
+  }
+  check_cuda(cudaGetLastError(), "preprocess quantized floating weight");
+  check_cuda(cudaDeviceSynchronize(), "sync quantized floating weight");
+}
+
+CudaWeights load_quantized_model_weights(
+    const ModelDims& dims,
+    const llm_infer::QuantizedArchive& archive) {
+  CudaWeights weights;
+  weights.dims = dims;
+  std::unordered_map<std::string, const llm_infer::QuantizedTensorRecord*> by_name;
+  for (const auto& rec : archive.records()) by_name.emplace(rec.name, &rec);
+  auto allocate = [&](const std::string& key, bool required) {
+    const auto it = by_name.find(key);
+    if (it == by_name.end()) {
+      if (required) {
+        std::cerr << "error: quantized model missing tensor: " << key << "\n";
+        std::exit(1);
+      }
+      return;
+    }
+    const auto& rec = *it->second;
+    auto tensor = std::make_unique<GpuTensor>();
+    tensor->name = rec.name;
+    tensor->shape = rec.shape;
+    if (should_transpose_like_v3a(rec.name)) {
+      tensor->shape = {rec.shape[1], rec.shape[0]};
+    }
+    tensor->dtype = rec.dtype == llm_infer::QuantizedDType::kInt8 ? GpuTensor::DType::I8 : GpuTensor::DType::F16;
+    if (tensor->is_int8()) {
+      tensor->i8.resize(static_cast<std::size_t>(rec.numel), "alloc int8 tensor");
+      tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int8 tensor scales");
+    } else {
+      tensor->f16.resize(static_cast<std::size_t>(rec.numel), "alloc quantized f16 tensor");
+    }
+    weights.tensors.emplace(key, std::move(tensor));
+  };
+  auto upload = [&](const std::string& key) {
+    const auto it = by_name.find(key);
+    if (it == by_name.end()) {
+      std::cerr << "error: quantized model missing tensor during upload: " << key << "\n";
+      std::exit(1);
+    }
+    load_quantized_tensor(archive, *it->second, weights.require_mutable(key));
+  };
+  for (const char* key : {"ln_out.weight", "ln_out.bias", "head.weight"}) allocate(key, true);
+  for (const char* key : {"ln_out.weight", "ln_out.bias", "head.weight"}) upload(key);
+  for (int layer = 0; layer < dims.layers; ++layer) {
+    for_each_layer_source_tensor(layer, [&](const std::string& key) { allocate(key, true); });
+    for_each_layer_source_tensor(layer, upload);
+    for_each_layer_t_copy(layer, [&](const std::string& key) { weights.allocate_t_copy(key); });
+    for_each_layer_t_copy(layer, [&](const std::string& key) { weights.launch_t_copy(key); });
+    check_cuda(cudaDeviceSynchronize(), "sync quantized layer load");
+    weights.layers.push_back(weights.layer_view(layer));
+  }
+  weights.build_global_view();
+  build_cpu_emb_ln0_f16_quantized(weights, dims, archive);
+  std::cout << "load_model quantized done tensors=" << weights.tensors.size()
+            << " gpu_mib=" << mib(weights.bytes()) << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << "\n";
+  if (std::getenv("RWKV_CMIX_STATS") != nullptr) weights.cmix_stats.initialize(dims.layers);
   return weights;
 }
 
@@ -714,10 +1008,24 @@ void linear_orig_layout_launch(
     int K,
     int N,
     const half* x,
-    const half* weight_orig,
+    const GpuTensor* weight_tensor,
     void* workspace,
     std::size_t workspace_bytes,
     half* y) {
+  if (weight_tensor == nullptr) {
+    std::cerr << "error: null linear weight\n";
+    std::exit(1);
+  }
+  if (weight_tensor->is_int8()) {
+    rwkv7_w8a16_linear_launch(
+        stream, M, K, N, x, weight_tensor->i8.p,
+        reinterpret_cast<const half*>(weight_tensor->scale.p),
+        weight_tensor->i8_packed ? W8BLayout::PackedNK
+                                 : (weight_tensor->i8_transposed ? W8BLayout::KN : W8BLayout::NK),
+        y, workspace, workspace_bytes);
+    return;
+  }
+  const half* weight_orig = hp(weight_tensor);
   if (path.rows == 1) {
     if (group == LinearGroup::FfnKey) {
       if (K == 2560) {
@@ -1024,6 +1332,12 @@ std::string basename_without_extension(const std::string& path) {
 }
 
 CudaWeights load_backend_weights(const std::string& model_path, bool chunk_load) {
+  if (llm_infer::is_quantized_archive(model_path)) {
+    auto archive = llm_infer::QuantizedArchive::open(model_path);
+    require_result(archive.ok(), archive.status().message());
+    const ModelDims dims = infer_quantized_model_dims(archive.value());
+    return load_quantized_model_weights(dims, archive.value());
+  }
   std::cout << "load_model mode=" << (chunk_load ? "chunked" : "whole-file");
   if (chunk_load) {
     std::cout << " chunk_mib=" << mib(kWeightLoadChunkBytes)
@@ -1043,10 +1357,483 @@ CudaWeights load_backend_weights(const std::string& model_path, bool chunk_load)
   return load_model_weights(dims, archive.value(), by_name);
 }
 
+struct W8A16TuneShape {
+  std::string name;
+  int K = 0;
+  int N = 0;
+  W8BLayout layout = W8BLayout::NK;
+  const GpuTensor* tensor = nullptr;
+};
+
+struct W8A16TuneRecord {
+  int K = 0;
+  int N = 0;
+  W8BLayout layout = W8BLayout::NK;
+  int m_bucket = 0;
+  int split_k = 0;
+};
+
+struct W8A16TuneCacheData {
+  std::string gpu_name;
+  std::string model_name;
+  ModelDims dims;
+  int sparse_max_rows = 0;
+  std::vector<int> sparse_max_rows_by_layer;
+  std::vector<W8A16TuneRecord> records;
+};
+
+std::vector<int> measured_cmix_sparse_rows_by_layer(const ModelDims& dims) {
+  std::vector<int> rows(static_cast<std::size_t>(dims.layers), kDefaultQuantizedCmixSparseMaxRows);
+  if (dims.layers == 32 && dims.channels == 4096 && dims.ffn == 16384) {
+    static constexpr int measured[] = {
+        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 32, 16,
+        16, 16, 16, 16, 16, 16, 16, 32, 16, 64, 64, 64, 64, 32, 32, 16};
+    rows.assign(std::begin(measured), std::end(measured));
+  }
+  return rows;
+}
+
+W8BLayout w8a16_layout(const GpuTensor* tensor) {
+  return tensor->i8_packed ? W8BLayout::PackedNK
+                           : (tensor->i8_transposed ? W8BLayout::KN : W8BLayout::NK);
+}
+
+const char* w8a16_layout_name(W8BLayout layout) {
+  switch (layout) {
+    case W8BLayout::NK: return "NK";
+    case W8BLayout::KN: return "KN";
+    case W8BLayout::PackedNK: return "PackedNK";
+  }
+  return "unknown";
+}
+
+void add_w8a16_tune_shape(
+    std::vector<W8A16TuneShape>& shapes,
+    const std::string& name,
+    int K,
+    int N,
+    const GpuTensor* tensor) {
+  if (tensor == nullptr || !tensor->is_int8()) return;
+  const W8BLayout layout = w8a16_layout(tensor);
+  for (const auto& shape : shapes) {
+    if (shape.K == K && shape.N == N && shape.layout == layout) return;
+  }
+  shapes.push_back({name, K, N, layout, tensor});
+}
+
+std::vector<W8A16TuneShape> collect_w8a16_tune_shapes(const CudaWeights& weights) {
+  std::vector<W8A16TuneShape> shapes;
+  for (std::size_t layer = 0; layer < weights.layers.size(); ++layer) {
+    const LayerWeights& w = weights.layers[layer];
+    add_w8a16_tune_shape(shapes, "att_c2c", weights.dims.channels, weights.dims.channels,
+                         w.att_receptance_w);
+    add_w8a16_tune_shape(shapes, "ffn_key", weights.dims.channels, weights.dims.ffn,
+                         w.ffn_key_w);
+    add_w8a16_tune_shape(shapes, "ffn_value_rawkn", weights.dims.ffn, weights.dims.channels,
+                         w.ffn_value_w);
+  }
+  add_w8a16_tune_shape(shapes, "head", weights.dims.channels, weights.dims.vocab, weights.head_w);
+  return shapes;
+}
+
+std::filesystem::path default_w8a16_tune_cache(
+    const std::string& model_path,
+    const std::string& gpu_name,
+    const std::string& cache_directory) {
+  std::string gpu_file = gpu_name;
+  for (char& value : gpu_file) {
+    if (!(std::isalnum(static_cast<unsigned char>(value)) || value == '-' || value == '_')) value = '_';
+  }
+  if (gpu_file.empty()) gpu_file = "gpu";
+  const std::filesystem::path path(model_path);
+  const std::filesystem::path directory = cache_directory.empty()
+      ? std::filesystem::current_path()
+      : std::filesystem::path(cache_directory);
+  return directory / (path.stem().string() + "." + gpu_file + ".w8a16.tune");
+}
+
+bool same_model_dims(const ModelDims& lhs, const ModelDims& rhs) {
+  return lhs.layers == rhs.layers && lhs.channels == rhs.channels && lhs.heads == rhs.heads &&
+         lhs.head_size == rhs.head_size && lhs.vocab == rhs.vocab && lhs.ffn == rhs.ffn;
+}
+
+bool load_w8a16_tune_cache(
+    const std::filesystem::path& path,
+    const std::string& model_name,
+    const ModelDims& dims,
+    const std::string& gpu_name,
+    const std::vector<W8A16TuneShape>& shapes,
+    W8A16TuneCacheData* cache) {
+  std::ifstream input(path);
+  if (!input) return false;
+  std::string magic;
+  input >> magic;
+  if (magic != "rwkv_w8a16_tune_v1") return false;
+  int tune_version = -1;
+  std::string key;
+  while (input >> key) {
+    if (key == "tune_version") {
+      input >> tune_version;
+    } else if (key == "gpu") {
+      input >> std::quoted(cache->gpu_name);
+    } else if (key == "model") {
+      input >> std::quoted(cache->model_name);
+    } else if (key == "dims") {
+      input >> cache->dims.layers >> cache->dims.channels >> cache->dims.heads >>
+          cache->dims.head_size >> cache->dims.vocab >> cache->dims.ffn;
+    } else if (key == "sparse_max_rows") {
+      input >> cache->sparse_max_rows;
+    } else if (key == "sparse_layer_rows") {
+      int layer = -1;
+      int rows = -1;
+      input >> layer >> rows;
+      if (layer < 0 || layer >= dims.layers || rows < 0 || rows > 64) return false;
+      if (cache->sparse_max_rows_by_layer.empty()) {
+        cache->sparse_max_rows_by_layer.assign(static_cast<std::size_t>(dims.layers), -1);
+      }
+      cache->sparse_max_rows_by_layer[static_cast<std::size_t>(layer)] = rows;
+    } else if (key == "split") {
+      int layout = 0;
+      W8A16TuneRecord record;
+      input >> record.K >> record.N >> layout >> record.m_bucket >> record.split_k;
+      record.layout = static_cast<W8BLayout>(layout);
+      cache->records.push_back(record);
+    } else {
+      std::string ignored;
+      std::getline(input, ignored);
+    }
+  }
+  if (!input.good() && !input.eof()) return false;
+  if (tune_version != kTuneVersion || cache->gpu_name != gpu_name || cache->model_name != model_name ||
+      !same_model_dims(cache->dims, dims) || cache->sparse_max_rows < 0 ||
+      cache->sparse_max_rows > 64) return false;
+  if (!cache->sparse_max_rows_by_layer.empty()) {
+    if (cache->sparse_max_rows_by_layer.size() != static_cast<std::size_t>(dims.layers)) return false;
+    for (int rows : cache->sparse_max_rows_by_layer) {
+      if (rows < 0 || rows > 64) return false;
+    }
+  }
+  for (const auto& shape : shapes) {
+    for (int m : {8, 16, 32, 64, 128}) {
+      bool found = false;
+      for (const auto& record : cache->records) {
+        if (record.K == shape.K && record.N == shape.N && record.layout == shape.layout &&
+            record.m_bucket == m && record.split_k >= 1 && record.split_k <= 4) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) return false;
+    }
+  }
+  return true;
+}
+
+void save_w8a16_tune_cache(const std::filesystem::path& path, const W8A16TuneCacheData& cache) {
+  if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+  const std::filesystem::path temp_path = path.string() + ".tmp";
+  std::ofstream output(temp_path, std::ios::trunc);
+  if (!output) {
+    std::cerr << "warning: cannot write W8A16 tune cache: " << temp_path << "\n";
+    return;
+  }
+  output << "rwkv_w8a16_tune_v1\n"
+         << "tune_version " << kTuneVersion << "\n"
+         << "gpu " << std::quoted(cache.gpu_name) << "\n"
+         << "model " << std::quoted(cache.model_name) << "\n"
+         << "dims " << cache.dims.layers << ' ' << cache.dims.channels << ' '
+         << cache.dims.heads << ' ' << cache.dims.head_size << ' '
+         << cache.dims.vocab << ' ' << cache.dims.ffn << "\n"
+         << "sparse_max_rows " << cache.sparse_max_rows << "\n";
+  for (std::size_t layer = 0; layer < cache.sparse_max_rows_by_layer.size(); ++layer) {
+    output << "sparse_layer_rows " << layer << ' ' << cache.sparse_max_rows_by_layer[layer] << "\n";
+  }
+  for (const auto& record : cache.records) {
+    output << "split " << record.K << ' ' << record.N << ' '
+           << static_cast<int>(record.layout) << ' ' << record.m_bucket << ' '
+           << record.split_k << "\n";
+  }
+  output.flush();
+  if (!output) {
+    std::cerr << "warning: cannot flush W8A16 tune cache: " << temp_path << "\n";
+    output.close();
+    std::error_code remove_error;
+    std::filesystem::remove(temp_path, remove_error);
+    return;
+  }
+  output.close();
+  if (!output) {
+    std::cerr << "warning: cannot close W8A16 tune cache: " << temp_path << "\n";
+    std::error_code remove_error;
+    std::filesystem::remove(temp_path, remove_error);
+    return;
+  }
+  std::error_code rename_error;
+  std::filesystem::rename(temp_path, path, rename_error);
+  if (rename_error) {
+    std::cerr << "warning: cannot replace W8A16 tune cache " << path << ": "
+              << rename_error.message() << "\n";
+    std::error_code remove_error;
+    std::filesystem::remove(temp_path, remove_error);
+  }
+}
+
+double tune_linear_once(
+    cudaStream_t stream,
+    int M,
+    const W8A16TuneShape& shape,
+    const half* x,
+    half* y,
+    void* workspace,
+    std::size_t workspace_bytes,
+    int split_k) {
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  check_cuda(cudaEventCreate(&start), "create W8A16 tuning start event");
+  check_cuda(cudaEventCreate(&stop), "create W8A16 tuning stop event");
+  check_cuda(cudaEventRecord(start, stream), "record W8A16 tuning start");
+  rwkv7_w8a16_linear_launch(stream, M, shape.K, shape.N, x, shape.tensor->i8.p,
+                            reinterpret_cast<const half*>(shape.tensor->scale.p), shape.layout,
+                            y, workspace, workspace_bytes, split_k);
+  check_cuda(cudaGetLastError(), "launch W8A16 tuning timed linear");
+  check_cuda(cudaEventRecord(stop, stream), "record W8A16 tuning stop");
+  check_cuda(cudaEventSynchronize(stop), "sync W8A16 tuning stop");
+  float elapsed = 0.0f;
+  check_cuda(cudaEventElapsedTime(&elapsed, start, stop), "elapsed W8A16 tuning linear");
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  return elapsed;
+}
+
+double tune_linear_median(
+    cudaStream_t stream,
+    int M,
+    const W8A16TuneShape& shape,
+    const half* x,
+    half* y,
+    void* workspace,
+    std::size_t workspace_bytes,
+    int split_k) {
+  for (int warmup = 0; warmup < 1; ++warmup) {
+    rwkv7_w8a16_linear_launch(stream, M, shape.K, shape.N, x, shape.tensor->i8.p,
+                              reinterpret_cast<const half*>(shape.tensor->scale.p), shape.layout,
+                              y, workspace, workspace_bytes, split_k);
+  }
+  check_cuda(cudaStreamSynchronize(stream), "sync W8A16 tuning warmup");
+  std::array<double, 5> samples{};
+  for (double& sample : samples) {
+    sample = tune_linear_once(stream, M, shape, x, y, workspace, workspace_bytes, split_k);
+  }
+  std::sort(samples.begin(), samples.end());
+  return samples[samples.size() / 2];
+}
+
+W8A16TuneCacheData tune_w8a16_model(
+    const CudaWeights& weights,
+    const std::vector<W8A16TuneShape>& shapes,
+    const std::string& model_name,
+    const std::string& gpu_name) {
+  W8A16TuneCacheData cache;
+  cache.gpu_name = gpu_name;
+  cache.model_name = model_name;
+  cache.dims = weights.dims;
+  rwkv7_w8a16_tuning_reset();
+  cudaStream_t stream = nullptr;
+  check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create W8A16 tuning stream");
+  DeviceBuffer<unsigned char> workspace;
+  workspace.resize(static_cast<std::size_t>(128) << 20, "alloc W8A16 tuning workspace");
+  DeviceBuffer<half> x;
+  DeviceBuffer<half> y;
+  std::mt19937 rng(1380668983u);
+  for (const auto& shape : shapes) {
+    for (int M : {8, 16, 32, 64, 128}) {
+      x.resize(static_cast<std::size_t>(M) * shape.K, "alloc W8A16 tuning x");
+      y.resize(static_cast<std::size_t>(M) * shape.N, "alloc W8A16 tuning y");
+      std::vector<half> host_x(static_cast<std::size_t>(M) * shape.K);
+      for (half& value : host_x) {
+        value = __float2half(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 1000.0f);
+      }
+      check_cuda(cudaMemcpyAsync(x.p, host_x.data(), host_x.size() * sizeof(half),
+                                 cudaMemcpyHostToDevice, stream), "copy W8A16 tuning x");
+      check_cuda(cudaStreamSynchronize(stream), "sync W8A16 tuning x");
+      double best_ms = std::numeric_limits<double>::infinity();
+      int best_split = 1;
+      for (int split_k : {1, 2, 4}) {
+        const double elapsed = tune_linear_median(stream, M, shape, x.p, y.p,
+                                                  workspace.p, workspace.n, split_k);
+        std::cout << "w8a16_tune linear=" << shape.name << " K=" << shape.K
+                  << " N=" << shape.N << " layout=" << w8a16_layout_name(shape.layout)
+                  << " M=" << M << " split_k=" << split_k << " ms=" << elapsed << "\n";
+        if (elapsed < best_ms) {
+          best_ms = elapsed;
+          best_split = split_k;
+        }
+      }
+      rwkv7_w8a16_tuning_set(shape.K, shape.N, shape.layout, M, best_split);
+      cache.records.push_back({shape.K, shape.N, shape.layout, M, best_split});
+      std::cout << "w8a16_tune_selected linear=" << shape.name << " M=" << M
+                << " split_k=" << best_split << " ms=" << best_ms << "\n";
+    }
+  }
+  check_cuda(cudaStreamSynchronize(stream), "sync W8A16 tuning linear complete");
+  cudaStreamDestroy(stream);
+  return cache;
+}
+
+double tune_sparse_median(
+    cudaStream_t stream,
+    int rows,
+    int C,
+    int F,
+    const half* preact,
+    half* dense_input,
+    half* out,
+    const GpuTensor* value,
+    void* workspace,
+    std::size_t workspace_bytes,
+    bool sparse) {
+  for (int warmup = 0; warmup < 1; ++warmup) {
+    if (sparse) {
+      rwkv7_cmix_sparse_down_relu_rows_t512_i8_launch(
+          stream, rows, 1, C, F, preact, value->i8.p,
+          reinterpret_cast<const half*>(value->scale.p), out);
+    } else {
+      check_cuda(cudaMemcpyAsync(dense_input, preact,
+                                 static_cast<std::size_t>(rows) * F * sizeof(half),
+                                 cudaMemcpyDeviceToDevice, stream), "copy W8A16 dense tuning input");
+      rwkv7_relu_square_launch(stream, dense_input, dense_input,
+                               static_cast<long long>(rows) * F);
+      rwkv7_w8a16_linear_launch(
+          stream, rows, F, C, dense_input, value->i8.p,
+          reinterpret_cast<const half*>(value->scale.p), w8a16_layout(value), out,
+          workspace, workspace_bytes);
+    }
+  }
+  check_cuda(cudaStreamSynchronize(stream), "sync cmix tuning warmup");
+  std::array<double, 5> samples{};
+  for (double& sample : samples) {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    check_cuda(cudaEventCreate(&start), "create cmix tuning start event");
+    check_cuda(cudaEventCreate(&stop), "create cmix tuning stop event");
+    check_cuda(cudaEventRecord(start, stream), "record cmix tuning start");
+    if (sparse) {
+      rwkv7_cmix_sparse_down_relu_rows_t512_i8_launch(
+          stream, rows, 1, C, F, preact, value->i8.p,
+          reinterpret_cast<const half*>(value->scale.p), out);
+    } else {
+      check_cuda(cudaMemcpyAsync(dense_input, preact,
+                                 static_cast<std::size_t>(rows) * F * sizeof(half),
+                                 cudaMemcpyDeviceToDevice, stream), "copy W8A16 dense tuning input");
+      rwkv7_relu_square_launch(stream, dense_input, dense_input,
+                               static_cast<long long>(rows) * F);
+      rwkv7_w8a16_linear_launch(
+          stream, rows, F, C, dense_input, value->i8.p,
+          reinterpret_cast<const half*>(value->scale.p), w8a16_layout(value), out,
+          workspace, workspace_bytes);
+    }
+    check_cuda(cudaGetLastError(), "launch cmix tuning path");
+    check_cuda(cudaEventRecord(stop, stream), "record cmix tuning stop");
+    check_cuda(cudaEventSynchronize(stop), "sync cmix tuning stop");
+    float elapsed = 0.0f;
+    check_cuda(cudaEventElapsedTime(&elapsed, start, stop), "elapsed cmix tuning path");
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    sample = elapsed;
+  }
+  std::sort(samples.begin(), samples.end());
+  return samples[samples.size() / 2];
+}
+
+int tune_cmix_sparse_threshold(
+    const W8A16TuneShape& value_shape) {
+  const int C = value_shape.N;
+  const int F = value_shape.K;
+  cudaStream_t stream = nullptr;
+  check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create cmix tuning stream");
+  DeviceBuffer<half> preact;
+  DeviceBuffer<half> dense_input;
+  DeviceBuffer<half> out;
+  DeviceBuffer<unsigned char> workspace;
+  workspace.resize(static_cast<std::size_t>(128) << 20, "alloc cmix tuning workspace");
+  int threshold = 0;
+  bool sparse_wins_for_all_smaller_rows = true;
+  for (int rows : {16, 32, 64}) {
+    preact.resize(static_cast<std::size_t>(rows) * F, "alloc cmix tuning preact");
+    dense_input.resize(static_cast<std::size_t>(rows) * F, "alloc cmix tuning dense input");
+    out.resize(static_cast<std::size_t>(rows) * C, "alloc cmix tuning output");
+    std::vector<half> host(static_cast<std::size_t>(rows) * F);
+    for (std::size_t index = 0; index < host.size(); ++index) {
+      const bool nonzero = (index % 20) < 3;
+      host[index] = __float2half(nonzero ? 0.25f : -0.25f);
+    }
+    check_cuda(cudaMemcpy(preact.p, host.data(), host.size() * sizeof(half), cudaMemcpyHostToDevice),
+               "copy cmix tuning preact");
+    const double sparse_ms = tune_sparse_median(
+        stream, rows, C, F, preact.p, dense_input.p, out.p, value_shape.tensor,
+        workspace.p, workspace.n, true);
+    const double dense_ms = tune_sparse_median(
+        stream, rows, C, F, preact.p, dense_input.p, out.p, value_shape.tensor,
+        workspace.p, workspace.n, false);
+    std::cout << "w8a16_tune cmix rows=" << rows << " sparse_ms=" << sparse_ms
+              << " dense_ms=" << dense_ms << "\n";
+    if (sparse_wins_for_all_smaller_rows && sparse_ms < dense_ms) threshold = rows;
+    else sparse_wins_for_all_smaller_rows = false;
+  }
+  cudaStreamDestroy(stream);
+  return threshold == 0 ? kDefaultQuantizedCmixSparseMaxRows : threshold;
+}
+
+void configure_w8a16_tuning(
+    CudaWeights& weights,
+    const std::string& model_path,
+    const std::string& requested_cache,
+    const std::string& default_cache_directory,
+    bool retune) {
+  const std::vector<W8A16TuneShape> shapes = collect_w8a16_tune_shapes(weights);
+  if (shapes.empty()) return;
+  const W8A16DeviceInfo device = rwkv7_w8a16_device_info();
+  const std::string gpu_name(device.name);
+  const std::filesystem::path cache_path = requested_cache.empty()
+      ? default_w8a16_tune_cache(model_path, gpu_name, default_cache_directory)
+      : std::filesystem::path(requested_cache);
+  const std::string model_name = basename_without_extension(model_path);
+  W8A16TuneCacheData cache;
+  if (!retune && load_w8a16_tune_cache(cache_path, model_name, weights.dims, gpu_name, shapes, &cache)) {
+    rwkv7_w8a16_tuning_reset();
+    for (const auto& record : cache.records) {
+      rwkv7_w8a16_tuning_set(record.K, record.N, record.layout, record.m_bucket, record.split_k);
+    }
+    weights.cmix_sparse_max_rows = cache.sparse_max_rows;
+    weights.cmix_sparse_max_rows_by_layer = cache.sparse_max_rows_by_layer.empty()
+        ? measured_cmix_sparse_rows_by_layer(weights.dims)
+        : cache.sparse_max_rows_by_layer;
+    std::cout << "w8a16_tune_cache hit path=" << cache_path
+              << " gpu=\"" << gpu_name << "\" sparse_max_rows="
+              << weights.cmix_sparse_max_rows << "\n";
+    return;
+  }
+  std::cout << "w8a16_tune start path=" << cache_path << " gpu=\"" << gpu_name << "\"\n";
+  cache = tune_w8a16_model(weights, shapes, model_name, gpu_name);
+  const auto value_it = std::find_if(shapes.begin(), shapes.end(), [](const W8A16TuneShape& shape) {
+    return shape.name == "ffn_value_rawkn";
+  });
+  cache.sparse_max_rows = value_it == shapes.end()
+      ? kDefaultQuantizedCmixSparseMaxRows
+      : tune_cmix_sparse_threshold(*value_it);
+  cache.sparse_max_rows_by_layer = measured_cmix_sparse_rows_by_layer(weights.dims);
+  weights.cmix_sparse_max_rows = cache.sparse_max_rows;
+  weights.cmix_sparse_max_rows_by_layer = cache.sparse_max_rows_by_layer;
+  save_w8a16_tune_cache(cache_path, cache);
+  std::cout << "w8a16_tune complete path=" << cache_path
+            << " sparse_max_rows=" << weights.cmix_sparse_max_rows << "\n";
+}
+
 void run_backend_forward(
     const CudaWeights& weights,
     const std::vector<std::vector<int64_t>>& token_batches,
     bool use_wkv32,
+    const std::string& cmix_sparse,
     GenerationState& state,
     DeviceLogits& out) {
   const auto& dims = weights.dims;
@@ -1075,8 +1862,9 @@ void run_backend_forward(
   run.B = B;
   run.T = T;
   run.wkv32 = use_wkv32;
+  run.cmix_sparse = cmix_sparse;
   const int C = dims.channels;
-  const PathConfig path = select_path(run, C);
+  PathConfig path = select_path(run, C);
   const int rows = B * T;
   const int output_rows = B;
   const int H = dims.heads;
@@ -1084,19 +1872,18 @@ void run_backend_forward(
   const int V = dims.vocab;
   const int F = dims.ffn;
 
-  HalfArena arena;
-  arena.allocate(static_cast<std::size_t>(rows) * C * 31 + static_cast<std::size_t>(output_rows) * C +
-                 static_cast<std::size_t>(rows) * F +
-                 static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * V);
-
-  DeviceBuffer<unsigned char> lt_workspace;
-  lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc backend cublasLt workspace");
-
-  cudaStream_t stream = nullptr;
-  check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create backend stream");
+  static thread_local ForwardResources resources;
+  resources.arena.allocate(static_cast<std::size_t>(rows) * C * 31 + static_cast<std::size_t>(output_rows) * C +
+                           static_cast<std::size_t>(rows) * F +
+                           static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * V);
+  resources.lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc backend cublasLt workspace");
+  resources.ensure_stream();
+  HalfArena& arena = resources.arena;
+  DeviceBuffer<unsigned char>& lt_workspace = resources.lt_workspace;
+  cudaStream_t stream = resources.stream;
+  BackendProfile profiler(std::getenv("RWKV_PROFILE") != nullptr);
 
   if (weights.cpu_emb_ln0_f16.size() != static_cast<std::size_t>(V) * C) {
-    check_cuda(cudaStreamDestroy(stream), "destroy backend stream");
     throw std::runtime_error("cpu emb+ln0 table is not ready");
   }
 
@@ -1105,7 +1892,6 @@ void run_backend_forward(
     for (int t = 0; t < T; ++t) {
       const int token_id = static_cast<int>(token_batches[static_cast<size_t>(b)][static_cast<size_t>(t)]);
       if (token_id < 0 || token_id >= V) {
-        check_cuda(cudaStreamDestroy(stream), "destroy backend stream");
         throw std::runtime_error("token id out of range");
       }
       const std::size_t row = static_cast<std::size_t>(b) * T + t;
@@ -1155,8 +1941,10 @@ void run_backend_forward(
   check_cuda(cudaMemcpyAsync(x0, host_x.data(), host_x.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice, stream),
              "copy backend emb rows");
 
+  const int profile_ln1 = profiler.begin(stream, "layer_norm_ln1");
   rwkv7_v3a_layer_norm_f16_launch(
       stream, rows, C, x0, hp(weights.layers[0].ln1_w), hp(weights.layers[0].ln1_b), xx0, kLnEps);
+  profiler.end(stream, profile_ln1);
   half* x_cur = x0;
   half* xx_cur = xx0;
   half* x_next = x1;
@@ -1170,7 +1958,6 @@ void run_backend_forward(
     const int Rg = static_cast<int>(w.att_g1_t->shape[0]);
     const int Rv = (layer == 0) ? 0 : static_cast<int>(w.att_v1_t->shape[0]);
     if (Rw > kLowrankMax || Ra > kLowrankMax || Rg > kLowrankMax || Rv > kLowrankMax) {
-      check_cuda(cudaStreamDestroy(stream), "destroy backend stream");
       throw std::runtime_error("lowrank exceeds arena max");
     }
 
@@ -1185,6 +1972,7 @@ void run_backend_forward(
     }
 
     if (!pre_mix_ready) {
+      const int profile_tmix = profiler.begin(stream, "tmix_mix6");
       rwkv7_tmix_mix6_launch(
           stream,
           B,
@@ -1204,16 +1992,24 @@ void run_backend_forward(
           xv,
           xa,
           xg);
+      profiler.end(stream, profile_tmix);
     } else {
       pre_mix_ready = false;
     }
 
-    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xr, hp(w.att_receptance_w), lt_workspace.p, lt_workspace.n, r);
-    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xk, hp(w.att_key_w), lt_workspace.p, lt_workspace.n, k);
-    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xv, hp(w.att_value_w), lt_workspace.p, lt_workspace.n, v_base);
+    const int profile_att_receptance = profiler.begin(stream, "att_receptance");
+    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xr, w.att_receptance_w, lt_workspace.p, lt_workspace.n, r);
+    profiler.end(stream, profile_att_receptance);
+    const int profile_att_key = profiler.begin(stream, "att_key");
+    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xk, w.att_key_w, lt_workspace.p, lt_workspace.n, k);
+    profiler.end(stream, profile_att_key);
+    const int profile_att_value = profiler.begin(stream, "att_value");
+    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xv, w.att_value_w, lt_workspace.p, lt_workspace.n, v_base);
+    profiler.end(stream, profile_att_value);
     half* v_use = v_base;
     bool v_done = false;
 
+    const int profile_att_lowrank = profiler.begin(stream, "att_lowrank");
     if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
       rwkv7_v3a_linear_wagv_rank_in_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, xw, xa, xg, xv,
@@ -1226,7 +2022,9 @@ void run_backend_forward(
       linear_rank_in_launch(stream, rows, C, Ra, xa, hp(w.att_a1), hp(w.att_a1_t), a1);
       linear_rank_in_launch(stream, rows, C, Rg, xg, hp(w.att_g1), hp(w.att_g1_t), g1);
     }
+    profiler.end(stream, profile_att_lowrank);
 
+    const int profile_att_lowrank_out = profiler.begin(stream, "att_lowrank_out");
     if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
       rwkv7_v3a_linear_wagv_rank_out_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, w1, a1, g1, v1,
@@ -1258,8 +2056,12 @@ void run_backend_forward(
       }
       v_use = v_out;
     }
+    profiler.end(stream, profile_att_lowrank_out);
 
+    const int profile_kk_gate = profiler.begin(stream, "tmix_kk_a_gate");
     rwkv7_tmix_kk_a_gate_launch(stream, B, T, C, H, k, hp(w.att_k_k), hp(w.att_a0), a12, hp(w.att_k_a), k2, neg_kk, kka);
+    profiler.end(stream, profile_kk_gate);
+    const int profile_wkv = profiler.begin(stream, "wkv");
     if (use_wkv32) {
       rwkv7_add_vec_launch(stream, C, w12, hp(w.att_w0), w_raw, row_elems);
       rwkv7_wkv_fp32io16_launch(stream, B, T, C, H, 0, layer_state32, r, w_raw, k2, v_use, neg_kk, kka, y);
@@ -1269,9 +2071,15 @@ void run_backend_forward(
       rwkv7_add_vec_launch(stream, C, w12, hp(w.att_w0), w_raw, row_elems);
       rwkv7_wkv_fp16_seq_launch(stream, B, T, C, H, layer_state16, r, w_raw, k2, v_use, neg_kk, kka, y, state.elapsed.p);
     }
+    profiler.end(stream, profile_wkv);
 
+    const int profile_att_post = profiler.begin(stream, "tmix_lnx_rkvres_xg");
     rwkv7_tmix_lnx_rkvres_xg_launch(stream, B, T, C, H, y, r, k2, v_use, hp(w.att_r_k), hp(w.att_ln_x_w), hp(w.att_ln_x_b), g, y2);
-    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, hp(w.att_output_w), lt_workspace.p, lt_workspace.n, att_out);
+    profiler.end(stream, profile_att_post);
+    const int profile_att_output = profiler.begin(stream, "att_output");
+    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, w.att_output_w, lt_workspace.p, lt_workspace.n, att_out);
+    profiler.end(stream, profile_att_output);
+    const int profile_ffn_mix = profiler.begin(stream, "ffn_mix");
     if (T == 1) {
       rwkv7_v3a_add_layer_norm_cmix_mix_f16_launch(
           stream, rows, C, x_cur, att_out, shift1, hp(w.ln2_w), hp(w.ln2_b), hp(w.ffn_x_k), x_after_att, mixed, kLnEps);
@@ -1280,48 +2088,103 @@ void run_backend_forward(
           stream, rows, C, x_cur, att_out, hp(w.ln2_w), hp(w.ln2_b), x_after_att, ln2_out, kLnEps);
       rwkv7_cmix_mix_launch(stream, B, T, C, ln2_out, shift1, hp(w.ffn_x_k), mixed);
     }
+    profiler.end(stream, profile_ffn_mix);
 
-    linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, F, mixed, hp(w.ffn_key_w), lt_workspace.p, lt_workspace.n, hid);
-    if (path.cmix == CmixMode::NoFcOne) {
-      rwkv7_cmix_sparse_down_relu_one_launch(stream, C, F, hid, hp(w.ffn_value_w), cmix_out);
-    } else if (path.cmix == CmixMode::NoFcRows2) {
-      if (rows >= 8) {
-        rwkv7_cmix_sparse_down_relu_rows_t512_launch(stream, B, T, C, F, hid, hp(w.ffn_value_w), cmix_out);
+    const int profile_ffn_key = profiler.begin(stream, "ffn_key");
+    linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, F, mixed, w.ffn_key_w, lt_workspace.p, lt_workspace.n, hid);
+    profiler.end(stream, profile_ffn_key);
+    if (weights.cmix_stats.enabled && T == 1) {
+      rwkv7_cmix_stats_relu2_launch(
+          stream, rows, F, hid, weights.cmix_stats.nonzero.p + layer,
+          weights.cmix_stats.total.p + layer, weights.cmix_stats.max_bits.p + layer);
+    }
+    const int layer_sparse_max_rows =
+        layer < static_cast<int>(weights.cmix_sparse_max_rows_by_layer.size())
+            ? weights.cmix_sparse_max_rows_by_layer[static_cast<std::size_t>(layer)]
+            : weights.cmix_sparse_max_rows;
+    const CmixMode cmix_mode =
+        run.cmix_sparse != "off" && path.cmix == CmixMode::Dense && w.ffn_value_w->is_int8() && C >= 4096 &&
+                rows <= layer_sparse_max_rows
+            ? CmixMode::NoFcRows2
+            : path.cmix;
+    const int profile_ffn_value = profiler.begin(stream, "ffn_value");
+    if (cmix_mode == CmixMode::NoFcOne) {
+      if (w.ffn_value_w->is_int8()) {
+        rwkv7_cmix_sparse_down_relu_one_i8_launch(
+            stream, C, F, hid, w.ffn_value_w->i8.p,
+            reinterpret_cast<const half*>(w.ffn_value_w->scale.p), cmix_out);
       } else {
-        rwkv7_cmix_sparse_down_relu_rows_launch(stream, B, T, C, F, hid, hp(w.ffn_value_w), cmix_out);
+        rwkv7_cmix_sparse_down_relu_one_launch(stream, C, F, hid, hp(w.ffn_value_w), cmix_out);
+      }
+    } else if (cmix_mode == CmixMode::NoFcRows2) {
+      if (rows >= 8) {
+        if (w.ffn_value_w->is_int8()) {
+          rwkv7_cmix_sparse_down_relu_rows_t512_i8_launch(
+              stream, B, T, C, F, hid, w.ffn_value_w->i8.p,
+              reinterpret_cast<const half*>(w.ffn_value_w->scale.p), cmix_out);
+        } else {
+          rwkv7_cmix_sparse_down_relu_rows_t512_launch(stream, B, T, C, F, hid, hp(w.ffn_value_w), cmix_out);
+        }
+      } else {
+        if (w.ffn_value_w->is_int8()) {
+          rwkv7_cmix_sparse_down_relu_rows_i8_launch(
+              stream, B, T, C, F, hid, w.ffn_value_w->i8.p,
+              reinterpret_cast<const half*>(w.ffn_value_w->scale.p), cmix_out);
+        } else {
+          rwkv7_cmix_sparse_down_relu_rows_launch(stream, B, T, C, F, hid, hp(w.ffn_value_w), cmix_out);
+        }
       }
     } else {
       rwkv7_relu_square_launch(stream, hid, hid, static_cast<long long>(rows) * F);
-      rwkv7_v3a_linear_f16_launch(stream, rows, F, C, hid, hp(w.ffn_value_w), cmix_out);
+      if (w.ffn_value_w->is_int8()) {
+        rwkv7_w8a16_linear_launch(
+            stream, rows, F, C, hid, w.ffn_value_w->i8.p,
+            reinterpret_cast<const half*>(w.ffn_value_w->scale.p),
+            w.ffn_value_w->i8_packed ? W8BLayout::PackedNK
+                                     : (w.ffn_value_w->i8_transposed ? W8BLayout::KN : W8BLayout::NK),
+            cmix_out, lt_workspace.p, lt_workspace.n);
+      } else {
+        rwkv7_v3a_linear_f16_launch(stream, rows, F, C, hid, hp(w.ffn_value_w), cmix_out);
+      }
     }
+    profiler.end(stream, profile_ffn_value);
 
     if (layer + 1 < dims.layers) {
       const LayerWeights& next = weights.layers[layer + 1];
       if (B == 1 && T == 1) {
         half* next_shift0 = state.shift.p + static_cast<std::size_t>(layer + 1) * 2 * B * C;
+        const int profile_next_mix = profiler.begin(stream, "layer_norm_tmix_mix6");
         rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
             stream, rows, C, x_after_att, cmix_out, next_shift0, hp(next.ln1_w), hp(next.ln1_b),
             hp(next.att_x_r), hp(next.att_x_w), hp(next.att_x_k), hp(next.att_x_v), hp(next.att_x_a), hp(next.att_x_g),
             x_next, xr, xw, xk, xv, xa, xg, kLnEps);
+        profiler.end(stream, profile_next_mix);
         xx_next = x_next;
         pre_mix_ready = true;
       } else {
+        const int profile_next_ln = profiler.begin(stream, "layer_norm_next");
         rwkv7_v3a_add_layer_norm_f16_launch(stream, rows, C, x_after_att, cmix_out, hp(next.ln1_w), hp(next.ln1_b), x_next, xx_next, kLnEps);
+        profiler.end(stream, profile_next_ln);
       }
       std::swap(x_cur, x_next);
       std::swap(xx_cur, xx_next);
     } else {
+      const int profile_last_ln = profiler.begin(stream, "layer_norm_last");
       rwkv7_v3a_add_last_layer_norm_f16_launch(
           stream, B, T, C, x_after_att, cmix_out, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, kLnEps);
+      profiler.end(stream, profile_last_ln);
     }
     check_cuda(cudaGetLastError(), "launch backend layer");
   }
 
+  const int profile_advance = profiler.begin(stream, "advance_elapsed");
   rwkv7_v3a_advance_i32_launch(stream, state.elapsed.p, T, B);
+  profiler.end(stream, profile_advance);
   PathConfig head_path;
   head_path.rows = output_rows;
   head_path.use_batched_rkv = false;
   head_path.cmix = CmixMode::Dense;
+  const int profile_head = profiler.begin(stream, "head");
   linear_orig_layout_launch(
       stream,
       head_path,
@@ -1330,39 +2193,104 @@ void run_backend_forward(
       C,
       V,
       final_x,
-      hp(weights.head_w),
+      weights.head_w,
       lt_workspace.p,
       lt_workspace.n,
       logits_f16);
+  profiler.end(stream, profile_head);
   check_cuda(cudaGetLastError(), "launch backend head");
   out.rows = output_rows;
   out.vocab_size = V;
   out.values.resize(static_cast<std::size_t>(output_rows) * V, "alloc backend logits f32");
+  const int profile_logits = profiler.begin(stream, "f16_to_f32_logits");
   rwkv7_v4_f16_to_f32_launch(stream, logits_f16, out.values.p, out.values.n);
+  profiler.end(stream, profile_logits);
   check_cuda(cudaGetLastError(), "launch backend logits f16->f32");
   check_cuda(cudaStreamSynchronize(stream), "sync backend stream");
-  check_cuda(cudaStreamDestroy(stream), "destroy backend stream");
+  profiler.report();
 }
 
 }  // namespace
 
 struct ModelBackend::Impl {
-  explicit Impl(std::string path, bool use_wkv32_, bool chunk_load_)
+  explicit Impl(std::string path, bool use_wkv32_, bool chunk_load_, std::string cmix_sparse_,
+                std::string tune_cache_, bool retune_, std::string tune_cache_directory_)
       : model_path(std::move(path)),
         model_name(basename_without_extension(model_path)),
         use_wkv32(use_wkv32_),
         chunk_load(chunk_load_),
-        weights(load_backend_weights(model_path, chunk_load)) {}
+        cmix_sparse(std::move(cmix_sparse_)),
+        tune_cache(std::move(tune_cache_)),
+        retune(retune_),
+        tune_cache_directory(std::move(tune_cache_directory_)),
+        weights(load_backend_weights(model_path, chunk_load)) {
+    configure_w8a16_tuning(weights, model_path, tune_cache, tune_cache_directory, retune);
+  }
+
+  ~Impl() {
+    if (!weights.cmix_stats.enabled) return;
+    std::vector<unsigned long long> nonzero(weights.dims.layers);
+    std::vector<unsigned long long> total(weights.dims.layers);
+    std::vector<unsigned int> max_bits(weights.dims.layers);
+    check_cuda(cudaMemcpy(nonzero.data(), weights.cmix_stats.nonzero.p,
+                          nonzero.size() * sizeof(nonzero.front()), cudaMemcpyDeviceToHost),
+               "copy cmix stats nonzero");
+    check_cuda(cudaMemcpy(total.data(), weights.cmix_stats.total.p,
+                          total.size() * sizeof(total.front()), cudaMemcpyDeviceToHost),
+               "copy cmix stats total");
+    check_cuda(cudaMemcpy(max_bits.data(), weights.cmix_stats.max_bits.p,
+                          max_bits.size() * sizeof(max_bits.front()), cudaMemcpyDeviceToHost),
+               "copy cmix stats max");
+    std::cout << "cmix_stats_begin\n";
+    for (int layer = 0; layer < weights.dims.layers; ++layer) {
+      const double ratio = total[layer] == 0
+                               ? 0.0
+                               : static_cast<double>(nonzero[layer]) / static_cast<double>(total[layer]);
+      float max_relu2 = 0.0f;
+      std::memcpy(&max_relu2, &max_bits[layer], sizeof(max_relu2));
+      std::cout << "cmix_stats layer=" << layer
+                << " decode_steps=" << (weights.dims.ffn == 0 ? 0 : total[layer] / weights.dims.ffn)
+                << " nonzero=" << nonzero[layer]
+                << " total=" << total[layer]
+                << " ratio=" << ratio
+                << " max_relu2=" << max_relu2;
+      const GpuTensor* value = weights.layers[static_cast<std::size_t>(layer)].ffn_value_w;
+      if (value != nullptr && value->is_int8() && value->scale.n > 0) {
+        std::vector<std::uint16_t> scales(value->scale.n);
+        check_cuda(cudaMemcpy(scales.data(), value->scale.p,
+                              scales.size() * sizeof(scales.front()), cudaMemcpyDeviceToHost),
+                   "copy cmix stats scales");
+        float min_scale = std::numeric_limits<float>::infinity();
+        for (std::uint16_t bits : scales) {
+          min_scale = std::min(min_scale, __half2float(*reinterpret_cast<const half*>(&bits)));
+        }
+        const double average_nnz = ratio * weights.dims.ffn;
+        const double overflow_est = min_scale > 0.0f
+                                        ? static_cast<double>(max_relu2) * average_nnz * 127.0 / min_scale
+                                        : std::numeric_limits<double>::infinity();
+        std::cout << " scale_min=" << min_scale << " overflow_est=" << overflow_est;
+      }
+      std::cout << "\n";
+    }
+    std::cout << "cmix_stats_end\n";
+  }
 
   std::string model_path;
   std::string model_name;
   bool use_wkv32 = false;
   bool chunk_load = false;
+  std::string cmix_sparse = "no-fc";
+  std::string tune_cache;
+  bool retune = false;
+  std::string tune_cache_directory;
   CudaWeights weights;
 };
 
-ModelBackend::ModelBackend(std::string model_path, bool use_wkv32, bool chunk_load)
-    : impl_(std::make_unique<Impl>(std::move(model_path), use_wkv32, chunk_load)) {}
+ModelBackend::ModelBackend(std::string model_path, bool use_wkv32, bool chunk_load, std::string cmix_sparse,
+                           std::string tune_cache, bool retune, std::string tune_cache_directory)
+    : impl_(std::make_unique<Impl>(std::move(model_path), use_wkv32, chunk_load,
+                                   std::move(cmix_sparse), std::move(tune_cache), retune,
+                                   std::move(tune_cache_directory))) {}
 
 ModelBackend::~ModelBackend() = default;
 
@@ -1403,7 +2331,7 @@ void ModelBackend::forward_prefill(
     const std::vector<std::vector<int64_t>>& token_batches,
     GenerationState& state,
     DeviceLogits& logits) const {
-  run_backend_forward(impl_->weights, token_batches, impl_->use_wkv32, state, logits);
+  run_backend_forward(impl_->weights, token_batches, impl_->use_wkv32, impl_->cmix_sparse, state, logits);
 }
 
 void ModelBackend::forward_decode(
@@ -1415,7 +2343,7 @@ void ModelBackend::forward_decode(
   for (int64_t token : token_batch) {
     batch.push_back({token});
   }
-  run_backend_forward(impl_->weights, batch, impl_->use_wkv32, state, logits);
+  run_backend_forward(impl_->weights, batch, impl_->use_wkv32, impl_->cmix_sparse, state, logits);
 }
 
 void ModelBackend::copy_state_slice(

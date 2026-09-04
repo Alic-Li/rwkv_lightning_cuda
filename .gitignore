@@ -16,6 +16,9 @@ rwkv_batch/
 bak/
 uploads/
 
+# Local scratch: design notes, benchmarks, experiment output
+tmp/
+
 # Local dependencies and large model files
 third_party/
 *.pth

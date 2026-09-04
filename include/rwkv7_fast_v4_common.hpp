@@ -135,13 +135,28 @@ struct HalfArena {
 };
 
 struct GpuTensor {
+  enum class DType {
+    F16,
+    I8,
+  };
+
   std::string name;
   std::vector<std::int64_t> shape;
+  DType dtype = DType::F16;
+  bool i8_transposed = false;
+  // Packed INT8 stores unsigned q+128 bytes in fragment order. The allocation
+  // remains int8_t so sparse/raw-KN paths keep their existing pointer type.
+  bool i8_packed = false;
   DeviceBuffer<std::uint16_t> f16;
+  DeviceBuffer<std::int8_t> i8;
+  DeviceBuffer<std::uint16_t> scale;
 
   std::size_t bytes() const {
-    return f16.n * sizeof(std::uint16_t);
+    return f16.n * sizeof(std::uint16_t) + i8.n * sizeof(std::int8_t) +
+           scale.n * sizeof(std::uint16_t);
   }
+
+  bool is_int8() const { return dtype == DType::I8; }
 };
 
 inline const half* hp(const GpuTensor* tensor) {

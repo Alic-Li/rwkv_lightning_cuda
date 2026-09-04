@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #include "rwkv7_fast_v4_kernels.cuh"
 
@@ -20,6 +22,33 @@ constexpr int FFN_TILE = 128;
 
 inline int64_t ceil_div(int64_t n, int64_t d) {
   return (n + d - 1) / d;
+}
+
+__global__ void i8_pack_kernel(
+    const std::int8_t* __restrict__ src_nk,
+    std::uint32_t* __restrict__ dst_words,
+    int N,
+    int K,
+    int words) {
+  const int word_index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (word_index >= words) return;
+  const int words_per_nt = (K / 16) * 8 * 32;
+  const int nt = word_index / words_per_nt;
+  int rem = word_index - nt * words_per_nt;
+  const int kt = rem / (8 * 32);
+  rem -= kt * 8 * 32;
+  const int ns = rem / 32;
+  const int lane = rem - ns * 32;
+  const int g = lane / 4;
+  const int r = lane & 3;
+  const int n = nt * 64 + ns * 8 + g;
+  const int k0 = kt * 16 + 2 * r;
+  const std::int8_t* row = src_nk + static_cast<std::int64_t>(n) * K;
+  const auto encode = [](std::int8_t value) -> std::uint32_t {
+    return static_cast<std::uint32_t>(static_cast<unsigned int>(static_cast<int>(value) + 128) & 0xffu);
+  };
+  dst_words[word_index] = encode(row[k0]) | (encode(row[k0 + 1]) << 8) |
+                          (encode(row[k0 + 8]) << 16) | (encode(row[k0 + 9]) << 24);
 }
 
 __device__ inline __half2 load_h2(const dtype* ptr) {
@@ -826,6 +855,328 @@ __global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_kernel
       acc);
 }
 
+__device__ __forceinline__ __half2 load_i8_pair_as_half2(
+    const std::int8_t* value_i8, std::int64_t index) {
+  const char2 q = *reinterpret_cast<const char2*>(value_i8 + index);
+  return __floats2half2_rn(static_cast<float>(q.x), static_cast<float>(q.y));
+}
+
+__device__ __forceinline__ float2 load_i8_pair_as_float2(
+    const std::int8_t* value_i8, std::int64_t index) {
+  const char2 q = *reinterpret_cast<const char2*>(value_i8 + index);
+  return make_float2(static_cast<float>(q.x), static_cast<float>(q.y));
+}
+
+__global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_relu_one_i8_kernel(
+    int C,
+    const dtype* __restrict__ preact,
+    const std::int8_t* __restrict__ value_i8,
+    const dtype* __restrict__ scale,
+    dtype* __restrict__ out) {
+  __shared__ __align__(256) __half vec_slice[FFN_TILE];
+  __shared__ __align__(256) int nnz_ids[FFN_TILE];
+  __shared__ int nnz_count;
+  __shared__ int warp_counts[FFN_TILE / 32];
+  __shared__ int warp_prefix[FFN_TILE / 32];
+  const int f_block = blockIdx.x;
+  const int c_block = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int start_f = f_block * FFN_TILE;
+  const int c_base = c_block * (2 * FFN_SPMV_THREADS);
+  if (tid < FFN_TILE / 2) {
+    const float2 values = __half22float2(load_h2(preact + start_f + tid * 2));
+    const float relu0 = fmaxf(values.x, 0.0f);
+    const float relu1 = fmaxf(values.y, 0.0f);
+    vec_slice[tid * 2] = __float2half_rn(relu0 * relu0);
+    vec_slice[tid * 2 + 1] = __float2half_rn(relu1 * relu1);
+  }
+  __syncthreads();
+  bool nonzero = false;
+  int local_pos = 0;
+  if (tid < FFN_TILE) {
+    nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    local_pos = __popc(mask & ((1u << lane) - 1u));
+    if (lane == 0) warp_counts[warp_id] = __popc(mask);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < FFN_TILE / 32; ++w) {
+      warp_prefix[w] = s;
+      s += warp_counts[w];
+    }
+    nnz_count = s;
+  }
+  __syncthreads();
+  if (tid < FFN_TILE && nonzero) nnz_ids[warp_prefix[warp_id] + local_pos] = tid;
+  __syncthreads();
+  float2 acc = make_float2(0.0f, 0.0f);
+  for (int i = 0; i < nnz_count; ++i) {
+    const int actual_f = start_f + nnz_ids[i];
+    const float vec = __half2float(vec_slice[nnz_ids[i]]);
+    const float2 mat = __half22float2(load_i8_pair_as_half2(
+        value_i8, static_cast<std::int64_t>(actual_f) * C + c_base + tid * 2));
+    acc.x = fmaf(vec, mat.x, acc.x);
+    acc.y = fmaf(vec, mat.y, acc.y);
+  }
+  const float2 s2 = __half22float2(*reinterpret_cast<const __half2*>(scale + c_base + tid * 2));
+  atomicAdd(reinterpret_cast<__half2*>(out + c_base + tid * 2),
+            __floats2half2_rn(acc.x * s2.x, acc.y * s2.y));
+}
+
+__global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_relu_rows_i8_kernel(
+    int C,
+    int F,
+    const dtype* __restrict__ preact,
+    const std::int8_t* __restrict__ value_i8,
+    const dtype* __restrict__ scale,
+    dtype* __restrict__ out) {
+  __shared__ __align__(256) __half vec_slice[FFN_TILE];
+  __shared__ __align__(256) int nnz_ids[FFN_TILE];
+  __shared__ int nnz_count;
+  __shared__ int warp_counts[FFN_TILE / 32];
+  __shared__ int warp_prefix[FFN_TILE / 32];
+  const int f_block = blockIdx.x;
+  const int c_block = blockIdx.y;
+  const int row = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int start_f = f_block * FFN_TILE;
+  const int c_base = c_block * (2 * FFN_SPMV_THREADS);
+  const dtype* pre_row = preact + static_cast<std::int64_t>(row) * F;
+  if (tid < FFN_TILE / 2) {
+    const float2 values = __half22float2(load_h2(pre_row + start_f + tid * 2));
+    const float relu0 = fmaxf(values.x, 0.0f);
+    const float relu1 = fmaxf(values.y, 0.0f);
+    vec_slice[tid * 2] = __float2half_rn(relu0 * relu0);
+    vec_slice[tid * 2 + 1] = __float2half_rn(relu1 * relu1);
+  }
+  __syncthreads();
+  bool nonzero = false;
+  int local_pos = 0;
+  if (tid < FFN_TILE) {
+    nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    local_pos = __popc(mask & ((1u << lane) - 1u));
+    if (lane == 0) warp_counts[warp_id] = __popc(mask);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < FFN_TILE / 32; ++w) {
+      warp_prefix[w] = s;
+      s += warp_counts[w];
+    }
+    nnz_count = s;
+  }
+  __syncthreads();
+  if (tid < FFN_TILE && nonzero) nnz_ids[warp_prefix[warp_id] + local_pos] = tid;
+  __syncthreads();
+  float2 acc = make_float2(0.0f, 0.0f);
+  for (int i = 0; i < nnz_count; ++i) {
+    const int actual_f = start_f + nnz_ids[i];
+    const float vec = __half2float(vec_slice[nnz_ids[i]]);
+    const float2 mat = __half22float2(load_i8_pair_as_half2(
+        value_i8, static_cast<std::int64_t>(actual_f) * C + c_base + tid * 2));
+    acc.x = fmaf(vec, mat.x, acc.x);
+    acc.y = fmaf(vec, mat.y, acc.y);
+  }
+  const float2 s2 = __half22float2(*reinterpret_cast<const __half2*>(scale + c_base + tid * 2));
+  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<std::int64_t>(row) * C + c_base + tid * 2),
+            __floats2half2_rn(acc.x * s2.x, acc.y * s2.y));
+}
+
+__global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_i8_kernel(
+    int C,
+    int F,
+    const dtype* __restrict__ preact,
+    const std::int8_t* __restrict__ value_i8,
+    const dtype* __restrict__ scale,
+    dtype* __restrict__ out) {
+  constexpr int TILE = 512;
+  constexpr int THREADS = 256;
+  __shared__ __align__(256) __half vec_slice[TILE];
+  __shared__ __align__(256) int nnz_ids[TILE];
+  __shared__ int nnz_count;
+  __shared__ int warp_counts[TILE / 32];
+  __shared__ int warp_prefix[TILE / 32];
+  const int f_block = blockIdx.x;
+  const int c_block = blockIdx.y;
+  const int row = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int start_f = f_block * TILE;
+  const int c_base = c_block * (2 * THREADS);
+  const dtype* pre_row = preact + static_cast<std::int64_t>(row) * F;
+#pragma unroll
+  for (int u = 0; u < 1; ++u) {
+    const int local_f = tid * 2 + u * (TILE / 2);
+    const float2 values = __half22float2(load_h2(pre_row + start_f + local_f));
+    const float relu0 = fmaxf(values.x, 0.0f);
+    const float relu1 = fmaxf(values.y, 0.0f);
+    vec_slice[local_f] = __float2half_rn(relu0 * relu0);
+    vec_slice[local_f + 1] = __float2half_rn(relu1 * relu1);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int local_f = tid + u * THREADS;
+    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    if (lane == 0) warp_counts[warp_id + u * (THREADS / 32)] = __popc(mask);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < TILE / 32; ++w) {
+      warp_prefix[w] = s;
+      s += warp_counts[w];
+    }
+    nnz_count = s;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int local_f = tid + u * THREADS;
+    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    const int local_pos = __popc(mask & ((1u << lane) - 1u));
+    const int group = warp_id + u * (THREADS / 32);
+    if (nonzero) nnz_ids[warp_prefix[group] + local_pos] = local_f;
+  }
+  __syncthreads();
+  float2 acc = make_float2(0.0f, 0.0f);
+  for (int i = 0; i < nnz_count; ++i) {
+    const int local_f = nnz_ids[i];
+    const int actual_f = start_f + local_f;
+    const float vec = __half2float(vec_slice[local_f]);
+    const float2 mat = __half22float2(load_i8_pair_as_half2(
+        value_i8, static_cast<std::int64_t>(actual_f) * C + c_base + tid * 2));
+    acc.x = fmaf(vec, mat.x, acc.x);
+    acc.y = fmaf(vec, mat.y, acc.y);
+  }
+  const float2 s2 = __half22float2(*reinterpret_cast<const __half2*>(scale + c_base + tid * 2));
+  atomicAdd(reinterpret_cast<__half2*>(out + static_cast<std::int64_t>(row) * C + c_base + tid * 2),
+            __floats2half2_rn(acc.x * s2.x, acc.y * s2.y));
+}
+
+template <int F_TILE, int C_TILE, bool DirectFloatWeights = false>
+__global__ __launch_bounds__(256, 6) void cmix_sparse_spmv_relu_rows_t1024_i8_kernel(
+    int C,
+    int F,
+    const dtype* __restrict__ preact,
+    const std::int8_t* __restrict__ value_i8,
+    const dtype* __restrict__ scale,
+    dtype* __restrict__ out) {
+  constexpr int THREADS = 256;
+  constexpr int TILE = F_TILE;
+  __shared__ __align__(256) __half vec_slice[TILE];
+  __shared__ __align__(256) int nnz_ids[TILE];
+  __shared__ int nnz_count;
+  __shared__ int warp_counts[TILE / 32];
+  __shared__ int warp_prefix[TILE / 32];
+  const int f_block = blockIdx.x;
+  const int c_block = blockIdx.y;
+  const int row = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp_id = tid >> 5;
+  const int start_f = f_block * TILE;
+  constexpr int C_PARTS = C_TILE / (2 * THREADS);
+  const int c_base = c_block * C_TILE;
+  const dtype* pre_row = preact + static_cast<std::int64_t>(row) * F;
+#pragma unroll
+  for (int u = 0; u < TILE / 512; ++u) {
+    const int local_f = tid * 2 + u * (TILE / 2);
+    const float2 values = __half22float2(load_h2(pre_row + start_f + local_f));
+    const float relu0 = fmaxf(values.x, 0.0f);
+    const float relu1 = fmaxf(values.y, 0.0f);
+    vec_slice[local_f] = __float2half_rn(relu0 * relu0);
+    vec_slice[local_f + 1] = __float2half_rn(relu1 * relu1);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int u = 0; u < TILE / 256; ++u) {
+    const int local_f = tid + u * THREADS;
+    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    if (lane == 0) warp_counts[warp_id + u * (THREADS / 32)] = __popc(mask);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < TILE / 32; ++w) {
+      warp_prefix[w] = s;
+      s += warp_counts[w];
+    }
+    nnz_count = s;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int u = 0; u < TILE / 256; ++u) {
+    const int local_f = tid + u * THREADS;
+    const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
+    const unsigned mask = __ballot_sync(0xffffffffu, nonzero);
+    const int local_pos = __popc(mask & ((1u << lane) - 1u));
+    const int group = warp_id + u * (THREADS / 32);
+    if (nonzero) nnz_ids[warp_prefix[group] + local_pos] = local_f;
+  }
+  __syncthreads();
+  float2 acc[C_PARTS];
+#pragma unroll
+  for (int part = 0; part < C_PARTS; ++part) acc[part] = make_float2(0.0f, 0.0f);
+  for (int i = 0; i < nnz_count; ++i) {
+    const int local_f = nnz_ids[i];
+    const int actual_f = start_f + local_f;
+    const float vec = __half2float(vec_slice[local_f]);
+#pragma unroll
+    for (int part = 0; part < C_PARTS; ++part) {
+      const int c_offset = c_base + part * (2 * THREADS) + tid * 2;
+      float2 mat;
+      if constexpr (DirectFloatWeights) {
+        mat = load_i8_pair_as_float2(
+            value_i8, static_cast<std::int64_t>(actual_f) * C + c_offset);
+      } else {
+        mat = __half22float2(load_i8_pair_as_half2(
+            value_i8, static_cast<std::int64_t>(actual_f) * C + c_offset));
+      }
+      acc[part].x = fmaf(vec, mat.x, acc[part].x);
+      acc[part].y = fmaf(vec, mat.y, acc[part].y);
+    }
+  }
+#pragma unroll
+  for (int part = 0; part < C_PARTS; ++part) {
+    const int c_offset = c_base + part * (2 * THREADS) + tid * 2;
+    const float2 s2 = __half22float2(*reinterpret_cast<const __half2*>(scale + c_offset));
+    atomicAdd(reinterpret_cast<__half2*>(out + static_cast<std::int64_t>(row) * C + c_offset),
+              __floats2half2_rn(acc[part].x * s2.x, acc[part].y * s2.y));
+  }
+}
+
+__global__ void cmix_stats_relu2_kernel(
+    const dtype* __restrict__ preact,
+    unsigned long long* __restrict__ nonzero,
+    unsigned long long* __restrict__ total,
+    unsigned int* __restrict__ max_bits,
+    long long elements) {
+  const long long index = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= elements) return;
+  const float value = __half2float(preact[index]);
+  const float relu2 = value > 0.0f ? value * value : 0.0f;
+  atomicAdd(total, 1ULL);
+  if (relu2 > 0.0f) atomicAdd(nonzero, 1ULL);
+  atomicMax(max_bits, __float_as_uint(relu2));
+}
+
 }  // namespace
 
 void rwkv7_tmix_mix6_launch(
@@ -1007,6 +1358,84 @@ void rwkv7_cmix_sparse_down_relu_rows_t512_launch(
       C, F, preact, value_fc, out);
 }
 
+void rwkv7_cmix_sparse_down_relu_one_i8_launch(
+    cudaStream_t stream,
+    int C,
+    int F,
+    const half* preact,
+    const std::int8_t* value_i8,
+    const half* scale,
+    half* out) {
+  zero_vec4_kernel<<<(C / 8 + 127) / 128, 128, 0, stream>>>(out, C / 8);
+  cmix_sparse_spmv_relu_one_i8_kernel<<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), 1), FFN_SPMV_THREADS, 0, stream>>>(
+      C, preact, value_i8, scale, out);
+}
+
+void rwkv7_cmix_sparse_down_relu_rows_i8_launch(
+    cudaStream_t stream,
+    int B,
+    int T,
+    int C,
+    int F,
+    const half* preact,
+    const std::int8_t* value_i8,
+    const half* scale,
+    half* out) {
+  const int rows = B * T;
+  const int64_t out_vec4 = static_cast<int64_t>(rows) * (C / 8);
+  zero_vec4_kernel<<<static_cast<int>(ceil_div(out_vec4, 128)), 128, 0, stream>>>(out, out_vec4);
+  cmix_sparse_spmv_relu_rows_i8_kernel<<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), rows), FFN_SPMV_THREADS, 0, stream>>>(
+      C, F, preact, value_i8, scale, out);
+}
+
+void rwkv7_cmix_sparse_down_relu_rows_t512_i8_launch(
+    cudaStream_t stream,
+    int B,
+    int T,
+    int C,
+    int F,
+    const half* preact,
+    const std::int8_t* value_i8,
+    const half* scale,
+    half* out) {
+  const int rows = B * T;
+  if (F < 512 || (F % 512) != 0) {
+    rwkv7_cmix_sparse_down_relu_rows_i8_launch(stream, B, T, C, F, preact, value_i8, scale, out);
+    return;
+  }
+  const int64_t out_vec4 = static_cast<int64_t>(rows) * (C / 8);
+  zero_vec4_kernel<<<static_cast<int>(ceil_div(out_vec4, 128)), 128, 0, stream>>>(out, out_vec4);
+  if (F < 1024 || (F % 1024) != 0) {
+    cmix_sparse_spmv_relu_rows_t512_i8_kernel<<<dim3(F / 512, C / 512, rows), 256, 0, stream>>>(
+        C, F, preact, value_i8, scale, out);
+  } else if (rows >= 64 && (C % 4096) == 0) {
+    if (rows > 64) {
+      cmix_sparse_spmv_relu_rows_t1024_i8_kernel<1024, 4096, true><<<dim3(F / 1024, C / 4096, rows), 256, 0, stream>>>(
+          C, F, preact, value_i8, scale, out);
+    } else {
+      cmix_sparse_spmv_relu_rows_t1024_i8_kernel<1024, 4096><<<dim3(F / 1024, C / 4096, rows), 256, 0, stream>>>(
+          C, F, preact, value_i8, scale, out);
+    }
+  } else {
+    cmix_sparse_spmv_relu_rows_t1024_i8_kernel<1024, 512><<<dim3(F / 1024, C / 512, rows), 256, 0, stream>>>(
+        C, F, preact, value_i8, scale, out);
+  }
+}
+
+void rwkv7_cmix_stats_relu2_launch(
+    cudaStream_t stream,
+    int rows,
+    int F,
+    const half* preact,
+    unsigned long long* nonzero,
+    unsigned long long* total,
+    unsigned int* max_bits) {
+  const long long elements = static_cast<long long>(rows) * F;
+  constexpr int threads = 256;
+  cmix_stats_relu2_kernel<<<static_cast<int>((elements + threads - 1) / threads), threads, 0, stream>>>(
+      preact, nonzero, total, max_bits, elements);
+}
+
 void rwkv7_cmix_mix_launch(
     cudaStream_t stream,
     int B,
@@ -1059,4 +1488,17 @@ void rwkv7_v4_f16_to_f32_launch(
   constexpr int threads = 256;
   f16_to_f32_kernel<<<static_cast<int>(ceil_div(elems, static_cast<int64_t>(threads))), threads, 0, stream>>>(
       src_f16, dst_f32, elems);
+}
+
+void rwkv7_v4_i8_pack_launch(
+    cudaStream_t stream, const std::int8_t* src_nk, std::int8_t* dst_packed, int N, int K) {
+  if (N <= 0 || K <= 0) return;
+  if ((N % 64) != 0 || (K % 16) != 0) {
+    std::fprintf(stderr, "i8 pack requires N %% 64 == 0 and K %% 16 == 0 (N=%d K=%d)\n", N, K);
+    std::exit(1);
+  }
+  const int words = N * K / 4;
+  constexpr int threads = 256;
+  i8_pack_kernel<<<static_cast<int>(ceil_div(words, threads)), threads, 0, stream>>>(
+      src_nk, reinterpret_cast<std::uint32_t*>(dst_packed), N, K, words);
 }

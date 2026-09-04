@@ -40,9 +40,11 @@ class ModelRouter {
 
   // The static constructor preserves the legacy single-model startup path.
   explicit ModelRouter(std::shared_ptr<InferenceEngine> engine);
-  // In dynamic mode model_directory contains the selectable .pth files.
+  // In dynamic mode model_directory contains selectable .pth or .rwkvq files.
   ModelRouter(std::filesystem::path model_directory, std::shared_ptr<class TrieTokenizer> tokenizer,
-              int prefill_chunk_size, bool use_wkv32, bool chunk_load = false);
+              int prefill_chunk_size, bool use_wkv32, bool chunk_load = false,
+              std::string cmix_sparse = "no-fc", std::string tune_cache = {},
+              bool retune = false, std::string tune_cache_directory = {});
 
   // Pins the currently loaded model for a request. Request model IDs are not
   // routing directives: switching is exclusively done by load().
@@ -61,6 +63,10 @@ class ModelRouter {
   int prefill_chunk_size_ = 128;
   bool use_wkv32_ = false;
   bool chunk_load_ = false;
+  std::string cmix_sparse_ = "no-fc";
+  std::string tune_cache_;
+  bool retune_ = false;
+  std::string tune_cache_directory_;
   std::unordered_map<std::string, std::filesystem::path> model_paths_;
 
   mutable std::mutex mutex_;

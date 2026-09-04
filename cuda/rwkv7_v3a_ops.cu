@@ -129,6 +129,23 @@ __global__ void f16_transpose_kernel(
   }
 }
 
+__global__ void i8_transpose_kernel(
+    const std::int8_t* __restrict__ src,
+    std::int8_t* __restrict__ dst,
+    int rows,
+    int cols) {
+  __shared__ std::int8_t tile[32][33];
+  const int c = static_cast<int>(blockIdx.x) * 32 + threadIdx.x;
+  const int r = static_cast<int>(blockIdx.y) * 32 + threadIdx.y;
+  if (r < rows && c < cols) tile[threadIdx.y][threadIdx.x] = src[static_cast<std::int64_t>(r) * cols + c];
+  __syncthreads();
+  const int out_c = static_cast<int>(blockIdx.y) * 32 + threadIdx.x;
+  const int out_r = static_cast<int>(blockIdx.x) * 32 + threadIdx.y;
+  if (out_c < rows && out_r < cols) {
+    dst[static_cast<std::int64_t>(out_r) * rows + out_c] = tile[threadIdx.x][threadIdx.y];
+  }
+}
+
 template <int Threads>
 __device__ __forceinline__ float block_sum_t(float x) {
   __shared__ float partial[Threads / 32];
@@ -2096,6 +2113,13 @@ void rwkv7_v4_f16_transpose_launch(
   dim3 block(16, 16);
   dim3 grid(static_cast<unsigned>(ceil_div(cols, block.x)), static_cast<unsigned>(ceil_div(rows, block.y)));
   f16_transpose_kernel<<<grid, block, 0, stream>>>(src_f16, dst_f16, rows, cols);
+}
+
+void rwkv7_v4_i8_transpose_launch(
+    cudaStream_t stream, const std::int8_t* src_i8, std::int8_t* dst_i8, int rows, int cols) {
+  const dim3 block(32, 32);
+  const dim3 grid(static_cast<unsigned>(ceil_div(cols, 32)), static_cast<unsigned>(ceil_div(rows, 32)));
+  i8_transpose_kernel<<<grid, block, 0, stream>>>(src_i8, dst_i8, rows, cols);
 }
 
 void rwkv7_v4_emb_ln0_bf16_to_f16_launch(

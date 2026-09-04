@@ -34,17 +34,21 @@ void print_usage(const char* program) {
       << "Usage: " << program << " --model-path <path> --vocab-path <path> [options]\n"
       << "\n"
       << "Options:\n"
-      << "  --model-path <path>     Path to the RWKV .pth model file. Required.\n"
+      << "  --model-path <path>     Path to an RWKV .pth or .rwkvq model file. Required.\n"
       << "  --vocab-path <path>     Path to rwkv_vocab_v20230424.txt. Required.\n"
       << "  --host <addr>           Host/interface to bind. Default: 127.0.0.1.\n"
       << "                          Use 0.0.0.0 explicitly to listen on all IPv4 interfaces.\n"
       << "  --port <port>           TCP port to bind. Default: 8000.\n"
       << "  --chunk-size <tokens>   Prefill chunk size. Default: 128.\n"
-      << "  --state-db-path <path>  SQLite state cache path. Default: rwkv_sessions.db.\n"
+      << "  --state-db-path <path>  SQLite state cache path. Default: rwkv_sessions.db in cwd.\n"
       << "  --password <token>      Require a bearer token or JSON password field.\n"
       << "  --wkv32                 Use fp32 WKV state with fp16 IO.\n"
       << "  --chunk-load            Stream model tensors from disk while loading.\n"
-      << "  --enable-dynamic-loading Treat --model-path as a directory of .pth models.\n"
+      << "  --cmix-sparse <mode>    Cmix sparse mode: no-fc (default) or off.\n"
+      << "  --tune-cache <path>     W8A16 tuning cache file (default: alongside state DB).\n"
+      << "                          Cache is per-service local state; keep it with the state DB.\n"
+      << "  --retune                Force W8A16 tuning even when cache exists.\n"
+      << "  --enable-dynamic-loading Treat --model-path as a directory of .pth/.rwkvq models.\n"
       << "  --help, -h              Show this help text.\n";
 }
 
@@ -74,6 +78,13 @@ int parse_positive_int(const std::string& option, const std::string& value) {
     throw std::runtime_error("invalid value for " + option + ": " + value);
   }
   return result;
+}
+
+std::string parse_cmix_sparse(const std::string& value) {
+  if (value != "no-fc" && value != "off") {
+    throw std::runtime_error("invalid value for --cmix-sparse: " + value);
+  }
+  return value;
 }
 
 std::string format_url_host(const std::string& host) {
@@ -127,6 +138,9 @@ int run_server(int argc, char* argv[]) {
   bool use_wkv32 = false;
   bool chunk_load = false;
   bool enable_dynamic_loading = false;
+  std::string cmix_sparse = "no-fc";
+  std::string tune_cache;
+  bool retune = false;
   std::optional<std::string> password;
 
   for (int i = 1; i < argc; ++i) {
@@ -155,6 +169,12 @@ int run_server(int argc, char* argv[]) {
       use_wkv32 = true;
     } else if (arg == "--chunk-load") {
       chunk_load = true;
+    } else if (arg == "--cmix-sparse") {
+      cmix_sparse = parse_cmix_sparse(require_value(arg));
+    } else if (arg == "--tune-cache") {
+      tune_cache = require_value(arg);
+    } else if (arg == "--retune") {
+      retune = true;
     } else if (arg == "--enable-dynamic-loading") {
       enable_dynamic_loading = true;
     } else if (arg == "--help" || arg == "-h") {
@@ -175,6 +195,11 @@ int run_server(int argc, char* argv[]) {
     throw std::runtime_error("--host must not be empty");
   }
 
+  const std::filesystem::path state_db_parent = std::filesystem::path(state_db_path).parent_path();
+  const std::string tune_cache_directory = state_db_parent.empty()
+      ? std::filesystem::current_path().string()
+      : state_db_parent.string();
+
   auto tokenizer = std::make_shared<rwkv7_server::TrieTokenizer>();
   if (tokenizer->load(vocab_path) != rwkv7_server::kTokenizerSuccess) {
     throw std::runtime_error("failed to load tokenizer vocab: " + vocab_path);
@@ -183,10 +208,12 @@ int run_server(int argc, char* argv[]) {
   std::unique_ptr<rwkv7_server::ModelRouter> models;
   if (enable_dynamic_loading) {
     models = std::make_unique<rwkv7_server::ModelRouter>(
-        model_path, tokenizer, prefill_chunk_size, use_wkv32, chunk_load);
+        model_path, tokenizer, prefill_chunk_size, use_wkv32, chunk_load, cmix_sparse,
+        tune_cache, retune, tune_cache_directory);
   } else {
     auto model = std::make_shared<rwkv7_server::ModelBackend>(
-        model_path, use_wkv32, chunk_load);
+        model_path, use_wkv32, chunk_load, cmix_sparse, tune_cache, retune,
+        tune_cache_directory);
     auto engine = std::make_shared<rwkv7_server::InferenceEngine>(model, tokenizer, model->model_name(), prefill_chunk_size);
     models = std::make_unique<rwkv7_server::ModelRouter>(std::move(engine));
   }
@@ -209,6 +236,9 @@ int run_server(int argc, char* argv[]) {
             << " prefill_chunk_size=" << prefill_chunk_size
             << " wkv=" << (use_wkv32 ? "fp32io16" : "fp16")
             << " chunk_load=" << (chunk_load ? "enabled" : "disabled")
+            << " cmix_sparse=" << cmix_sparse
+            << " tune_cache=" << (tune_cache.empty() ? "default" : tune_cache)
+            << " retune=" << (retune ? "enabled" : "disabled")
             << " dynamic_loading=" << (enable_dynamic_loading ? "enabled" : "disabled")
             << " password=" << (password.has_value() ? "enabled" : "disabled") << std::endl;
   const std::string url_host = format_url_host(host);

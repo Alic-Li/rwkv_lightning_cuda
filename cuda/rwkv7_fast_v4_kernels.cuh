@@ -4,6 +4,9 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cstddef>
+#include <cstdint>
+
+#include "../quant/gemmv/rwkv_w8a16.cuh"
 
 void rwkv7_v4_bf16_to_f16_launch(
     cudaStream_t stream, const uint16_t* src_bf16, uint16_t* dst_f16, long long elems);
@@ -22,6 +25,12 @@ void rwkv7_v4_bf16_to_f16_transpose_rows_launch(
 
 void rwkv7_v4_f16_transpose_launch(
     cudaStream_t stream, const uint16_t* src_f16, uint16_t* dst_f16, int rows, int cols);
+
+void rwkv7_v4_i8_transpose_launch(
+    cudaStream_t stream, const std::int8_t* src_i8, std::int8_t* dst_i8, int rows, int cols);
+
+void rwkv7_v4_i8_pack_launch(
+    cudaStream_t stream, const std::int8_t* src_nk, std::int8_t* dst_packed, int N, int K);
 
 void rwkv7_v4_emb_ln0_bf16_to_f16_launch(
     cudaStream_t stream, int V, int C,
@@ -97,6 +106,22 @@ void rwkv7_cmix_sparse_down_relu_rows_launch(
 void rwkv7_cmix_sparse_down_relu_rows_t512_launch(
     cudaStream_t stream, int B, int T, int C, int F,
     const half* preact, const half* value_fc, half* out);
+
+void rwkv7_cmix_sparse_down_relu_one_i8_launch(
+    cudaStream_t stream, int C, int F, const half* preact,
+    const std::int8_t* value_i8, const half* scale, half* out);
+
+void rwkv7_cmix_sparse_down_relu_rows_i8_launch(
+    cudaStream_t stream, int B, int T, int C, int F, const half* preact,
+    const std::int8_t* value_i8, const half* scale, half* out);
+
+void rwkv7_cmix_sparse_down_relu_rows_t512_i8_launch(
+    cudaStream_t stream, int B, int T, int C, int F, const half* preact,
+    const std::int8_t* value_i8, const half* scale, half* out);
+
+void rwkv7_cmix_stats_relu2_launch(
+    cudaStream_t stream, int rows, int F, const half* preact,
+    unsigned long long* nonzero, unsigned long long* total, unsigned int* max_bits);
 
 void rwkv7_cmix_sparse_one_launch(
     cudaStream_t stream, int C, int F,

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620">
+<rect width="100%" height="100%" fill="white"/>
+<text x="600" y="24" text-anchor="middle" font-family="sans-serif" font-size="18">FP16 vs INT8 per-chunk perplexity</text>
+<line x1="82" y1="548.00" x2="1172" y2="548.00" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="72" y="552.00" text-anchor="end" font-family="sans-serif" font-size="12">2.80593</text>
+<line x1="82" y1="420.00" x2="1172" y2="420.00" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="72" y="424.00" text-anchor="end" font-family="sans-serif" font-size="12">5.8675</text>
+<line x1="82" y1="292.00" x2="1172" y2="292.00" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="72" y="296.00" text-anchor="end" font-family="sans-serif" font-size="12">8.92906</text>
+<line x1="82" y1="164.00" x2="1172" y2="164.00" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="72" y="168.00" text-anchor="end" font-family="sans-serif" font-size="12">11.9906</text>
+<line x1="82" y1="36.00" x2="1172" y2="36.00" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="72" y="40.00" text-anchor="end" font-family="sans-serif" font-size="12">15.0522</text>
+<line x1="82.00" y1="36" x2="82.00" y2="548" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="82.00" y="570" text-anchor="middle" font-family="sans-serif" font-size="12">1</text>
+<line x1="222.65" y1="36" x2="222.65" y2="548" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="222.65" y="570" text-anchor="middle" font-family="sans-serif" font-size="12">5</text>
+<line x1="398.45" y1="36" x2="398.45" y2="548" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="398.45" y="570" text-anchor="middle" font-family="sans-serif" font-size="12">10</text>
+<line x1="539.10" y1="36" x2="539.10" y2="548" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="539.10" y="570" text-anchor="middle" font-family="sans-serif" font-size="12">14</text>
+<line x1="714.90" y1="36" x2="714.90" y2="548" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="714.90" y="570" text-anchor="middle" font-family="sans-serif" font-size="12">19</text>
+<line x1="855.55" y1="36" x2="855.55" y2="548" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="855.55" y="570" text-anchor="middle" font-family="sans-serif" font-size="12">23</text>
+<line x1="1031.35" y1="36" x2="1031.35" y2="548" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="1031.35" y="570" text-anchor="middle" font-family="sans-serif" font-size="12">28</text>
+<line x1="1172.00" y1="36" x2="1172.00" y2="548" stroke="#bbbbbb" stroke-dasharray="4,4"/>
+<text x="1172.00" y="570" text-anchor="middle" font-family="sans-serif" font-size="12">32</text>
+<line x1="82" y1="548" x2="1172" y2="548" stroke="#222"/>
+<line x1="82" y1="36" x2="82" y2="548" stroke="#222"/>
+<path d="M 82.00,215.75 L 117.16,324.13 L 152.32,407.99 L 187.48,323.63 L 222.65,408.66 L 257.81,412.45 L 292.97,312.52 L 328.13,346.56 L 363.29,395.49 L 398.45,463.47 L 433.61,420.02 L 468.77,470.43 L 503.94,457.33 L 539.10,434.60 L 574.26,237.76 L 609.42,537.80 L 644.58,479.81 L 679.74,424.08 L 714.90,503.18 L 750.06,487.94 L 785.23,339.67 L 820.39,253.34 L 855.55,253.25 L 890.71,430.41 L 925.87,424.85 L 961.03,82.62 L 996.19,431.41 L 1031.35,514.87 L 1066.52,450.92 L 1101.68,347.82 L 1136.84,198.24 L 1172.00,412.30" fill="none" stroke="#4776b6" stroke-width="2"/>
+<path d="M 82.00,218.94 L 117.16,322.48 L 152.32,409.03 L 187.48,325.58 L 222.65,408.51 L 257.81,412.53 L 292.97,305.69 L 328.13,347.19 L 363.29,395.54 L 398.45,464.27 L 433.61,417.87 L 468.77,470.62 L 503.94,457.70 L 539.10,435.26 L 574.26,243.44 L 609.42,536.66 L 644.58,478.81 L 679.74,422.44 L 714.90,502.80 L 750.06,488.12 L 785.23,339.73 L 820.39,250.62 L 855.55,249.57 L 890.71,430.26 L 925.87,423.69 L 961.03,83.69 L 996.19,431.29 L 1031.35,514.42 L 1066.52,451.82 L 1101.68,348.32 L 1136.84,196.85 L 1172.00,413.19" fill="none" stroke="#d14b4b" stroke-width="2"/>
+<text x="18" y="292.0" transform="rotate(-90 18 292.0)" text-anchor="middle" font-family="sans-serif" font-size="14">PPL</text>
+<text x="627.0" y="602" text-anchor="middle" font-family="sans-serif" font-size="14">Chunk (128 tokens)</text>
+<text x="94" y="54" font-family="sans-serif" font-size="12" fill="#4776b6">FP16</text>
+<text x="140" y="54" font-family="sans-serif" font-size="12" fill="#d14b4b">INT8</text>
+</svg>

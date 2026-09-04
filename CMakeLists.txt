@@ -110,6 +110,7 @@ endif()
 set(RWKV7_FAST_HOST_SOURCES
   src/pth_archive.cpp
   src/pth_tensor.cpp
+  quant/modeling/rwkv_quantized.cpp
   src/rwkv_tokenizer.cpp
   src/utils/tokenizer.cpp
   src/rwkv_sampler.cpp
@@ -134,6 +135,7 @@ else()
     cuda/rwkv7_fast_ops_fp16.cu
     cuda/rwkv7_wkv_fp16_v2.cu
     cuda/rwkv7_wkv_fp32_v2.cu
+    quant/gemmv/rwkv_w8a16.cu
   )
 endif()
 
@@ -142,12 +144,55 @@ add_library(rwkv7_fast_backend_core STATIC
   ${RWKV7_FAST_GPU_SOURCES}
 )
 
+add_executable(rwkv_quantize
+  quant/modeling/rwkv_quantize.cpp
+  src/pth_archive.cpp
+  src/pth_tensor.cpp
+  quant/modeling/rwkv_quantized.cpp
+)
+target_include_directories(rwkv_quantize PRIVATE include src quant/modeling)
+target_compile_options(rwkv_quantize PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+
+if(RWKV_GPU_BACKEND STREQUAL "CUDA")
+  add_executable(rwkv_w8a16_bench tools/bench_w8a16.cpp)
+  target_include_directories(rwkv_w8a16_bench PRIVATE include quant/gemmv)
+  target_link_libraries(rwkv_w8a16_bench PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)
+  target_compile_options(rwkv_w8a16_bench PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+  add_executable(rwkv_quantized_smoke tools/quantized_smoke.cpp)
+  target_include_directories(rwkv_quantized_smoke PRIVATE include cuda src quant/modeling quant/gemmv)
+  target_link_libraries(rwkv_quantized_smoke PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)
+  target_compile_options(rwkv_quantized_smoke PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+  add_executable(rwkv_cmix_stats tools/calibration/cmix_stats.cpp)
+  target_include_directories(rwkv_cmix_stats PRIVATE include cuda src quant/modeling quant/gemmv)
+  target_link_libraries(rwkv_cmix_stats PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)
+  target_compile_options(rwkv_cmix_stats PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+  add_executable(rwkv_profile_model tools/calibration/profile_model.cpp)
+  target_include_directories(rwkv_profile_model PRIVATE include cuda src quant/modeling quant/gemmv)
+  target_link_libraries(rwkv_profile_model PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)
+  target_compile_options(rwkv_profile_model PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+  add_executable(rwkv_prefill_bench tools/calibration/prefill_bench.cpp)
+  target_include_directories(rwkv_prefill_bench PRIVATE include cuda src quant/modeling quant/gemmv)
+  target_link_libraries(rwkv_prefill_bench PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)
+  target_compile_options(rwkv_prefill_bench PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+  add_executable(rwkv_model_bench tools/bench_model.cpp)
+  target_include_directories(rwkv_model_bench PRIVATE include cuda src quant/modeling quant/gemmv)
+  target_link_libraries(rwkv_model_bench PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)
+  target_compile_options(rwkv_model_bench PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+  add_executable(rwkv_logit_mse_curve tools/calibration/logit_mse_curve.cpp)
+  target_include_directories(rwkv_logit_mse_curve PRIVATE include cuda src quant/modeling quant/gemmv)
+  target_link_libraries(rwkv_logit_mse_curve PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)
+  target_compile_options(rwkv_logit_mse_curve PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+  add_executable(rwkv_calibration_bandwidth tools/calibration/bandwidth.cu)
+  target_link_libraries(rwkv_calibration_bandwidth PRIVATE CUDA::cudart)
+  set_property(TARGET rwkv_calibration_bandwidth PROPERTY CUDA_RUNTIME_LIBRARY Shared)
+endif()
+
 if(RWKV_GPU_BACKEND STREQUAL "HIP")
-  target_include_directories(rwkv7_fast_backend_core PUBLIC hip include src src/utils)
+  target_include_directories(rwkv7_fast_backend_core PUBLIC hip include src src/utils quant/modeling quant/gemmv)
   target_compile_definitions(rwkv7_fast_backend_core PUBLIC RWKV_USE_HIP)
   target_link_libraries(rwkv7_fast_backend_core PUBLIC hip::host roc::hipblas roc::hipblaslt hip::hiprand ${RWKV_SQLITE_TARGET})
 else()
-  target_include_directories(rwkv7_fast_backend_core PUBLIC cuda include src)
+  target_include_directories(rwkv7_fast_backend_core PUBLIC cuda include src quant/modeling quant/gemmv)
   target_link_libraries(rwkv7_fast_backend_core PUBLIC CUDA::cublas CUDA::cublasLt ${RWKV_SQLITE_TARGET})
   set_property(TARGET rwkv7_fast_backend_core PROPERTY CUDA_RUNTIME_LIBRARY Shared)
 endif()

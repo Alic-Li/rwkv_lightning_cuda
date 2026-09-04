@@ -106,7 +106,11 @@ class ModelBackend final : public IModelBackend {
   explicit ModelBackend(
       std::string model_path,
       bool use_wkv32 = false,
-      bool chunk_load = false);
+      bool chunk_load = false,
+      std::string cmix_sparse = "no-fc",
+      std::string tune_cache = {},
+      bool retune = false,
+      std::string tune_cache_directory = {});
   ~ModelBackend() override;
 
   ModelBackend(const ModelBackend&) = delete;

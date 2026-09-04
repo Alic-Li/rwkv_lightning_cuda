@@ -5,15 +5,30 @@ cmake -S . -B ./build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120"
 
-cmake --build ./build -j --config Release --target bundle_rwkv_lighting_cuda
+cmake --build ./build -j --config Release --target rwkv_quantize bundle_rwkv_lighting_cuda
 ```
+
+### CUDA W8A16 quantization
+
+The build produces `build/rwkv_quantize`, a standalone converter for BF16 RWKV
+checkpoints. It writes a streaming `.rwkvq` file containing per-output-channel
+symmetric INT8 weights and FP16 scales; embeddings, layer norms, LoRA factors,
+and other non-linear tensors remain BF16.
+
+```bash
+./build/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
+```
+
+The CUDA inference backend detects `.rwkvq` files automatically, keeps INT8
+weights on device, and executes W8A16 GEMV for attention projections, FFN
+projections, and the output head. HIP builds continue to use the BF16/PTH path.
 
 Windows
 ```bash
 $env:CudaToolkitDir="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\"
 cmake -S . -B ./build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120" -DCMAKE_TOOLCHAIN_FILE="D:/vcpkg/scripts/buildsystems/vcpkg.cmake"  -DCMAKE_CXX_FLAGS="/Zc:preprocessor" -DCMAKE_CUDA_FLAGS="-Xcompiler=/Zc:preprocessor"
 
-cmake --build ./build --config Release -j --target bundle_rwkv_lighting_cuda
+cmake --build ./build --config Release -j --target rwkv_quantize bundle_rwkv_lighting_cuda
 ```
 
 AMD ROCm
@@ -45,6 +60,11 @@ Run server
 ```
 
 `--chunk-size` controls prompt prefill chunking and defaults to `128` when omitted.
+`--state-db-path` defaults to `rwkv_sessions.db` in the current working directory.
+The W8A16 tuning cache is per-service-instance local state: unless `--tune-cache`
+is provided, it is stored alongside the state database (also in the current working
+directory by default). Keep the cache and state database together when deploying a
+service, or set an explicit cache path.
 `--chunk-load` avoids reading the complete `.pth` file or a complete large tensor into
 host memory before the CUDA upload. It uses a persistent model-file stream and two
 reusable 32 MiB pinned buffers to overlap disk reads, CUDA copies, and preprocessing.
@@ -58,7 +78,7 @@ retaining `active_request` for compatibility.
 
 ### Dynamic model loading
 
-By default, `--model-path` remains the path to one `.pth` file and the original
+By default, `--model-path` remains the path to one `.pth` or `.rwkvq` file and the original
 single-model startup behavior is unchanged. To load models on demand, make it a
 directory and add `--enable-dynamic-loading`:
 
@@ -70,8 +90,8 @@ directory and add `--enable-dynamic-loading`:
   --vocab-path /path/to/rwkv_vocab_v20230424.txt
 ```
 
-The directory's top-level `.pth` files are exposed by `GET /v1/models`; their
-file names without `.pth` are the model IDs. The response identifies the current
+The directory's top-level `.pth` and `.rwkvq` files are exposed by `GET /v1/models`; their
+file names without the extension are the model IDs. The response identifies the current
 `loaded` model and every `available` model. Load or switch models explicitly:
 
 ```bash

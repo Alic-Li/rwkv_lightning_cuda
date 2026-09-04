@@ -35,22 +35,27 @@ ModelRouter::ModelRouter(std::shared_ptr<InferenceEngine> engine)
 
 ModelRouter::ModelRouter(std::filesystem::path model_directory,
                          std::shared_ptr<TrieTokenizer> tokenizer,
-                         int prefill_chunk_size, bool use_wkv32, bool chunk_load)
+                         int prefill_chunk_size, bool use_wkv32, bool chunk_load,
+                         std::string cmix_sparse, std::string tune_cache, bool retune,
+                         std::string tune_cache_directory)
     : dynamic_(true), tokenizer_(std::move(tokenizer)), prefill_chunk_size_(prefill_chunk_size),
-      use_wkv32_(use_wkv32), chunk_load_(chunk_load) {
+      use_wkv32_(use_wkv32), chunk_load_(chunk_load), cmix_sparse_(std::move(cmix_sparse)),
+      tune_cache_(std::move(tune_cache)), retune_(retune),
+      tune_cache_directory_(std::move(tune_cache_directory)) {
   if (!std::filesystem::is_directory(model_directory)) {
     throw std::runtime_error("--model-path must be a directory when --enable-dynamic-loading is set: " +
                              model_directory.string());
   }
   for (const auto& entry : std::filesystem::directory_iterator(model_directory)) {
-    if (!entry.is_regular_file() || entry.path().extension() != ".pth") continue;
+    if (!entry.is_regular_file() ||
+        (entry.path().extension() != ".pth" && entry.path().extension() != ".rwkvq")) continue;
     const std::string id = entry.path().stem().string();
     if (!model_paths_.emplace(id, entry.path()).second) {
       throw std::runtime_error("duplicate dynamic model id: " + id);
     }
   }
   if (model_paths_.empty()) {
-    throw std::runtime_error("no .pth model files found in: " + model_directory.string());
+    throw std::runtime_error("no .pth or .rwkvq model files found in: " + model_directory.string());
   }
 }
 
@@ -99,7 +104,8 @@ void ModelRouter::load(const std::string& requested_model) {
   std::shared_ptr<InferenceEngine> loaded;
   try {
     auto backend = std::make_shared<ModelBackend>(
-        model_paths_.at(id).string(), use_wkv32_, chunk_load_);
+        model_paths_.at(id).string(), use_wkv32_, chunk_load_, cmix_sparse_, tune_cache_, retune_,
+        tune_cache_directory_);
     loaded = std::make_shared<InferenceEngine>(backend, tokenizer_, backend->model_name(), prefill_chunk_size_);
   } catch (...) {
     lock.lock();

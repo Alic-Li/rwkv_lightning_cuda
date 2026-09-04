@@ -1047,6 +1047,7 @@ void run_backend_forward(
     const HipWeights& weights,
     const std::vector<std::vector<int64_t>>& token_batches,
     bool use_wkv32,
+    const std::string& cmix_sparse,
     GenerationState& state,
     DeviceLogits& out) {
   const auto& dims = weights.dims;
@@ -1075,6 +1076,7 @@ void run_backend_forward(
   run.B = B;
   run.T = T;
   run.wkv32 = use_wkv32;
+  run.cmix_sparse = cmix_sparse;
   const int C = dims.channels;
   const PathConfig path = select_path(run, C);
   const int rows = B * T;
@@ -1347,22 +1349,24 @@ void run_backend_forward(
 }  // namespace
 
 struct ModelBackend::Impl {
-  explicit Impl(std::string path, bool use_wkv32_, bool chunk_load_)
+  explicit Impl(std::string path, bool use_wkv32_, bool chunk_load_, std::string cmix_sparse_)
       : model_path(std::move(path)),
         model_name(basename_without_extension(model_path)),
         use_wkv32(use_wkv32_),
         chunk_load(chunk_load_),
+        cmix_sparse(std::move(cmix_sparse_)),
         weights(load_backend_weights(model_path, chunk_load)) {}
 
   std::string model_path;
   std::string model_name;
   bool use_wkv32 = false;
   bool chunk_load = false;
+  std::string cmix_sparse = "no-fc";
   HipWeights weights;
 };
 
-ModelBackend::ModelBackend(std::string model_path, bool use_wkv32, bool chunk_load)
-    : impl_(std::make_unique<Impl>(std::move(model_path), use_wkv32, chunk_load)) {}
+ModelBackend::ModelBackend(std::string model_path, bool use_wkv32, bool chunk_load, std::string cmix_sparse)
+    : impl_(std::make_unique<Impl>(std::move(model_path), use_wkv32, chunk_load, std::move(cmix_sparse))) {}
 
 ModelBackend::~ModelBackend() = default;
 
@@ -1403,7 +1407,7 @@ void ModelBackend::forward_prefill(
     const std::vector<std::vector<int64_t>>& token_batches,
     GenerationState& state,
     DeviceLogits& logits) const {
-  run_backend_forward(impl_->weights, token_batches, impl_->use_wkv32, state, logits);
+  run_backend_forward(impl_->weights, token_batches, impl_->use_wkv32, impl_->cmix_sparse, state, logits);
 }
 
 void ModelBackend::forward_decode(
@@ -1415,7 +1419,7 @@ void ModelBackend::forward_decode(
   for (int64_t token : token_batch) {
     batch.push_back({token});
   }
-  run_backend_forward(impl_->weights, batch, impl_->use_wkv32, state, logits);
+  run_backend_forward(impl_->weights, batch, impl_->use_wkv32, impl_->cmix_sparse, state, logits);
 }
 
 void ModelBackend::copy_state_slice(
