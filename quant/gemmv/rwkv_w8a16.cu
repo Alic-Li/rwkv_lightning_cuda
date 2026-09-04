@@ -652,7 +652,7 @@ __global__ __launch_bounds__(256, 1) void w8a16_mma_kernel(
       const int kt16 = (local_k_begin + tile) * 4;
       const std::int64_t word_base =
           (static_cast<std::int64_t>(nt) * (K / 16) + kt16) * 8 * 32;
-      w8_cp_async_16<true>(
+      w8_cp_async_16<false>(
           b_stage + tid * 16,
           weight + word_base * 4 + static_cast<std::int64_t>(tid) * 16,
           pred);
@@ -895,7 +895,7 @@ __global__ __launch_bounds__(256, 2) void w8a16_mma_bm64_bn128_kernel(
         const int kt16 = (local_k_begin + tile) * 4;
         const std::int64_t word_base =
             (static_cast<std::int64_t>(nt) * (K / 16) + kt16) * 8 * 32;
-        w8_cp_async_16<true>(
+        w8_cp_async_16<false>(
             b_stage + static_cast<std::size_t>(group) * BK * 64 + local * 16,
             weight + word_base * 4 + static_cast<std::int64_t>(local) * 16,
             pred);

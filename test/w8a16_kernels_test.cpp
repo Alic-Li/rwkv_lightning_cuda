@@ -139,7 +139,9 @@ void check_i8_pack() {
 }
 
 void check_packed_mma_simple() {
-  constexpr int M = 16;
+  // M=17..31 selects w8a16_mma_kernel<32, true>, which is distinct from the
+  // M=32 BM64xBN128 path exercised below.
+  constexpr int M = 24;
   constexpr int N = 64;
   constexpr int K = 64;
   std::vector<std::int8_t> source(static_cast<std::size_t>(N) * K, 1);
