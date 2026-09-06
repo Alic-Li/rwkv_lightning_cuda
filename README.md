@@ -197,12 +197,66 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/chat/completions" \
 ```
 
 `think_type` controls the assistant think prefix for chat-message prompts:
-`fast`, `free`, `preferChinese`, `en`, `enShort`/`en_short`, and
+`none`, `fast`, `free`, `preferChinese`, `en`, `enShort`/`en_short`, and
 `enLong`/`en_long`. `fast` uses a short closed think prefix and does not force
 reasoning. The other modes force reasoning by masking tokens `111` and `754`
 on the second and third generated tokens. If `think_type` is omitted,
 `enable_think:true` or `think:true` maps to `free`; otherwise the default is
 `fast`.
+
+Upload a serialized RWKV state first, then pass the returned string `state_id`
+to a chat request. Uploaded files are validated as PyTorch state archives and
+kept in a process-local temporary directory. They are removed explicitly with
+the delete endpoint or automatically when the server exits. The upload limit
+is 512 MiB. State tensors stored as either PyTorch `bfloat16` or `float32` are
+supported; they are converted to the configured WKV runtime precision while
+loading.
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/state/upload" \
+  -F "file=@./rwkv-state-agentic.pth"
+```
+
+The response contains a generated ID such as
+`{"object":"rwkv.state","state_id":"state-0123..."}`. Use that value in a
+generation request:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "model":"api-test",
+    "messages":[{"role":"user","content":"Continue from the supplied state."}],
+    "state_id":"state-0123...",
+    "stream":false,
+    "max_tokens":8
+  }'
+```
+
+Omit `state_id` to use the normal zero-initialized state. All inference
+endpoints accept the same string field: `/v1/chat/completions`,
+`/v1/batch/completions`, `/translate/v1/batch-translate`, and
+`/state/chat/completions`. For a batch request, the uploaded state is copied
+to every batch slot before its prompt is evaluated. On the stateful endpoint,
+an explicit uploaded state takes precedence over the cached `session_id`
+state for that request, and the resulting state is cached back into the
+session afterward. Chat requests carrying `state_id` default to the classic
+`User`/`Assistant` prompt without a think prefix, matching typical state-tuning
+data. An explicit `think_type` overrides this behavior; `think_type:"none"`
+also disables the prefix explicitly.
+
+List or delete uploaded states:
+
+```bash
+curl -sS "http://127.0.0.1:8000/v1/state/list"
+
+curl -sS -X DELETE "http://127.0.0.1:8000/v1/state/delete" \
+  -H "Content-Type: application/json" \
+  --data '{"state_id":"state-0123..."}'
+```
+
+When `--password` is enabled, use an `Authorization: Bearer ...` header for the
+multipart upload request.
 
 Use `stream:true` for SSE chunks. The stream ends with `data: [DONE]`.
 
@@ -235,6 +289,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/batch/completions" \
   -H "Content-Type: application/json" \
   --data '{
     "contents":["English: Hello\n\nChinese:","English: Good morning\n\nChinese:"],
+    "state_id":"state-0123...",
     "stream":false,
     "max_tokens":8,
     "temperature":1.0,
@@ -253,6 +308,7 @@ curl -sS -N -X POST "http://127.0.0.1:8000/v1/batch/completions" \
   -H "Content-Type: application/json" \
   --data '{
     "contents":["English: Hello\n\nChinese:","English: Good morning\n\nChinese:"],
+    "state_id":"state-0123...",
     "stream":true,
     "max_tokens":8,
     "temperature":1.0,
@@ -276,7 +332,8 @@ curl -sS -X POST "http://127.0.0.1:8000/translate/v1/batch-translate" \
   --data '{
     "source_lang":"English",
     "target_lang":"Chinese",
-    "text_list":["Hello","Good morning"]
+    "text_list":["Hello","Good morning"],
+    "state_id":"state-0123..."
   }'
 ```
 

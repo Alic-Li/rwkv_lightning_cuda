@@ -22,6 +22,7 @@
 #include "rwkv_server_backend.hpp"
 #include "rwkv_state_cache.hpp"
 #include "rwkv_tokenizer.hpp"
+#include "rwkv_uploaded_state_store.hpp"
 
 namespace {
 
@@ -254,6 +255,9 @@ int run_server(int argc, char* argv[]) {
            "/v1/server/resume",
            "/v1/tokens/count",
            "/v1/chat/completions",
+           "/v1/state/upload",
+           "/v1/state/delete",
+           "/v1/state/list",
            "/v1/models"}) {
       std::cout << "||      http://" << url_host << ":" << port << endpoint << std::endl;
   }
@@ -265,8 +269,10 @@ int run_server(int argc, char* argv[]) {
   drogon::app()
       .addListener(host, port)
       .setThreadNum(4)
+      .setClientMaxBodySize(rwkv7_server::kMaxUploadedStateBytes + (1ull << 20))
       .run();
 
+  rwkv7_server::UploadedStateStore::instance().shutdown();
   rwkv7_server::StateCacheManager::instance().shutdown();
   return 0;
 }

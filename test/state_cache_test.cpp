@@ -59,6 +59,12 @@ void expect_state_eq(const rwkv7_server::GenerationState& state, const rwkv7_ser
 int main() {
   std::filesystem::path db_path = rwkv_test::unique_temp_path("rwkv_state_cache_test");
   try {
+    const std::vector<int> pth_layout = {1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<int> runtime_layout = {1, 3, 2, 4, 5, 7, 6, 8};
+    TEST_EQ(
+        rwkv7_fast_v4::transpose_time_state_for_runtime(pth_layout, 2, 2),
+        runtime_layout);
+
     if (!rwkv_test::cuda_device_available()) {
       std::cout << "rwkv_state_cache_test skipped: no CUDA device available\n";
       return 0;

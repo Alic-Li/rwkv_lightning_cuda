@@ -26,6 +26,8 @@ struct ThinkPromptConfig {
 
 ThinkPromptConfig think_prompt_config(ThinkType think_type) {
   switch (think_type) {
+    case ThinkType::None:
+      return {"", "", false};
     case ThinkType::Fast:
       return {"<think>\n</think", "", false};
     case ThinkType::Free:
@@ -391,11 +393,25 @@ std::vector<std::string> InferenceEngine::batch_generate(
     return {};
   }
 
+  auto state = model_->create_state(static_cast<int>(prompts.size()));
+  return batch_generate_with_state(prompts, state, options);
+}
+
+std::vector<std::string> InferenceEngine::batch_generate_with_state(
+    const std::vector<std::string>& prompts,
+    GenerationState& state,
+    const GenerateOptions& options) const {
+  if (prompts.empty()) {
+    return {};
+  }
+  const int batch_size = static_cast<int>(prompts.size());
+  if (state.batch_size != batch_size) {
+    throw std::runtime_error("generation state batch size mismatch");
+  }
+
   std::vector<size_t> sorted_to_original;
   const auto sorted_prompt_ids = encode_prompts_sorted(prompts, sorted_to_original);
 
-  const int batch_size = static_cast<int>(prompts.size());
-  auto state = model_->create_state(batch_size);
   DeviceLogits logits;
   prefill_batch_chunked(sorted_prompt_ids, state, logits);
 
@@ -461,14 +477,34 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream(
     return stats;
   }
 
+  auto state = model_->create_state(static_cast<int>(prompts.size()));
+  return batch_generate_stream_with_state(
+      prompts, state, options, chunk_size, emit, should_stop, on_prefill_complete);
+}
+
+InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_state(
+    const std::vector<std::string>& prompts,
+    GenerationState& state,
+    const GenerateOptions& options,
+    int chunk_size,
+    const StreamCallback& emit,
+    const ControlCallback& should_stop,
+    const StatsCallback& on_prefill_complete) const {
+  GenerationStats stats;
+  if (prompts.empty()) {
+    return stats;
+  }
+  const int batch_size = static_cast<int>(prompts.size());
+  if (state.batch_size != batch_size) {
+    throw std::runtime_error("streaming generation state batch size mismatch");
+  }
+
   std::vector<size_t> sorted_to_original;
   const auto sorted_prompt_ids = encode_prompts_sorted(prompts, sorted_to_original);
   for (const auto& prompt_ids : sorted_prompt_ids) {
     stats.prompt_tokens += static_cast<int>(prompt_ids.size());
   }
 
-  const int batch_size = static_cast<int>(prompts.size());
-  auto state = model_->create_state(batch_size);
   DeviceLogits logits;
   const auto prefill_begin = std::chrono::steady_clock::now();
   prefill_batch_chunked(sorted_prompt_ids, state, logits);

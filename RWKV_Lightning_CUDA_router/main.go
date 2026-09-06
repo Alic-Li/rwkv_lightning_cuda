@@ -47,6 +47,7 @@ type scheduler struct {
 	backends []*backend
 	next     uint64
 	sessions map[string]*backend
+	states   map[string]*backend
 	cooldown time.Duration
 }
 
@@ -63,7 +64,11 @@ func newScheduler(c config) (*scheduler, error) {
 	if len(c.Backends) == 0 {
 		return nil, errors.New("at least one [[backends]] entry is required")
 	}
-	s := &scheduler{sessions: make(map[string]*backend), cooldown: time.Duration(c.FailureCooldownSeconds) * time.Second}
+	s := &scheduler{
+		sessions: make(map[string]*backend),
+		states:   make(map[string]*backend),
+		cooldown: time.Duration(c.FailureCooldownSeconds) * time.Second,
+	}
 	for i, item := range c.Backends {
 		u, err := url.Parse(item.URL)
 		if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
@@ -84,13 +89,25 @@ func newScheduler(c config) (*scheduler, error) {
 	return s, nil
 }
 
-func (s *scheduler) acquire(bsz int64, session string) (*backend, func(), error) {
+func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(), error) {
 	if bsz < 1 {
 		bsz = 1
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+	if stateID != "" {
+		if b := s.states[stateID]; b != nil {
+			if now.Before(b.unhealthy) {
+				return nil, nil, errors.New("backend holding the uploaded state is temporarily unavailable")
+			}
+			b.inflight += bsz
+			if session != "" {
+				s.sessions[session] = b
+			}
+			return b, s.releaseFunc(b, bsz), nil
+		}
+	}
 	if session != "" {
 		if b := s.sessions[session]; b != nil && !now.Before(b.unhealthy) {
 			b.inflight += bsz
@@ -120,6 +137,27 @@ func (s *scheduler) acquire(bsz int64, session string) (*backend, func(), error)
 	return chosen, s.releaseFunc(chosen, bsz), nil
 }
 
+func (s *scheduler) bindState(stateID string, b *backend) {
+	if stateID == "" || b == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.states == nil {
+		s.states = make(map[string]*backend)
+	}
+	s.states[stateID] = b
+}
+
+func (s *scheduler) unbindState(stateID string) {
+	if stateID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.states, stateID)
+}
+
 func (s *scheduler) releaseFunc(b *backend, bsz int64) func() {
 	var once sync.Once
 	return func() { once.Do(func() { s.mu.Lock(); b.inflight -= bsz; s.mu.Unlock() }) }
@@ -147,7 +185,11 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bsz, session := batchSize(r.URL.Path, body)
-	b, release, err := p.scheduler.acquire(bsz, session)
+	stateID := stateIDFromBody(r.URL.Path, body)
+	if stateID == "" {
+		stateID = r.URL.Query().Get("state_id")
+	}
+	b, release, err := p.scheduler.acquire(bsz, session, stateID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -177,6 +219,26 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	copyHeaders(w.Header(), resp.Header)
+	if r.URL.Path == "/v1/state/upload" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		responseBody, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			p.scheduler.failed(b)
+			http.Error(w, "upstream response read failed", http.StatusBadGateway)
+			return
+		}
+		var uploaded struct {
+			StateID string `json:"state_id"`
+		}
+		if json.Unmarshal(responseBody, &uploaded) == nil {
+			p.scheduler.bindState(uploaded.StateID, b)
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(responseBody)
+		return
+	}
+	if r.URL.Path == "/v1/state/delete" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		p.scheduler.unbindState(stateID)
+	}
 	w.WriteHeader(resp.StatusCode)
 	destination := io.Writer(w)
 	if strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
@@ -185,6 +247,19 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(destination, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("proxy %s: response copy: %v", b.name, err)
 	}
+}
+
+func stateIDFromBody(path string, body []byte) string {
+	if path == "/v1/state/upload" || len(body) == 0 {
+		return ""
+	}
+	var payload struct {
+		StateID string `json:"state_id"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return ""
+	}
+	return payload.StateID
 }
 
 type flushingWriter struct{ http.ResponseWriter }

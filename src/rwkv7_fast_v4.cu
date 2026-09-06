@@ -44,6 +44,10 @@ struct TensorStorageSource {
 TensorStorageSource tensor_storage_source(
     const llm_infer::PthArchive& archive,
     const llm_infer::TensorRecord& rec) {
+  if (rec.dtype != llm_infer::TensorDType::kBFloat16) {
+    std::cerr << "error: v4 GPU model loader requires bfloat16 weights: " << rec.name << std::endl;
+    std::exit(1);
+  }
   if (!is_contiguous_shape(rec.shape, rec.stride)) {
     std::cerr << "error: v4 GPU loader currently requires contiguous tensor: " << rec.name << std::endl;
     std::exit(1);
@@ -2327,6 +2331,92 @@ GenerationState ModelBackend::create_state(int batch_size) const {
   }
   check_cuda(cudaMemset(state.elapsed.p, 0, static_cast<std::size_t>(batch_size) * sizeof(int)), "zero backend elapsed");
   check_cuda(cudaDeviceSynchronize(), "sync backend state init");
+  return state;
+}
+
+GenerationState ModelBackend::load_state_from_pth(const std::string& path, int batch_size) const {
+  if (batch_size <= 0) {
+    throw std::runtime_error("batch_size must be positive");
+  }
+  auto state = create_state(batch_size);
+  auto archive = llm_infer::PthArchive::open(path);
+  if (!archive.ok()) {
+    throw std::runtime_error("failed to open state PTH: " + archive.status().message());
+  }
+  auto records = llm_infer::parse_pth_tensor_records(archive.value());
+  if (!records.ok()) {
+    throw std::runtime_error("failed to parse state PTH: " + records.status().message());
+  }
+
+  const auto& dims = impl_->weights.dims;
+  const std::size_t lane_elems = static_cast<std::size_t>(dims.heads) * dims.head_size * dims.head_size;
+  std::vector<bool> loaded(static_cast<std::size_t>(dims.layers), false);
+  for (const auto& record : records.value()) {
+    constexpr const char* prefix = "blocks.";
+    constexpr const char* suffix = ".att.time_state";
+    if (record.name.rfind(prefix, 0) != 0 || record.name.size() <= std::strlen(prefix) + std::strlen(suffix) ||
+        record.name.compare(record.name.size() - std::strlen(suffix), std::strlen(suffix), suffix) != 0) {
+      continue;
+    }
+    const auto layer_text = record.name.substr(std::strlen(prefix),
+                                                record.name.size() - std::strlen(prefix) - std::strlen(suffix));
+    char* end = nullptr;
+    const long layer = std::strtol(layer_text.c_str(), &end, 10);
+    if (end == layer_text.c_str() || *end != '\0' || layer < 0 || layer >= dims.layers) {
+      throw std::runtime_error("invalid state tensor name: " + record.name);
+    }
+    if ((record.dtype != llm_infer::TensorDType::kBFloat16 &&
+         record.dtype != llm_infer::TensorDType::kFloat32) ||
+        record.shape != std::vector<std::int64_t>{dims.heads, dims.head_size, dims.head_size}) {
+      throw std::runtime_error("invalid shape or dtype for state tensor: " + record.name);
+    }
+    if (loaded[static_cast<std::size_t>(layer)]) {
+      throw std::runtime_error("duplicate state tensor: " + record.name);
+    }
+    auto tensor = llm_infer::load_tensor_select(
+        archive.value(), record, false, !impl_->use_wkv32, impl_->use_wkv32);
+    if (!tensor.ok()) {
+      throw std::runtime_error("failed to load state tensor " + record.name + ": " + tensor.status().message());
+    }
+    const auto& values = tensor.value();
+    if (impl_->use_wkv32) {
+      const auto runtime_values = transpose_time_state_for_runtime(
+          values.values, dims.heads, dims.head_size);
+      for (int batch = 0; batch < batch_size; ++batch) {
+        const std::size_t offset =
+            (static_cast<std::size_t>(layer) * batch_size + static_cast<std::size_t>(batch)) * lane_elems;
+        const auto err = cudaMemcpy(
+            state.wkv_state32.p + offset, runtime_values.data(),
+            lane_elems * sizeof(float), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+          throw std::runtime_error("failed to copy state tensor " + record.name + " to device: " + cudaGetErrorString(err));
+        }
+      }
+    } else {
+      const auto runtime_values = transpose_time_state_for_runtime(
+          values.values_f16, dims.heads, dims.head_size);
+      for (int batch = 0; batch < batch_size; ++batch) {
+        const std::size_t offset =
+            (static_cast<std::size_t>(layer) * batch_size + static_cast<std::size_t>(batch)) * lane_elems;
+        const auto err = cudaMemcpy(
+            state.wkv_state.p + offset, runtime_values.data(),
+            lane_elems * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+          throw std::runtime_error("failed to copy state tensor " + record.name + " to device: " + cudaGetErrorString(err));
+        }
+      }
+    }
+    loaded[static_cast<std::size_t>(layer)] = true;
+  }
+  for (int layer = 0; layer < dims.layers; ++layer) {
+    if (!loaded[static_cast<std::size_t>(layer)]) {
+      throw std::runtime_error("state PTH is missing blocks." + std::to_string(layer) + ".att.time_state");
+    }
+  }
+  const auto err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    throw std::runtime_error("failed to synchronize state upload: " + std::string(cudaGetErrorString(err)));
+  }
   return state;
 }
 

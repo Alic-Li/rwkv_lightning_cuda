@@ -11,6 +11,7 @@ namespace llm_infer {
 
 enum class TensorDType {
   kBFloat16,
+  kFloat32,
 };
 
 struct TensorRecord {
@@ -50,6 +51,15 @@ std::uint16_t float_to_f16_bits(float value);
 
 Result<std::vector<TensorRecord>> parse_pth_tensor_records(const PthArchive& archive);
 Result<TensorStats> compute_tensor_stats(const PthArchive& archive, const TensorRecord& record);
+Result<TensorData> load_tensor_select(
+    const PthArchive& archive,
+    const TensorRecord& record,
+    bool need_bf16,
+    bool need_f16,
+    bool need_float);
+Result<TensorData> load_tensor_as_float(const PthArchive& archive, const TensorRecord& record);
+
+// Compatibility aliases. These accept both bfloat16 and float32 storage.
 Result<TensorData> load_bf16_tensor_select(
     const PthArchive& archive,
     const TensorRecord& record,

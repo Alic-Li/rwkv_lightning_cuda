@@ -19,6 +19,7 @@ struct GlobalRef {
 struct StorageRef {
   std::string key;
   std::uint64_t size = 0;
+  TensorDType dtype = TensorDType::kBFloat16;
 };
 
 struct Value {
@@ -77,8 +78,19 @@ Value value_of_kind(Value::Kind kind) {
   return value;
 }
 
-bool is_bfloat16_storage(const GlobalRef& global) {
-  return global.module == "torch" && global.name == "BFloat16Storage";
+bool storage_dtype(const GlobalRef& global, TensorDType* dtype) {
+  if (global.module != "torch") {
+    return false;
+  }
+  if (global.name == "BFloat16Storage") {
+    *dtype = TensorDType::kBFloat16;
+    return true;
+  }
+  if (global.name == "FloatStorage") {
+    *dtype = TensorDType::kFloat32;
+    return true;
+  }
+  return false;
 }
 
 std::vector<std::int64_t> tuple_to_ints(const Value& value) {
@@ -132,9 +144,29 @@ T load_scalar(const std::uint8_t* ptr) {
   return value;
 }
 
-double read_bf16_element_as_double(const std::uint8_t* base, std::uint64_t element_index) {
-  const std::uint8_t* ptr = base + element_index * sizeof(std::uint16_t);
-  return bf16_bits_to_float(load_scalar<std::uint16_t>(ptr));
+float read_element_as_float(
+    const std::uint8_t* base,
+    TensorDType dtype,
+    std::uint64_t element_index) {
+  const std::uint8_t* ptr = base + element_index * dtype_size_bytes(dtype);
+  switch (dtype) {
+    case TensorDType::kBFloat16:
+      return bf16_bits_to_float(load_scalar<std::uint16_t>(ptr));
+    case TensorDType::kFloat32:
+      return load_scalar<float>(ptr);
+  }
+  return 0.0f;
+}
+
+std::uint16_t read_element_as_bf16(
+    const std::uint8_t* base,
+    TensorDType dtype,
+    std::uint64_t element_index) {
+  if (dtype == TensorDType::kBFloat16) {
+    const std::uint8_t* ptr = base + element_index * sizeof(std::uint16_t);
+    return load_scalar<std::uint16_t>(ptr);
+  }
+  return float_to_bf16_bits(read_element_as_float(base, dtype, element_index));
 }
 
 class PickleTensorParser {
@@ -297,9 +329,10 @@ private:
     out.kind = Value::Kind::kStorage;
     out.storage.key = pid.items[2].s;
     out.storage.size = static_cast<std::uint64_t>(pid.items[4].i);
-    if (!is_bfloat16_storage(pid.items[1].global)) {
+    if (!storage_dtype(pid.items[1].global, &out.storage.dtype)) {
       return Status::error(
-          "unsupported storage dtype; this reader only supports torch.BFloat16Storage, got: " +
+          "unsupported storage dtype; this reader supports torch.BFloat16Storage and "
+          "torch.FloatStorage, got: " +
           pid.items[1].global.module + "." + pid.items[1].global.name);
     }
     return push(std::move(out));
@@ -333,7 +366,7 @@ private:
       }
       Value out;
       out.kind = Value::Kind::kTensor;
-      out.tensor.dtype = TensorDType::kBFloat16;
+      out.tensor.dtype = args.items[0].storage.dtype;
       out.tensor.storage_key = args.items[0].storage.key;
       out.tensor.storage_size = args.items[0].storage.size;
       out.tensor.storage_offset = static_cast<std::uint64_t>(args.items[1].i);
@@ -563,50 +596,58 @@ void update_minmax(TensorStats* stats, double value) {
 
 void scan_strided(
     const std::uint8_t* base,
+    TensorDType dtype,
     const std::vector<std::int64_t>& shape,
     const std::vector<std::int64_t>& stride,
     std::size_t dim,
     std::uint64_t offset,
     TensorStats* stats) {
   if (dim == shape.size()) {
-    update_minmax(stats, read_bf16_element_as_double(base, offset));
+    update_minmax(stats, read_element_as_float(base, dtype, offset));
     return;
   }
   for (std::int64_t i = 0; i < shape[dim]; ++i) {
-    scan_strided(base, shape, stride, dim + 1, offset + static_cast<std::uint64_t>(i * stride[dim]), stats);
+    scan_strided(
+        base, dtype, shape, stride, dim + 1,
+        offset + static_cast<std::uint64_t>(i * stride[dim]), stats);
   }
 }
 
 void load_strided_float(
     const std::uint8_t* base,
+    TensorDType dtype,
     const std::vector<std::int64_t>& shape,
     const std::vector<std::int64_t>& stride,
     std::size_t dim,
     std::uint64_t offset,
     std::vector<float>* out) {
   if (dim == shape.size()) {
-    out->push_back(static_cast<float>(read_bf16_element_as_double(base, offset)));
+    out->push_back(read_element_as_float(base, dtype, offset));
     return;
   }
   for (std::int64_t i = 0; i < shape[dim]; ++i) {
-    load_strided_float(base, shape, stride, dim + 1, offset + static_cast<std::uint64_t>(i * stride[dim]), out);
+    load_strided_float(
+        base, dtype, shape, stride, dim + 1,
+        offset + static_cast<std::uint64_t>(i * stride[dim]), out);
   }
 }
 
 void load_strided_bf16(
     const std::uint8_t* base,
+    TensorDType dtype,
     const std::vector<std::int64_t>& shape,
     const std::vector<std::int64_t>& stride,
     std::size_t dim,
     std::uint64_t offset,
     std::vector<std::uint16_t>* out) {
   if (dim == shape.size()) {
-    const std::uint8_t* ptr = base + offset * sizeof(std::uint16_t);
-    out->push_back(load_scalar<std::uint16_t>(ptr));
+    out->push_back(read_element_as_bf16(base, dtype, offset));
     return;
   }
   for (std::int64_t i = 0; i < shape[dim]; ++i) {
-    load_strided_bf16(base, shape, stride, dim + 1, offset + static_cast<std::uint64_t>(i * stride[dim]), out);
+    load_strided_bf16(
+        base, dtype, shape, stride, dim + 1,
+        offset + static_cast<std::uint64_t>(i * stride[dim]), out);
   }
 }
 
@@ -616,16 +657,20 @@ const char* dtype_name(TensorDType dtype) {
   switch (dtype) {
     case TensorDType::kBFloat16:
       return "bfloat16";
+    case TensorDType::kFloat32:
+      return "float32";
   }
-  return "bfloat16";
+  return "unknown";
 }
 
 std::uint64_t dtype_size_bytes(TensorDType dtype) {
   switch (dtype) {
     case TensorDType::kBFloat16:
       return 2;
+    case TensorDType::kFloat32:
+      return 4;
   }
-  return 2;
+  return 0;
 }
 
 std::string shape_string(const std::vector<std::int64_t>& dims) {
@@ -767,15 +812,20 @@ Result<TensorStats> compute_tensor_stats(const PthArchive& archive, const Tensor
       return Status::error("tensor data range exceeds storage: " + record.name);
     }
     for (std::uint64_t i = 0; i < n; ++i) {
-      update_minmax(&stats, read_bf16_element_as_double(storage.value().data(), record.storage_offset + i));
+      update_minmax(
+          &stats,
+          read_element_as_float(
+              storage.value().data(), record.dtype, record.storage_offset + i));
     }
   } else {
-    scan_strided(storage.value().data(), record.shape, record.stride, 0, record.storage_offset, &stats);
+    scan_strided(
+        storage.value().data(), record.dtype, record.shape, record.stride,
+        0, record.storage_offset, &stats);
   }
   return stats;
 }
 
-Result<TensorData> load_bf16_tensor_select(
+Result<TensorData> load_tensor_select(
     const PthArchive& archive,
     const TensorRecord& record,
     bool need_bf16,
@@ -809,28 +859,35 @@ Result<TensorData> load_bf16_tensor_select(
       return Status::error("tensor data range exceeds storage: " + record.name);
     }
     for (std::uint64_t i = 0; i < n; ++i) {
-      const std::uint8_t* ptr = storage.value().data() + (record.storage_offset + i) * sizeof(std::uint16_t);
-      const std::uint16_t bits = load_scalar<std::uint16_t>(ptr);
-      if (need_bf16) out.values_bf16.push_back(bits);
-      if (need_f16 || need_float) {
-        const float value = bf16_bits_to_float(bits);
-        if (need_f16) out.values_f16.push_back(float_to_f16_bits(value));
-        if (need_float) out.values.push_back(value);
+      const std::uint64_t element = record.storage_offset + i;
+      if (need_bf16) {
+        out.values_bf16.push_back(
+            read_element_as_bf16(storage.value().data(), record.dtype, element));
       }
+      const float value =
+          read_element_as_float(storage.value().data(), record.dtype, element);
+      if (need_f16) out.values_f16.push_back(float_to_f16_bits(value));
+      if (need_float) out.values.push_back(value);
     }
   } else {
     if (need_bf16) {
-      load_strided_bf16(storage.value().data(), record.shape, record.stride, 0, record.storage_offset, &out.values_bf16);
+      load_strided_bf16(
+          storage.value().data(), record.dtype, record.shape, record.stride,
+          0, record.storage_offset, &out.values_bf16);
     }
     if (need_float) {
-      load_strided_float(storage.value().data(), record.shape, record.stride, 0, record.storage_offset, &out.values);
+      load_strided_float(
+          storage.value().data(), record.dtype, record.shape, record.stride,
+          0, record.storage_offset, &out.values);
     }
     if (need_f16) {
       std::vector<float> tmp;
       const std::vector<float>* src = &out.values;
       if (!need_float) {
         tmp.reserve(static_cast<std::size_t>(n));
-        load_strided_float(storage.value().data(), record.shape, record.stride, 0, record.storage_offset, &tmp);
+        load_strided_float(
+            storage.value().data(), record.dtype, record.shape, record.stride,
+            0, record.storage_offset, &tmp);
         src = &tmp;
       }
       out.values_f16.reserve(src->size());
@@ -842,8 +899,24 @@ Result<TensorData> load_bf16_tensor_select(
   return out;
 }
 
+Result<TensorData> load_tensor_as_float(
+    const PthArchive& archive,
+    const TensorRecord& record) {
+  return load_tensor_select(archive, record, true, true, true);
+}
+
+Result<TensorData> load_bf16_tensor_select(
+    const PthArchive& archive,
+    const TensorRecord& record,
+    bool need_bf16,
+    bool need_f16,
+    bool need_float) {
+  return load_tensor_select(
+      archive, record, need_bf16, need_f16, need_float);
+}
+
 Result<TensorData> load_bf16_tensor_as_float(const PthArchive& archive, const TensorRecord& record) {
-  return load_bf16_tensor_select(archive, record, true, true, true);
+  return load_tensor_as_float(archive, record);
 }
 
 }  // namespace llm_infer

@@ -38,6 +38,11 @@ class InferenceEngine {
       const std::vector<std::string>& prompts,
       const GenerateOptions& options) const;
 
+  std::vector<std::string> batch_generate_with_state(
+      const std::vector<std::string>& prompts,
+      GenerationState& state,
+      const GenerateOptions& options) const;
+
   std::vector<std::string> batch_generate_state(
       const std::vector<std::string>& prompts,
       GenerationState& state,
@@ -45,6 +50,15 @@ class InferenceEngine {
 
   GenerationStats batch_generate_stream(
       const std::vector<std::string>& prompts,
+      const GenerateOptions& options,
+      int chunk_size,
+      const StreamCallback& emit,
+      const ControlCallback& should_stop = {},
+      const StatsCallback& on_prefill_complete = {}) const;
+
+  GenerationStats batch_generate_stream_with_state(
+      const std::vector<std::string>& prompts,
+      GenerationState& state,
       const GenerateOptions& options,
       int chunk_size,
       const StreamCallback& emit,

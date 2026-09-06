@@ -21,6 +21,7 @@
 #include "rwkv_model_router.hpp"
 #include "rwkv_prefill_admission.hpp"
 #include "rwkv_state_cache.hpp"
+#include "rwkv_uploaded_state_store.hpp"
 
 namespace rwkv7_server {
 namespace {
@@ -390,9 +391,120 @@ bool check_password(
   return false;
 }
 
+std::string state_id_from_request(const Json::Value& body);
+
+Json::Value uploaded_state_json(const UploadedStateInfo& info) {
+  Json::Value item;
+  item["state_id"] = info.state_id;
+  item["filename"] = info.filename;
+  item["size_bytes"] = static_cast<Json::UInt64>(info.size_bytes);
+  item["tensor_count"] = info.tensor_count;
+  item["created"] = static_cast<Json::Int64>(info.created);
+  return item;
+}
+
+void register_uploaded_state_routes(
+    HttpAppFramework& app,
+    const std::optional<std::string>& password) {
+  const auto options_handler = [](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k204NoContent);
+    cb(resp);
+  };
+  for (const auto& path : {"/v1/state/upload", "/v1/state/delete", "/v1/state/list"}) {
+    app.registerHandler(path, options_handler, {Options});
+  }
+
+  app.registerHandler(
+      "/v1/state/upload",
+      [password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        Json::Value auth_body = Json::objectValue;
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, auth_body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+        MultiPartParser parser;
+        if (parser.parse(req) != 0) {
+          cb(json_response(make_error("Invalid multipart/form-data request"), k400BadRequest));
+          return;
+        }
+        const auto& files = parser.getFiles();
+        if (files.size() != 1) {
+          cb(json_response(make_error("Request must contain exactly one state file"), k400BadRequest));
+          return;
+        }
+        try {
+          const auto& file = files.front();
+          const auto info = UploadedStateStore::instance().upload(
+              file.getFileName(), file.fileData(), file.fileLength());
+          Json::Value resp = uploaded_state_json(info);
+          resp["object"] = "rwkv.state";
+          cb(json_response(std::move(resp)));
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+        }
+      },
+      {Post});
+
+  app.registerHandler(
+      "/v1/state/list",
+      [password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        const auto json = req->getJsonObject();
+        Json::Value body = json ? *json : Json::Value(Json::objectValue);
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+        const auto states = UploadedStateStore::instance().list();
+        Json::Value resp;
+        resp["object"] = "list";
+        resp["data"] = Json::arrayValue;
+        for (const auto& state : states) {
+          resp["data"].append(uploaded_state_json(state));
+        }
+        cb(json_response(std::move(resp)));
+      },
+      {Get, Post});
+
+  app.registerHandler(
+      "/v1/state/delete",
+      [password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        const auto json = req->getJsonObject();
+        Json::Value body = json ? *json : Json::Value(Json::objectValue);
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+        try {
+          std::string state_id = state_id_from_request(body);
+          if (state_id.empty()) {
+            state_id = req->getParameter("state_id");
+          }
+          if (state_id.empty()) {
+            cb(json_response(make_error("Missing state_id"), k400BadRequest));
+            return;
+          }
+          const bool deleted = UploadedStateStore::instance().erase(state_id);
+          Json::Value resp;
+          resp["state_id"] = state_id;
+          resp["deleted"] = deleted;
+          cb(json_response(std::move(resp), deleted ? k200OK : k404NotFound));
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+        }
+      },
+      {Delete, Post});
+}
+
 ThinkType parse_think_type(const Json::Value& body) {
   if (body.isMember("think_type")) {
     const auto value = body.get("think_type", "").asString();
+    if (value == "none" || value == "off" || value == "disabled") {
+      return ThinkType::None;
+    }
     if (value == "fast") {
       return ThinkType::Fast;
     }
@@ -420,7 +532,12 @@ ThinkType parse_think_type(const Json::Value& body) {
 }
 
 bool force_reasoning_for_think_type(ThinkType think_type) {
-  return think_type != ThinkType::Fast;
+  return think_type != ThinkType::None && think_type != ThinkType::Fast;
+}
+
+bool has_explicit_think_type(const Json::Value& body) {
+  return body.isMember("think_type") || body.isMember("think") ||
+         body.isMember("enable_think");
 }
 
 GenerateOptions parse_options(const Json::Value& body, GenerateOptions options = {}) {
@@ -484,6 +601,30 @@ std::vector<std::string> parse_contents(const Json::Value& body) {
     }
   }
   return prompts;
+}
+
+std::string state_id_from_request(const Json::Value& body) {
+  if (!body.isMember("state_id") || body["state_id"].isNull()) {
+    return {};
+  }
+  if (!body["state_id"].isString()) {
+    throw std::runtime_error("state_id must be a string");
+  }
+  return body["state_id"].asString();
+}
+
+GenerationState create_request_state(
+    const InferenceEngine& engine,
+    const std::string& state_id,
+    int batch_size = 1) {
+  if (state_id.empty()) {
+    return engine.model()->create_state(batch_size);
+  }
+  auto uploaded = UploadedStateStore::instance().acquire(state_id);
+  if (!uploaded.has_value()) {
+    throw std::runtime_error("uploaded state not found: " + state_id);
+  }
+  return engine.model()->load_state_from_pth(uploaded->path.string(), batch_size);
 }
 
 std::string create_translation_prompt(
@@ -602,7 +743,10 @@ void start_streaming_task(
   }).detach();
 }
 
-std::string format_openai_prompt(const Json::Value& body, const InferenceEngine& engine) {
+std::string format_openai_prompt(
+    const Json::Value& body,
+    const InferenceEngine& engine,
+    bool uploaded_state = false) {
   std::vector<std::pair<std::string, std::string>> dialogue_messages;
   std::vector<std::string> system_parts;
   const auto system_field = body.get("system", "").asString();
@@ -629,6 +773,13 @@ std::string format_openai_prompt(const Json::Value& body, const InferenceEngine&
   }
 
   const auto contents = parse_contents(body);
+  if (dialogue_messages.empty() && system_parts.empty() && !contents.empty() &&
+      (contents.front().rfind("User:", 0) == 0 ||
+       contents.front().find("\n\nAssistant:") != std::string::npos)) {
+    // Compatibility clients may send an already formatted prompt through
+    // contents. Do not wrap it in a second User/Assistant envelope.
+    return contents.front();
+  }
   if (!contents.empty()) {
     dialogue_messages.emplace_back("User", contents.front());
   }
@@ -645,7 +796,10 @@ std::string format_openai_prompt(const Json::Value& body, const InferenceEngine&
       system += part;
     }
   }
-  return engine.format_openai_prompt(system, dialogue_messages, parse_think_type(body));
+  const auto think_type = uploaded_state && !has_explicit_think_type(body)
+      ? ThinkType::None
+      : parse_think_type(body);
+  return engine.format_openai_prompt(system, dialogue_messages, think_type);
 }
 
 Json::Value build_openai_response(
@@ -835,6 +989,7 @@ void register_api_routes_legacy(
            "/v1/models"}) {
     app.registerHandler(path, handle_options, {Options});
   }
+  register_uploaded_state_routes(app, password);
 
   app.registerHandler(
       "/v1/server/status",
@@ -1041,6 +1196,13 @@ void register_api_routes_legacy(
           cb(auth_resp);
           return;
         }
+        std::string state_id;
+        try {
+          state_id = state_id_from_request(*json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
 
         const auto prompts = parse_contents(*json);
         if (prompts.empty()) {
@@ -1062,7 +1224,7 @@ void register_api_routes_legacy(
             options.max_tokens,
             prompt_tokens);
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, admission, active, prompts, options, model, metrics_requested,
+          cb(make_sse_response([&engine, admission, active, prompts, state_id, options, model, metrics_requested,
                                 chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
@@ -1070,7 +1232,7 @@ void register_api_routes_legacy(
                 active->id,
                 model,
                 static_cast<int>(prompts.size()),
-                [&, admission, active, prompts, options, chunk_size, metrics_requested](const InferenceEngine::StreamCallback& emit) {
+                [&, admission, active, prompts, state_id, options, chunk_size, metrics_requested](const InferenceEngine::StreamCallback& emit) {
                   auto permit = admission->acquire(
                       static_cast<int>(prompts.size()),
                       "batch.completions",
@@ -1086,8 +1248,11 @@ void register_api_routes_legacy(
                       record_generation_stats(active, stats);
                     };
                   }
-                  const auto stats = engine.batch_generate_stream(
+                  auto state = create_request_state(
+                      engine, state_id, static_cast<int>(prompts.size()));
+                  const auto stats = engine.batch_generate_stream_with_state(
                       prompts,
+                      state,
                       options,
                       chunk_size,
                       [&, metrics_requested](int index, const std::string& chunk) {
@@ -1134,19 +1299,29 @@ void register_api_routes_legacy(
           return;
         }
         std::vector<std::string> results(prompts.size());
-        const auto stats = engine.batch_generate_stream(
-            prompts,
-            options,
-            parse_chunk_size(*json, 0),
-            [&](int index, const std::string& chunk) {
-              if (index >= 0 && index < static_cast<int>(results.size())) {
-                results[static_cast<size_t>(index)] += chunk;
-              }
-              return true;
-            },
-            [active]() {
-              return active->stop_requested.load() || active->pause_requested.load();
-            });
+        InferenceEngine::GenerationStats stats;
+        try {
+          auto state = create_request_state(
+              engine, state_id, static_cast<int>(prompts.size()));
+          stats = engine.batch_generate_stream_with_state(
+              prompts,
+              state,
+              options,
+              parse_chunk_size(*json, 0),
+              [&](int index, const std::string& chunk) {
+                if (index >= 0 && index < static_cast<int>(results.size())) {
+                  results[static_cast<size_t>(index)] += chunk;
+                }
+                return true;
+              },
+              [active]() {
+                return active->stop_requested.load() || active->pause_requested.load();
+              });
+        } catch (const std::exception& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
         if (metrics_requested) {
           record_generation_stats(active, stats);
         }
@@ -1162,6 +1337,13 @@ void register_api_routes_legacy(
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
+          return;
+        }
+        std::string state_id;
+        try {
+          state_id = state_id_from_request(*json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
           return;
         }
         const auto source_lang = (*json).get("source_lang", "auto").asString();
@@ -1200,7 +1382,15 @@ void register_api_routes_legacy(
           cb(json_response(prefill_limit_error(error), k400BadRequest));
           return;
         }
-        const auto results = engine.batch_generate(prompts, options);
+        std::vector<std::string> results;
+        try {
+          auto state = create_request_state(
+              engine, state_id, static_cast<int>(prompts.size()));
+          results = engine.batch_generate_with_state(prompts, state, options);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
         Json::Value resp;
         resp["translations"] = Json::arrayValue;
         for (const auto& text : results) {
@@ -1228,6 +1418,13 @@ void register_api_routes_legacy(
         }
 
         const auto session_id = (*json).get("session_id", "").asString();
+        std::string state_id;
+        try {
+          state_id = state_id_from_request(*json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
         const auto prompts = parse_contents(*json);
         if (session_id.empty()) {
           cb(json_response(make_error("Missing session_id"), k400BadRequest));
@@ -1248,7 +1445,7 @@ void register_api_routes_legacy(
             prompt_tokens,
             session_id);
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, admission, session_id, prompts, options,
+          cb(make_sse_response([&engine, admission, session_id, state_id, prompts, options,
                                 active, model, chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
@@ -1256,7 +1453,7 @@ void register_api_routes_legacy(
                 active->id,
                 model,
                 1,
-                [&, admission, active, session_id, prompts, options, chunk_size](
+                [&, admission, active, session_id, state_id, prompts, options, chunk_size](
                     const InferenceEngine::StreamCallback& emit) {
                   auto permit = admission->acquire(1, "state.chat.completions", [active]() {
                     return active->stop_requested.load() || active->pause_requested.load();
@@ -1264,10 +1461,13 @@ void register_api_routes_legacy(
                   if (!permit.has_value()) {
                     return;
                   }
-                  auto cached_state = StateCacheManager::instance().get_state(session_id);
-                  auto state = cached_state.has_value()
-                      ? std::move(*cached_state)
-                      : engine.model()->create_state(1);
+                  auto cached_state = state_id.empty()
+                      ? StateCacheManager::instance().get_state(session_id)
+                      : std::optional<GenerationState>{};
+                  auto state = !state_id.empty()
+                      ? create_request_state(engine, state_id)
+                      : (cached_state.has_value() ? std::move(*cached_state)
+                                                  : engine.model()->create_state(1));
                   auto state_ptr = std::make_shared<GenerationState>(std::move(state));
                   engine.batch_generate_state_stream(
                       prompts,
@@ -1306,10 +1506,17 @@ void register_api_routes_legacy(
           return;
         }
         auto& manager = StateCacheManager::instance();
-        auto cached_state = manager.get_state(session_id);
-        auto state = cached_state.has_value()
-            ? std::move(*cached_state)
-            : engine.model()->create_state(1);
+        GenerationState state;
+        try {
+          auto cached_state = state_id.empty() ? manager.get_state(session_id) : std::optional<GenerationState>{};
+          state = !state_id.empty()
+              ? create_request_state(engine, state_id)
+              : (cached_state.has_value() ? std::move(*cached_state) : engine.model()->create_state(1));
+        } catch (const std::exception& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
         auto texts = engine.batch_generate_state(prompts, state, options);
         manager.put_state(session_id, state);
         Json::Value resp;
@@ -1406,7 +1613,14 @@ void register_api_routes_legacy(
           return;
         }
 
-        const auto prompt = format_openai_prompt(*json, engine);
+        std::string state_id;
+        try {
+          state_id = state_id_from_request(*json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+        const auto prompt = format_openai_prompt(*json, engine, !state_id.empty());
         // std::cout << prompt << std::endl; // Debug Prompt
         auto options = parse_options(*json);
         if ((*json).isMember("think_type") || (*json).isMember("think") || (*json).isMember("enable_think")) {
@@ -1421,7 +1635,7 @@ void register_api_routes_legacy(
             prompt_tokens);
 
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, admission, prompt, options, active, model,
+          cb(make_sse_response([&engine, admission, prompt, state_id, options, active, model,
                                 chunk_size = parse_chunk_size(*json, 2)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
@@ -1429,7 +1643,7 @@ void register_api_routes_legacy(
                 active->id,
                 model,
                 1,
-                [&, admission, active, prompt, options, chunk_size](
+                [&, admission, active, prompt, state_id, options, chunk_size](
                     const InferenceEngine::StreamCallback& emit) {
                   auto permit = admission->acquire(1, "chat.completions", [active]() {
                     return active->stop_requested.load() || active->pause_requested.load();
@@ -1437,7 +1651,8 @@ void register_api_routes_legacy(
                   if (!permit.has_value()) {
                     return;
                   }
-                  auto state_ptr = std::make_shared<GenerationState>(engine.model()->create_state(1));
+                  auto state_ptr = std::make_shared<GenerationState>(
+                      create_request_state(engine, state_id));
                   auto logits_ptr = std::make_shared<DeviceLogits>();
                   const auto prefill_begin = std::chrono::steady_clock::now();
                   const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
@@ -1497,7 +1712,15 @@ void register_api_routes_legacy(
           cb(json_response(make_error("Request cancelled"), k409Conflict));
           return;
         }
-        auto state_ptr = std::make_shared<GenerationState>(engine.model()->create_state(1));
+        std::shared_ptr<GenerationState> state_ptr;
+        try {
+          state_ptr = std::make_shared<GenerationState>(
+              create_request_state(engine, state_id));
+        } catch (const std::exception& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
         auto logits_ptr = std::make_shared<DeviceLogits>();
         std::string completion;
 
@@ -1579,6 +1802,7 @@ void register_api_routes(
   for (const auto& path : {"/v1/models", "/v1/model/load", "/v1/chat/completions", "/v1/batch/completions", "/v1/tokens/count", "/v1/server/status"}) {
     app.registerHandler(path, options_handler, {Options});
   }
+  register_uploaded_state_routes(app, password);
 
   app.registerHandler("/v1/models", [&models, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
     Json::Value body = Json::objectValue;
@@ -1637,8 +1861,11 @@ void register_api_routes(
     try {
       auto lease = std::make_shared<ModelRouter::Lease>(models.acquire());
       auto& engine = lease->engine();
+      const std::string state_id = state_id_from_request(*json);
       const std::string model = engine.model_name();
-      const auto prompts = batch ? parse_contents(*json) : std::vector<std::string>{format_openai_prompt(*json, engine)};
+      const auto prompts = batch
+          ? parse_contents(*json)
+          : std::vector<std::string>{format_openai_prompt(*json, engine, !state_id.empty())};
       if (prompts.empty()) { cb(json_response(make_error("Empty prompts list"), k400BadRequest)); return; }
       auto options = parse_options(*json);
       if (!batch && ((*json).isMember("think_type") || (*json).isMember("think") || (*json).isMember("enable_think"))) {
@@ -1646,16 +1873,36 @@ void register_api_routes(
       }
       const int chunk_size = parse_chunk_size(*json, batch ? 8 : 2);
       if ((*json).get("stream", false).asBool()) {
-        cb(make_sse_response([lease, prompts, options, model, chunk_size](ResponseStreamPtr stream) {
+        cb(make_sse_response([lease, prompts, state_id, options, model, chunk_size](ResponseStreamPtr stream) {
           start_streaming_task(std::move(stream), "chatcmpl-rwkv-fast", model, static_cast<int>(prompts.size()),
-            [lease, prompts, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
+            [lease, prompts, state_id, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
               auto& engine = lease->engine();
-              engine.batch_generate_stream(prompts, options, chunk_size, emit);
+              if (!state_id.empty()) {
+                auto state = create_request_state(
+                    engine, state_id, static_cast<int>(prompts.size()));
+                if (prompts.size() == 1) {
+                  engine.batch_generate_state_stream(prompts, state, options, chunk_size, emit);
+                } else {
+                  engine.batch_generate_stream_with_state(
+                      prompts, state, options, chunk_size, emit);
+                }
+              } else {
+                engine.batch_generate_stream(prompts, options, chunk_size, emit);
+              }
             }, [] {});
         }));
         return;
       }
-      const auto results = engine.batch_generate(prompts, options);
+      std::vector<std::string> results;
+      if (!state_id.empty()) {
+        auto state = create_request_state(
+            engine, state_id, static_cast<int>(prompts.size()));
+        results = prompts.size() == 1
+            ? engine.batch_generate_state(prompts, state, options)
+            : engine.batch_generate_with_state(prompts, state, options);
+      } else {
+        results = engine.batch_generate(prompts, options);
+      }
       if (batch) {
         Json::Value resp; resp["id"] = "rwkv7-fast-batch"; resp["object"] = "chat.completion"; resp["model"] = model; resp["choices"] = build_choices(results);
         cb(json_response(std::move(resp)));

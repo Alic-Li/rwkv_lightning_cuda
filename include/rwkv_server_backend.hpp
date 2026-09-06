@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,7 @@ struct PrefillCapacity {
 };
 
 enum class ThinkType {
+  None,
   Fast,
   Free,
   PreferChinese,
@@ -77,6 +79,11 @@ class IModelBackend {
   virtual ~IModelBackend() = default;
 
   virtual GenerationState create_state(int batch_size) const = 0;
+  // Load a serialized PyTorch state. Backends that do not support this format
+  // retain the normal zero-initialized state behavior only when no path is set.
+  virtual GenerationState load_state_from_pth(const std::string&, int batch_size) const {
+    throw std::runtime_error("PTH state loading is not supported by this backend");
+  }
   virtual void forward_prefill(
       const std::vector<std::vector<int64_t>>& token_batches,
       GenerationState& state,
@@ -122,6 +129,7 @@ class ModelBackend final : public IModelBackend {
   ModelBackend& operator=(ModelBackend&&) noexcept;
 
   GenerationState create_state(int batch_size) const override;
+  GenerationState load_state_from_pth(const std::string& path, int batch_size) const override;
   void forward_prefill(
       const std::vector<std::vector<int64_t>>& token_batches,
       GenerationState& state,

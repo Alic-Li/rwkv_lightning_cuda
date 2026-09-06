@@ -58,6 +58,12 @@ std::string archive_prefix(const llm_infer::PthArchive& archive) {
 
 llm_infer::Result<std::vector<float>> load_values(
     const llm_infer::PthArchive& archive, const llm_infer::TensorRecord& record) {
+  if (record.dtype != llm_infer::TensorDType::kBFloat16) {
+    auto loaded = llm_infer::load_tensor_select(
+        archive, record, false, false, true);
+    if (!loaded.ok()) return loaded.status();
+    return loaded.value().values;
+  }
   const std::uint64_t element_count = tensor_numel(record.shape);
   if (!is_contiguous(record.shape, record.stride)) {
     auto loaded = llm_infer::load_bf16_tensor_select(archive, record, false, false, true);

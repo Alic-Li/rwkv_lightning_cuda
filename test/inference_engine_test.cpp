@@ -69,13 +69,16 @@ int main() {
             "SYS",
             {{"User", "Q1"}, {"Assistant", "A1"}, {"User", "Q2"}},
             false),
-        std::string("System: SYS\n\nUser: Q1\n\nAssistant: A1\n\nUser: Q2\n\nAssistant: <think></think"));
+        std::string("System: SYS\n\nUser: Q1\n\nAssistant: A1\n\nUser: Q2\n\nAssistant: <think>\n</think"));
     TEST_EQ(
         engine.format_openai_prompt("SYS", {{"User", "Q"}}, true),
         std::string("System: SYS\n\nUser: Q\n\nAssistant: <think"));
     TEST_EQ(
         engine.format_openai_prompt("SYS", {{"User", "Q"}}, rwkv7_server::ThinkType::EnShort),
         std::string("System: SYS\n\nUser: Q (think a bit)\n\nAssistant: <think"));
+    TEST_EQ(
+        engine.format_openai_prompt("SYS", {{"User", "Q"}}, rwkv7_server::ThinkType::None),
+        std::string("System: SYS\n\nUser: Q\n\nAssistant: "));
     TEST_EQ(engine.count_tokens(answer), static_cast<int>(answer_ids.size()));
 
     rwkv7_server::GenerationState invalid_state;

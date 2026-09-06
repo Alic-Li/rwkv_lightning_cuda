@@ -2,7 +2,7 @@
 listen = "0.0.0.0:8080"
 
 # 0 means no router-enforced body limit. The backend still validates its own limits.
-max_request_body_bytes = 16777216
+max_request_body_bytes = 537919488
 
 # Non-streaming and SSE requests are both kept open until the upstream finishes.
 # 0 disables the total request timeout (recommended when clients use long generations).

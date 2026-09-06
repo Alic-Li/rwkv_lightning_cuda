@@ -117,6 +117,7 @@ set(RWKV7_FAST_HOST_SOURCES
   src/rwkv_inference_engine.cpp
   src/rwkv_prefill_admission.cpp
   src/rwkv_state_cache.cpp
+  src/rwkv_uploaded_state_store.cpp
 )
 if(RWKV_GPU_BACKEND STREQUAL "HIP")
   set(RWKV7_FAST_GPU_SOURCES

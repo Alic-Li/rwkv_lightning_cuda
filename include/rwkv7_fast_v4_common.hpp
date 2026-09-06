@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -33,6 +34,38 @@ struct ModelDims {
   int vocab = 0;
   int ffn = 0;
 };
+
+// State-tuning PTH files store each head as [V, K], while the fused WKV
+// kernels use the physical ABI [K, V]. This is equivalent to PyTorch's
+// time_state.transpose(1, 2) used by the reference RWKV state loader.
+template <typename T>
+inline std::vector<T> transpose_time_state_for_runtime(
+    const std::vector<T>& source,
+    int heads,
+    int head_size) {
+  if (heads <= 0 || head_size <= 0) {
+    throw std::runtime_error("invalid time-state dimensions");
+  }
+  const std::size_t expected =
+      static_cast<std::size_t>(heads) * head_size * head_size;
+  if (source.size() != expected) {
+    throw std::runtime_error("time-state element count does not match model dimensions");
+  }
+
+  std::vector<T> runtime(expected);
+  for (int head = 0; head < heads; ++head) {
+    for (int value = 0; value < head_size; ++value) {
+      for (int key = 0; key < head_size; ++key) {
+        const std::size_t source_index =
+            (static_cast<std::size_t>(head) * head_size + value) * head_size + key;
+        const std::size_t runtime_index =
+            (static_cast<std::size_t>(head) * head_size + key) * head_size + value;
+        runtime[runtime_index] = source[source_index];
+      }
+    }
+  }
+  return runtime;
+}
 
 enum class CmixMode {
   NoFcOne,
