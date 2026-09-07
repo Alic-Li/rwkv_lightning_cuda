@@ -5,18 +5,18 @@ cmake -S . -B ./build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120"
 
-cmake --build ./build -j --config Release --target rwkv_quantize bundle_rwkv_lighting_cuda
+cmake --build ./build -j --config Release --target bundle_rwkv_quantize bundle_rwkv_lighting_cuda
 ```
 
 ### CUDA W8A16 quantization
 
-The build produces `build/rwkv_quantize`, a standalone converter for BF16 RWKV
+The build produces `build/bundle/rwkv_quantize/rwkv_quantize`, a standalone converter for BF16 RWKV
 checkpoints. It writes a streaming `.rwkvq` file containing per-output-channel
 symmetric INT8 weights and FP16 scales; embeddings, layer norms, LoRA factors,
 and other non-linear tensors remain BF16.
 
 ```bash
-./build/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
+./build/bundle/rwkv_quantize/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
 ```
 
 The CUDA inference backend detects `.rwkvq` files automatically, keeps INT8
@@ -28,7 +28,7 @@ Windows
 $env:CudaToolkitDir="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\"
 cmake -S . -B ./build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120" -DCMAKE_TOOLCHAIN_FILE="D:/vcpkg/scripts/buildsystems/vcpkg.cmake"  -DCMAKE_CXX_FLAGS="/Zc:preprocessor" -DCMAKE_CUDA_FLAGS="-Xcompiler=/Zc:preprocessor"
 
-cmake --build ./build --config Release -j --target rwkv_quantize bundle_rwkv_lighting_cuda
+cmake --build ./build --config Release -j --target bundle_rwkv_quantize bundle_rwkv_lighting_cuda
 ```
 
 AMD ROCm

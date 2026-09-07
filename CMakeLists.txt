@@ -153,6 +153,7 @@ add_executable(rwkv_quantize
 )
 target_include_directories(rwkv_quantize PRIVATE include src quant/modeling)
 target_compile_options(rwkv_quantize PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+rwkv_configure_runtime_bundle(rwkv_quantize)
 
 if(RWKV_GPU_BACKEND STREQUAL "CUDA")
   add_executable(rwkv_w8a16_bench tools/bench_w8a16.cpp)
