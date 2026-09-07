@@ -19,7 +19,7 @@ constexpr int kForceReasoningDenyTokenB = 754;
 constexpr float kMaskedLogit = -1.0e30f;
 
 struct ThinkPromptConfig {
-  const char* header = "<think>\n</think";
+  const char* header = "<think></think";
   const char* user_msg_footer = "";
   bool force_reasoning = false;
 };
@@ -29,7 +29,7 @@ ThinkPromptConfig think_prompt_config(ThinkType think_type) {
     case ThinkType::None:
       return {"", "", false};
     case ThinkType::Fast:
-      return {"<think>\n</think", "", false};
+      return {"<think></think", "", false};
     case ThinkType::Free:
       return {"<think", "", true};
     case ThinkType::PreferChinese:
@@ -41,7 +41,7 @@ ThinkPromptConfig think_prompt_config(ThinkType think_type) {
     case ThinkType::EnLong:
       return {"<think", " (think a lot)", true};
   }
-  return {"<think>\n</think", "", false};
+  return {"<think></think", "", false};
 }
 
 bool should_force_reasoning_mask(const GenerateOptions& options, int generated_step) {
