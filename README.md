@@ -204,7 +204,7 @@ on the second and third generated tokens. If `think_type` is omitted,
 `enable_think:true` or `think:true` maps to `free`; otherwise the default is
 `fast`.
 
-Upload a serialized RWKV state first, then pass the returned string `state_id`
+Upload a serialized RWKV state first, then pass the returned filename as `state_id`
 to a chat request. Uploaded files are validated as PyTorch state archives and
 kept in a process-local temporary directory. They are removed explicitly with
 the delete endpoint or automatically when the server exits. The upload limit
@@ -217,9 +217,10 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/state/upload" \
   -F "file=@./rwkv-state-agentic.pth"
 ```
 
-The response contains a generated ID such as
-`{"object":"rwkv.state","state_id":"state-0123..."}`. Use that value in a
-generation request:
+The response uses the uploaded file's basename as its ID, for example
+`{"object":"rwkv.state","state_id":"rwkv-state-agentic.pth"}`. Uploading a
+file with a name that is already present returns an `already exists` error. Use
+that value in a generation request:
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8000/v1/chat/completions" \
@@ -227,7 +228,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/chat/completions" \
   --data '{
     "model":"api-test",
     "messages":[{"role":"user","content":"Continue from the supplied state."}],
-    "state_id":"state-0123...",
+    "state_id":"rwkv-state-agentic.pth",
     "stream":false,
     "max_tokens":8
   }'
@@ -252,7 +253,7 @@ curl -sS "http://127.0.0.1:8000/v1/state/list"
 
 curl -sS -X DELETE "http://127.0.0.1:8000/v1/state/delete" \
   -H "Content-Type: application/json" \
-  --data '{"state_id":"state-0123..."}'
+  --data '{"state_id":"rwkv-state-agentic.pth"}'
 ```
 
 When `--password` is enabled, use an `Authorization: Bearer ...` header for the
@@ -289,7 +290,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/batch/completions" \
   -H "Content-Type: application/json" \
   --data '{
     "contents":["English: Hello\n\nChinese:","English: Good morning\n\nChinese:"],
-    "state_id":"state-0123...",
+    "state_id":"rwkv-state-agentic.pth",
     "stream":false,
     "max_tokens":8,
     "temperature":1.0,
@@ -308,7 +309,7 @@ curl -sS -N -X POST "http://127.0.0.1:8000/v1/batch/completions" \
   -H "Content-Type: application/json" \
   --data '{
     "contents":["English: Hello\n\nChinese:","English: Good morning\n\nChinese:"],
-    "state_id":"state-0123...",
+    "state_id":"rwkv-state-agentic.pth",
     "stream":true,
     "max_tokens":8,
     "temperature":1.0,
@@ -333,7 +334,7 @@ curl -sS -X POST "http://127.0.0.1:8000/translate/v1/batch-translate" \
     "source_lang":"English",
     "target_lang":"Chinese",
     "text_list":["Hello","Good morning"],
-    "state_id":"state-0123..."
+    "state_id":"rwkv-state-agentic.pth"
   }'
 ```
 

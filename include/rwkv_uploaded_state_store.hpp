@@ -50,7 +50,6 @@ class UploadedStateStore {
   UploadedStateStore(const UploadedStateStore&) = delete;
   UploadedStateStore& operator=(const UploadedStateStore&) = delete;
 
-  std::string make_state_id_locked();
   void ensure_directory_locked();
 
   mutable std::mutex mutex_;

@@ -86,17 +86,6 @@ void UploadedStateStore::ensure_directory_locked() {
   }
 }
 
-std::string UploadedStateStore::make_state_id_locked() {
-  for (;;) {
-    std::ostringstream id;
-    id << "state-" << std::hex << std::setfill('0')
-       << std::setw(16) << random_() << std::setw(16) << random_();
-    if (states_.find(id.str()) == states_.end()) {
-      return id.str();
-    }
-  }
-}
-
 UploadedStateInfo UploadedStateStore::upload(
     const std::string& filename,
     const char* data,
@@ -110,8 +99,16 @@ UploadedStateInfo UploadedStateStore::upload(
 
   std::lock_guard<std::mutex> lock(mutex_);
   ensure_directory_locked();
-  const std::string state_id = make_state_id_locked();
-  const auto path = directory_ / (state_id + ".pth");
+  // Use a basename only: multipart clients may include a local path, but that
+  // must neither become part of the public ID nor escape the upload directory.
+  std::string state_id = std::filesystem::path(filename).filename().string();
+  if (state_id.empty() || state_id == "." || state_id == "..") {
+    state_id = "state.pth";
+  }
+  if (states_.find(state_id) != states_.end()) {
+    throw std::runtime_error("uploaded state already exists: " + state_id);
+  }
+  const auto path = directory_ / state_id;
   try {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(data, static_cast<std::streamsize>(size));
@@ -122,7 +119,7 @@ UploadedStateInfo UploadedStateStore::upload(
 
     auto entry = std::make_shared<Entry>();
     entry->info.state_id = state_id;
-    entry->info.filename = filename.empty() ? "state.pth" : filename;
+    entry->info.filename = state_id;
     entry->info.size_bytes = static_cast<std::uint64_t>(size);
     entry->info.tensor_count = validate_state_pth(path);
     entry->info.created = now_seconds();

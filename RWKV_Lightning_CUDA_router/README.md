@@ -40,12 +40,13 @@ backend unhealthy because they may be valid request errors.
 for the lifetime of the router process. Do not place stateful traffic behind a
 router restart unless the state store is shared by all backends.
 
-Successful `/v1/state/upload` responses also create an in-memory
-`state_id`-to-backend affinity entry. Every inference or delete request carrying
-that `state_id` is sent back to the backend holding the uploaded file. These
-entries are removed after a successful `/v1/state/delete` and are not preserved
-across router restarts. The example body limit is 513 MiB so it can proxy the
-backend's 512 MiB state upload limit plus multipart framing.
+`/v1/state/upload`, `/v1/state/list`, and `/v1/state/delete` are sent concurrently
+to every configured backend, and the router waits for every response. An upload
+therefore creates the same filename-based `state_id` on every worker, so subsequent
+inference requests carrying that ID remain safely load-balanced. If a worker fails
+or workers return inconsistent status/IDs, the router returns an error instead of
+claiming the state is synchronized. The example body limit is 513 MiB so it can
+proxy the backend's 512 MiB state upload limit plus multipart framing.
 
 The router does not retry POST requests: retrying after an uncertain upstream write
 can execute a generation twice. Clients may safely retry connection failures.

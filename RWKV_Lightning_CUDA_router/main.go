@@ -47,7 +47,6 @@ type scheduler struct {
 	backends []*backend
 	next     uint64
 	sessions map[string]*backend
-	states   map[string]*backend
 	cooldown time.Duration
 }
 
@@ -66,7 +65,6 @@ func newScheduler(c config) (*scheduler, error) {
 	}
 	s := &scheduler{
 		sessions: make(map[string]*backend),
-		states:   make(map[string]*backend),
 		cooldown: time.Duration(c.FailureCooldownSeconds) * time.Second,
 	}
 	for i, item := range c.Backends {
@@ -96,18 +94,6 @@ func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	if stateID != "" {
-		if b := s.states[stateID]; b != nil {
-			if now.Before(b.unhealthy) {
-				return nil, nil, errors.New("backend holding the uploaded state is temporarily unavailable")
-			}
-			b.inflight += bsz
-			if session != "" {
-				s.sessions[session] = b
-			}
-			return b, s.releaseFunc(b, bsz), nil
-		}
-	}
 	if session != "" {
 		if b := s.sessions[session]; b != nil && !now.Before(b.unhealthy) {
 			b.inflight += bsz
@@ -137,27 +123,6 @@ func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(
 	return chosen, s.releaseFunc(chosen, bsz), nil
 }
 
-func (s *scheduler) bindState(stateID string, b *backend) {
-	if stateID == "" || b == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.states == nil {
-		s.states = make(map[string]*backend)
-	}
-	s.states[stateID] = b
-}
-
-func (s *scheduler) unbindState(stateID string) {
-	if stateID == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.states, stateID)
-}
-
 func (s *scheduler) releaseFunc(b *backend, bsz int64) func() {
 	var once sync.Once
 	return func() { once.Do(func() { s.mu.Lock(); b.inflight -= bsz; s.mu.Unlock() }) }
@@ -168,6 +133,28 @@ func (s *scheduler) failed(b *backend) {
 	defer s.mu.Unlock()
 	if s.cooldown > 0 {
 		b.unhealthy = time.Now().Add(s.cooldown)
+	}
+}
+
+// acquireAll reserves every backend while a state-store operation is in
+// progress. Uploaded states live in each backend's local filesystem, so these
+// operations must not be load-balanced to only one of them.
+func (s *scheduler) acquireAll() ([]*backend, func()) {
+	s.mu.Lock()
+	backends := append([]*backend(nil), s.backends...)
+	for _, b := range backends {
+		b.inflight++
+	}
+	s.mu.Unlock()
+	var once sync.Once
+	return backends, func() {
+		once.Do(func() {
+			s.mu.Lock()
+			for _, b := range backends {
+				b.inflight--
+			}
+			s.mu.Unlock()
+		})
 	}
 }
 
@@ -182,6 +169,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := p.readBody(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		return
+	}
+	if isSynchronizedStateRoute(r.URL.Path) {
+		p.serveSynchronizedState(w, r, body)
 		return
 	}
 	bsz, session := batchSize(r.URL.Path, body)
@@ -219,26 +210,6 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	copyHeaders(w.Header(), resp.Header)
-	if r.URL.Path == "/v1/state/upload" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		responseBody, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			p.scheduler.failed(b)
-			http.Error(w, "upstream response read failed", http.StatusBadGateway)
-			return
-		}
-		var uploaded struct {
-			StateID string `json:"state_id"`
-		}
-		if json.Unmarshal(responseBody, &uploaded) == nil {
-			p.scheduler.bindState(uploaded.StateID, b)
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(responseBody)
-		return
-	}
-	if r.URL.Path == "/v1/state/delete" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		p.scheduler.unbindState(stateID)
-	}
 	w.WriteHeader(resp.StatusCode)
 	destination := io.Writer(w)
 	if strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
@@ -247,6 +218,106 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(destination, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("proxy %s: response copy: %v", b.name, err)
 	}
+}
+
+func isSynchronizedStateRoute(path string) bool {
+	return path == "/v1/state/upload" || path == "/v1/state/list" || path == "/v1/state/delete"
+}
+
+type stateResponse struct {
+	backend *backend
+	status  int
+	header  http.Header
+	body    []byte
+	err     error
+}
+
+// serveSynchronizedState fans state-file mutations and checks out to every
+// backend and waits for every result. A single successful worker is never
+// enough: otherwise a later load-balanced inference could miss the state.
+func (p *proxy) serveSynchronizedState(w http.ResponseWriter, r *http.Request, body []byte) {
+	backends, release := p.scheduler.acquireAll()
+	defer release()
+	ctx := r.Context()
+	if p.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.timeout)
+		defer cancel()
+	}
+
+	responses := make([]stateResponse, len(backends))
+	var wg sync.WaitGroup
+	for i, b := range backends {
+		wg.Add(1)
+		go func(i int, b *backend) {
+			defer wg.Done()
+			target := *b.baseURL
+			target.Path = joinPath(b.baseURL.Path, r.URL.Path)
+			target.RawQuery = r.URL.RawQuery
+			upstream, err := http.NewRequestWithContext(ctx, r.Method, target.String(), bytes.NewReader(body))
+			if err != nil {
+				responses[i] = stateResponse{backend: b, err: err}
+				return
+			}
+			copyHeaders(upstream.Header, r.Header)
+			upstream.Host = b.baseURL.Host
+			resp, err := p.client.Do(upstream)
+			if err != nil {
+				p.scheduler.failed(b)
+				responses[i] = stateResponse{backend: b, err: err}
+				return
+			}
+			defer resp.Body.Close()
+			responseBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				p.scheduler.failed(b)
+			}
+			responses[i] = stateResponse{backend: b, status: resp.StatusCode, header: resp.Header.Clone(), body: responseBody, err: err}
+		}(i, b)
+	}
+	wg.Wait()
+
+	for _, response := range responses {
+		if response.err != nil {
+			http.Error(w, "state synchronization failed on backend "+response.backend.name, http.StatusBadGateway)
+			return
+		}
+	}
+	if r.URL.Path == "/v1/state/upload" {
+		var stateID string
+		for _, response := range responses {
+			if response.status < 200 || response.status >= 300 {
+				copyHeaders(w.Header(), response.header)
+				w.WriteHeader(response.status)
+				_, _ = w.Write(response.body)
+				return
+			}
+			var uploaded struct {
+				StateID string `json:"state_id"`
+			}
+			if json.Unmarshal(response.body, &uploaded) != nil || uploaded.StateID == "" {
+				http.Error(w, "backend returned an invalid uploaded state response", http.StatusBadGateway)
+				return
+			}
+			if stateID == "" {
+				stateID = uploaded.StateID
+			} else if stateID != uploaded.StateID {
+				http.Error(w, "backends returned different state_id values", http.StatusBadGateway)
+				return
+			}
+		}
+	} else {
+		status := responses[0].status
+		for _, response := range responses[1:] {
+			if response.status != status {
+				http.Error(w, "state synchronization returned inconsistent backend responses", http.StatusBadGateway)
+				return
+			}
+		}
+	}
+	copyHeaders(w.Header(), responses[0].header)
+	w.WriteHeader(responses[0].status)
+	_, _ = w.Write(responses[0].body)
 }
 
 func stateIDFromBody(path string, body []byte) string {
