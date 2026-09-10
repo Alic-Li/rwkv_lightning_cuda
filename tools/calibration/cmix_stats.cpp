@@ -60,7 +60,13 @@ int main(int argc, char** argv) {
     if (tokenizer.load(argv[2]) != rwkv7_server::kTokenizerSuccess) {
       throw std::runtime_error("failed to load vocabulary");
     }
-    setenv("RWKV_CMIX_STATS", "1", 1);
+#ifdef _WIN32
+    if (_putenv_s("RWKV_CMIX_STATS", "1") != 0) {
+#else
+    if (setenv("RWKV_CMIX_STATS", "1", 1) != 0) {
+#endif
+      throw std::runtime_error("failed to enable RWKV_CMIX_STATS");
+    }
     auto model = std::make_shared<rwkv7_server::ModelBackend>(argv[1], false, true, "no-fc",
                                                                tune_cache, retune);
     std::cout << "cmix_stats_config prompt_index=" << prompt_index << " decode_steps=64\n";

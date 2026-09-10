@@ -21,8 +21,8 @@ constexpr int kChannels = 2560;
 constexpr float kEps = 1.0e-5f;
 
 float pattern_value(int index, float scale, float bias) {
-  return std::sinf(static_cast<float>(index % 97) * 0.173f) * scale +
-         std::cosf(static_cast<float>(index % 53) * 0.071f) * (scale * 0.5f) +
+  return std::sin(static_cast<float>(index % 97) * 0.173f) * scale +
+         std::cos(static_cast<float>(index % 53) * 0.071f) * (scale * 0.5f) +
          bias;
 }
 
@@ -299,7 +299,7 @@ int main() {
       for (int c = 0; c < kChannels; ++c) {
         weight[c] = pattern_value(c + 5, 0.08f, 1.0f);
         bias[c] = pattern_value(c + 9, 0.03f, 0.01f);
-        x_k[c] = 0.5f + 0.4f * std::sinf(static_cast<float>(c) * 0.007f);
+        x_k[c] = 0.5f + 0.4f * std::sin(static_cast<float>(c) * 0.007f);
       }
       std::vector<float> expect_x_out;
       std::vector<float> expect_mixed;

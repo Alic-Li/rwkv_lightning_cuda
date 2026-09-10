@@ -57,7 +57,13 @@ int main(int argc, char** argv) {
     rwkv7_server::DeviceLogits logits;
     model->forward_prefill(prompt, state, logits);
     model->forward_decode(tokens, state, logits);
-    setenv("RWKV_PROFILE", "1", 1);
+#ifdef _WIN32
+    if (_putenv_s("RWKV_PROFILE", "1") != 0) {
+#else
+    if (setenv("RWKV_PROFILE", "1", 1) != 0) {
+#endif
+      throw std::runtime_error("failed to enable RWKV_PROFILE");
+    }
     std::cout << "profile_config batch=" << batch << " cmix_sparse=" << cmix_sparse << "\n";
     cudaProfilerStart();
     model->forward_decode(tokens, state, logits);

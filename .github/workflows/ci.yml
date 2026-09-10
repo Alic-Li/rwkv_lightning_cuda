@@ -1,0 +1,123 @@
+name: CI and Release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: CUDA / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    env:
+      CUDA_VERSION: '12.9.0'
+      # PRs compile one architecture; release/manual builds cover the full set.
+      CUDA_ARCHITECTURES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;87;89;90;100;120' }}
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite'
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: RWKV_Lightning_CUDA_router/go.mod
+          cache-dependency-path: RWKV_Lightning_CUDA_router/go.sum
+      - name: Test Go components
+        shell: bash
+        run: |
+          (cd RWKV_Lightning_CUDA_router && go test ./... && go vet ./...)
+          go vet RWKV_Lightning_CUDA_Launcher/main.go
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+        with:
+          arch: x64
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config zip unzip autoconf automake libtool
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@c35baa1a18fd1fc9dcf47c5bd839bf30559c0bc3 # v0.2.24
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: local
+          linux-local-args: '["--toolkit"]'
+          use-github-cache: false
+          log-file-suffix: ${{ matrix.os }}.txt
+      - name: Check out pinned vcpkg
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0 # 2025.06.13
+          path: third_party/vcpkg
+          persist-credentials: false
+      - name: Cache C++ dependencies
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ matrix.os }}-2025.06.13-${{ hashFiles('tools/ci/vcpkg.json') }}
+      - name: Build, test and package
+        run: python tools/ci/build_release.py
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: build/Testing/Temporary/
+          if-no-files-found: ignore
+
+  release:
+    name: Draft GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Verify checksums and create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          cd dist
+          sha256sum --check *.sha256
+          if gh release view "$RELEASE_TAG" --json isDraft > release.json 2>/dev/null; then
+            jq -e '.isDraft == true' release.json
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
+          fi
+          gh release upload "$RELEASE_TAG" ./*.zip ./*.tar.gz ./*.sha256 --clobber
