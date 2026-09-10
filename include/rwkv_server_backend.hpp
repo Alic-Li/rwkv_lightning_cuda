@@ -10,6 +10,7 @@
 #include "rwkv_gpu_runtime.hpp"
 
 #include "rwkv7_fast_v4_common.hpp"
+#include "rwkv_state_tuning.hpp"
 
 namespace rwkv7_server {
 
@@ -155,6 +156,10 @@ class ModelBackend final : public IModelBackend {
   int vocab_size() const override;
   const std::string& model_path() const override;
   const std::string& model_name() const override;
+
+  // Read-only FP16 views for the optional state-tuning sidecar. The returned
+  // pointers remain owned by this backend and are valid for its lifetime.
+  rwkv7_state_tuning::FrozenModelView state_tuning_model_view() const;
 
  private:
   struct Impl;

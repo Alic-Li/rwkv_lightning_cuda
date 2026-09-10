@@ -5,7 +5,7 @@ cmake -S . -B ./build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120"
 
-cmake --build ./build -j --config Release --target bundle_rwkv_quantize bundle_rwkv_lighting_cuda
+cmake --build ./build -j --config Release --target bundle_rwkv_quantize bundle_rwkv_lighting_cuda bundle_rwkv_state_tune
 ```
 
 ### CUDA W8A16 quantization
@@ -46,6 +46,36 @@ $env:CGO_ENABLED="0"
 go build -trimpath -ldflags="-s -w" -o .\rwkv_launcher.exe .\main.go
 ```
 ## Run
+
+### Standalone state tuning (CUDA)
+
+With `RWKV7_STATE_TUNING=ON` (the default for CUDA builds), the standalone
+`rwkv_state_tune` binary trains only `blocks.N.att.time_state` from JSONL rows
+of the form `{"text":"..."}`:
+
+```bash
+./build/rwkv_state_tune \
+  --model /path/to/model.pth \
+  --data /path/to/train.jsonl \
+  --output ./state_output \
+  --ctx 128 \
+  --chunk 128 \
+  --epochs 1 \
+  --max-steps 10000 \
+  --lr 1.0 \
+  --lr-final 0.01 \
+  --warmup-steps 10 \
+  --save-every 500 \
+  --batch-size 2
+```
+
+This first correctness-oriented version uses the existing BF16 PTH loader and
+its FP16 runtime weights and rejects INT8 training. Samples are truncated at
+`--ctx`; `--chunk` controls checkpoint/recompute length with reverse state
+gradient propagation. `--batch-size N` accumulates N variable-length samples
+per optimizer update. Checkpoints contain only state tensors and can be uploaded to the
+existing inference backend. See `src/state_tuning/README.md` for implementation
+details.
 
 Run server
 

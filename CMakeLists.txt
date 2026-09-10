@@ -45,6 +45,7 @@ endif()
 option(RWKV7_FAST_V4_GC_SECTIONS "Enable section garbage collection to reduce binary size" ON)
 option(RWKV7_FAST_V4_AUTO_STRIP "Strip the release binary after linking when possible" ON)
 option(RWKV7_FAST_BUILD_TESTS "Build unit tests" ON)
+option(RWKV7_STATE_TUNING "Build the CUDA state-tuning backward sidecar" ON)
 
 function(rwkv_configure_msvc_optimized_target target_name)
   target_compile_definitions(${target_name} PRIVATE
@@ -138,6 +139,19 @@ else()
     cuda/rwkv7_wkv_fp32_v2.cu
     quant/gemmv/rwkv_w8a16.cu
   )
+  if(RWKV7_STATE_TUNING)
+    list(APPEND RWKV7_FAST_GPU_SOURCES
+      cuda/rwkv7_statepassing_clampw.cpp
+      cuda/rwkv7_statepassing_clampw.cu
+      src/state_tuning/backward_kernels.cu
+      src/state_tuning/block_backward.cu
+      src/state_tuning/block_forward.cu
+      src/state_tuning/training_kernels.cu
+      src/state_tuning/model_backward.cpp
+      src/state_tuning/model_forward.cu
+      src/state_tuning/state_checkpoint.cpp
+    )
+  endif()
 endif()
 
 add_library(rwkv7_fast_backend_core STATIC
@@ -156,6 +170,19 @@ target_compile_options(rwkv_quantize PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
 rwkv_configure_runtime_bundle(rwkv_quantize)
 
 if(RWKV_GPU_BACKEND STREQUAL "CUDA")
+  if(RWKV7_STATE_TUNING)
+    add_executable(rwkv_state_tune
+      src/state_tuning/rwkv_state_tune_main.cpp
+      src/state_tuning/dataset.cpp
+    )
+    target_include_directories(rwkv_state_tune PRIVATE src/state_tuning)
+    target_link_libraries(rwkv_state_tune PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)
+    target_compile_definitions(rwkv_state_tune PRIVATE
+      RWKV_STATE_TUNE_DEFAULT_VOCAB="${PROJECT_SOURCE_DIR}/src/rwkv_vocab_v20230424.txt"
+    )
+    target_compile_options(rwkv_state_tune PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+    rwkv_configure_runtime_bundle(rwkv_state_tune)
+  endif()
   add_executable(rwkv_w8a16_bench tools/bench_w8a16.cpp)
   target_include_directories(rwkv_w8a16_bench PRIVATE include quant/gemmv)
   target_link_libraries(rwkv_w8a16_bench PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)

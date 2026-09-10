@@ -2420,6 +2420,80 @@ GenerationState ModelBackend::load_state_from_pth(const std::string& path, int b
   return state;
 }
 
+rwkv7_state_tuning::FrozenModelView ModelBackend::state_tuning_model_view() const {
+  using rwkv7_state_tuning::FrozenBlockWeights;
+  using rwkv7_state_tuning::FrozenModelView;
+  const CudaWeights& source = impl_->weights;
+  auto f16 = [](const GpuTensor* tensor, const char* name) -> const half* {
+    if (!tensor) {
+      throw std::runtime_error(std::string("state tuning is missing weight ") + name);
+    }
+    if (tensor->is_int8()) {
+      throw std::runtime_error(
+          std::string("state tuning requires FP16/BF16 frozen weights; INT8 tensor: ") +
+          name);
+    }
+    return hp(tensor);
+  };
+  FrozenModelView result;
+  result.layers = source.dims.layers;
+  result.channels = source.dims.channels;
+  result.heads = source.dims.heads;
+  result.vocab = source.dims.vocab;
+  result.cpu_emb_ln0_f16 = source.cpu_emb_ln0_f16.data();
+  result.cpu_emb_ln0_elements = source.cpu_emb_ln0_f16.size();
+  result.ln_out_weight = f16(source.ln_out_w, "ln_out.weight");
+  result.ln_out_bias = f16(source.ln_out_b, "ln_out.bias");
+  result.head_weight_orig = f16(source.head_w, "head.weight");
+  result.blocks.reserve(source.layers.size());
+  for (std::size_t layer = 0; layer < source.layers.size(); ++layer) {
+    const LayerWeights& w = source.layers[layer];
+    FrozenBlockWeights out;
+    out.channels = source.dims.channels;
+    out.heads = source.dims.heads;
+    out.ffn = source.dims.ffn;
+    out.rank_w = static_cast<int>(w.att_w1->shape[1]);
+    out.rank_a = static_cast<int>(w.att_a1->shape[1]);
+    out.rank_g = static_cast<int>(w.att_g1->shape[1]);
+    out.rank_v = layer == 0 ? 0 : static_cast<int>(w.att_v1->shape[1]);
+    out.ln1_weight = f16(w.ln1_w, "ln1.weight");
+    out.ln1_bias = f16(w.ln1_b, "ln1.bias");
+    out.ln2_weight = f16(w.ln2_w, "ln2.weight");
+    out.ln2_bias = f16(w.ln2_b, "ln2.bias");
+    out.mix_r = f16(w.att_x_r, "att.x_r");
+    out.mix_w = f16(w.att_x_w, "att.x_w");
+    out.mix_k = f16(w.att_x_k, "att.x_k");
+    out.mix_v = f16(w.att_x_v, "att.x_v");
+    out.mix_a = f16(w.att_x_a, "att.x_a");
+    out.mix_g = f16(w.att_x_g, "att.x_g");
+    out.receptance = f16(w.att_receptance_w, "att.receptance.weight");
+    out.key = f16(w.att_key_w, "att.key.weight");
+    out.value = f16(w.att_value_w, "att.value.weight");
+    out.output = f16(w.att_output_w, "att.output.weight");
+    out.w0 = f16(w.att_w0, "att.w0");
+    out.w1 = f16(w.att_w1, "att.w1");
+    out.w2 = f16(w.att_w2, "att.w2");
+    out.a0 = f16(w.att_a0, "att.a0");
+    out.a1 = f16(w.att_a1, "att.a1");
+    out.a2 = f16(w.att_a2, "att.a2");
+    out.g1 = f16(w.att_g1, "att.g1");
+    out.g2 = f16(w.att_g2, "att.g2");
+    out.v0 = layer == 0 ? nullptr : f16(w.att_v0, "att.v0");
+    out.v1 = layer == 0 ? nullptr : f16(w.att_v1, "att.v1");
+    out.v2 = layer == 0 ? nullptr : f16(w.att_v2, "att.v2");
+    out.k_k = f16(w.att_k_k, "att.k_k");
+    out.k_a = f16(w.att_k_a, "att.k_a");
+    out.r_k = f16(w.att_r_k, "att.r_k");
+    out.att_group_norm_weight = f16(w.att_ln_x_w, "att.ln_x.weight");
+    out.att_group_norm_bias = f16(w.att_ln_x_b, "att.ln_x.bias");
+    out.ffn_mix = f16(w.ffn_x_k, "ffn.x_k");
+    out.ffn_key = f16(w.ffn_key_w, "ffn.key.weight");
+    out.ffn_value = f16(w.ffn_value_w, "ffn.value.weight");
+    result.blocks.push_back(out);
+  }
+  return result;
+}
+
 void ModelBackend::forward_prefill(
     const std::vector<std::vector<int64_t>>& token_batches,
     GenerationState& state,
