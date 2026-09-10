@@ -138,6 +138,7 @@ else()
     cuda/rwkv7_wkv_fp16_v2.cu
     cuda/rwkv7_wkv_fp32_v2.cu
     quant/gemmv/rwkv_w8a16.cu
+    quant/gemmv/rwkv_w4a16.cu
   )
   if(RWKV7_STATE_TUNING)
     list(APPEND RWKV7_FAST_GPU_SOURCES
@@ -183,6 +184,9 @@ if(RWKV_GPU_BACKEND STREQUAL "CUDA")
     target_compile_options(rwkv_state_tune PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
     rwkv_configure_runtime_bundle(rwkv_state_tune)
   endif()
+  add_executable(rwkv_w4a16_bench tools/bench_w4a16.cpp)
+  target_link_libraries(rwkv_w4a16_bench PRIVATE rwkv7_fast_backend_core)
+  target_compile_options(rwkv_w4a16_bench PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
   add_executable(rwkv_w8a16_bench tools/bench_w8a16.cpp)
   target_include_directories(rwkv_w8a16_bench PRIVATE include quant/gemmv)
   target_link_libraries(rwkv_w8a16_bench PRIVATE rwkv7_fast_backend_core CUDA::cublas CUDA::cublasLt)

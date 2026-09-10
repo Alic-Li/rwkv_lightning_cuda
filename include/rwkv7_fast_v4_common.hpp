@@ -171,6 +171,7 @@ struct GpuTensor {
   enum class DType {
     F16,
     I8,
+    I4,
   };
 
   std::string name;
@@ -182,14 +183,19 @@ struct GpuTensor {
   bool i8_packed = false;
   DeviceBuffer<std::uint16_t> f16;
   DeviceBuffer<std::int8_t> i8;
+  DeviceBuffer<std::uint8_t> i4;
   DeviceBuffer<std::uint16_t> scale;
+  int quant_group_size = 0;
 
   std::size_t bytes() const {
     return f16.n * sizeof(std::uint16_t) + i8.n * sizeof(std::int8_t) +
+           i4.n * sizeof(std::uint8_t) +
            scale.n * sizeof(std::uint16_t);
   }
 
   bool is_int8() const { return dtype == DType::I8; }
+  bool is_int4() const { return dtype == DType::I4; }
+  bool is_quantized() const { return is_int8() || is_int4(); }
 };
 
 inline const half* hp(const GpuTensor* tensor) {

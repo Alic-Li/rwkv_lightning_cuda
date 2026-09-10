@@ -24,6 +24,7 @@
 #include "pth_tensor.hpp"
 #include "rwkv_quantized.hpp"
 #include "rwkv_server_backend.hpp"
+#include "rwkv_w4a16.cuh"
 #include "rwkv7_fast_v4_common.hpp"
 #include "rwkv7_fast_v4_kernels.cuh"
 
@@ -881,6 +882,20 @@ void load_quantized_tensor(
     GpuTensor* tensor) {
   std::vector<std::uint8_t> data;
   require_result(archive.read_data(rec, &data).ok_status(), "read quantized tensor " + rec.name);
+  if (rec.dtype == llm_infer::QuantizedDType::kInt4) {
+    require_result(rec.shape.size() == 2, "INT4 weight must be rank-2: " + rec.name);
+    tensor->dtype = GpuTensor::DType::I4;
+    tensor->quant_group_size = rec.quant_group_size;
+    tensor->i4.resize(data.size(), "alloc int4 weight");
+    tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int4 scales");
+    std::vector<std::uint16_t> scales;
+    require_result(archive.read_scales(rec, &scales).ok_status(), "read INT4 scales");
+    check_cuda(cudaMemcpy(tensor->i4.p, data.data(), data.size(), cudaMemcpyHostToDevice),
+               "copy int4 weight");
+    check_cuda(cudaMemcpy(tensor->scale.p, scales.data(), scales.size() * sizeof(std::uint16_t),
+                          cudaMemcpyHostToDevice), "copy int4 scales");
+    return;
+  }
   if (rec.dtype == llm_infer::QuantizedDType::kInt8) {
     tensor->dtype = GpuTensor::DType::I8;
     tensor->i8.resize(static_cast<std::size_t>(rec.numel), "alloc int8 weight");
@@ -960,13 +975,23 @@ CudaWeights load_quantized_model_weights(
     auto tensor = std::make_unique<GpuTensor>();
     tensor->name = rec.name;
     tensor->shape = rec.shape;
-    if (should_transpose_like_v3a(rec.name)) {
+    if (rec.dtype != llm_infer::QuantizedDType::kInt4 && should_transpose_like_v3a(rec.name)) {
       tensor->shape = {rec.shape[1], rec.shape[0]};
     }
-    tensor->dtype = rec.dtype == llm_infer::QuantizedDType::kInt8 ? GpuTensor::DType::I8 : GpuTensor::DType::F16;
+    tensor->dtype = rec.dtype == llm_infer::QuantizedDType::kInt8
+                        ? GpuTensor::DType::I8
+                        : rec.dtype == llm_infer::QuantizedDType::kInt4
+                              ? GpuTensor::DType::I4
+                              : GpuTensor::DType::F16;
     if (tensor->is_int8()) {
       tensor->i8.resize(static_cast<std::size_t>(rec.numel), "alloc int8 tensor");
       tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int8 tensor scales");
+    } else if (tensor->is_int4()) {
+      const std::size_t rows = static_cast<std::size_t>(rec.shape[0]);
+      const std::size_t cols = static_cast<std::size_t>(rec.shape[1]);
+      tensor->i4.resize(rows * (cols / 2 + cols % 2), "alloc int4 tensor");
+      tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int4 tensor scales");
+      tensor->quant_group_size = rec.quant_group_size;
     } else {
       tensor->f16.resize(static_cast<std::size_t>(rec.numel), "alloc quantized f16 tensor");
     }
@@ -1027,6 +1052,12 @@ void linear_orig_layout_launch(
         weight_tensor->i8_packed ? W8BLayout::PackedNK
                                  : (weight_tensor->i8_transposed ? W8BLayout::KN : W8BLayout::NK),
         y, workspace, workspace_bytes);
+    return;
+  }
+  if (weight_tensor->is_int4()) {
+    rwkv7_w4a16_linear_launch(stream, M, K, N, x, weight_tensor->i4.p,
+                              reinterpret_cast<const half*>(weight_tensor->scale.p), y,
+                              weight_tensor->quant_group_size, workspace, workspace_bytes);
     return;
   }
   const half* weight_orig = hp(weight_tensor);
@@ -2109,11 +2140,11 @@ void run_backend_forward(
         layer < static_cast<int>(weights.cmix_sparse_max_rows_by_layer.size())
             ? weights.cmix_sparse_max_rows_by_layer[static_cast<std::size_t>(layer)]
             : weights.cmix_sparse_max_rows;
-    const CmixMode cmix_mode =
-        run.cmix_sparse != "off" && path.cmix == CmixMode::Dense && w.ffn_value_w->is_int8() && C >= 4096 &&
-                rows <= layer_sparse_max_rows
-            ? CmixMode::NoFcRows2
-            : path.cmix;
+    CmixMode cmix_mode = w.ffn_value_w->is_int4() ? CmixMode::Dense : path.cmix;
+    if (run.cmix_sparse != "off" && cmix_mode == CmixMode::Dense &&
+        w.ffn_value_w->is_int8() && C >= 4096 && rows <= layer_sparse_max_rows) {
+      cmix_mode = CmixMode::NoFcRows2;
+    }
     const int profile_ffn_value = profiler.begin(stream, "ffn_value");
     if (cmix_mode == CmixMode::NoFcOne) {
       if (w.ffn_value_w->is_int8()) {
@@ -2150,6 +2181,11 @@ void run_backend_forward(
             w.ffn_value_w->i8_packed ? W8BLayout::PackedNK
                                      : (w.ffn_value_w->i8_transposed ? W8BLayout::KN : W8BLayout::NK),
             cmix_out, lt_workspace.p, lt_workspace.n);
+      } else if (w.ffn_value_w->is_int4()) {
+        rwkv7_w4a16_linear_launch(
+            stream, rows, F, C, hid, w.ffn_value_w->i4.p,
+            reinterpret_cast<const half*>(w.ffn_value_w->scale.p), cmix_out,
+            w.ffn_value_w->quant_group_size, lt_workspace.p, lt_workspace.n);
       } else {
         rwkv7_v3a_linear_f16_launch(stream, rows, F, C, hid, hp(w.ffn_value_w), cmix_out);
       }
@@ -2428,9 +2464,9 @@ rwkv7_state_tuning::FrozenModelView ModelBackend::state_tuning_model_view() cons
     if (!tensor) {
       throw std::runtime_error(std::string("state tuning is missing weight ") + name);
     }
-    if (tensor->is_int8()) {
+    if (tensor->is_quantized()) {
       throw std::runtime_error(
-          std::string("state tuning requires FP16/BF16 frozen weights; INT8 tensor: ") +
+          std::string("state tuning requires FP16/BF16 frozen weights; quantized tensor: ") +
           name);
     }
     return hp(tensor);

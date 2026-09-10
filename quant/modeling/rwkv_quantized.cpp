@@ -1,5 +1,6 @@
 #include "rwkv_quantized.hpp"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <unordered_set>
@@ -22,7 +23,7 @@ void write_value(std::ofstream& file, T value) {
 }
 
 bool valid_dtype(std::uint8_t value) {
-  return value <= static_cast<std::uint8_t>(QuantizedDType::kInt8);
+  return value <= static_cast<std::uint8_t>(QuantizedDType::kInt4);
 }
 
 std::uint64_t checked_numel(const std::vector<std::int64_t>& shape) {
@@ -39,7 +40,20 @@ std::uint64_t checked_numel(const std::vector<std::int64_t>& shape) {
 
 std::uint64_t data_bytes(const QuantizedTensorRecord& record) {
   if (record.dtype == QuantizedDType::kInt8) return record.numel;
+  if (record.dtype == QuantizedDType::kInt4 && record.shape.size() == 2) {
+    const std::uint64_t rows = static_cast<std::uint64_t>(record.shape[0]);
+    const std::uint64_t cols = static_cast<std::uint64_t>(record.shape[1]);
+    const std::uint64_t row_bytes = cols / 2 + cols % 2;
+    if (row_bytes != 0 && rows > std::numeric_limits<std::uint64_t>::max() / row_bytes) {
+      return std::numeric_limits<std::uint64_t>::max();
+    }
+    return rows * row_bytes;
+  }
   return record.numel * 2;
+}
+
+bool is_integer_quantized(QuantizedDType dtype) {
+  return dtype == QuantizedDType::kInt8 || dtype == QuantizedDType::kInt4;
 }
 
 }  // namespace
@@ -83,9 +97,8 @@ Result<QuantizedArchive> QuantizedArchive::open(const std::string& path) {
         !read_value(file, &reserved) || !read_value(file, &numel)) {
       return Status::error("truncated quantized tensor header");
     }
-    (void)reserved;
     if (!valid_dtype(dtype) || rank > 16 || name_len == 0 || name_len > (1u << 20) ||
-        (dtype == static_cast<std::uint8_t>(QuantizedDType::kInt8) && rank == 0)) {
+        (dtype >= static_cast<std::uint8_t>(QuantizedDType::kInt8) && rank == 0)) {
       return Status::error("invalid quantized tensor metadata");
     }
     QuantizedTensorRecord record;
@@ -93,6 +106,7 @@ Result<QuantizedArchive> QuantizedArchive::open(const std::string& path) {
     file.read(record.name.data(), static_cast<std::streamsize>(name_len));
     if (!file) return Status::error("truncated quantized tensor name");
     record.dtype = static_cast<QuantizedDType>(dtype);
+    record.quant_group_size = record.dtype == QuantizedDType::kInt4 ? reserved : 0;
     if (!names.insert(record.name).second) {
       return Status::error("duplicate quantized tensor: " + record.name);
     }
@@ -106,7 +120,7 @@ Result<QuantizedArchive> QuantizedArchive::open(const std::string& path) {
     if (checked_numel(record.shape) != record.numel) {
       return Status::error("quantized tensor element count mismatch: " + record.name);
     }
-    if (record.dtype != QuantizedDType::kInt8 &&
+    if (record.dtype != QuantizedDType::kInt8 && record.dtype != QuantizedDType::kInt4 &&
         record.numel > std::numeric_limits<std::uint64_t>::max() / sizeof(std::uint16_t)) {
       return Status::error("quantized tensor is too large: " + record.name);
     }
@@ -118,9 +132,23 @@ Result<QuantizedArchive> QuantizedArchive::open(const std::string& path) {
     }
     file.seekg(static_cast<std::streamoff>(bytes), std::ios::cur);
     if (!file) return Status::error("truncated quantized tensor data: " + record.name);
-    if (record.dtype == QuantizedDType::kInt8) {
+    if (is_integer_quantized(record.dtype)) {
       std::uint64_t scale_count = 0;
-      if (!read_value(file, &scale_count) || scale_count != record.shape.front()) {
+      std::uint64_t expected_scales = static_cast<std::uint64_t>(record.shape.front());
+      if (record.dtype == QuantizedDType::kInt4) {
+        if (record.shape.size() != 2 ||
+            (record.quant_group_size != 32 && record.quant_group_size != 128)) {
+          return Status::error("invalid INT4 metadata: " + record.name);
+        }
+        const std::uint64_t cols = static_cast<std::uint64_t>(record.shape[1]);
+        const std::uint64_t groups = cols / record.quant_group_size +
+                                     (cols % record.quant_group_size != 0);
+        if (groups != 0 && expected_scales > std::numeric_limits<std::uint64_t>::max() / groups) {
+          return Status::error("INT4 scale count overflow: " + record.name);
+        }
+        expected_scales *= groups;
+      }
+      if (!read_value(file, &scale_count) || scale_count != expected_scales) {
         return Status::error("invalid quantized scale count: " + record.name);
       }
       record.scale_count = scale_count;
@@ -160,7 +188,7 @@ Status QuantizedArchive::read_data(const QuantizedTensorRecord& record, std::vec
 }
 
 Status QuantizedArchive::read_scales(const QuantizedTensorRecord& record, std::vector<std::uint16_t>* out) const {
-  if (record.dtype != QuantizedDType::kInt8 || record.scale_offset > file_size_ ||
+  if (!is_integer_quantized(record.dtype) || record.scale_offset > file_size_ ||
       record.scale_count * sizeof(std::uint16_t) > file_size_ - record.scale_offset) {
     return Status::error("quantized scale range is invalid: " + record.name);
   }
@@ -187,24 +215,47 @@ QuantizedWriter::~QuantizedWriter() {
 
 Status QuantizedWriter::append(
     const std::string& name, QuantizedDType dtype, const std::vector<std::int64_t>& shape,
-    const std::vector<std::uint8_t>& data, const std::vector<std::uint16_t>& scales) {
+    const std::vector<std::uint8_t>& data, const std::vector<std::uint16_t>& scales,
+    std::uint16_t quant_group_size) {
+  const std::uint64_t logical_numel = checked_numel(shape);
+  const bool shape_nonnegative =
+      std::all_of(shape.begin(), shape.end(), [](std::int64_t dim) { return dim >= 0; });
+  const bool int4 = dtype == QuantizedDType::kInt4;
+  const std::uint64_t rows = shape.empty() ? 0 : static_cast<std::uint64_t>(shape[0]);
+  const std::uint64_t cols = shape.size() == 2 ? static_cast<std::uint64_t>(shape[1]) : 0;
+  const std::uint64_t int4_row_bytes = cols / 2 + cols % 2;
+  const bool int4_size_overflow = int4_row_bytes != 0 &&
+                                  rows > std::numeric_limits<std::uint64_t>::max() / int4_row_bytes;
+  const std::uint64_t int4_data_bytes = int4_size_overflow ? 0 : rows * int4_row_bytes;
+  const std::uint64_t groups = int4 && quant_group_size != 0
+                                   ? cols / quant_group_size + (cols % quant_group_size != 0)
+                                   : 0;
+  const bool scale_count_overflow = groups != 0 &&
+                                    rows > std::numeric_limits<std::uint64_t>::max() / groups;
+  const std::uint64_t expected_scales = int4 ? rows * groups : rows;
   if (!file_) return Status::error("failed to open quantized output");
   if (closed_ || count_ >= expected_count_ || name.empty() || name.size() > std::numeric_limits<std::uint32_t>::max() ||
-      static_cast<std::uint8_t>(dtype) > static_cast<std::uint8_t>(QuantizedDType::kInt8) ||
-      (dtype == QuantizedDType::kInt8 && shape.empty()) ||
-      shape.size() > 16 || checked_numel(shape) != (dtype == QuantizedDType::kInt8 ? data.size() : data.size() / 2) ||
-      (dtype == QuantizedDType::kInt8 && scales.size() != shape.front())) {
+      static_cast<std::uint8_t>(dtype) > static_cast<std::uint8_t>(QuantizedDType::kInt4) ||
+      !shape_nonnegative ||
+      (is_integer_quantized(dtype) && shape.empty()) || shape.size() > 16 ||
+      (int4 && (shape.size() != 2 || (quant_group_size != 32 && quant_group_size != 128) ||
+                int4_size_overflow || scale_count_overflow)) ||
+      (!int4 && quant_group_size != 0) ||
+      data.size() != (int4 ? int4_data_bytes
+                           : dtype == QuantizedDType::kInt8 ? logical_numel : logical_numel * 2) ||
+      (is_integer_quantized(dtype) && scales.size() != expected_scales) ||
+      (!is_integer_quantized(dtype) && !scales.empty())) {
     return Status::error("invalid quantized tensor for output: " + name);
   }
   write_value(file_, static_cast<std::uint32_t>(name.size()));
   write_value(file_, static_cast<std::uint8_t>(dtype));
   write_value(file_, static_cast<std::uint8_t>(shape.size()));
-  write_value(file_, static_cast<std::uint16_t>(0));
-  write_value(file_, checked_numel(shape));
+  write_value(file_, int4 ? quant_group_size : static_cast<std::uint16_t>(0));
+  write_value(file_, logical_numel);
   file_.write(name.data(), static_cast<std::streamsize>(name.size()));
   for (std::int64_t dim : shape) write_value(file_, dim);
   if (!data.empty()) file_.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-  if (dtype == QuantizedDType::kInt8) {
+  if (is_integer_quantized(dtype)) {
     write_value(file_, static_cast<std::uint64_t>(scales.size()));
     file_.write(reinterpret_cast<const char*>(scales.data()),
                 static_cast<std::streamsize>(scales.size() * sizeof(std::uint16_t)));

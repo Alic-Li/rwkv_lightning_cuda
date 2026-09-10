@@ -13,6 +13,7 @@ enum class QuantizedDType : std::uint8_t {
   kBFloat16 = 0,
   kFloat16 = 1,
   kInt8 = 2,
+  kInt4 = 3,
 };
 
 struct QuantizedTensorRecord {
@@ -23,6 +24,7 @@ struct QuantizedTensorRecord {
   std::uint64_t data_offset = 0;
   std::uint64_t scale_offset = 0;
   std::uint64_t scale_count = 0;
+  std::uint16_t quant_group_size = 0;
 };
 
 class QuantizedArchive {
@@ -55,7 +57,8 @@ class QuantizedWriter {
       QuantizedDType dtype,
       const std::vector<std::int64_t>& shape,
       const std::vector<std::uint8_t>& data,
-      const std::vector<std::uint16_t>& scales = {});
+      const std::vector<std::uint16_t>& scales = {},
+      std::uint16_t quant_group_size = 0);
   Status close();
 
  private:

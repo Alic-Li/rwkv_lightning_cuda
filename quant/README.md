@@ -1,15 +1,24 @@
-# CUDA W8A16 quantization
+# CUDA W8A16 and W4A16 quantization
 
-This directory contains the CUDA W8A16 implementation used by the backend. The
+This directory contains the CUDA W8A16 and W4A16 implementations used by the backend. The
 `rwkv_quantize` tool converts a BF16 RWKV checkpoint into a streaming `.rwkvq`
-archive. Linear tensors use per-output-channel symmetric INT8 weights with one
-FP16 scale per output row; embeddings, layer norms, LoRA factors, and other
-non-linear tensors remain BF16.
+archive. Linear tensors use either per-output-channel symmetric INT8 or grouped
+symmetric INT4; embeddings, layer norms, LoRA factors, and other non-linear
+tensors remain BF16.
+
+W4 export uses symmetric signed INT4 groups along K. Two values are packed in
+each byte and the group size (32 or 128) is recorded in every INT4 tensor:
+
+```bash
+rwkv_quantize --format w4a16 --group-size 128 model.pth model.w4a16.rwkvq
+rwkv_quantized_smoke model.w4a16.rwkvq
+```
 
 The CUDA backend detects `.rwkvq` files automatically. INT8 weights stay on the
 device and use W8A16 GEMV/GEMM for attention projections, FFN projections, and
 the output head. Runtime tuning selects split-K and batched kernel variants per
-GPU/model shape and persists the result in the `--tune-cache` file. HIP builds
+GPU/model shape and persists the result in the `--tune-cache` file. INT4 tensors
+use the W4A16 GEMV/Tensor Core path and shape-based split-K selection. HIP builds
 continue to use the BF16/PTH path.
 
 ## Measured result
