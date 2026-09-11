@@ -66,6 +66,9 @@ def main():
     # Limit parallelism: multiple nvcc processes can exhaust hosted-runner memory.
     run("cmake", "--build", BUILD, "--config", "Release", "--parallel", "2")
     dependency_dirs = [BUILD / "vcpkg_installed" / TRIPLET / "bin", cuda / "bin"]
+    # CUDA 13 installs Windows DLLs into bin/x64 instead of bin.
+    if WINDOWS and (cuda / "bin" / "x64").is_dir():
+        dependency_dirs.append(cuda / "bin" / "x64")
     test_env = os.environ.copy()
     if WINDOWS:
         test_env["PATH"] = os.pathsep.join(map(str, dependency_dirs)) + os.pathsep + test_env["PATH"]
@@ -89,11 +92,13 @@ def main():
             raise RuntimeError(f"MSVC runtime not found under {redist}")
         for dll in crt_files:
             shutil.copy2(dll, bundle / dll.name)
-        # CUDA 12 names DLLs cudart64_12.dll/cublas64_12.dll; CUDA 13 renamed
-        # them (cudart.dll/cublas.dll), so glob both schemes.
-        for pattern in ("cudart*.dll", "cublas*.dll"):
-            for dll in sorted((cuda / "bin").glob(pattern)):
-                shutil.copy2(dll, bundle / dll.name)
+        # copy_runtime_deps resolves the DLLs the executables actually import;
+        # these globs are a safety net covering the CUDA 12 (bin) and CUDA 13
+        # (bin/x64) toolkit layouts.
+        for sub in dependency_dirs[1:]:
+            for pattern in ("cudart*.dll", "cublas*.dll"):
+                for dll in sorted(sub.glob(pattern)):
+                    shutil.copy2(dll, bundle / dll.name)
     run("go", "build", "-trimpath", "-ldflags=-s -w", "-o",
         bundle / ("rwkv_launcher" + SUFFIX), "main.go",
         cwd=ROOT / "RWKV_Lightning_CUDA_Launcher")
