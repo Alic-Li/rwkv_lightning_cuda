@@ -37,7 +37,8 @@ def main():
     cuda = Path(os.environ["CUDA_PATH"])
     version = os.environ.get("GITHUB_REF_NAME", "local")
     version = re.sub(r"[^A-Za-z0-9._-]", "-", version)
-    name = f"rwkv-lightning-{version}-{'windows' if WINDOWS else 'linux'}-x64-cuda12.9"
+    cuda_tag = "cuda" + ".".join(os.environ.get("CUDA_VERSION", "12.9.0").split(".")[:2])
+    name = f"rwkv-lightning-{version}-{'windows' if WINDOWS else 'linux'}-x64-{cuda_tag}"
     bundle = BUILD / "release" / name
     if bundle.exists():
         shutil.rmtree(bundle)
@@ -88,8 +89,11 @@ def main():
             raise RuntimeError(f"MSVC runtime not found under {redist}")
         for dll in crt_files:
             shutil.copy2(dll, bundle / dll.name)
-        for dll in ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll"):
-            shutil.copy2(cuda / "bin" / dll, bundle / dll)
+        # CUDA 12 names DLLs cudart64_12.dll/cublas64_12.dll; CUDA 13 renamed
+        # them (cudart.dll/cublas.dll), so glob both schemes.
+        for pattern in ("cudart*.dll", "cublas*.dll"):
+            for dll in sorted((cuda / "bin").glob(pattern)):
+                shutil.copy2(dll, bundle / dll.name)
     run("go", "build", "-trimpath", "-ldflags=-s -w", "-o",
         bundle / ("rwkv_launcher" + SUFFIX), "main.go",
         cwd=ROOT / "RWKV_Lightning_CUDA_Launcher")

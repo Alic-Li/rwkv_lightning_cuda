@@ -16,15 +16,16 @@ concurrency:
 
 jobs:
   build:
-    name: CUDA / ${{ matrix.os }}
+    name: CUDA ${{ matrix.cuda }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, windows-2022]
+        cuda: ['12.9.0', '13.2.2']
     env:
-      CUDA_VERSION: '12.9.0'
+      CUDA_VERSION: ${{ matrix.cuda }}
       # PRs compile one architecture; release/manual builds cover the full set.
       CUDA_ARCHITECTURES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;87;89;90;100;120' }}
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite'
@@ -56,13 +57,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config zip unzip autoconf automake libtool
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@c35baa1a18fd1fc9dcf47c5bd839bf30559c0bc3 # v0.2.24
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
-          cuda: ${{ env.CUDA_VERSION }}
+          cuda: ${{ matrix.cuda }}
           method: local
           linux-local-args: '["--toolkit"]'
           use-github-cache: false
-          log-file-suffix: ${{ matrix.os }}.txt
+          log-file-suffix: ${{ matrix.os }}-${{ matrix.cuda }}.txt
       - name: Check out pinned vcpkg
         uses: actions/checkout@v4
         with:
@@ -80,7 +81,7 @@ jobs:
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: package-${{ matrix.os }}
+          name: package-${{ matrix.os }}-${{ matrix.cuda }}
           path: dist/*
           if-no-files-found: error
           compression-level: 0
@@ -89,7 +90,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.os }}
+          name: test-logs-${{ matrix.os }}-${{ matrix.cuda }}
           path: build/Testing/Temporary/
           if-no-files-found: ignore
 

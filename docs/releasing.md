@@ -1,8 +1,9 @@
 # CI and releases
 
 The `CI and Release` GitHub Actions workflow builds CUDA packages for Linux x86-64
-(Ubuntu 22.04) and Windows x64 (Windows Server 2022 / MSVC). It uses CUDA 12.9,
-pinned vcpkg dependencies, and the Go version in the router's `go.mod`.
+(Ubuntu 22.04) and Windows x64 (Windows Server 2022 / MSVC) against a CUDA
+12.9 / 13.2 matrix. It uses pinned vcpkg dependencies and the Go version in the
+router's `go.mod`.
 
 ## Publish a version
 
@@ -50,8 +51,9 @@ process; start it with `rwkv_router --config router.config.example.toml` after
 editing that example. Pass `--vocab ./rwkv_vocab_v20230424.txt` when using the
 state-tuning CLI (its compiled default points to the build machine's source tree).
 
-The target machine needs an NVIDIA driver compatible with CUDA 12.9 and its GPU.
-Linux packages require glibc 2.35 or newer. CUDA development tools are not required
+The target machine needs an NVIDIA driver compatible with the CUDA version of the
+package (12.9 or 13.2) and its GPU. Linux packages require glibc 2.35 or newer.
+CUDA development tools are not required
 on the target machine. Keep the bundled CUDA and third-party runtime libraries
 with the executables.
 
