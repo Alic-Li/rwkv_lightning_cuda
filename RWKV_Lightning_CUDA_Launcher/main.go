@@ -2,25 +2,37 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
-	"html/template"
+	"io"
+	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 const defaultPort = "8000"
 const defaultVocabPath = "./rwkv_vocab_v20230424.txt"
 const listenAddr = "127.0.0.1:8088"
+
+//go:embed dist/*
+var webFiles embed.FS
 
 type startRequest struct {
 	ModelPath            string `json:"model_path"`
@@ -30,142 +42,701 @@ type startRequest struct {
 	UseWKV32             bool   `json:"use_wkv32"`
 	ChunkLoad            bool   `json:"chunk_load"`
 	EnableDynamicLoading bool   `json:"enable_dynamic_loading"`
+	ChunkSize            int    `json:"chunk_size"`
+	StateDBPath          string `json:"state_db_path"`
+	TuneCache            string `json:"tune_cache"`
+}
+type tuneRequest struct {
+	Model       string  `json:"model"`
+	Data        string  `json:"data"`
+	Output      string  `json:"output"`
+	Vocab       string  `json:"vocab"`
+	Ctx         int     `json:"ctx"`
+	Chunk       int     `json:"chunk"`
+	Epochs      int     `json:"epochs"`
+	BatchSize   int     `json:"batch_size"`
+	MaxSteps    int     `json:"max_steps"`
+	LR          float64 `json:"lr"`
+	LRFinal     float64 `json:"lr_final"`
+	WarmupSteps int     `json:"warmup_steps"`
+	SaveEvery   int     `json:"save_every"`
+	Seed        int     `json:"seed"`
+}
+type process struct {
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	cancel     context.CancelFunc
+	done       chan struct{}
+	state      string
+	errorText  string
+	started    time.Time
+	finished   time.Time
+	logs       []string
+	secret     string
+	checkpoint string
+	progress   map[string]any
+	losses     []map[string]any
 }
 
-type launcher struct {
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	cancel  context.CancelFunc
-	running bool
-
-	logMu   sync.Mutex
-	logs    []string
-	clients map[chan string]struct{}
+func newProcess() *process {
+	return &process{state: "offline", logs: []string{}, losses: []map[string]any{}}
 }
 
-func newLauncher() *launcher {
-	return &launcher{clients: make(map[chan string]struct{})}
-}
+var progressRE = regexp.MustCompile(`\]\s+(\d+)/(\d+) epoch=(\d+)/(\d+) loss=([\d.eE+\-]+).* lr=([\d.eE+\-]+) tok/s=([\d.eE+\-]+) ETA=([\d.eE+\-]+)s`)
 
-func (l *launcher) appendLog(line string) {
-	line = strings.TrimRight(line, "\r\n")
+func (p *process) appendLog(line string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.secret != "" {
+		line = strings.ReplaceAll(line, p.secret, "[redacted]")
+	}
+	line = strings.TrimSpace(line)
 	if line == "" {
 		return
 	}
-
-	l.logMu.Lock()
-	stamp := time.Now().Format("15:04:05")
-	msg := "[" + stamp + "] " + line
-	l.logs = append(l.logs, msg)
-	if len(l.logs) > 2000 {
-		l.logs = l.logs[len(l.logs)-2000:]
+	p.logs = append(p.logs, "["+time.Now().Format("15:04:05")+"] "+line)
+	if len(p.logs) > 2000 {
+		p.logs = append([]string{}, p.logs[len(p.logs)-2000:]...)
 	}
-	for ch := range l.clients {
-		select {
-		case ch <- msg:
-		default:
+	if m := progressRE.FindStringSubmatch(line); m != nil {
+		keys := []string{"step", "total", "epoch", "epochs", "loss", "lr", "tokens_per_second", "eta"}
+		v := map[string]any{}
+		for i, k := range keys {
+			n, _ := strconv.ParseFloat(m[i+1], 64)
+			v[k] = n
+		}
+		p.progress = v
+		p.losses = append(p.losses, map[string]any{"step": v["step"], "loss": v["loss"]})
+		if len(p.losses) > 2000 {
+			p.losses = p.losses[len(p.losses)-2000:]
 		}
 	}
-	l.logMu.Unlock()
+	if i := strings.Index(line, "saved: "); i >= 0 {
+		p.checkpoint = strings.TrimSpace(line[i+7:])
+		if !filepath.IsAbs(p.checkpoint) {
+			p.checkpoint = filepath.Join(appDir(), p.checkpoint)
+		}
+	}
 }
 
-func (l *launcher) start(req startRequest) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.running {
-		return fmt.Errorf("backend is already running")
+// State tuning renders progress with carriage returns, not newline-delimited logs.
+func splitProgress(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		return i + 1, data[:i], nil
 	}
-
-	modelPath := strings.TrimSpace(req.ModelPath)
-	if modelPath == "" {
-		return fmt.Errorf("model path is required")
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
 	}
-
-	vocabPath := strings.TrimSpace(req.VocabPath)
-	if vocabPath == "" {
-		vocabPath = defaultVocabPath
+	return 0, nil, nil
+}
+func (p *process) launch(exe string, args []string, secret string) error {
+	p.mu.Lock()
+	if p.cmd != nil {
+		p.mu.Unlock()
+		return fmt.Errorf("process is already running")
 	}
-
-	port := strings.TrimSpace(req.Port)
-	if port == "" {
-		port = defaultPort
-	}
-	if _, err := strconv.Atoi(port); err != nil {
-		return fmt.Errorf("invalid port: %s", port)
-	}
-
-	exe := backendExecutable()
-	if _, err := os.Stat(exe); err != nil {
-		return fmt.Errorf("backend executable not found: %s", exe)
-	}
-
-	// Adjust these flags if your backend CLI uses different names.
-	args := []string{
-		"--model-path", modelPath,
-		"--vocab-path", vocabPath,
-		"--port", port,
-		"--chunk-size", "128",
-	}
-	if strings.TrimSpace(req.Password) != "" {
-		args = append(args, "--password", strings.TrimSpace(req.Password))
-	}
-	if req.UseWKV32 {
-		args = append(args, "--wkv32")
-	}
-	if req.ChunkLoad {
-		args = append(args, "--chunk-load")
-	}
-	if req.EnableDynamicLoading {
-		args = append(args, "--enable-dynamic-loading")
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = appDir()
 	cmd.Env = backendProcessEnv(cmd.Dir)
-
+	// Drain both pipes before Wait to avoid losing the final checkpoint/log lines.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
+		p.mu.Unlock()
 		return err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
+		p.mu.Unlock()
 		return err
 	}
-
-	if err := cmd.Start(); err != nil {
+	if err = cmd.Start(); err != nil {
 		cancel()
+		p.state = "error"
+		p.errorText = err.Error()
+		p.mu.Unlock()
 		return err
 	}
-
-	l.cmd = cmd
-	l.cancel = cancel
-	l.running = true
-	l.appendLog("started: " + exe + " " + strings.Join(args, " "))
-
-	go pipeScanner(l, "stdout", stdout)
-	go pipeScanner(l, "stderr", stderr)
-
+	p.cmd = cmd
+	p.cancel = cancel
+	p.done = make(chan struct{})
+	p.state = "starting"
+	p.errorText = ""
+	p.secret = secret
+	p.started = time.Now()
+	p.finished = time.Time{}
+	p.checkpoint = ""
+	p.progress = nil
+	p.losses = []map[string]any{}
+	p.logs = []string{}
+	done := p.done
+	p.mu.Unlock()
+	p.appendLog("started: " + exe) // Never log credential-bearing argv.
+	var wg sync.WaitGroup
+	for name, pipe := range map[string]io.ReadCloser{"stdout": stdout, "stderr": stderr} {
+		wg.Add(1)
+		go func(name string, pipe io.ReadCloser) {
+			defer wg.Done()
+			s := bufio.NewScanner(pipe)
+			s.Buffer(make([]byte, 65536), 8*1024*1024)
+			s.Split(splitProgress)
+			for s.Scan() {
+				p.appendLog(name + ": " + s.Text())
+			}
+			if e := s.Err(); e != nil {
+				p.appendLog(name + " scanner error: " + e.Error())
+			}
+		}(name, pipe)
+	}
 	go func() {
+		wg.Wait()
 		err := cmd.Wait()
-		l.mu.Lock()
-		l.running = false
-		l.cmd = nil
-		l.cancel = nil
-		l.mu.Unlock()
-		if err != nil {
-			l.appendLog("backend exited: " + err.Error())
+		cancel()
+		p.mu.Lock()
+		stopped := p.state == "stopping"
+		p.cmd = nil
+		p.cancel = nil
+		p.finished = time.Now()
+		if err != nil && !stopped {
+			p.state = "error"
+			p.errorText = err.Error()
+		} else if stopped {
+			p.state = "offline"
 		} else {
-			l.appendLog("backend exited normally")
+			p.state = "completed"
 		}
+		p.mu.Unlock()
+		if err != nil && !stopped {
+			p.appendLog("process exited: " + err.Error())
+		} else {
+			p.appendLog("process exited")
+		}
+		close(done)
 	}()
-
 	return nil
 }
+func (p *process) active() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.cmd != nil }
+func (p *process) stop() error {
+	p.mu.Lock()
+	if p.cmd == nil {
+		p.mu.Unlock()
+		return nil
+	}
+	p.state = "stopping"
+	p.cancel()
+	done := p.done
+	p.mu.Unlock()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("process did not exit within 10 seconds")
+	}
+}
+func (p *process) snapshot() map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	elapsed := 0.0
+	if !p.started.IsZero() {
+		end := p.finished
+		if end.IsZero() {
+			end = time.Now()
+		}
+		elapsed = end.Sub(p.started).Seconds()
+	}
+	return map[string]any{"status": p.state, "running": p.cmd != nil, "error": p.errorText, "logs": append([]string{}, p.logs...), "progress": p.progress, "losses": append([]map[string]any{}, p.losses...), "checkpoint": p.checkpoint, "elapsed": elapsed}
+}
 
+// Keep the legacy runtime log stream available to existing local clients.
+func (p *process) sse(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+	last := ""
+	for {
+		p.mu.Lock()
+		lines := append([]string{}, p.logs...)
+		p.mu.Unlock()
+		start := 0
+		if last != "" {
+			for i := len(lines) - 1; i >= 0; i-- {
+				if lines[i] == last {
+					start = i + 1
+					break
+				}
+			}
+		}
+		for _, line := range lines[start:] {
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", line); err != nil {
+				return
+			}
+			last = line
+		}
+		flusher.Flush()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+type launcher struct {
+	mu      sync.Mutex
+	runtime *process
+	tuning  *process
+	config  startRequest
+}
+
+func newLauncher() *launcher {
+	return &launcher{runtime: newProcess(), tuning: newProcess(), config: startRequest{Port: defaultPort, VocabPath: defaultVocabPath, ChunkSize: 128, StateDBPath: "rwkv_sessions.db"}}
+}
+func existingPath(path string, dir bool) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("path is required")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(appDir(), path)
+	}
+	st, e := os.Stat(path)
+	if e != nil {
+		return e
+	}
+	if st.IsDir() != dir {
+		return fmt.Errorf("wrong path type: %s", path)
+	}
+	return nil
+}
+func runtimeArgs(req startRequest) ([]string, error) {
+	if err := existingPath(req.ModelPath, req.EnableDynamicLoading); err != nil {
+		return nil, fmt.Errorf("model: %w", err)
+	}
+	if req.VocabPath == "" {
+		req.VocabPath = defaultVocabPath
+	}
+	if err := existingPath(req.VocabPath, false); err != nil {
+		return nil, fmt.Errorf("vocab: %w", err)
+	}
+	if req.Port == "" {
+		req.Port = defaultPort
+	}
+	port, e := strconv.Atoi(req.Port)
+	if e != nil || port < 1 || port > 65535 || port == 8088 {
+		return nil, fmt.Errorf("port must be 1–65535 and different from launcher port 8088")
+	}
+	if req.ChunkSize == 0 {
+		req.ChunkSize = 128
+	}
+	if req.ChunkSize < 1 {
+		return nil, fmt.Errorf("prefill chunk size must be positive")
+	}
+	args := []string{"--model-path", req.ModelPath, "--vocab-path", req.VocabPath, "--host", "127.0.0.1", "--port", req.Port, "--chunk-size", strconv.Itoa(req.ChunkSize)}
+	for _, pair := range [][2]string{{"--password", req.Password}, {"--state-db-path", req.StateDBPath}, {"--tune-cache", req.TuneCache}} {
+		if pair[1] != "" {
+			args = append(args, pair[0], pair[1])
+		}
+	}
+	for _, flag := range []struct {
+		on   bool
+		name string
+	}{{req.UseWKV32, "--wkv32"}, {req.ChunkLoad, "--chunk-load"}, {req.EnableDynamicLoading, "--enable-dynamic-loading"}} {
+		if flag.on {
+			args = append(args, flag.name)
+		}
+	}
+	return args, nil
+}
+func (l *launcher) start(req startRequest) error {
+	if l.tuning.active() {
+		return fmt.Errorf("state tuning is using the GPU; stop tuning first")
+	}
+	if l.runtime.active() {
+		return fmt.Errorf("backend is already running")
+	}
+	args, err := runtimeArgs(req)
+	if err != nil {
+		return err
+	}
+	if req.Port == "" {
+		req.Port = defaultPort
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", req.Port), 300*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return fmt.Errorf("port %s is already in use", req.Port)
+	}
+	if err = l.runtime.launch(backendExecutable(), args, req.Password); err != nil {
+		return err
+	}
+	l.config = req
+	return nil
+}
+func (l *launcher) status() map[string]any {
+	l.mu.Lock()
+	config := l.config
+	l.mu.Unlock()
+	out := l.runtime.snapshot()
+	safe := config
+	safe.Password = ""
+	out["config"] = safe
+	out["base_url"] = "http://127.0.0.1:" + config.Port
+	out["translation_adapter"] = true
+	if out["running"] == true && out["status"] != "stopping" {
+		client := http.Client{Timeout: 1500 * time.Millisecond}
+		resp, err := client.Get("http://127.0.0.1:" + config.Port + "/v1/server/status")
+		if err == nil {
+			defer resp.Body.Close()
+			var data map[string]any
+			if resp.StatusCode == 200 && json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data) == nil && data["status"] == "running" {
+				out["status"] = "ready"
+				out["backend"] = data
+			}
+		}
+	}
+	if out["status"] == "completed" {
+		out["status"] = "offline"
+	}
+	return out
+}
+func validateDataset(path string) (int, error) {
+	if err := existingPath(path, false); err != nil {
+		return 0, err
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(appDir(), path)
+	}
+	f, e := os.Open(path)
+	if e != nil {
+		return 0, e
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	s.Buffer(make([]byte, 65536), 16<<20)
+	count, line := 0, 0
+	for s.Scan() {
+		line++
+		if len(s.Bytes()) == 0 {
+			continue
+		}
+		dec := json.NewDecoder(strings.NewReader(s.Text()))
+		tok, err := dec.Token()
+		if err != nil || tok != json.Delim('{') {
+			return 0, fmt.Errorf("line %d: expected JSON object", line)
+		}
+		key, err := dec.Token()
+		if err != nil || key != "text" {
+			return 0, fmt.Errorf("line %d: only text field is supported", line)
+		}
+		value, valueErr := dec.Token()
+		_, isString := value.(string)
+		if valueErr != nil || !isString {
+			return 0, fmt.Errorf("line %d: text must be a string", line)
+		}
+		if dec.More() {
+			return 0, fmt.Errorf("line %d: exactly one text field is required", line)
+		}
+		if tok, err = dec.Token(); err != nil || tok != json.Delim('}') {
+			return 0, fmt.Errorf("line %d: invalid object", line)
+		}
+		if _, err = dec.Token(); err != io.EOF {
+			return 0, fmt.Errorf("line %d: trailing data", line)
+		}
+		count++
+	}
+	if e = s.Err(); e != nil {
+		return 0, e
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("dataset is empty")
+	}
+	return count, nil
+}
+func tuningArgs(req tuneRequest) ([]string, error) {
+	if err := existingPath(req.Model, false); err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(filepath.Ext(req.Model), ".pth") {
+		return nil, fmt.Errorf("state tuning requires a BF16 .pth base model")
+	}
+	if _, err := validateDataset(req.Data); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(req.Output) == "" {
+		return nil, fmt.Errorf("output directory is required")
+	}
+	if req.Ctx < 1 || req.Chunk < 1 || req.Epochs < 1 || req.BatchSize < 1 || req.LR <= 0 || req.LRFinal <= 0 || req.MaxSteps < 0 || req.WarmupSteps < 0 || req.SaveEvery < 0 || req.Seed < 0 {
+		return nil, fmt.Errorf("invalid training parameter; sizes and learning rates must be positive, counts nonnegative")
+	}
+	args := []string{"--model", req.Model, "--data", req.Data, "--output", req.Output}
+	if req.Vocab != "" {
+		if err := existingPath(req.Vocab, false); err != nil {
+			return nil, err
+		}
+		args = append(args, "--vocab", req.Vocab)
+	}
+	for _, p := range []struct {
+		name string
+		n    int
+	}{{"ctx", req.Ctx}, {"chunk", req.Chunk}, {"epochs", req.Epochs}, {"batch-size", req.BatchSize}, {"max-steps", req.MaxSteps}, {"warmup-steps", req.WarmupSteps}, {"save-every", req.SaveEvery}, {"seed", req.Seed}} {
+		args = append(args, "--"+p.name, strconv.Itoa(p.n))
+	}
+	args = append(args, "--lr", strconv.FormatFloat(req.LR, 'g', -1, 64), "--lr-final", strconv.FormatFloat(req.LRFinal, 'g', -1, 64))
+	return args, nil
+}
+func (l *launcher) proxy(w http.ResponseWriter, r *http.Request) {
+	l.mu.Lock()
+	config := l.config
+	l.mu.Unlock()
+	target, _ := url.Parse("http://127.0.0.1:" + config.Port)
+	if r.URL.Path == "/v1/chat/completions" && r.Method == "POST" {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<20))
+		if err != nil {
+			writeJSON(w, 400, map[string]any{"error": err.Error()})
+			return
+		}
+		var payload map[string]json.RawMessage
+		if err = json.Unmarshal(body, &payload); err != nil {
+			writeJSON(w, 400, map[string]any{"error": err.Error()})
+			return
+		}
+		// CUDA chat adds a User/Assistant envelope. Raw contents must use the existing generic continuation handler.
+		if _, raw := payload["contents"]; raw {
+			if _, chat := payload["messages"]; !chat {
+				r.URL.Path = "/v1/batch/completions"
+			}
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.FlushInterval = -1
+	original := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		original(req)
+		if req.Header.Get("Authorization") == "" && config.Password != "" {
+			req.Header.Set("Authorization", "Bearer "+config.Password)
+		}
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
+		writeJSON(w, 502, map[string]any{"error": "runtime connection: " + e.Error()})
+	}
+	proxy.ServeHTTP(w, r)
+}
+func decode(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	d := json.NewDecoder(r.Body)
+	d.DisallowUnknownFields()
+	if e := d.Decode(v); e != nil {
+		return e
+	}
+	if e := d.Decode(new(any)); e != io.EOF {
+		return fmt.Errorf("unexpected trailing request data")
+	}
+	return nil
+}
+func (l *launcher) handler() http.Handler {
+	mux := http.NewServeMux()
+	web, _ := fs.Sub(webFiles, "dist")
+	mux.Handle("/", http.FileServer(http.FS(web)))
+	api := func(path, method string, f func(http.ResponseWriter, *http.Request) error) {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != method {
+				writeJSON(w, 405, map[string]any{"error": "method not allowed"})
+				return
+			}
+			if err := f(w, r); err != nil {
+				writeJSON(w, 400, map[string]any{"error": err.Error()})
+			}
+		})
+	}
+	api("/api/status", "GET", func(w http.ResponseWriter, r *http.Request) error { writeJSON(w, 200, l.status()); return nil })
+	for _, action := range []string{"start", "stop", "restart"} {
+		action := action
+		api("/api/"+action, "POST", func(w http.ResponseWriter, r *http.Request) error {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			req := l.config
+			if action == "start" {
+				if e := decode(w, r, &req); e != nil {
+					return e
+				}
+			}
+			if action != "start" {
+				if e := l.runtime.stop(); e != nil {
+					return e
+				}
+			}
+			if action != "stop" {
+				if e := l.start(req); e != nil {
+					l.runtime.appendLog("start failed: " + e.Error())
+					l.runtime.mu.Lock()
+					if l.runtime.cmd == nil {
+						l.runtime.state = "error"
+						l.runtime.errorText = e.Error()
+					}
+					l.runtime.mu.Unlock()
+					return e
+				}
+			}
+			writeJSON(w, 200, map[string]any{"ok": true})
+			return nil
+		})
+	}
+	api("/api/pick-file", "POST", func(w http.ResponseWriter, r *http.Request) error {
+		path, e := pickFile()
+		if e != nil {
+			return e
+		}
+		writeJSON(w, 200, map[string]any{"path": path})
+		return nil
+	})
+	api("/api/tuning/validate", "POST", func(w http.ResponseWriter, r *http.Request) error {
+		var req struct {
+			Path string `json:"path"`
+		}
+		if e := decode(w, r, &req); e != nil {
+			return e
+		}
+		n, e := validateDataset(req.Path)
+		if e != nil {
+			return e
+		}
+		writeJSON(w, 200, map[string]any{"samples": n})
+		return nil
+	})
+	api("/api/tuning/status", "GET", func(w http.ResponseWriter, r *http.Request) error {
+		out := l.tuning.snapshot()
+		name := "rwkv_state_tune"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		_, err := os.Stat(filepath.Join(appDir(), name))
+		out["available"] = err == nil
+		writeJSON(w, 200, out)
+		return nil
+	})
+	api("/api/tuning/start", "POST", func(w http.ResponseWriter, r *http.Request) error {
+		var req tuneRequest
+		if e := decode(w, r, &req); e != nil {
+			return e
+		}
+		args, e := tuningArgs(req)
+		if e != nil {
+			return e
+		}
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if l.runtime.active() {
+			return fmt.Errorf("inference is using the GPU; stop inference before starting tuning")
+		}
+		name := "rwkv_state_tune"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		if e = l.tuning.launch(filepath.Join(appDir(), name), args, ""); e != nil {
+			return e
+		}
+		l.tuning.mu.Lock()
+		if l.tuning.cmd != nil {
+			l.tuning.state = "running"
+		}
+		l.tuning.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return nil
+	})
+	api("/api/tuning/stop", "POST", func(w http.ResponseWriter, r *http.Request) error {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if e := l.tuning.stop(); e != nil {
+			return e
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return nil
+	})
+	api("/api/tuning/open-folder", "POST", func(w http.ResponseWriter, r *http.Request) error {
+		l.tuning.mu.Lock()
+		path := l.tuning.checkpoint
+		l.tuning.mu.Unlock()
+		if path == "" {
+			return fmt.Errorf("no saved checkpoint")
+		}
+		folder := filepath.Dir(path)
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "windows":
+			cmd = exec.Command("explorer", folder)
+		case "darwin":
+			cmd = exec.Command("open", folder)
+		default:
+			cmd = exec.Command("xdg-open", folder)
+		}
+		if e := cmd.Start(); e != nil {
+			return e
+		}
+		go cmd.Wait()
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return nil
+	})
+	mux.HandleFunc("/logs", l.runtime.sse)
+	mux.HandleFunc("/v1/", l.proxy)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Loopback binding plus Host/Origin checks prevent cross-site launcher control and DNS rebinding.
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host
+		}
+		if host != "localhost" && host != "127.0.0.1" && host != "[::1]" && host != "::1" {
+			writeJSON(w, 403, map[string]any{"error": "local host required"})
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, e := url.Parse(origin)
+			if e != nil || u.Host != r.Host {
+				writeJSON(w, 403, map[string]any{"error": "same-origin request required"})
+				return
+			}
+		}
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			writeJSON(w, 403, map[string]any{"error": "cross-site request rejected"})
+			return
+		}
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		mux.ServeHTTP(w, r)
+	})
+}
+func main() {
+	l := newLauncher()
+	url := "http://" + listenAddr
+	if os.Getenv("RWKV_LAUNCHER_NO_BROWSER") != "1" {
+		go func() { time.Sleep(350 * time.Millisecond); openBrowser(url) }()
+	}
+	log.Printf("RWKV Lightning Launcher: %s", url)
+	server := http.Server{Addr: listenAddr, Handler: l.handler(), ReadHeaderTimeout: 5 * time.Second}
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-shutdown
+		l.mu.Lock()
+		_ = l.runtime.stop()
+		_ = l.tuning.stop()
+		l.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+}
 func backendProcessEnv(baseDir string) []string {
 	env := os.Environ()
 	if runtime.GOOS != "windows" {
@@ -209,86 +780,6 @@ func getEnvCaseInsensitive(name string) (value string, key string) {
 		}
 	}
 	return "", name
-}
-
-func pipeScanner(l *launcher, name string, r interface{ Read([]byte) (int, error) }) {
-	s := bufio.NewScanner(r)
-	buf := make([]byte, 0, 1024*1024)
-	s.Buffer(buf, 8*1024*1024)
-	for s.Scan() {
-		l.appendLog(name + ": " + s.Text())
-	}
-	if err := s.Err(); err != nil {
-		l.appendLog(name + " scanner error: " + err.Error())
-	}
-}
-
-func (l *launcher) stop() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if !l.running || l.cmd == nil {
-		return fmt.Errorf("backend is not running")
-	}
-
-	l.appendLog("stopping backend...")
-	if l.cancel != nil {
-		l.cancel()
-	}
-	if l.cmd.Process != nil {
-		_ = l.cmd.Process.Kill()
-	}
-	return nil
-}
-
-func (l *launcher) status() map[string]any {
-	l.mu.Lock()
-	running := l.running
-	l.mu.Unlock()
-	return map[string]any{"running": running}
-}
-
-func (l *launcher) sse(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	ch := make(chan string, 256)
-
-	l.logMu.Lock()
-	for _, line := range l.logs {
-		fmt.Fprintf(w, "data: %s\n\n", sseEscape(line))
-	}
-	l.clients[ch] = struct{}{}
-	l.logMu.Unlock()
-	flusher.Flush()
-
-	defer func() {
-		l.logMu.Lock()
-		delete(l.clients, ch)
-		l.logMu.Unlock()
-		close(ch)
-	}()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case line := <-ch:
-			fmt.Fprintf(w, "data: %s\n\n", sseEscape(line))
-			flusher.Flush()
-		}
-	}
-}
-
-func sseEscape(s string) string {
-	return strings.ReplaceAll(s, "\n", " ")
 }
 
 func backendExecutable() string {
@@ -349,339 +840,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-
-func main() {
-	l := newLauncher()
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_ = page.Execute(w, map[string]string{
-			"DefaultPort":  defaultPort,
-			"DefaultVocab": defaultVocabPath,
-		})
-	})
-
-	http.HandleFunc("/api/start", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req startRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		if err := l.start(req); err != nil {
-			l.appendLog("start failed: " + err.Error())
-			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, map[string]any{"ok": true})
-	})
-
-	http.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if err := l.stop(); err != nil {
-			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, map[string]any{"ok": true})
-	})
-
-	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, l.status())
-	})
-
-	http.HandleFunc("/api/pick-file", func(w http.ResponseWriter, r *http.Request) {
-		path, err := pickFile()
-		if err != nil {
-			writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, map[string]any{"ok": true, "path": path})
-	})
-
-	http.HandleFunc("/logs", l.sse)
-
-	url := "http://" + listenAddr
-	go func() {
-		time.Sleep(350 * time.Millisecond)
-		openBrowser(url)
-	}()
-
-	log.Printf("RWKV Lightning CUDA Launcher: %s", url)
-	log.Printf("Backend executable: %s", backendExecutable())
-	if err := http.ListenAndServe(listenAddr, nil); err != nil {
-		log.Fatal(err)
-	}
-}
-
-var page = template.Must(template.New("page").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>RWKV Lightning CUDA Control Center</title>
-  <style>
-    :root {
-      --bg: #f7fafc;
-      --card: rgba(255,255,255,.86);
-      --text: #0f172a;
-      --muted: #64748b;
-      --border: #dbe4ef;
-      --primary: #2563eb;
-      --primary2: #1d4ed8;
-      --danger: #dc2626;
-      --danger2: #b91c1c;
-      --console: #0b1020;
-      --consoleText: #d5e7ff;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(circle at 10% 10%, #dbeafe 0, transparent 30%),
-        radial-gradient(circle at 90% 20%, #e0e7ff 0, transparent 28%),
-        linear-gradient(135deg, #f8fafc, #eef6ff);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 28px;
-    }
-    .shell {
-      width: min(980px, 100%);
-      background: var(--card);
-      border: 1px solid rgba(219, 228, 239, .9);
-      border-radius: 24px;
-      box-shadow: 0 24px 80px rgba(15, 23, 42, .12);
-      backdrop-filter: blur(16px);
-      overflow: hidden;
-    }
-    .header {
-      padding: 24px 28px 12px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-    }
-    .title { font-size: 22px; font-weight: 750; letter-spacing: -.02em; }
-    .subtitle { margin-top: 4px; color: var(--muted); font-size: 13px; }
-    .badge {
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 8px 12px;
-      font-size: 13px;
-      color: var(--muted);
-      background: rgba(255,255,255,.65);
-      white-space: nowrap;
-    }
-    .content { padding: 14px 28px 28px; }
-    .grid { display: grid; gap: 12px; }
-    .row { display: grid; grid-template-columns: 130px minmax(0, 1fr) 96px; gap: 10px; align-items: center; }
-    .row.small { grid-template-columns: 130px minmax(0, 1fr) 130px minmax(0, 1fr); }
-    label { font-size: 13px; font-weight: 650; color: #334155; }
-    input {
-      width: 100%;
-      height: 40px;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 0 12px;
-      color: var(--text);
-      background: rgba(255,255,255,.85);
-      outline: none;
-      transition: border .15s, box-shadow .15s;
-    }
-    input:focus { border-color: #93c5fd; box-shadow: 0 0 0 4px rgba(147,197,253,.26); }
-    button {
-      height: 40px;
-      border: 0;
-      border-radius: 12px;
-      padding: 0 16px;
-      font-weight: 700;
-      cursor: pointer;
-      transition: transform .08s, background .15s, opacity .15s;
-    }
-    button:active { transform: translateY(1px); }
-    .browse { background: #eaf2ff; color: #1e40af; }
-    .browse:hover { background: #dbeafe; }
-    .actions { display: flex; gap: 12px; margin-top: 16px; }
-    .start { background: var(--primary); color: white; min-width: 120px; }
-    .start:hover { background: var(--primary2); }
-    .stop { background: #fee2e2; color: var(--danger); min-width: 120px; }
-    .stop:hover { background: #fecaca; color: var(--danger2); }
-    button:disabled { opacity: .55; cursor: not-allowed; }
-    .console-wrap { margin-top: 18px; border: 1px solid #101827; border-radius: 18px; overflow: hidden; background: var(--console); }
-    .console-top { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: #111827; color: #9ca3af; font-size: 12px; }
-    #console {
-      width: 100%;
-      height: 390px;
-      padding: 14px;
-      background: var(--console);
-      color: var(--consoleText);
-      border: 0;
-      resize: vertical;
-      outline: none;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: 12.5px;
-      line-height: 1.55;
-    }
-    .hint { margin-top: 10px; color: var(--muted); font-size: 12px; }
-    @media (max-width: 720px) {
-      body { padding: 12px; }
-      .header { display: block; }
-      .badge { margin-top: 12px; display: inline-block; }
-      .row, .row.small { grid-template-columns: 1fr; }
-      .actions { flex-direction: column; }
-      button { width: 100%; }
-    }
-	input[type="checkbox"] {
-	  margin-right: 6px;
-	  width: 16px;
-	  height: 16px;
-	  vertical-align: middle;
-	}
-  </style>
-</head>
-<body>
-  <main class="shell">
-    <div class="header">
-      <div>
-        <div class="title">RWKV Lightning CUDA Control Center</div>
-        <div class="subtitle">Local launcher for rwkv_lighting_cuda</div>
-      </div>
-      <div class="badge" id="status">Checking...</div>
-    </div>
-
-    <div class="content">
-      <div class="grid">
-        <div class="row">
-          <label>Model Path</label>
-          <input id="model" placeholder="Select model file..." />
-          <button class="browse" onclick="pickFile('model')">Browse</button>
-        </div>
-        <div class="row">
-          <label>Vocab Path</label>
-          <input id="vocab" value="{{.DefaultVocab}}" />
-          <button class="browse" onclick="pickFile('vocab')">Browse</button>
-        </div>
-		<div class="row small">
-		  <label>Port</label>
-		  <input id="port" value="{{.DefaultPort}}" inputmode="numeric" />
-		  <label>Password</label>
-		  <input id="password" type="password" placeholder="empty = disabled" />
-		</div>
-		<div class="row" style="align-items: center;">
-		  <label></label>
-		  <label style="display: flex; align-items: center; font-weight: 500; color: #334155; gap: 8px;">
-		    <input type="checkbox" id="useWkv32" />
-		    Use FP32 WKV (More accurate, Bsz=1 Have almost same speed, High concurrency use more VRAM)
-		  </label>
-		  <label style="display: flex; align-items: center; font-weight: 500; color: #334155; gap: 8px;">
-		    <input type="checkbox" id="chunkLoad" />
-		    Chunk-load model weights (lower host RAM during loading)
-		  </label>
-		  <label style="display: flex; align-items: center; font-weight: 500; color: #334155; gap: 8px;">
-		    <input type="checkbox" id="enableDynamicLoading" />
-		    Enable dynamic model loading (Model Path must be a directory)
-		  </label>
-		  <label></label>
-		</div>
-      </div>
-
-      <div class="console-wrap">
-        <div class="console-top">
-          <span>terminal output</span>
-          <span id="logState">connected</span>
-        </div>
-        <textarea id="console" readonly></textarea>
-      </div>
-
-      <div class="actions">
-        <button class="start" id="startBtn" onclick="startBackend()">Start</button>
-        <button class="stop" id="stopBtn" onclick="stopBackend()">Stop</button>
-      </div>
-      <div class="hint">Password is only passed to backend when non-empty. Backend executable must be next to this launcher.</div>
-    </div>
-  </main>
-
-<script>
-const consoleBox = document.getElementById('console');
-const statusBox = document.getElementById('status');
-const startBtn = document.getElementById('startBtn');
-const stopBtn = document.getElementById('stopBtn');
-
-function log(line) {
-  consoleBox.value += line + "\n";
-  consoleBox.scrollTop = consoleBox.scrollHeight;
-}
-
-async function pickFile(target) {
-  try {
-    const r = await fetch('/api/pick-file');
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.error || 'file picker failed');
-    if (j.path) document.getElementById(target).value = j.path;
-  } catch (e) {
-    log('[launcher] ' + e.message);
-  }
-}
-
-async function startBackend() {
-  const payload = {
-    model_path: document.getElementById('model').value,
-    vocab_path: document.getElementById('vocab').value,
-    port: document.getElementById('port').value,
-    password: document.getElementById('password').value,
-  	use_wkv32: document.getElementById('useWkv32').checked,
-		chunk_load: document.getElementById('chunkLoad').checked,
-		enable_dynamic_loading: document.getElementById('enableDynamicLoading').checked,
-  };
-  try {
-    const r = await fetch('/api/start', { method: 'POST', body: JSON.stringify(payload) });
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.error || 'start failed');
-    await refreshStatus();
-  } catch (e) {
-    log('[launcher] ' + e.message);
-  }
-}
-
-async function stopBackend() {
-  try {
-    const r = await fetch('/api/stop', { method: 'POST' });
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.error || 'stop failed');
-    await refreshStatus();
-  } catch (e) {
-    log('[launcher] ' + e.message);
-  }
-}
-
-async function refreshStatus() {
-  try {
-    const r = await fetch('/api/status');
-    const j = await r.json();
-    statusBox.textContent = j.running ? 'Backend running' : 'Backend stopped';
-    statusBox.style.color = j.running ? '#166534' : '#64748b';
-    startBtn.disabled = !!j.running;
-    stopBtn.disabled = !j.running;
-  } catch (_) {
-    statusBox.textContent = 'Launcher offline';
-  }
-}
-
-const es = new EventSource('/logs');
-es.onmessage = (e) => log(e.data);
-es.onerror = () => { document.getElementById('logState').textContent = 'reconnecting...'; };
-es.onopen = () => { document.getElementById('logState').textContent = 'connected'; };
-
-refreshStatus();
-setInterval(refreshStatus, 1200);
-</script>
-</body>
-</html>`))
