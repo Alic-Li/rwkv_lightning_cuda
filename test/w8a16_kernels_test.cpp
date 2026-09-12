@@ -482,7 +482,8 @@ void check_sparse_rows(int B, int T, bool use_t512) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  const bool quick = argc > 1 && std::string(argv[1]) == "--quick";
   if (!rwkv_test::cuda_device_available()) {
     std::cout << "SKIP: CUDA device unavailable\n";
     return 0;
@@ -492,9 +493,9 @@ int main() {
     check_packed_mma();
     check_packed_mma_bn128();
     for (int M : {1, 2, 4, 8, 12, 16, 32, 64, 100, 128}) {
-      check_linear(M, 4096, 4096, W8BLayout::NK);
+      check_linear(M, quick ? 256 : 4096, quick ? 128 : 4096, W8BLayout::NK);
       if (M == 1 || M == 8 || M >= 9) {
-        check_linear(M, 16384, 4096, W8BLayout::KN);
+        check_linear(M, quick ? 320 : 16384, quick ? 192 : 4096, W8BLayout::KN);
       }
     }
     check_sparse();

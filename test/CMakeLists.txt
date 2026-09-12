@@ -33,6 +33,8 @@ if(RWKV_GPU_BACKEND STREQUAL "CUDA" AND RWKV7_STATE_TUNING)
 endif()
 
 if(RWKV_GPU_BACKEND STREQUAL "CUDA")
+  rwkv_add_unit_test(rwkv_kernel_safety_test ${CMAKE_CURRENT_SOURCE_DIR}/kernel_safety_test.cpp)
+  set_tests_properties(rwkv_kernel_safety_test PROPERTIES SKIP_RETURN_CODE 77)
   rwkv_add_unit_test(rwkv_w4a16_kernels_test ${CMAKE_CURRENT_SOURCE_DIR}/w4a16_kernels_test.cpp)
   set_tests_properties(rwkv_w4a16_kernels_test PROPERTIES SKIP_RETURN_CODE 77)
   rwkv_add_unit_test(rwkv_w4a16_model_test ${CMAKE_CURRENT_SOURCE_DIR}/w4a16_model_test.cpp)

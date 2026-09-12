@@ -232,11 +232,11 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     const int V4 = V / 4;
     float4 l4, p4;
 
-    logits    += (b*T+(T-1)) * V;  // B T V
+    logits    += (static_cast<int64_t>(b)*T+(T-1)) * V;  // B T V
     penalties +=           b * V;  // B V
     outputs   +=           b    ;  // B
     states    +=           b    ;  // B
-    probs     += (b*T+(T-1)) * V;  // B T V
+    probs     += static_cast<int64_t>(b) * V;  // Scratch is [B,V].
 
     float maxu = -INFINITY;
     for (int i=t; i<V4; i+=d) {
@@ -635,10 +635,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     const int V4 = V / 4;
     float4 l4, p4;
 
-    logits    += (b*T+(T-1)) * V;  // B T V
+    logits    += (static_cast<int64_t>(b)*T+(T-1)) * V;  // B T V
     outputs   +=           b    ;  // B
     states    +=           b    ;  // B
-    probs     += (b*T+(T-1)) * V;  // B T V
+    probs     += static_cast<int64_t>(b) * V;  // Scratch is [B,V].
 
     float maxu = -INFINITY;
     for (int i=t; i<V4; i+=d) {
@@ -872,10 +872,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     const int V4 = V / 4;
     float4 l4, p4;
 
-    logits    += (b*T+(T-1)) * V;  // B T V
+    logits    += (static_cast<int64_t>(b)*T+(T-1)) * V;  // B T V
     outputs   +=           b    ;  // B
     states    +=           b    ;  // B
-    probs     += (b*T+(T-1)) * V;  // B T V
+    probs     += static_cast<int64_t>(b) * V;  // Scratch is [B,V].
 
     float maxu = -INFINITY;
     for (int i=t; i<V4; i+=d) {

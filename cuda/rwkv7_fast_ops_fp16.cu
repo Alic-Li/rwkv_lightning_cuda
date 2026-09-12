@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 
 #include "rwkv7_fast_v4_kernels.cuh"
 
@@ -29,12 +30,12 @@ __global__ void i8_pack_kernel(
     std::uint32_t* __restrict__ dst_words,
     int N,
     int K,
-    int words) {
-  const int word_index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t words) {
+  const int64_t word_index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (word_index >= words) return;
-  const int words_per_nt = (K / 16) * 8 * 32;
+  const int64_t words_per_nt = static_cast<int64_t>(K / 16) * 8 * 32;
   const int nt = word_index / words_per_nt;
-  int rem = word_index - nt * words_per_nt;
+  int64_t rem = word_index - static_cast<int64_t>(nt) * words_per_nt;
   const int kt = rem / (8 * 32);
   rem -= kt * 8 * 32;
   const int ns = rem / 32;
@@ -445,6 +446,21 @@ __global__ void cmix_mix_kernel(
   const float2 prev = __half22float2(prev2);
   const float2 mix = __half22float2(load_h2(x_k + c));
   store_h2(out + idx, cur.x + (prev.x - cur.x) * mix.x, cur.y + (prev.y - cur.y) * mix.y);
+}
+
+// Scalar fallback for odd extents; the vector path retains its even-size ABI.
+template<int Op>
+__global__ void element_scalar_kernel(const half* x, const half* vec, half* out,
+                                      int C, int64_t elems) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= elems) return;
+  const float v = __half2float(x[i]);
+  float result;
+  if constexpr (Op == 0) { const float r = fmaxf(v, 0.0f); result = r*r; }
+  else if constexpr (Op == 1) result = tanhf(v);
+  else if constexpr (Op == 2) result = sigmoid_fast(v);
+  else result = v + __half2float(vec[i % C]);
+  out[i] = __float2half_rn(result);
 }
 
 __global__ void relu_square_kernel(
@@ -1198,6 +1214,8 @@ void rwkv7_tmix_mix6_launch(
     half* out_v,
     half* out_a,
     half* out_g) {
+  if (B <= 0 || T <= 0 || C <= 0 || (C & 1))
+    throw std::invalid_argument("time mixing requires positive dimensions and even channels");
   constexpr int threads = 256;
   const int64_t total_pairs = static_cast<int64_t>(B) * T * (C / 2);
   tmix_mix6_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
@@ -1225,7 +1243,8 @@ void rwkv7_tmix_kk_a_gate_launch(
     half* neg_kk,
     half* kka) {
   (void)C;
-  assert(C == H * HEAD_SIZE);
+  if (B <= 0 || T <= 0 || H <= 0 || C != static_cast<int64_t>(H) * HEAD_SIZE)
+    throw std::invalid_argument("time mixing requires positive dimensions and 64 channels per head");
   const int64_t bth_size = static_cast<int64_t>(B) * T * H;
   const int blocks = static_cast<int>(ceil_div(bth_size, static_cast<int64_t>(WARPS_PER_BLOCK)));
   tmix_kk_a_gate_kernel<<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(
@@ -1250,7 +1269,8 @@ void rwkv7_tmix_lnx_rkvres_xg_launch(
     const half* g,
     half* out) {
   (void)C;
-  assert(C == H * HEAD_SIZE);
+  if (B <= 0 || T <= 0 || H <= 0 || C != static_cast<int64_t>(H) * HEAD_SIZE)
+    throw std::invalid_argument("time mixing requires positive dimensions and 64 channels per head");
   const int64_t bth_size = static_cast<int64_t>(B) * T * H;
   tmix_lnx_rkvres_xg_kernel<<<static_cast<int>(bth_size), HEAD_SIZE, 0, stream>>>(
       C, H, x, r, k, v, r_k, weight, bias, g, out, bth_size);
@@ -1283,6 +1303,8 @@ void rwkv7_cmix_sparse_one_launch(
     const half* value_fc,
     half* act_scratch,
     half* out) {
+  if (C <= 0 || F <= 0 || C % 256 || F % 128)
+    throw std::invalid_argument("sparse CMix requires C multiple of 256 and F multiple of 128");
   cmix_sparse_up_one_kernel<64><<<F, 64, 0, stream>>>(
       C, x, shift_state, x_k, key_fc, act_scratch);
   cmix_sparse_copy_zero_one_kernel<<<(C / 8 + 127) / 128, 128, 0, stream>>>(
@@ -1304,6 +1326,10 @@ void rwkv7_cmix_sparse_rows_launch(
     const half* value_fc,
     half* act_scratch,
     half* out) {
+  if (B <= 0 || T <= 0 || static_cast<long long>(B) * T > 65535)
+    throw std::invalid_argument("sparse CMix row count exceeds grid limits");
+  if (C <= 0 || F <= 0 || C % 256 || F % 128)
+    throw std::invalid_argument("sparse CMix requires C multiple of 256 and F multiple of 128");
   const int rows = B * T;
   cmix_sparse_up_rows_kernel<64><<<dim3(F, rows, 1), 64, 0, stream>>>(
       T, C, F, x, shift_state, x_k, key_fc, act_scratch);
@@ -1321,6 +1347,8 @@ void rwkv7_cmix_sparse_down_relu_one_launch(
     const half* preact,
     const half* value_fc,
     half* out) {
+  if (C <= 0 || F <= 0 || C % 256 || F % 128)
+    throw std::invalid_argument("sparse CMix requires C multiple of 256 and F multiple of 128");
   zero_vec4_kernel<<<(C / 8 + 127) / 128, 128, 0, stream>>>(out, C / 8);
   cmix_sparse_spmv_relu_one_kernel<<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), 1), FFN_SPMV_THREADS, 0, stream>>>(
       C, preact, value_fc, out);
@@ -1335,6 +1363,10 @@ void rwkv7_cmix_sparse_down_relu_rows_launch(
     const half* preact,
     const half* value_fc,
     half* out) {
+  if (B <= 0 || T <= 0 || static_cast<long long>(B) * T > 65535)
+    throw std::invalid_argument("sparse CMix row count exceeds grid limits");
+  if (C <= 0 || F <= 0 || C % 256 || F % 128)
+    throw std::invalid_argument("sparse CMix requires C multiple of 256 and F multiple of 128");
   const int rows = B * T;
   const int64_t out_vec4 = static_cast<int64_t>(rows) * (C / 8);
   zero_vec4_kernel<<<static_cast<int>(ceil_div(out_vec4, 128)), 128, 0, stream>>>(out, out_vec4);
@@ -1351,6 +1383,14 @@ void rwkv7_cmix_sparse_down_relu_rows_t512_launch(
     const half* preact,
     const half* value_fc,
     half* out) {
+  if (B <= 0 || T <= 0 || static_cast<long long>(B) * T > 65535)
+    throw std::invalid_argument("sparse CMix row count exceeds grid limits");
+  if (C <= 0 || F <= 0 || C % 256 || F % 128)
+    throw std::invalid_argument("sparse CMix requires C multiple of 256 and F multiple of 128");
+  if (C % 512 || F % 512) {
+    rwkv7_cmix_sparse_down_relu_rows_launch(stream, B, T, C, F, preact, value_fc, out);
+    return;
+  }
   const int rows = B * T;
   const int64_t out_vec4 = static_cast<int64_t>(rows) * (C / 8);
   zero_vec4_kernel<<<static_cast<int>(ceil_div(out_vec4, 128)), 128, 0, stream>>>(out, out_vec4);
@@ -1366,6 +1406,8 @@ void rwkv7_cmix_sparse_down_relu_one_i8_launch(
     const std::int8_t* value_i8,
     const half* scale,
     half* out) {
+  if (C <= 0 || F <= 0 || C % 256 || F % 128)
+    throw std::invalid_argument("sparse CMix requires C multiple of 256 and F multiple of 128");
   zero_vec4_kernel<<<(C / 8 + 127) / 128, 128, 0, stream>>>(out, C / 8);
   cmix_sparse_spmv_relu_one_i8_kernel<<<dim3(F / FFN_TILE, C / (2 * FFN_SPMV_THREADS), 1), FFN_SPMV_THREADS, 0, stream>>>(
       C, preact, value_i8, scale, out);
@@ -1381,6 +1423,10 @@ void rwkv7_cmix_sparse_down_relu_rows_i8_launch(
     const std::int8_t* value_i8,
     const half* scale,
     half* out) {
+  if (B <= 0 || T <= 0 || static_cast<long long>(B) * T > 65535)
+    throw std::invalid_argument("sparse CMix row count exceeds grid limits");
+  if (C <= 0 || F <= 0 || C % 256 || F % 128)
+    throw std::invalid_argument("sparse CMix requires C multiple of 256 and F multiple of 128");
   const int rows = B * T;
   const int64_t out_vec4 = static_cast<int64_t>(rows) * (C / 8);
   zero_vec4_kernel<<<static_cast<int>(ceil_div(out_vec4, 128)), 128, 0, stream>>>(out, out_vec4);
@@ -1398,8 +1444,12 @@ void rwkv7_cmix_sparse_down_relu_rows_t512_i8_launch(
     const std::int8_t* value_i8,
     const half* scale,
     half* out) {
+  if (B <= 0 || T <= 0 || static_cast<long long>(B) * T > 65535)
+    throw std::invalid_argument("sparse CMix row count exceeds grid limits");
+  if (C <= 0 || F <= 0 || C % 256 || F % 128)
+    throw std::invalid_argument("sparse CMix requires C multiple of 256 and F multiple of 128");
   const int rows = B * T;
-  if (F < 512 || (F % 512) != 0) {
+  if ((C % 512) != 0 || F < 512 || (F % 512) != 0) {
     rwkv7_cmix_sparse_down_relu_rows_i8_launch(stream, B, T, C, F, preact, value_i8, scale, out);
     return;
   }
@@ -1445,6 +1495,8 @@ void rwkv7_cmix_mix_launch(
     half* shift_state,
     const half* x_k,
     half* out) {
+  if (B <= 0 || T <= 0 || C <= 0 || (C & 1))
+    throw std::invalid_argument("time mixing requires positive dimensions and even channels");
   constexpr int threads = 256;
   const int64_t total_pairs = static_cast<int64_t>(B) * T * (C / 2);
   cmix_mix_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
@@ -1455,6 +1507,12 @@ void rwkv7_cmix_mix_launch(
 }
 
 void rwkv7_relu_square_launch(cudaStream_t stream, const half* x, half* out, long long elems) {
+  if (elems <= 0) return;
+  if ((elems & 1)) {
+    element_scalar_kernel<0><<<static_cast<int>(ceil_div(elems, 256)), 256, 0, stream>>>(
+        x, nullptr, out, 1, elems);
+    return;
+  }
   constexpr int threads = 256;
   const int64_t total_pairs = elems / 2;
   relu_square_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
@@ -1462,6 +1520,12 @@ void rwkv7_relu_square_launch(cudaStream_t stream, const half* x, half* out, lon
 }
 
 void rwkv7_act_tanh_launch(cudaStream_t stream, const half* x, half* out, long long elems) {
+  if (elems <= 0) return;
+  if ((elems & 1)) {
+    element_scalar_kernel<1><<<static_cast<int>(ceil_div(elems, 256)), 256, 0, stream>>>(
+        x, nullptr, out, 1, elems);
+    return;
+  }
   constexpr int threads = 256;
   const int64_t total_pairs = elems / 2;
   act_tanh_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
@@ -1469,6 +1533,12 @@ void rwkv7_act_tanh_launch(cudaStream_t stream, const half* x, half* out, long l
 }
 
 void rwkv7_act_sigmoid_launch(cudaStream_t stream, const half* x, half* out, long long elems) {
+  if (elems <= 0) return;
+  if ((elems & 1)) {
+    element_scalar_kernel<2><<<static_cast<int>(ceil_div(elems, 256)), 256, 0, stream>>>(
+        x, nullptr, out, 1, elems);
+    return;
+  }
   constexpr int threads = 256;
   const int64_t total_pairs = elems / 2;
   act_sigmoid_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
@@ -1477,6 +1547,13 @@ void rwkv7_act_sigmoid_launch(cudaStream_t stream, const half* x, half* out, lon
 
 void rwkv7_add_vec_launch(
     cudaStream_t stream, int C, const half* x, const half* vec, half* out, long long elems) {
+  if (elems <= 0) return;
+  if (C <= 0) throw std::invalid_argument("add_vec requires positive channels");
+  if (((elems & 1) || (C & 1))) {
+    element_scalar_kernel<3><<<static_cast<int>(ceil_div(elems, 256)), 256, 0, stream>>>(
+        x, vec, out, C, elems);
+    return;
+  }
   constexpr int threads = 256;
   const int64_t total_pairs = elems / 2;
   add_vec_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
@@ -1497,7 +1574,7 @@ void rwkv7_v4_i8_pack_launch(
     std::fprintf(stderr, "i8 pack requires N %% 64 == 0 and K %% 16 == 0 (N=%d K=%d)\n", N, K);
     std::exit(1);
   }
-  const int words = N * K / 4;
+  const int64_t words = static_cast<int64_t>(N) * K / 4;
   constexpr int threads = 256;
   i8_pack_kernel<<<static_cast<int>(ceil_div(words, threads)), threads, 0, stream>>>(
       src_nk, reinterpret_cast<std::uint32_t*>(dst_packed), N, K, words);

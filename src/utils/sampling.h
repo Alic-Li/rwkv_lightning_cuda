@@ -15,6 +15,9 @@ cudaError_t setup_rand_raw(
     int batch_size,
     cudaStream_t stream);
 
+// logits is [B,T,V]; samples only the last time step. probs and penalties
+// each contain B*V floats, outputs B ints. Concurrent calls need separate
+// outputs, scratch, penalties and RNG states.
 cudaError_t batch_sampling_repetition_temperature_topk_topp_raw(
     const float* logits,
     float* penalties,
@@ -32,6 +35,7 @@ cudaError_t batch_sampling_repetition_temperature_topk_topp_raw(
     double top_p,
     cudaStream_t stream);
 
+// logits is [B,T,V], probs is [B,V], outputs is [B].
 cudaError_t batch_sampling_temperature_topk_topp_raw(
     const float* logits,
     int* outputs,
