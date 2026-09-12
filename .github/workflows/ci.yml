@@ -115,6 +115,9 @@ jobs:
         shell: bash
         run: |
           cd dist
+          # Accept checksum artifacts produced by older Windows builds, whose
+          # Python text output used CRLF and confused GNU sha256sum.
+          sed -i 's/\r$//' -- *.sha256
           sha256sum --check *.sha256
           if gh release view "$RELEASE_TAG" --json isDraft > release.json 2>/dev/null; then
             jq -e '.isDraft == true' release.json

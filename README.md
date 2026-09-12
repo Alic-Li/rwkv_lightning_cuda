@@ -90,15 +90,15 @@ of the form `{"text":"..."}`:
   --model /path/to/model.pth \
   --data /path/to/train.jsonl \
   --output ./state_output \
-  --ctx 128 \
+  --ctx 512 \
   --chunk 128 \
   --epochs 1 \
   --max-steps 10000 \
-  --lr 1.0 \
-  --lr-final 0.01 \
+  --lr 0.0005 \
+  --lr-final 0.0005 \
   --warmup-steps 10 \
-  --save-every 500 \
-  --batch-size 2
+  --save-every 100 \
+  --batch-size 8
 ```
 
 This first correctness-oriented version uses the existing BF16 PTH loader and

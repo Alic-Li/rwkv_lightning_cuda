@@ -133,8 +133,10 @@ def main():
                                        root_dir=bundle.parent, base_dir=name))
     with archive.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    archive.with_name(archive.name + ".sha256").write_text(
-        f"{digest}  {archive.name}\n", encoding="utf-8")
+    # Write bytes so Windows does not translate the LF to CRLF. GNU
+    # sha256sum treats a trailing CR as part of the referenced filename.
+    archive.with_name(archive.name + ".sha256").write_bytes(
+        f"{digest}  {archive.name}\n".encode("ascii"))
     print(f"Package: {archive}")
 
 
