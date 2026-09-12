@@ -29,14 +29,20 @@ def run(*args, cwd=ROOT, env=None):
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
+def package_version():
+    value = os.environ.get(
+        "RWKV_RELEASE_VERSION", os.environ.get("GITHUB_REF_NAME", "local")
+    )
+    return re.sub(r"[^A-Za-z0-9._-]", "-", value)
+
+
 def main():
     if platform.system() not in ("Windows", "Linux"):
         raise SystemExit("CUDA release builds require Linux or Windows")
     if platform.machine().lower() not in ("x86_64", "amd64"):
         raise SystemExit("These release packages target x86-64")
     cuda = Path(os.environ["CUDA_PATH"])
-    version = os.environ.get("GITHUB_REF_NAME", "local")
-    version = re.sub(r"[^A-Za-z0-9._-]", "-", version)
+    version = package_version()
     cuda_tag = "cuda" + ".".join(os.environ.get("CUDA_VERSION", "12.9.0").split(".")[:2])
     name = f"rwkv-lightning-{version}-{'windows' if WINDOWS else 'linux'}-x64-{cuda_tag}"
     bundle = BUILD / "release" / name
@@ -111,6 +117,7 @@ def main():
     shutil.copy2(ROOT / "docs/releasing.md", bundle / "RELEASING.md")
     shutil.copy2(ROOT / "README.md", bundle)
     (bundle / "BUILD-INFO.json").write_text(json.dumps({
+        "version": version,
         "commit": os.environ.get("GITHUB_SHA", "local"),
         "ref": os.environ.get("GITHUB_REF", "local"),
         "cuda": os.environ.get("CUDA_VERSION", "12.9.0"),

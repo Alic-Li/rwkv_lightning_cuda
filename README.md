@@ -1,7 +1,11 @@
 ## CI / Release
 
 GitHub Actions builds Linux and Windows CUDA packages on PRs and `main`. Push a
-`v*` tag to generate a draft Release with binaries and SHA-256 checksums. See
+change to the root [`VERSION`](VERSION) file on `main` to publish a new Release
+with Linux/Windows binaries and SHA-256 checksums. For example, change `1.4.0`
+to `1.5.0`, commit, and push to `main`; CI creates tag `v1.5.0`, uploads all
+packages, then publishes the Release. Pushes that keep an already published
+version run normal CI without creating another Release. See
 [the release guide](docs/releasing.md) for the workflow and package contents.
 
 ## Project layout

@@ -4,7 +4,6 @@ on:
   pull_request:
   push:
     branches: [main]
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -12,11 +11,55 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: true
 
 jobs:
+  version:
+    name: Resolve release version
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read and validate VERSION
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "VERSION must contain a semantic version such as 1.5.0" >&2
+            exit 1
+          fi
+
+          tag="v$version"
+          should_release=false
+          case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
+            push:refs/heads/main|workflow_dispatch:refs/heads/main)
+              # A missing release or an interrupted draft should be completed.
+              # A published release means this VERSION has already shipped.
+              if gh release view "$tag" --json isDraft > release.json 2>/dev/null; then
+                if [[ "$(jq -r '.isDraft' release.json)" == "true" ]]; then
+                  should_release=true
+                fi
+              else
+                should_release=true
+              fi
+              ;;
+          esac
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          echo "Package version: $tag; create/update release: $should_release"
+
   build:
     name: CUDA ${{ matrix.cuda }} / ${{ matrix.os }}
+    needs: version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -26,6 +69,7 @@ jobs:
         cuda: ['12.9.0', '13.2.2']
     env:
       CUDA_VERSION: ${{ matrix.cuda }}
+      RWKV_RELEASE_VERSION: ${{ needs.version.outputs.tag }}
       # PRs compile one architecture; release/manual builds cover the full set.
       CUDA_ARCHITECTURES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;87;89;90;100;120' }}
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite'
@@ -95,23 +139,26 @@ jobs:
           if-no-files-found: ignore
 
   release:
-    name: Create or update GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    name: Publish GitHub Release
+    if: needs.version.outputs.should_release == 'true'
+    needs: [version, build]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           pattern: package-*
           path: dist
           merge-multiple: true
-      - name: Verify checksums and create or update release
+      - name: Verify checksums and publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
         shell: bash
         run: |
           cd dist
@@ -119,13 +166,21 @@ jobs:
           # Python text output used CRLF and confused GNU sha256sum.
           sed -i 's/\r$//' -- *.sha256
           sha256sum --check *.sha256
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" \
+              -f sha="$GITHUB_SHA" > /dev/null
+          fi
+
           if gh release view "$RELEASE_TAG" --json isDraft > release.json 2>/dev/null; then
-            if [[ "$(jq -r '.isDraft' release.json)" == "true" ]]; then
-              echo "Uploading assets to existing draft release $RELEASE_TAG"
-            else
-              echo "Uploading assets to existing published release $RELEASE_TAG"
+            if [[ "$(jq -r '.isDraft' release.json)" != "true" ]]; then
+              echo "Release $RELEASE_TAG is already published; refusing to replace it" >&2
+              exit 1
             fi
+            echo "Resuming existing draft release $RELEASE_TAG"
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
           fi
           gh release upload "$RELEASE_TAG" ./*.zip ./*.tar.gz ./*.sha256 --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest

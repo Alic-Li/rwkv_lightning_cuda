@@ -29,7 +29,7 @@ import (
 
 const defaultPort = "8000"
 const defaultVocabPath = "./rwkv_vocab_v20230424.txt"
-const listenAddr = "127.0.0.1:8088"
+const listenAddr = "127.0.0.1:10721"
 
 //go:embed dist/*
 var webFiles embed.FS

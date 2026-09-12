@@ -7,32 +7,31 @@ router's `go.mod`.
 
 ## Publish a version
 
-1. Merge the release changes into `main` and wait for CI to pass.
-2. Create and push a version tag:
+1. Change the semantic version in the repository root `VERSION` file:
 
-   ```bash
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
+   ```text
+   1.5.0
    ```
 
-3. Wait for both platform builds. The workflow creates a **draft** GitHub Release
-   with generated release notes, a Linux `.tar.gz`, a Windows `.zip`, and a
-   `.sha256` file for each archive.
-4. Test the packages on a CUDA machine, review the notes, and click **Publish release**.
-   For an RC/beta, also select **Set as a pre-release** in the release editor.
+2. Commit the version change with the release changes and push it to `main`.
+3. Wait for all platform builds. The workflow creates tag `v1.5.0`, creates a
+   draft Release, uploads the Linux `.tar.gz`, Windows `.zip`, and matching
+   `.sha256` files, then publishes the Release with generated notes.
 
 No personal access token is needed: only the release job receives
-`contents: write` through `GITHUB_TOKEN`. Re-running a tag workflow updates assets
-on its existing draft; it fails rather than replacing a published release.
-Use a new version tag for changes to an already published version.
+`contents: write` through `GITHUB_TOKEN`. If a run fails after creating the tag
+or draft, re-running it resumes that unpublished version. A push whose `VERSION`
+already has a published Release runs normal CI and does not replace that Release.
+Increment `VERSION` again to publish another release.
 
 ## Build without publishing
 
 PRs and pushes to `main` run CI automatically. `Actions → CI and Release → Run
-workflow` also builds downloadable artifacts. A branch run does not create a
-release; selecting a `v*` tag also runs the draft-release job.
+workflow` on `main` also builds downloadable artifacts and publishes the version
+only if it does not already have a Release. Pull requests and manual runs from
+other branches never publish.
 
-PRs compile for SM 86 to keep review builds smaller. Main, tag and manual builds
+PRs compile for SM 86 to keep review builds smaller. Main and manual builds
 compile for SM 75, 80, 86, 87, 89, 90, 100 and 120. Toolkit and architecture changes
 should be made together in `.github/workflows/ci.yml` and `tools/ci/build_release.py`.
 HIP/ROCm and ARM builds are not included in this workflow.
@@ -80,6 +79,6 @@ source commit and compiled architectures. CTest logs are uploaded even on failur
 
 Implementation: `tools/ci/build_release.py` builds/tests/packages both platforms;
 `tools/ci/vcpkg.json` lists dependencies; the workflow handles provisioning, caching,
-artifacts and draft releases. You can run the Python script locally on Linux/Windows
+artifacts and releases. You can run the Python script locally on Linux/Windows
 with CUDA in `CUDA_PATH`, the pinned vcpkg checkout in `third_party/vcpkg`, Go,
 CMake, Ninja and the platform compiler available (MSVC developer shell on Windows).
