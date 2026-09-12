@@ -241,10 +241,8 @@ __device__ __forceinline__ half2 dequant_pair(unsigned byte, half2 scale) {
                  scale);
 }
 
-// Register-dequantized m16n8k16 path, following the existing W8 MMA approach.
-// Each warp owns 16 columns and reuses B across 16- or 64-row request tiles.
 template <int G, int BM>
-__global__ void mma_aligned(int M, int K, int N, const half *__restrict__ x,
+__global__ void mma_direct(int M, int K, int N, const half *__restrict__ x,
                             const unsigned char *__restrict__ q,
                             const half *__restrict__ scales,
                             half *__restrict__ y, float *__restrict__ partial,
@@ -345,6 +343,145 @@ __global__ void mma_aligned(int M, int K, int N, const half *__restrict__ x,
 #endif
 }
 
+// Register-dequantized m16n8k16 path, following the existing W8 MMA approach.
+// Each warp owns 16 columns and reuses B across 16- or 64-row request tiles.
+template <int G, int BM>
+__global__ void mma_aligned(int M, int K, int N, const half *__restrict__ x,
+                            const unsigned char *__restrict__ q,
+                            const half *__restrict__ scales,
+                            half *__restrict__ y, float *__restrict__ partial,
+                            int splits) {
+#if __CUDA_ARCH__ >= 750
+  // Two disjoint stages overlap next-tile loads with register dequantization
+  // and MMA. Each activation fragment is reused across both column fragments.
+  __shared__ __align__(16) half a[2][BM * 64];
+  __shared__ __align__(16) unsigned char packed[2][64 * 32];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+  const int m0 = blockIdx.y * BM, n0 = blockIdx.x * 64;
+  const int tiles = K / 64, groups = (std::size_t(K) + G - 1) / G;
+  const int begin =
+      tiles / splits * blockIdx.z + min(int(blockIdx.z), tiles % splits);
+  const int end = begin + tiles / splits + (int(blockIdx.z) < tiles % splits);
+  auto fetch = [&](int tile, int stage) {
+    for (int i = tid; i < BM * 8; i += 128) {
+      const int row = i / 8, chunk = i % 8;
+      half* dst = a[stage] + row * 64 + (chunk ^ (row & 7)) * 8;
+      const half* src = x + std::size_t(m0 + row) * K + tile * 64 + chunk * 8;
+#if __CUDA_ARCH__ >= 800
+      const unsigned addr = __cvta_generic_to_shared(dst);
+      const int bytes = m0 + row < M ? 16 : 0;
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                   :: "r"(addr), "l"(src), "r"(bytes) : "memory");
+#else
+      *reinterpret_cast<int4*>(dst) = m0 + row < M
+          ? *reinterpret_cast<const int4*>(src) : make_int4(0, 0, 0, 0);
+#endif
+    }
+    const int n = tid / 2, chunk = tid % 2;
+    unsigned char* dst = packed[stage] + n * 32 + chunk * 16;
+    const unsigned char* src = q + std::size_t(n0 + n) * (K / 2) + tile * 32 + chunk * 16;
+#if __CUDA_ARCH__ >= 800
+    const unsigned addr = __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 :: "r"(addr), "l"(src) : "memory");
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#else
+    *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
+#endif
+  };
+  float acc[BM / 16][2][4] = {};
+  if (begin < end) fetch(begin, 0);
+  for (int tile = begin; tile < end; ++tile) {
+    const int stage = (tile - begin) & 1;
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
+    __syncthreads();
+    if (tile + 1 < end) fetch(tile + 1, stage ^ 1);
+    uint2 raw[2];
+    half2 s0[2], s1[2];
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+      const int n = n0 + warp * 16 + jj * 8 + lane / 4;
+      raw[jj] = *reinterpret_cast<const uint2*>(packed[stage] +
+          (warp * 16 + jj * 8 + lane / 4) * 32 + (lane & 3) * 8);
+      s0[jj] = __half2half2(scales[std::size_t(n) * groups + tile * 64 / G]);
+      s1[jj] = G == 32
+          ? __half2half2(scales[std::size_t(n) * groups + tile * 2 + 1]) : s0[jj];
+    }
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      unsigned avs[BM / 16][4];
+#pragma unroll
+      for (int mm = 0; mm < BM / 16; ++mm) {
+        const int row = mm * 16 + lane % 16;
+        const int chunk = kk * 2 + lane / 16;
+        const unsigned addr = __cvta_generic_to_shared(
+            a[stage] + row * 64 + (chunk ^ (row & 7)) * 8);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(avs[mm][0]), "=r"(avs[mm][1]), "=r"(avs[mm][2]), "=r"(avs[mm][3])
+                     : "r"(addr));
+      }
+#pragma unroll
+      for (int jj = 0; jj < 2; ++jj) {
+        const unsigned lo = __shfl_sync(0xffffffff, raw[jj].x, (lane & ~3) + kk);
+        const unsigned hi = __shfl_sync(0xffffffff, raw[jj].y, (lane & ~3) + kk);
+        const half2 b0 = dequant_pair(lo >> ((lane & 3) * 8), kk < 2 ? s0[jj] : s1[jj]);
+        const half2 b1 = dequant_pair(hi >> ((lane & 3) * 8), kk < 2 ? s0[jj] : s1[jj]);
+        const unsigned bbits0 = *reinterpret_cast<const unsigned*>(&b0),
+                       bbits1 = *reinterpret_cast<const unsigned*>(&b1);
+#pragma unroll
+        for (int mm = 0; mm < BM / 16; ++mm) {
+          const unsigned* av = avs[mm];
+#if __CUDA_ARCH__ >= 800
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                       : "+f"(acc[mm][jj][0]), "+f"(acc[mm][jj][1]),
+                         "+f"(acc[mm][jj][2]), "+f"(acc[mm][jj][3])
+                       : "r"(av[0]), "r"(av[1]), "r"(av[2]), "r"(av[3]),
+                         "r"(bbits0), "r"(bbits1));
+#else
+          asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                       "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                       : "+f"(acc[mm][jj][0]), "+f"(acc[mm][jj][1]),
+                         "+f"(acc[mm][jj][2]), "+f"(acc[mm][jj][3])
+                       : "r"(av[0]), "r"(av[1]), "r"(bbits0));
+          asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                       "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                       : "+f"(acc[mm][jj][0]), "+f"(acc[mm][jj][1]),
+                         "+f"(acc[mm][jj][2]), "+f"(acc[mm][jj][3])
+                       : "r"(av[2]), "r"(av[3]), "r"(bbits1));
+#endif
+        }
+      }
+    }
+    // All warps must finish reading this stage before it can be overwritten.
+    __syncthreads();
+  }
+#pragma unroll
+  for (int mm = 0; mm < BM / 16; ++mm) {
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int m = m0 + mm * 16 + lane / 4 + j * 8;
+        const int n = n0 + warp * 16 + jj * 8 + (lane & 3) * 2;
+        if (m < M) {
+          const std::size_t i = std::size_t(m) * N + n;
+          if (splits == 1)
+            *reinterpret_cast<half2 *>(y + i) =
+                __floats2half2_rn(acc[mm][jj][j * 2], acc[mm][jj][j * 2 + 1]);
+          else
+            *reinterpret_cast<float2 *>(partial +
+                                        std::size_t(blockIdx.z) * M * N + i) =
+                make_float2(acc[mm][jj][j * 2], acc[mm][jj][j * 2 + 1]);
+        }
+      }
+    }
+  }
+#endif
+}
+
 __global__ void reduce(const float *partial, half *y, std::size_t count,
                        int splits) {
   const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -360,14 +497,18 @@ void launch(cudaStream_t stream, int M, int K, int N, const half *x,
             const unsigned char *q, const half *scale, half *y, float *tmp,
             int splits) {
   const bool aligned_mma = K % 64 == 0 && N % 64 == 0 &&
-                           reinterpret_cast<std::uintptr_t>(q) % 8 == 0 &&
+                           reinterpret_cast<std::uintptr_t>(q) % 16 == 0 &&
                            reinterpret_cast<std::uintptr_t>(x) % 16 == 0 &&
                            reinterpret_cast<std::uintptr_t>(y) % 4 == 0 &&
                            reinterpret_cast<std::uintptr_t>(tmp) % 8 == 0;
   if (M > 1 && aligned_mma && (M > 4 || splits > 1)) {
     if (M <= 16)
-      mma_aligned<G, 16>
+      mma_direct<G, 16>
           <<<dim3(N / 64, ceil_div(M, 16), splits), 128, 0, stream>>>(
+              M, K, N, x, q, scale, y, tmp, splits);
+    else if (M <= 32)
+      mma_aligned<G, 32>
+          <<<dim3(N / 64, ceil_div(M, 32), splits), 128, 0, stream>>>(
               M, K, N, x, q, scale, y, tmp, splits);
     else
       mma_aligned<G, 64>
@@ -463,10 +604,10 @@ void rwkv7_w4a16_linear_launch(cudaStream_t stream, int M, int K, int N,
     splits = 1;
     const std::size_t blocks =
         M == 1 ? ceil_div(N, 4)
-               : std::size_t(ceil_div(N, 64)) * ceil_div(M, M <= 16 ? 16 : 64);
+               : std::size_t(ceil_div(N, 64)) * ceil_div(M, M <= 16 ? 16 : M <= 32 ? 32 : 64);
     // Large batches already expose parallelism; cap scratch traffic there.
     const int max_splits = M > 64 ? 8 : 16;
-    while (M > 1 && splits < max_splits && blocks * splits < 2048 &&
+    while (M > 1 && splits < max_splits && blocks * splits < (M <= 16 ? 2048 : 512) &&
            tiles / (splits * 2) >= (M <= 4    ? 2
                                     : M <= 32 ? 4
                                               : 8))

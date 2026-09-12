@@ -62,9 +62,25 @@ rwkv7_w4a16_linear_launch(stream, M, K, N,
 
 `force_split_k=1` 关闭 split-K；显式 `>1` 要求足够的 workspace，否则抛出 `std::invalid_argument`。自动模式最多使用 16 个 split（M>64 时最多 8 个），workspace 不足时退回单 split。单 split 不需要 workspace。形状非正数时不执行；group size 只能是 32 或 128。量化输入要求有限 FP16 数值。
 
-decode 快路径一次读取 8 个权重和 8 个激活。对齐的多请求路径使用 16×64 / 64×64 输出 tile，在寄存器中解包并使用 Tensor Core；SM75 使用两次 m16n8k8，SM80+ 使用 m16n8k16。非对齐及尾部维度有带边界检查的 GEMV/WMMA 路径。Tensor Core 解包后的权重会舍入为 FP16，与 FP32 解包的 GEMV 存在正常浮点误差。
+decode 快路径一次读取 8 个权重和 8 个激活。对齐的多请求路径使用 16×64 / 32×64 / 64×64 输出 tile，在寄存器中解包并使用 Tensor Core；SM75 使用两次 m16n8k8，SM80+ 使用 m16n8k16。非对齐及尾部维度有带边界检查的 GEMV/WMMA 路径。Tensor Core 解包后的权重会舍入为 FP16，与 FP32 解包的 GEMV 存在正常浮点误差。
 
 kernel 不分配临时内存，不同步 stream，不查询设备，不使用全局 tuning 状态或 atomicAdd。split-K 写各自 FP32 分片后固定顺序归约。共享权重可供多个 stream 同时读取，输出和 workspace 必须独立；量化完成后再通过 stream 顺序或 event 建立读取依赖。输入、权重、scale、输出和 workspace 不应相互重叠。可在预先分配好 buffer 后捕获 CUDA Graph。
+
+## 大 batch 流水线（2026-09-12）
+
+参考 [Marlin 的 CUDA 实现](https://github.com/IST-DASLab/marlin/blob/master/marlin/marlin_cuda_kernel.cu)
+采用异步加载、双缓冲和跨输出片段复用激活的思路。M>16 的对齐路径将激活和
+INT4 权重放入两个互不重叠的 shared-memory stage，在计算当前 tile 时加载下一
+个 tile；同一 `ldmatrix` 激活片段复用给两个 N 片段。M=17..32 使用 32 行 tile，
+更大 batch 使用 64 行 tile，并降低自动 split-K 的并行度目标以减少临时输出流量。
+M<=16 保留原寄存器解包路径。新流水线路径要求 qweight 16 字节对齐，其余情况
+仍走既有安全回退。
+
+保留当前 signed nibble、G32/G128 scale 和 archive 布局，不引入 Marlin 的离线
+重排格式或跨 block 锁。该选择无需重新量化已有模型，并保留确定顺序的 FP32
+split-K 归约。Marlin 针对中等 batch 的性能数据不能直接套用到本项目或 Blackwell。
+
+详细审计、测试边界与修改前后数据见 [kernel 审计记录](../../docs/kernel-audit-2026-09-12.md)。
 
 ## 构建和验证
 

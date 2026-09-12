@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "status.hpp"
+#include "rwkv/common/status.hpp"
 
 namespace llm_infer {
 

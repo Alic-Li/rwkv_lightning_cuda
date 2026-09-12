@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "rwkv_server_backend.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
 
 namespace {
 

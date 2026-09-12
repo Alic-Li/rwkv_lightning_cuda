@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
         "M,K,N,G,W8_us,W4_auto_us,speedup,W4_s1_us,W4_s2_us,W4_s4_us,W4_s8_us,W4_s16_us,W4_s32_us,W4_"
         "4streams_us_per_call");
     for (int G : {128, 32})
-      for (int M : {1, 2, 4, 8, 16, 32, 64, 128}) run(M, K, N, G, iters, stream);
+      for (int M : {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}) run(M, K, N, G, iters, stream);
     check(cudaStreamDestroy(stream));
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

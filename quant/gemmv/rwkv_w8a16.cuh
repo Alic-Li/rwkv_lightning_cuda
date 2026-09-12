@@ -28,6 +28,10 @@ int rwkv7_w8a16_tuning_get(int K, int N, W8BLayout layout, int M);
 void rwkv7_v4_i8_pack_launch(
     cudaStream_t stream, const std::int8_t* src_nk, std::int8_t* dst_packed, int N, int K);
 
+// K/N must be multiples of 64. X and qweight require 16-byte alignment;
+// scale/Y require 4-byte alignment. Split-K scratch requires float alignment.
+// Concurrent calls may share read-only inputs, but require separate Y/scratch.
+// Device information and tuning lookups use the calling thread's current GPU.
 void rwkv7_w8a16_linear_launch(
     cudaStream_t stream, int M, int K, int N,
     const half* x, const std::int8_t* qweight, const half* scale,

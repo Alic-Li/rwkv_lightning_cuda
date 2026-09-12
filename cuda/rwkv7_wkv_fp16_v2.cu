@@ -3,6 +3,7 @@
 #undef __CUDA_NO_HALF_OPERATORS__
 
 #include <assert.h>
+#include <stdexcept>
 
 #include <cuda/pipeline>
 #include <cuda_fp16.h>
@@ -160,7 +161,7 @@ __global__ void __launch_bounds__(CLONE_N, 2) wkv_fp16_v1_clone_kernel(
   __shared__ __align__(128) half2 r[CLONE_N / 2], k[CLONE_N / 2], w[CLONE_N / 2], a[CLONE_N / 2], bvec[CLONE_N / 2], bvec_dummy[CLONE_N / 2];
 #pragma unroll
   for (int tt = 0; tt < T; tt++) {
-    int t = b * T * C + h * CLONE_N + tt * C;
+    int64_t t = (static_cast<int64_t>(b) * T + tt) * C + h * CLONE_N;
     __syncthreads();
     clone_cp_async<4>((half2*)(i < 32 ? w : a) + lane, (half2*)((i < 32 ? w_ptr : a_ptr) + t) + lane, true RWKV_ASYNC_PIPE_TAIL_PASS);
     clone_cp_commit(RWKV_ASYNC_PIPE_PASS);
@@ -255,7 +256,7 @@ __device__ __forceinline__ void cp_wait(RWKV_ASYNC_PIPE_DECL) {
 __device__ __forceinline__ void prefetch_token(
     int tid,
     int lane,
-    int token,
+    int64_t token,
     half2* r,
     half2* w,
     half2* k,
@@ -312,7 +313,7 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
   __shared__ __align__(128) half2 r[HALF2_N], k[HALF2_N], w[HALF2_N], a[HALF2_N], bvec[HALF2_N], bvec_dummy[HALF2_N];
 #pragma unroll
   for (int tt = 0; tt < T; tt++) {
-    int t = b_id * T * C + h * N + tt * C;
+    int64_t t = (static_cast<int64_t>(b_id) * T + tt) * C + h * N;
     __syncthreads();
     cp_async<4>((half2*)(i < 32 ? w : a) + lane, (half2*)((i < 32 ? w_ptr : a_ptr) + t) + lane, true RWKV_ASYNC_PIPE_TAIL_PASS);
     cp_commit(RWKV_ASYNC_PIPE_PASS);
@@ -381,7 +382,7 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_seq_v2_kernel(
   }
 
   __shared__ __align__(128) half2 r[2][HALF2_N], w[2][HALF2_N], k[2][HALF2_N], a[2][HALF2_N], bvec[2][HALF2_N], bvec_dummy[HALF2_N];
-  int token = (b_id * T) * C + h * N;
+  int64_t token = static_cast<int64_t>(b_id) * T * C + h * N;
   prefetch_token(i, lane, token, r[0], w[0], k[0], a[0], bvec[0], bvec_dummy, r_ptr, w_ptr, k_ptr, a_ptr, b_ptr RWKV_ASYNC_PIPE_TAIL_PASS);
 
   for (int tt = 0; tt < T; ++tt) {
@@ -400,7 +401,7 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_seq_v2_kernel(
     __syncthreads();
 
     if (tt + 1 < T) {
-      int next_token = token + C;
+      int64_t next_token = token + C;
       prefetch_token(i, lane, next_token, r[cur ^ 1], w[cur ^ 1], k[cur ^ 1], a[cur ^ 1], bvec[cur ^ 1], bvec_dummy, r_ptr, w_ptr, k_ptr, a_ptr, b_ptr RWKV_ASYNC_PIPE_TAIL_PASS);
     }
 
@@ -452,9 +453,9 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_direct_kernel(
   }
 
   __shared__ __align__(128) half2 r[HALF2_N], w[HALF2_N], k[HALF2_N], a[HALF2_N], bvec[HALF2_N];
-  const int token = b_id * C + h * N;
+  const int64_t token = static_cast<int64_t>(b_id) * C + h * N;
   if (i < HALF2_N) {
-    const int idx2 = (token >> 1) + i;
+    const int64_t idx2 = (token >> 1) + i;
     r[i] = __ldg(reinterpret_cast<const half2*>(r_ptr) + idx2);
     w[i] = __ldg(reinterpret_cast<const half2*>(w_ptr) + idx2);
     k[i] = __ldg(reinterpret_cast<const half2*>(k_ptr) + idx2);
@@ -520,7 +521,7 @@ __global__ __launch_bounds__(N, 1) void wkv_fp16_one_cp_kernel(
   }
 
   __shared__ __align__(128) half2 r[HALF2_N], w[HALF2_N], k[HALF2_N], a[HALF2_N], bvec[HALF2_N], bvec_dummy[HALF2_N];
-  const int token = b_id * C + h * N;
+  const int64_t token = static_cast<int64_t>(b_id) * C + h * N;
   cp_async<4>((half2*)(i < 32 ? w : a) + lane, (half2*)((i < 32 ? w_ptr : a_ptr) + token) + lane, true RWKV_ASYNC_PIPE_TAIL_PASS);
   cp_commit(RWKV_ASYNC_PIPE_PASS);
   cp_async<4>((half2*)(i < 32 ? r : k) + lane, (half2*)((i < 32 ? r_ptr : k_ptr) + token) + lane, true RWKV_ASYNC_PIPE_TAIL_PASS);
@@ -583,7 +584,8 @@ void rwkv7_wkv_fp16_seq_launch(
     const half* b,
     half* y,
     const int* elapsed_t) {
-  assert(C == H * N);
+  if (B <= 0 || T <= 0 || H <= 0 || C != static_cast<int64_t>(H) * N || static_cast<int64_t>(B) * H > 2147483647)
+    throw std::invalid_argument("invalid WKV dimensions or grid size");
   if (T == 1) {
     rwkv7_wkv_fp16_one_launch(stream, B, C, H, state, r, w, k, v, a, b, y, elapsed_t);
     return;
@@ -636,8 +638,8 @@ void rwkv7_wkv_fp16_seq_w0_launch(
     const half* b,
     half* y,
     const int* elapsed_t) {
-  assert(C == H * N);
-  assert(T >= 1);
+  if (B <= 0 || T <= 0 || H <= 0 || C != static_cast<int64_t>(H) * N || static_cast<int64_t>(B) * H > 2147483647)
+    throw std::invalid_argument("invalid WKV dimensions or grid size");
   if (T == 1) {
     rwkv7_wkv_fp16_one_w0_launch(stream, B, C, H, state, r, w, w0, k, v, a, b, y, elapsed_t);
     return;
@@ -665,7 +667,8 @@ void rwkv7_wkv_fp16_one_launch(
     const half* b,
     half* y,
     const int* elapsed_t) {
-  assert(C == H * N);
+  if (B <= 0 || H <= 0 || C != static_cast<int64_t>(H) * N || static_cast<int64_t>(B) * H > 2147483647)
+    throw std::invalid_argument("invalid WKV dimensions or grid size");
   if (B <= 2) {
     wkv_fp16_v1_clone_kernel<true><<<dim3(B * H), dim3(N), 0, stream>>>(
         B,
@@ -708,7 +711,8 @@ void rwkv7_wkv_fp16_one_w0_launch(
     const half* b,
     half* y,
     const int* elapsed_t) {
-  assert(C == H * N);
+  if (B <= 0 || H <= 0 || C != static_cast<int64_t>(H) * N || static_cast<int64_t>(B) * H > 2147483647)
+    throw std::invalid_argument("invalid WKV dimensions or grid size");
   if (B <= 2) {
     wkv_fp16_v1_clone_kernel<true><<<dim3(B * H), dim3(N), 0, stream>>>(
         B, 1, C, H, state, r, w, w0, k, v, a, b, y, elapsed_t);

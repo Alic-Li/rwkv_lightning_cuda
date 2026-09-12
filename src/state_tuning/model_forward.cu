@@ -1,4 +1,4 @@
-#include "rwkv_state_tuning.hpp"
+#include "rwkv/runtime/rwkv_state_tuning.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -52,6 +52,8 @@ const half *model_forward_state_tuning_f16(
   }
   const int C = weights[0].channels;
   const int H = weights[0].heads;
+  if (H <= 0 || C <= 0 || C % H)
+    throw std::invalid_argument("invalid state-tuning model head dimensions");
   const int N = C / H;
   if (N != 64)
     throw std::invalid_argument("state-tuning model requires N=64");

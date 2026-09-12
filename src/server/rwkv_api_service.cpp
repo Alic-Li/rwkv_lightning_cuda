@@ -1,0 +1,1920 @@
+#include "rwkv/server/rwkv_api_service.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <cstdio>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <drogon/drogon.h>
+
+#include "rwkv/inference/rwkv_inference_engine.hpp"
+#include "rwkv/server/rwkv_model_router.hpp"
+#include "rwkv/server/rwkv_prefill_admission.hpp"
+#include "rwkv/server/rwkv_state_cache.hpp"
+#include "rwkv/server/rwkv_uploaded_state_store.hpp"
+
+namespace rwkv7_server {
+namespace {
+
+using namespace drogon;
+
+class RequestRegistry {
+ public:
+  struct ActiveRequest {
+    std::string id;
+    std::string endpoint;
+    std::string model;
+    std::string state_key;
+    Json::Int64 created = 0;
+    int prompt_tokens = 0;
+    int max_tokens = 0;
+    std::atomic<int> generated_tokens{0};
+    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> pause_requested{false};
+    std::atomic<int> prefilled_tokens{0};
+    std::atomic<double> prefill_progress{0.0};
+    std::atomic<double> prefill_speed{0.0};
+    std::atomic<double> decode_speed{0.0};
+  };
+
+  struct RequestSnapshot {
+    std::string id;
+    std::string endpoint;
+    std::string model;
+    std::string state_key;
+    Json::Int64 created = 0;
+    Json::Int64 finished = 0;
+    int prompt_tokens = 0;
+    int prefilled_tokens = 0;
+    int generated_tokens = 0;
+    int max_tokens = 0;
+    bool stop_requested = false;
+    bool pause_requested = false;
+    double prefill_progress = 0.0;
+    double prefill_speed = 0.0;
+    double decode_speed = 0.0;
+  };
+
+  struct PausedRequest {
+    std::string id;
+    std::string endpoint;
+    std::string model;
+    Json::Int64 created = 0;
+    int generated_tokens = 0;
+    int chunk_size = 1;
+    GenerateOptions options;
+    std::shared_ptr<GenerationState> state;
+    std::shared_ptr<DeviceLogits> logits;
+  };
+
+  static RequestRegistry& instance() {
+    static RequestRegistry registry;
+    return registry;
+  }
+
+  std::shared_ptr<ActiveRequest> start(
+      std::string endpoint,
+      std::string model,
+      int max_tokens,
+      int prompt_tokens = 0,
+      std::string state_key = {},
+      std::string request_id = {}) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto active = std::make_shared<ActiveRequest>();
+    active->id = request_id.empty() ? make_id_locked() : std::move(request_id);
+    active->endpoint = std::move(endpoint);
+    active->model = std::move(model);
+    active->state_key = std::move(state_key);
+    active->created = now_seconds();
+    active->prompt_tokens = prompt_tokens;
+    active->max_tokens = max_tokens;
+    active_.push_back(active);
+    return active;
+  }
+
+  std::shared_ptr<ActiveRequest> active(const std::string& request_id = {}) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (request_id.empty()) {
+      return active_.empty() ? nullptr : active_.back();
+    }
+    const auto it = std::find_if(active_.rbegin(), active_.rend(), [&](const auto& item) {
+      return item->id == request_id;
+    });
+    return it == active_.rend() ? nullptr : *it;
+  }
+
+  bool stop_active(const std::string& request_id = {}) {
+    if (!request_id.empty()) {
+      const auto target = active(request_id);
+      if (!target) {
+        return false;
+      }
+      target->stop_requested.store(true);
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& item : active_) {
+      item->stop_requested.store(true);
+    }
+    return !active_.empty();
+  }
+
+  std::optional<std::string> pause_active(const std::string& request_id = {}) {
+    const auto active = this->active(request_id);
+    if (!active) {
+      return std::nullopt;
+    }
+    active->pause_requested.store(true);
+    return active->id;
+  }
+
+  void finish(const std::shared_ptr<ActiveRequest>& active) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = std::find(active_.begin(), active_.end(), active);
+    if (it != active_.end()) {
+      auto snapshot = snapshot_request(**it);
+      snapshot.finished = now_seconds();
+      last_ = std::move(snapshot);
+      active_.erase(it);
+    }
+  }
+
+  void put_paused(PausedRequest paused) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    paused_[paused.id] = std::move(paused);
+  }
+
+  std::optional<PausedRequest> take_paused(const std::string& id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = paused_.find(id);
+    if (it == paused_.end()) {
+      return std::nullopt;
+    }
+    auto paused = std::move(it->second);
+    paused_.erase(it);
+    return paused;
+  }
+
+  Json::Value active_json() const {
+    const auto active = this->active();
+    if (!active) {
+      return Json::Value(Json::nullValue);
+    }
+    return active_request_json(*active);
+  }
+
+  Json::Value active_requests_json() const {
+    std::vector<std::shared_ptr<ActiveRequest>> active;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      active = active_;
+    }
+    Json::Value out = Json::arrayValue;
+    for (const auto& item : active) {
+      out.append(active_request_json(*item));
+    }
+    return out;
+  }
+
+  Json::Value last_json() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!last_.has_value()) {
+      return Json::Value(Json::nullValue);
+    }
+    return snapshot_json(*last_);
+  }
+
+  Json::Value paused_json() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Json::Value out = Json::arrayValue;
+    for (const auto& [id, paused] : paused_) {
+      Json::Value item;
+      item["id"] = id;
+      item["endpoint"] = paused.endpoint;
+      item["model"] = paused.model;
+      item["created"] = paused.created;
+      item["generated_tokens"] = paused.generated_tokens;
+      out.append(item);
+    }
+    return out;
+  }
+
+ private:
+  static Json::Int64 now_seconds() {
+    return static_cast<Json::Int64>(
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+  }
+
+  std::string make_id_locked() {
+    std::ostringstream oss;
+    oss << "req-" << now_seconds() << "-" << ++next_id_;
+    return oss.str();
+  }
+
+  static RequestSnapshot snapshot_request(const ActiveRequest& active) {
+    RequestSnapshot snapshot;
+    snapshot.id = active.id;
+    snapshot.endpoint = active.endpoint;
+    snapshot.model = active.model;
+    snapshot.state_key = active.state_key;
+    snapshot.created = active.created;
+    snapshot.prompt_tokens = active.prompt_tokens;
+    snapshot.prefilled_tokens = active.prefilled_tokens.load();
+    snapshot.generated_tokens = active.generated_tokens.load();
+    snapshot.max_tokens = active.max_tokens;
+    snapshot.stop_requested = active.stop_requested.load();
+    snapshot.pause_requested = active.pause_requested.load();
+    snapshot.prefill_progress = active.prefill_progress.load();
+    snapshot.prefill_speed = active.prefill_speed.load();
+    snapshot.decode_speed = active.decode_speed.load();
+    return snapshot;
+  }
+
+  static Json::Value snapshot_json(const RequestSnapshot& snapshot) {
+    Json::Value out;
+    out["id"] = snapshot.id;
+    out["endpoint"] = snapshot.endpoint;
+    out["model"] = snapshot.model;
+    out["created"] = snapshot.created;
+    if (snapshot.finished > 0) {
+      out["finished"] = snapshot.finished;
+    }
+    out["prompt_tokens"] = snapshot.prompt_tokens;
+    out["prefilled_tokens"] = snapshot.prefilled_tokens;
+    out["generated_tokens"] = snapshot.generated_tokens;
+    out["max_tokens"] = snapshot.max_tokens;
+    out["stop_requested"] = snapshot.stop_requested;
+    out["pause_requested"] = snapshot.pause_requested;
+    out["prefill_progress"] = snapshot.prefill_progress;
+    out["prefill_speed"] = snapshot.prefill_speed;
+    out["decode_speed"] = snapshot.decode_speed;
+    if (!snapshot.state_key.empty()) {
+      out["state_key"] = snapshot.state_key;
+    }
+    return out;
+  }
+
+  static Json::Value active_request_json(const ActiveRequest& active) {
+    Json::Value out;
+    out["id"] = active.id;
+    out["endpoint"] = active.endpoint;
+    out["model"] = active.model;
+    out["created"] = active.created;
+    out["prompt_tokens"] = active.prompt_tokens;
+    out["prefilled_tokens"] = active.prefilled_tokens.load();
+    out["generated_tokens"] = active.generated_tokens.load();
+    out["max_tokens"] = active.max_tokens;
+    out["stop_requested"] = active.stop_requested.load();
+    out["pause_requested"] = active.pause_requested.load();
+    out["prefill_progress"] = active.prefill_progress.load();
+    out["prefill_speed"] = active.prefill_speed.load();
+    out["decode_speed"] = active.decode_speed.load();
+    if (!active.state_key.empty()) {
+      out["state_key"] = active.state_key;
+    }
+    return out;
+  }
+
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<ActiveRequest>> active_;
+  std::optional<RequestSnapshot> last_;
+  std::unordered_map<std::string, PausedRequest> paused_;
+  Json::UInt64 next_id_ = 0;
+};
+
+void record_prefill_metrics(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    int prefill_tokens,
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end) {
+  active->prefilled_tokens.store(prefill_tokens);
+  active->prefill_progress.store(1.0);
+  const double prefill_seconds = std::chrono::duration<double>(end - begin).count();
+  if (prefill_seconds > 0.0) {
+    active->prefill_speed.store(prefill_tokens / prefill_seconds);
+  }
+}
+
+void update_decode_metrics(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    int generated_tokens,
+    double decode_seconds) {
+  if (generated_tokens > 0) {
+    active->generated_tokens.store(generated_tokens);
+  }
+  if (decode_seconds > 0.0 && active->generated_tokens.load() > 0) {
+    active->decode_speed.store(active->generated_tokens.load() / decode_seconds);
+  }
+}
+
+void update_decode_metrics(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    std::chrono::steady_clock::time_point begin) {
+  const double decode_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+  if (decode_seconds > 0.0 && active->generated_tokens.load() > 0) {
+    active->decode_speed.store(active->generated_tokens.load() / decode_seconds);
+  }
+}
+
+void record_generation_stats(
+    const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
+    const InferenceEngine::GenerationStats& stats) {
+  active->prefilled_tokens.store(stats.prompt_tokens);
+  active->prefill_progress.store(1.0);
+  if (stats.prefill_seconds > 0.0) {
+    active->prefill_speed.store(stats.prompt_tokens / stats.prefill_seconds);
+  }
+  update_decode_metrics(active, stats.generated_tokens, stats.decode_seconds);
+}
+
+Json::Value make_error(const std::string& message) {
+  Json::Value out;
+  out["error"] = message;
+  return out;
+}
+
+Json::Value prefill_limit_error(const PrefillBatchLimitExceeded& error) {
+  Json::Value out;
+  out["error"] = error.what();
+  out["request_bsz"] = error.request_batch_size();
+  out["max_bsz"] = error.max_batch_size();
+  return out;
+}
+
+HttpResponsePtr json_response(Json::Value payload, HttpStatusCode code = k200OK) {
+  Json::StreamWriterBuilder builder;
+  builder["emitUTF8"] = true;
+  builder["indentation"] = "";
+  auto resp = HttpResponse::newHttpResponse();
+  resp->setContentTypeCode(CT_APPLICATION_JSON);
+  resp->setBody(Json::writeString(builder, payload));
+  resp->setStatusCode(code);
+  return resp;
+}
+
+std::optional<std::string> bearer_token(const HttpRequestPtr& req) {
+  auto auth = req->getHeader("authorization");
+  if (auth.empty()) {
+    auth = req->getHeader("Authorization");
+  }
+  if (auth.rfind("Bearer ", 0) != 0) {
+    return std::nullopt;
+  }
+  return auth.substr(7);
+}
+
+bool check_password(
+    const HttpRequestPtr& req,
+    const Json::Value& body,
+    const std::optional<std::string>& password,
+    HttpResponsePtr& out) {
+  if (!password.has_value()) {
+    return true;
+  }
+  const auto token = bearer_token(req);
+  if (body.get("password", "").asString() == *password ||
+      (token.has_value() && *token == *password)) {
+    return true;
+  }
+  out = json_response(make_error("Unauthorized: invalid or missing password"), k401Unauthorized);
+  return false;
+}
+
+std::string state_id_from_request(const Json::Value& body);
+
+Json::Value uploaded_state_json(const UploadedStateInfo& info) {
+  Json::Value item;
+  item["state_id"] = info.state_id;
+  item["filename"] = info.filename;
+  item["size_bytes"] = static_cast<Json::UInt64>(info.size_bytes);
+  item["tensor_count"] = info.tensor_count;
+  item["created"] = static_cast<Json::Int64>(info.created);
+  return item;
+}
+
+void register_uploaded_state_routes(
+    HttpAppFramework& app,
+    const std::optional<std::string>& password) {
+  const auto options_handler = [](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k204NoContent);
+    cb(resp);
+  };
+  for (const auto& path : {"/v1/state/upload", "/v1/state/delete", "/v1/state/list"}) {
+    app.registerHandler(path, options_handler, {Options});
+  }
+
+  app.registerHandler(
+      "/v1/state/upload",
+      [password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        Json::Value auth_body = Json::objectValue;
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, auth_body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+        MultiPartParser parser;
+        if (parser.parse(req) != 0) {
+          cb(json_response(make_error("Invalid multipart/form-data request"), k400BadRequest));
+          return;
+        }
+        const auto& files = parser.getFiles();
+        if (files.size() != 1) {
+          cb(json_response(make_error("Request must contain exactly one state file"), k400BadRequest));
+          return;
+        }
+        try {
+          const auto& file = files.front();
+          const auto info = UploadedStateStore::instance().upload(
+              file.getFileName(), file.fileData(), file.fileLength());
+          Json::Value resp = uploaded_state_json(info);
+          resp["object"] = "rwkv.state";
+          cb(json_response(std::move(resp)));
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+        }
+      },
+      {Post});
+
+  app.registerHandler(
+      "/v1/state/list",
+      [password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        const auto json = req->getJsonObject();
+        Json::Value body = json ? *json : Json::Value(Json::objectValue);
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+        const auto states = UploadedStateStore::instance().list();
+        Json::Value resp;
+        resp["object"] = "list";
+        resp["data"] = Json::arrayValue;
+        for (const auto& state : states) {
+          resp["data"].append(uploaded_state_json(state));
+        }
+        cb(json_response(std::move(resp)));
+      },
+      {Get, Post});
+
+  app.registerHandler(
+      "/v1/state/delete",
+      [password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        const auto json = req->getJsonObject();
+        Json::Value body = json ? *json : Json::Value(Json::objectValue);
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+        try {
+          std::string state_id = state_id_from_request(body);
+          if (state_id.empty()) {
+            state_id = req->getParameter("state_id");
+          }
+          if (state_id.empty()) {
+            cb(json_response(make_error("Missing state_id"), k400BadRequest));
+            return;
+          }
+          const bool deleted = UploadedStateStore::instance().erase(state_id);
+          Json::Value resp;
+          resp["state_id"] = state_id;
+          resp["deleted"] = deleted;
+          cb(json_response(std::move(resp), deleted ? k200OK : k404NotFound));
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+        }
+      },
+      {Delete, Post});
+}
+
+ThinkType parse_think_type(const Json::Value& body) {
+  if (body.isMember("think_type")) {
+    const auto value = body.get("think_type", "").asString();
+    if (value == "none" || value == "off" || value == "disabled") {
+      return ThinkType::None;
+    }
+    if (value == "fast") {
+      return ThinkType::Fast;
+    }
+    if (value == "free") {
+      return ThinkType::Free;
+    }
+    if (value == "preferChinese" || value == "prefer_chinese") {
+      return ThinkType::PreferChinese;
+    }
+    if (value == "en") {
+      return ThinkType::En;
+    }
+    if (value == "enShort" || value == "en_short") {
+      return ThinkType::EnShort;
+    }
+    if (value == "enLong" || value == "en_long") {
+      return ThinkType::EnLong;
+    }
+  }
+  if (body.isMember("think") ? body.get("think", false).asBool()
+                             : body.get("enable_think", false).asBool()) {
+    return ThinkType::Free;
+  }
+  return ThinkType::Fast;
+}
+
+bool force_reasoning_for_think_type(ThinkType think_type) {
+  return think_type != ThinkType::None && think_type != ThinkType::Fast;
+}
+
+bool has_explicit_think_type(const Json::Value& body) {
+  return body.isMember("think_type") || body.isMember("think") ||
+         body.isMember("enable_think");
+}
+
+GenerateOptions parse_options(const Json::Value& body, GenerateOptions options = {}) {
+  options.max_tokens = body.get("max_tokens", options.max_tokens).asInt();
+  options.temperature = body.get("temperature", options.temperature).asDouble();
+  options.top_k = body.get("top_k", options.top_k).asInt();
+  options.top_p = body.get("top_p", options.top_p).asDouble();
+  options.alpha_presence = body.get("alpha_presence", options.alpha_presence).asDouble();
+  options.alpha_frequency = body.get("alpha_frequency", options.alpha_frequency).asDouble();
+  options.alpha_decay = body.get("alpha_decay", options.alpha_decay).asDouble();
+  options.force_reasoning = body.get("force_reasoning", options.force_reasoning).asBool();
+
+  const auto& stop_tokens = body["stop_tokens"];
+  if (stop_tokens.isArray()) {
+    options.stop_tokens.clear();
+    for (const auto& item : stop_tokens) {
+      options.stop_tokens.push_back(item.asInt64());
+    }
+  }
+  return options;
+}
+
+int parse_chunk_size(const Json::Value& body, int fallback) {
+  return std::max(1, body.get("chunk_size", fallback).asInt());
+}
+
+bool parse_metrics_requested(const Json::Value& body) {
+  const auto read_flag = [&body](const char* key) {
+    const auto& value = body[key];
+    return value.isBool() && value.asBool();
+  };
+  return read_flag("metrics") || read_flag("report_metrics") || read_flag("include_metrics");
+}
+
+std::string normalize_content(const Json::Value& content) {
+  if (content.isString()) {
+    return content.asString();
+  }
+  if (content.isArray()) {
+    std::string text;
+    for (const auto& item : content) {
+      if (item.isObject() && item.get("type", "").asString() == "text") {
+        text += item.get("text", "").asString();
+      } else if (item.isString()) {
+        text += item.asString();
+      }
+    }
+    return text;
+  }
+  if (content.isNull()) {
+    return "";
+  }
+  return content.asString();
+}
+
+std::vector<std::string> parse_contents(const Json::Value& body) {
+  std::vector<std::string> prompts;
+  if (body.isMember("contents") && body["contents"].isArray()) {
+    for (const auto& item : body["contents"]) {
+      prompts.push_back(item.asString());
+    }
+  }
+  return prompts;
+}
+
+std::string state_id_from_request(const Json::Value& body) {
+  if (!body.isMember("state_id") || body["state_id"].isNull()) {
+    return {};
+  }
+  if (!body["state_id"].isString()) {
+    throw std::runtime_error("state_id must be a string");
+  }
+  return body["state_id"].asString();
+}
+
+GenerationState create_request_state(
+    const InferenceEngine& engine,
+    const std::string& state_id,
+    int batch_size = 1) {
+  if (state_id.empty()) {
+    return engine.model()->create_state(batch_size);
+  }
+  auto uploaded = UploadedStateStore::instance().acquire(state_id);
+  if (!uploaded.has_value()) {
+    throw std::runtime_error("uploaded state not found: " + state_id);
+  }
+  return engine.model()->load_state_from_pth(uploaded->path.string(), batch_size);
+}
+
+std::string create_translation_prompt(
+    const std::string& source_lang,
+    const std::string& target_lang,
+    const std::string& text) {
+  return source_lang + ": " + text + "\n\n" + target_lang + ":";
+}
+
+Json::Value build_choices(const std::vector<std::string>& texts) {
+  Json::Value choices = Json::arrayValue;
+  for (size_t i = 0; i < texts.size(); ++i) {
+    Json::Value choice;
+    choice["index"] = static_cast<int>(i);
+    choice["message"]["role"] = "assistant";
+    choice["message"]["content"] = texts[i];
+    choice["finish_reason"] = "stop";
+    choices.append(choice);
+  }
+  return choices;
+}
+
+HttpResponsePtr make_sse_response(const std::function<void(ResponseStreamPtr)>& producer) {
+  auto resp = HttpResponse::newAsyncStreamResponse(
+      [producer](ResponseStreamPtr stream) { producer(std::move(stream)); },
+      true);
+  resp->setContentTypeString("text/event-stream; charset=utf-8");
+  resp->addHeader("Cache-Control", "no-cache");
+  resp->addHeader("X-Accel-Buffering", "no");
+  return resp;
+}
+
+bool send_finish_chunk(
+    const ResponseStreamPtr& stream,
+    const std::string& id,
+    const std::string& model,
+    int choice_count,
+    const std::string& finish_reason = "stop") {
+  Json::Value payload;
+  if (!id.empty()) {
+    payload["id"] = id;
+  }
+  payload["object"] = "chat.completion.chunk";
+  payload["created"] =
+      static_cast<Json::Int64>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+  if (!model.empty()) {
+    payload["model"] = model;
+  }
+  payload["choices"] = Json::arrayValue;
+  for (int i = 0; i < choice_count; ++i) {
+    Json::Value choice;
+    choice["index"] = i;
+    choice["delta"] = Json::objectValue;
+    choice["finish_reason"] = finish_reason;
+    payload["choices"].append(choice);
+  }
+  Json::StreamWriterBuilder builder;
+  builder["emitUTF8"] = true;
+  builder["indentation"] = "";
+  return stream->send("data: " + Json::writeString(builder, payload) + "\n\n");
+}
+
+void start_streaming_task(
+    ResponseStreamPtr stream,
+    std::string id,
+    std::string model,
+    int choice_count,
+    const std::function<void(const InferenceEngine::StreamCallback&)>& task,
+    const std::function<void()>& on_done = {}) {
+  std::thread([stream = std::move(stream),
+               id = std::move(id),
+               model = std::move(model),
+               choice_count,
+               task,
+               on_done]() mutable {
+    auto emit = [&stream, &id, &model](int index, const std::string& chunk) -> bool {
+      Json::Value payload;
+      if (!id.empty()) {
+        payload["id"] = id;
+      }
+      payload["object"] = "chat.completion.chunk";
+      payload["created"] =
+          static_cast<Json::Int64>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+      if (!model.empty()) {
+        payload["model"] = model;
+      }
+      payload["choices"] = Json::arrayValue;
+      Json::Value choice;
+      choice["index"] = index;
+      choice["delta"]["content"] = chunk;
+      payload["choices"].append(choice);
+      Json::StreamWriterBuilder builder;
+      builder["emitUTF8"] = true;
+      builder["indentation"] = "";
+      return stream->send("data: " + Json::writeString(builder, payload) + "\n\n");
+    };
+    try {
+      task(emit);
+      send_finish_chunk(stream, id, model, std::max(1, choice_count));
+    } catch (const PrefillBatchLimitExceeded& e) {
+      Json::StreamWriterBuilder builder;
+      builder["indentation"] = "";
+      stream->send("data: " + Json::writeString(builder, prefill_limit_error(e)) + "\n\n");
+    } catch (const std::exception& e) {
+      Json::Value err;
+      err["error"] = e.what();
+      Json::StreamWriterBuilder builder;
+      builder["indentation"] = "";
+      stream->send("data: " + Json::writeString(builder, err) + "\n\n");
+    }
+    stream->send("data: [DONE]\n\n");
+    stream->close();
+    if (on_done) {
+      on_done();
+    }
+  }).detach();
+}
+
+std::string format_openai_prompt(
+    const Json::Value& body,
+    const InferenceEngine& engine,
+    bool uploaded_state = false) {
+  std::vector<std::pair<std::string, std::string>> dialogue_messages;
+  std::vector<std::string> system_parts;
+  const auto system_field = body.get("system", "").asString();
+  if (!system_field.empty()) {
+    system_parts.push_back(system_field);
+  }
+
+  if (body.isMember("messages") && body["messages"].isArray()) {
+    for (const auto& msg : body["messages"]) {
+      auto role = msg.get("role", "user").asString();
+      auto content = normalize_content(msg["content"]);
+      if (content.empty()) {
+        continue;
+      }
+      if (role == "system") {
+        system_parts.push_back(content);
+        continue;
+      }
+      if (!role.empty()) {
+        role[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(role[0])));
+      }
+      dialogue_messages.emplace_back(role.empty() ? "User" : role, content);
+    }
+  }
+
+  const auto contents = parse_contents(body);
+  if (dialogue_messages.empty() && system_parts.empty() && !contents.empty() &&
+      (contents.front().rfind("User:", 0) == 0 ||
+       contents.front().find("\n\nAssistant:") != std::string::npos)) {
+    // Compatibility clients may send an already formatted prompt through
+    // contents. Do not wrap it in a second User/Assistant envelope.
+    return contents.front();
+  }
+  if (!contents.empty()) {
+    dialogue_messages.emplace_back("User", contents.front());
+  }
+  if (dialogue_messages.empty()) {
+    dialogue_messages.emplace_back("User", "");
+  }
+
+  std::string system;
+  for (const auto& part : system_parts) {
+    if (!part.empty()) {
+      if (!system.empty()) {
+        system += '\n';
+      }
+      system += part;
+    }
+  }
+  const auto think_type = uploaded_state && !has_explicit_think_type(body)
+      ? ThinkType::None
+      : parse_think_type(body);
+  return engine.format_openai_prompt(system, dialogue_messages, think_type);
+}
+
+Json::Value build_openai_response(
+    const InferenceEngine& engine,
+    const Json::Value& body,
+    const std::string& prompt,
+    const std::string& completion) {
+  Json::Value resp;
+  resp["id"] = "chatcmpl-rwkv-fast";
+  resp["object"] = "chat.completion";
+  resp["created"] =
+      static_cast<Json::Int64>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+  resp["model"] = body.get("model", engine.model_name()).asString();
+  resp["choices"] = Json::arrayValue;
+  Json::Value choice;
+  choice["index"] = 0;
+  choice["message"]["role"] = "assistant";
+  choice["message"]["content"] = completion;
+  choice["finish_reason"] = "stop";
+  resp["choices"].append(choice);
+  resp["usage"]["prompt_tokens"] = engine.count_tokens(prompt);
+  resp["usage"]["completion_tokens"] = engine.count_tokens(completion);
+  resp["usage"]["total_tokens"] =
+      resp["usage"]["prompt_tokens"].asInt() + resp["usage"]["completion_tokens"].asInt();
+  return resp;
+}
+
+Json::Value build_models_response(const ModelRouter& models) {
+  Json::Value resp;
+  resp["object"] = "list";
+  resp["data"] = Json::arrayValue;
+
+  const std::string loaded_id = models.current_model_id();
+  resp["loaded"] = loaded_id.empty() ? Json::Value(Json::nullValue) : Json::Value(loaded_id);
+  resp["available"] = Json::arrayValue;
+  for (const auto& id : models.model_ids()) {
+    resp["available"].append(id);
+    Json::Value model;
+    model["id"] = id;
+    model["object"] = "model";
+    model["created"] =
+        static_cast<Json::Int64>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+    model["owned_by"] = "rwkv_lighting_cuda";
+    model["status"] = id == loaded_id ? "loaded" : "available";
+    resp["data"].append(model);
+  }
+  return resp;
+}
+
+Json::Value build_models_response(const InferenceEngine& engine) {
+  Json::Value resp;
+  resp["object"] = "list";
+  resp["data"] = Json::arrayValue;
+  Json::Value model;
+  model["id"] = engine.model_name();
+  model["object"] = "model";
+  model["created"] = static_cast<Json::Int64>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+  model["owned_by"] = "rwkv_lighting_cuda";
+  resp["data"].append(model);
+  return resp;
+}
+
+Json::Value build_status_response(
+    const InferenceEngine& engine,
+    PrefillAdmissionController& admission) {
+  Json::Value resp;
+  resp["status"] = "running";
+  resp["api_version"] = "1.3";
+  resp["engine_version"] = "albatross-1.3.0";
+  resp["model"]["id"] = engine.model_name();
+  resp["model"]["name"] = engine.model_name();
+  resp["model"]["path"] = engine.model()->model_path();
+  resp["capabilities"]["chat_messages"] = true;
+  resp["capabilities"]["completion"] = true;
+  resp["capabilities"]["batch_completion"] = true;
+  resp["capabilities"]["stream"] = true;
+  resp["capabilities"]["stop"] = true;
+  resp["capabilities"]["token_count"] = true;
+  resp["capabilities"]["metrics"] = true;
+  resp["capabilities"]["session_cache"] = true;
+  resp["capabilities"]["pause_resume"] = true;
+  resp["capabilities"]["think_type"] = true;
+  resp["capabilities"]["concurrent_generation"] = true;
+  resp["capabilities"]["chunk_prefill"] = true;
+  resp["prefill_chunk_size"] = engine.prefill_chunk_size();
+  const auto queue = admission.snapshot();
+  resp["prefill_queue"]["hard_max_bsz"] = queue.hard_max_batch_size;
+  resp["prefill_queue"]["dynamic_max_bsz"] = queue.dynamic_max_batch_size;
+  resp["prefill_queue"]["reserved_bsz"] = queue.reserved_batch_size;
+  resp["prefill_queue"]["available_bsz"] =
+      std::max(0, queue.dynamic_max_batch_size - queue.reserved_batch_size);
+  resp["prefill_queue"]["queued_requests"] = static_cast<Json::UInt64>(queue.queued_requests);
+  resp["prefill_queue"]["free_vram_bytes"] = static_cast<Json::UInt64>(queue.capacity.free_vram_bytes);
+  resp["prefill_queue"]["total_vram_bytes"] = static_cast<Json::UInt64>(queue.capacity.total_vram_bytes);
+  resp["prefill_queue"]["reserve_vram_bytes"] = static_cast<Json::UInt64>(queue.capacity.reserve_vram_bytes);
+  resp["prefill_queue"]["bytes_per_bsz"] = static_cast<Json::UInt64>(queue.capacity.bytes_per_batch);
+  resp["active_request"] = RequestRegistry::instance().active_json();
+  resp["active_requests"] = RequestRegistry::instance().active_requests_json();
+  resp["last_request"] = RequestRegistry::instance().last_json();
+  resp["paused_requests"] = RequestRegistry::instance().paused_json();
+  return resp;
+}
+
+Json::Value build_options_debug(const InferenceEngine& engine, const GenerateOptions& options) {
+  Json::Value out;
+  out["max_tokens"] = options.max_tokens;
+  out["temperature"] = options.temperature;
+  out["top_k"] = options.top_k;
+  out["top_p"] = options.top_p;
+  out["alpha_presence"] = options.alpha_presence;
+  out["alpha_frequency"] = options.alpha_frequency;
+  out["alpha_decay"] = options.alpha_decay;
+  out["force_reasoning"] = options.force_reasoning;
+  out["stop_tokens"] = Json::arrayValue;
+  out["stop_texts"] = Json::arrayValue;
+  for (const auto token : options.stop_tokens) {
+    out["stop_tokens"].append(static_cast<Json::Int64>(token));
+    out["stop_texts"].append(engine.tokenizer()->decode(static_cast<int>(token)));
+  }
+  return out;
+}
+
+void print_chat_context_debug(
+    const char* endpoint,
+    const std::string& session_id,
+    const std::string& prompt,
+    int prompt_tokens,
+    const GenerateOptions& options) {
+  std::printf(
+      "[debug_context] endpoint=%s session_id=%s prompt_tokens=%d max_tokens=%d temperature=%.4f top_k=%d top_p=%.4f alpha_presence=%.4f alpha_frequency=%.4f alpha_decay=%.4f force_reasoning=%s stop_tokens=",
+      endpoint,
+      session_id.empty() ? "<none>" : session_id.c_str(),
+      prompt_tokens,
+      options.max_tokens,
+      options.temperature,
+      options.top_k,
+      options.top_p,
+      options.alpha_presence,
+      options.alpha_frequency,
+      options.alpha_decay,
+      options.force_reasoning ? "true" : "false");
+  if (options.stop_tokens.empty()) {
+    std::printf("[]\n");
+  } else {
+    for (size_t i = 0; i < options.stop_tokens.size(); ++i) {
+      std::printf("%s%lld", i == 0 ? "[" : ",", static_cast<long long>(options.stop_tokens[i]));
+    }
+    std::printf("]\n");
+  }
+  std::printf("[debug_context] prompt_begin\n%s\n[debug_context] prompt_end\n", prompt.c_str());
+  std::fflush(stdout);
+}
+
+}  // namespace
+
+void register_api_routes_legacy(
+    InferenceEngine& engine,
+    const std::optional<std::string>& password) {
+  auto& app = drogon::app();
+  auto admission = std::make_shared<PrefillAdmissionController>([&engine]() {
+    return engine.model()->query_prefill_capacity(engine.prefill_chunk_size());
+  });
+  app.registerPostHandlingAdvice([](const HttpRequestPtr&, const HttpResponsePtr& resp) {
+    resp->addHeader("Access-Control-Allow-Origin", "*");
+    resp->addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    resp->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  });
+
+  auto handle_options = [](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k204NoContent);
+    cb(resp);
+  };
+
+  for (const auto& path : {
+           "/v1/batch/completions",
+           "/translate/v1/batch-translate",
+           "/state/chat/completions",
+           "/state/status",
+           "/state/delete",
+           "/v1/server/status",
+           "/v1/server/stop",
+           "/v1/server/pause",
+           "/v1/server/resume",
+           "/v1/tokens/count",
+           "/v1/chat/completions",
+           "/v1/models"}) {
+    app.registerHandler(path, handle_options, {Options});
+  }
+  register_uploaded_state_routes(app, password);
+
+  app.registerHandler(
+      "/v1/server/status",
+      [&engine, admission](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
+        cb(json_response(build_status_response(engine, *admission)));
+      },
+      {Get});
+
+  app.registerHandler(
+      "/v1/server/stop",
+      [&password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        Json::Value body = json ? *json : Json::Value(Json::objectValue);
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+
+        const auto request_id = body.get("request_id", "").asString();
+        const bool stopped = RequestRegistry::instance().stop_active(request_id);
+        Json::Value resp;
+        resp["ok"] = true;
+        resp["stopped"] = stopped;
+        resp["active_request"] = RequestRegistry::instance().active_json();
+        cb(json_response(std::move(resp)));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/v1/server/pause",
+      [&password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        Json::Value body = json ? *json : Json::Value(Json::objectValue);
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+
+        const auto target_id = body.get("request_id", "").asString();
+        const auto request_id = RequestRegistry::instance().pause_active(target_id);
+        Json::Value resp;
+        resp["ok"] = true;
+        resp["paused"] = request_id.has_value();
+        if (request_id.has_value()) {
+          resp["request_id"] = *request_id;
+        }
+        resp["active_request"] = RequestRegistry::instance().active_json();
+        cb(json_response(std::move(resp)));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/v1/server/resume",
+      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        if (!json) {
+          cb(json_response(make_error("Invalid JSON"), k400BadRequest));
+          return;
+        }
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, *json, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+
+        const auto request_id = (*json).get("request_id", (*json).get("session_id", "").asString()).asString();
+        if (request_id.empty()) {
+          cb(json_response(make_error("Missing request_id"), k400BadRequest));
+          return;
+        }
+
+        auto paused = RequestRegistry::instance().take_paused(request_id);
+        if (!paused.has_value()) {
+          cb(json_response(make_error("Paused request not found"), k404NotFound));
+          return;
+        }
+        if (!paused->state || !paused->logits) {
+          cb(json_response(make_error("Paused request state is incomplete"), k500InternalServerError));
+          return;
+        }
+
+        GenerateOptions options = paused->options;
+        options.force_reasoning_token_offset = paused->generated_tokens;
+        if (!(*json).isMember("max_tokens")) {
+          options.max_tokens = std::max(0, paused->options.max_tokens - paused->generated_tokens);
+        }
+        options = parse_options(*json, options);
+        const int chunk_size = parse_chunk_size(*json, paused->chunk_size);
+        const std::string model = (*json).get("model", paused->model).asString();
+
+        auto active = RequestRegistry::instance().start(
+            "server.resume",
+            model,
+            options.max_tokens,
+            0,
+            request_id,
+            request_id);
+        active->generated_tokens.store(paused->generated_tokens);
+
+        auto state_ptr = paused->state;
+        auto logits_ptr = paused->logits;
+        const auto saved_generated_tokens = paused->generated_tokens;
+        cb(make_sse_response([&engine, admission, active, state_ptr, logits_ptr, options, chunk_size, request_id, model,
+                              saved_generated_tokens](ResponseStreamPtr stream) {
+          start_streaming_task(
+              std::move(stream),
+              request_id,
+              model,
+              1,
+              [&, admission, active, state_ptr, logits_ptr, options, chunk_size, saved_generated_tokens](
+                  const InferenceEngine::StreamCallback& emit) {
+                auto permit = admission->acquire(1, "server.resume", [active]() {
+                  return active->stop_requested.load() || active->pause_requested.load();
+                });
+                if (!permit.has_value()) {
+                  return;
+                }
+                const auto stats = engine.generate_from_logits_stream(
+                    *state_ptr,
+                    *logits_ptr,
+                    options,
+                    chunk_size,
+                    [&](int index, const std::string& chunk) {
+                      const int tokens = engine.count_tokens(chunk);
+                      active->generated_tokens.fetch_add(tokens);
+                      return emit(index, chunk);
+                    },
+                    [active]() {
+                      return active->stop_requested.load() || active->pause_requested.load();
+                    });
+                if (stats.decode_seconds > 0.0) {
+                  active->decode_speed.store(stats.generated_tokens / stats.decode_seconds);
+                }
+                if (active->pause_requested.load()) {
+                  RequestRegistry::PausedRequest paused_again;
+                  paused_again.id = active->id;
+                  paused_again.endpoint = active->endpoint;
+                  paused_again.model = active->model;
+                  paused_again.created = active->created;
+                  paused_again.generated_tokens = active->generated_tokens.load();
+                  paused_again.chunk_size = chunk_size;
+                  paused_again.options = options;
+                  paused_again.options.max_tokens += saved_generated_tokens;
+                  paused_again.state = state_ptr;
+                  paused_again.logits = logits_ptr;
+                  StateCacheManager::instance().put_state(paused_again.id, *state_ptr);
+                  RequestRegistry::instance().put_paused(std::move(paused_again));
+                }
+              },
+              [active]() {
+                RequestRegistry::instance().finish(active);
+              });
+        }));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/v1/tokens/count",
+      [&engine, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        if (!json) {
+          cb(json_response(make_error("Invalid JSON"), k400BadRequest));
+          return;
+        }
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, *json, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+
+        std::string text;
+        if ((*json).isMember("text")) {
+          text = (*json).get("text", "").asString();
+        } else if ((*json).isMember("messages")) {
+          text = format_openai_prompt(*json, engine);
+        } else if ((*json).isMember("contents")) {
+          const auto prompts = parse_contents(*json);
+          for (const auto& prompt : prompts) {
+            text += prompt;
+          }
+        } else {
+          cb(json_response(make_error("Missing text or messages"), k400BadRequest));
+          return;
+        }
+
+        Json::Value resp;
+        resp["tokens"] = engine.count_tokens(text);
+        cb(json_response(std::move(resp)));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/v1/batch/completions",
+      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        if (!json) {
+          cb(json_response(make_error("Invalid JSON"), k400BadRequest));
+          return;
+        }
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, *json, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+        std::string state_id;
+        try {
+          state_id = state_id_from_request(*json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+
+        const auto prompts = parse_contents(*json);
+        if (prompts.empty()) {
+          cb(json_response(make_error("Empty prompts list"), k400BadRequest));
+          return;
+        }
+        const auto options = parse_options(*json);
+        const bool metrics_requested = parse_metrics_requested(*json);
+        int prompt_tokens = 0;
+        if (metrics_requested) {
+          for (const auto& prompt : prompts) {
+            prompt_tokens += engine.count_tokens(prompt);
+          }
+        }
+        const auto model = (*json).get("model", engine.model_name()).asString();
+        auto active = RequestRegistry::instance().start(
+            "batch.completions",
+            model,
+            options.max_tokens,
+            prompt_tokens);
+        if ((*json).get("stream", false).asBool()) {
+          cb(make_sse_response([&engine, admission, active, prompts, state_id, options, model, metrics_requested,
+                                chunk_size = parse_chunk_size(*json, 8)](
+                                   ResponseStreamPtr stream) {
+            start_streaming_task(
+                std::move(stream),
+                active->id,
+                model,
+                static_cast<int>(prompts.size()),
+                [&, admission, active, prompts, state_id, options, chunk_size, metrics_requested](const InferenceEngine::StreamCallback& emit) {
+                  auto permit = admission->acquire(
+                      static_cast<int>(prompts.size()),
+                      "batch.completions",
+                      [active]() {
+                        return active->stop_requested.load() || active->pause_requested.load();
+                      });
+                  if (!permit.has_value()) {
+                    return;
+                  }
+                  InferenceEngine::StatsCallback on_prefill_complete;
+                  if (metrics_requested) {
+                    on_prefill_complete = [active](const InferenceEngine::GenerationStats& stats) {
+                      record_generation_stats(active, stats);
+                    };
+                  }
+                  auto state = create_request_state(
+                      engine, state_id, static_cast<int>(prompts.size()));
+                  const auto stats = engine.batch_generate_stream_with_state(
+                      prompts,
+                      state,
+                      options,
+                      chunk_size,
+                      [&, metrics_requested](int index, const std::string& chunk) {
+                        if (metrics_requested) {
+                          active->generated_tokens.fetch_add(engine.count_tokens(chunk));
+                        }
+                        return emit(index, chunk);
+                      },
+                      [active]() {
+                        return active->stop_requested.load() || active->pause_requested.load();
+                      },
+                      on_prefill_complete);
+                  if (metrics_requested) {
+                    record_generation_stats(active, stats);
+                  }
+                },
+                [active]() {
+                  RequestRegistry::instance().finish(active);
+                });
+          }));
+          return;
+        }
+
+        Json::Value resp;
+        resp["id"] = "rwkv7-fast-batch";
+        resp["object"] = "chat.completion";
+        resp["model"] = model;
+        std::optional<PrefillAdmissionController::Permit> permit;
+        try {
+          permit = admission->acquire(
+              static_cast<int>(prompts.size()),
+              "batch.completions",
+              [active]() {
+                return active->stop_requested.load() || active->pause_requested.load();
+              });
+        } catch (const PrefillBatchLimitExceeded& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(prefill_limit_error(error), k400BadRequest));
+          return;
+        }
+        if (!permit.has_value()) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error("Request cancelled"), k409Conflict));
+          return;
+        }
+        std::vector<std::string> results(prompts.size());
+        InferenceEngine::GenerationStats stats;
+        try {
+          auto state = create_request_state(
+              engine, state_id, static_cast<int>(prompts.size()));
+          stats = engine.batch_generate_stream_with_state(
+              prompts,
+              state,
+              options,
+              parse_chunk_size(*json, 0),
+              [&](int index, const std::string& chunk) {
+                if (index >= 0 && index < static_cast<int>(results.size())) {
+                  results[static_cast<size_t>(index)] += chunk;
+                }
+                return true;
+              },
+              [active]() {
+                return active->stop_requested.load() || active->pause_requested.load();
+              });
+        } catch (const std::exception& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+        if (metrics_requested) {
+          record_generation_stats(active, stats);
+        }
+        resp["choices"] = build_choices(results);
+        RequestRegistry::instance().finish(active);
+        cb(json_response(std::move(resp)));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/translate/v1/batch-translate",
+      [&engine, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        if (!json) {
+          cb(json_response(make_error("Invalid JSON"), k400BadRequest));
+          return;
+        }
+        std::string state_id;
+        try {
+          state_id = state_id_from_request(*json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+        const auto source_lang = (*json).get("source_lang", "auto").asString();
+        const auto target_lang = (*json).get("target_lang", "").asString();
+        if (target_lang.empty()) {
+          cb(json_response(make_error("Missing target_lang"), k400BadRequest));
+          return;
+        }
+
+        std::vector<std::string> prompts;
+        if ((*json).isMember("text_list") && (*json)["text_list"].isArray()) {
+          for (const auto& item : (*json)["text_list"]) {
+            prompts.push_back(create_translation_prompt(source_lang, target_lang, item.asString()));
+          }
+        }
+        if (prompts.empty()) {
+          cb(json_response(make_error("Empty text_list"), k400BadRequest));
+          return;
+        }
+
+        GenerateOptions options;
+        options.max_tokens = 2048;
+        options.temperature = 1.0;
+        options.top_k = 1;
+        options.top_p = 0.0;
+        options.alpha_presence = 0.0;
+        options.alpha_frequency = 0.0;
+        options.stop_tokens = {0};
+
+        std::optional<PrefillAdmissionController::Permit> permit;
+        try {
+          permit = admission->acquire(
+              static_cast<int>(prompts.size()),
+              "batch.translate");
+        } catch (const PrefillBatchLimitExceeded& error) {
+          cb(json_response(prefill_limit_error(error), k400BadRequest));
+          return;
+        }
+        std::vector<std::string> results;
+        try {
+          auto state = create_request_state(
+              engine, state_id, static_cast<int>(prompts.size()));
+          results = engine.batch_generate_with_state(prompts, state, options);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+        Json::Value resp;
+        resp["translations"] = Json::arrayValue;
+        for (const auto& text : results) {
+          Json::Value item;
+          item["detected_source_lang"] = source_lang == "auto" ? "auto" : source_lang;
+          item["text"] = text;
+          resp["translations"].append(item);
+        }
+        cb(json_response(std::move(resp)));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/state/chat/completions",
+      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        if (!json) {
+          cb(json_response(make_error("Invalid JSON"), k400BadRequest));
+          return;
+        }
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, *json, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+
+        const auto session_id = (*json).get("session_id", "").asString();
+        std::string state_id;
+        try {
+          state_id = state_id_from_request(*json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+        const auto prompts = parse_contents(*json);
+        if (session_id.empty()) {
+          cb(json_response(make_error("Missing session_id"), k400BadRequest));
+          return;
+        }
+        if (prompts.size() != 1) {
+          cb(json_response(make_error("Request must contain exactly one prompt"), k400BadRequest));
+          return;
+        }
+
+        const auto options = parse_options(*json);
+        const int prompt_tokens = engine.count_tokens(prompts.front());
+        const auto model = (*json).get("model", engine.model_name()).asString();
+        auto active = RequestRegistry::instance().start(
+            "state.chat.completions",
+            model,
+            options.max_tokens,
+            prompt_tokens,
+            session_id);
+        if ((*json).get("stream", false).asBool()) {
+          cb(make_sse_response([&engine, admission, session_id, state_id, prompts, options,
+                                active, model, chunk_size = parse_chunk_size(*json, 8)](
+                                   ResponseStreamPtr stream) {
+            start_streaming_task(
+                std::move(stream),
+                active->id,
+                model,
+                1,
+                [&, admission, active, session_id, state_id, prompts, options, chunk_size](
+                    const InferenceEngine::StreamCallback& emit) {
+                  auto permit = admission->acquire(1, "state.chat.completions", [active]() {
+                    return active->stop_requested.load() || active->pause_requested.load();
+                  });
+                  if (!permit.has_value()) {
+                    return;
+                  }
+                  auto cached_state = state_id.empty()
+                      ? StateCacheManager::instance().get_state(session_id)
+                      : std::optional<GenerationState>{};
+                  auto state = !state_id.empty()
+                      ? create_request_state(engine, state_id)
+                      : (cached_state.has_value() ? std::move(*cached_state)
+                                                  : engine.model()->create_state(1));
+                  auto state_ptr = std::make_shared<GenerationState>(std::move(state));
+                  engine.batch_generate_state_stream(
+                      prompts,
+                      *state_ptr,
+                      options,
+                      chunk_size,
+                      [&](int index, const std::string& chunk) {
+                        active->generated_tokens.fetch_add(engine.count_tokens(chunk));
+                        return emit(index, chunk);
+                      },
+                      [active]() {
+                        return active->stop_requested.load() || active->pause_requested.load();
+                      });
+                  StateCacheManager::instance().put_state(session_id, *state_ptr);
+                },
+                [active]() {
+                  RequestRegistry::instance().finish(active);
+                });
+          }));
+          return;
+        }
+
+        std::optional<PrefillAdmissionController::Permit> permit;
+        try {
+          permit = admission->acquire(1, "state.chat.completions", [active]() {
+            return active->stop_requested.load() || active->pause_requested.load();
+          });
+        } catch (const PrefillBatchLimitExceeded& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(prefill_limit_error(error), k400BadRequest));
+          return;
+        }
+        if (!permit.has_value()) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error("Request cancelled"), k409Conflict));
+          return;
+        }
+        auto& manager = StateCacheManager::instance();
+        GenerationState state;
+        try {
+          auto cached_state = state_id.empty() ? manager.get_state(session_id) : std::optional<GenerationState>{};
+          state = !state_id.empty()
+              ? create_request_state(engine, state_id)
+              : (cached_state.has_value() ? std::move(*cached_state) : engine.model()->create_state(1));
+        } catch (const std::exception& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+        auto texts = engine.batch_generate_state(prompts, state, options);
+        manager.put_state(session_id, state);
+        Json::Value resp;
+        resp["id"] = "rwkv7-fast-state";
+        resp["object"] = "chat.completion";
+        resp["model"] = model;
+        resp["choices"] = build_choices(texts);
+        RequestRegistry::instance().finish(active);
+        cb(json_response(std::move(resp)));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/state/status",
+      [&password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        Json::Value body = json ? *json : Json::Value(Json::objectValue);
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+
+        const auto summary = StateCacheManager::instance().list_all_states();
+        Json::Value resp;
+        resp["status"] = "success";
+        resp["l1_cache_count"] = static_cast<int>(summary.l1_cache.size());
+        resp["l2_cache_count"] = static_cast<int>(summary.l2_cache.size());
+        resp["database_count"] = static_cast<int>(summary.database.size());
+        resp["total_sessions"] = static_cast<int>(
+            summary.l1_cache.size() + summary.l2_cache.size() + summary.database.size());
+        resp["sessions"] = Json::arrayValue;
+
+        auto append = [&](const std::vector<std::string>& ids, const std::string& level) {
+          for (const auto& id : ids) {
+            Json::Value item;
+            item["session_id"] = id;
+            item["cache_level"] = level;
+            if (level == "Database (Disk)") {
+              if (auto ts = StateCacheManager::instance().get_db_timestamp(id); ts.has_value()) {
+                item["timestamp"] = *ts;
+              }
+            }
+            resp["sessions"].append(item);
+          }
+        };
+
+        append(summary.l1_cache, "L1 (VRAM)");
+        append(summary.l2_cache, "L2 (RAM)");
+        append(summary.database, "Database (Disk)");
+        cb(json_response(std::move(resp)));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/state/delete",
+      [&password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        if (!json) {
+          cb(json_response(make_error("Invalid JSON"), k400BadRequest));
+          return;
+        }
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, *json, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+
+        const auto session_id = (*json).get("session_id", "").asString();
+        if (session_id.empty()) {
+          cb(json_response(make_error("Missing session_id"), k400BadRequest));
+          return;
+        }
+        const bool ok = StateCacheManager::instance().delete_state_from_any_level(session_id);
+        Json::Value resp;
+        resp["status"] = ok ? "success" : "not_found";
+        resp["message"] = ok ? ("Session " + session_id + " deleted successfully")
+                             : ("Session " + session_id + " not found");
+        cb(json_response(std::move(resp), ok ? k200OK : k404NotFound));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/v1/chat/completions",
+      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        auto json = req->getJsonObject();
+        if (!json) {
+          cb(json_response(make_error("Invalid JSON"), k400BadRequest));
+          return;
+        }
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, *json, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+
+        std::string state_id;
+        try {
+          state_id = state_id_from_request(*json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+        const auto prompt = format_openai_prompt(*json, engine, !state_id.empty());
+        // std::cout << prompt << std::endl; // Debug Prompt
+        auto options = parse_options(*json);
+        if ((*json).isMember("think_type") || (*json).isMember("think") || (*json).isMember("enable_think")) {
+          options.force_reasoning = force_reasoning_for_think_type(parse_think_type(*json));
+        }
+        const int prompt_tokens = engine.count_tokens(prompt);
+        const auto model = (*json).get("model", engine.model_name()).asString();
+        auto active = RequestRegistry::instance().start(
+            "chat.completions",
+            model,
+            options.max_tokens,
+            prompt_tokens);
+
+        if ((*json).get("stream", false).asBool()) {
+          cb(make_sse_response([&engine, admission, prompt, state_id, options, active, model,
+                                chunk_size = parse_chunk_size(*json, 2)](
+                                   ResponseStreamPtr stream) {
+            start_streaming_task(
+                std::move(stream),
+                active->id,
+                model,
+                1,
+                [&, admission, active, prompt, state_id, options, chunk_size](
+                    const InferenceEngine::StreamCallback& emit) {
+                  auto permit = admission->acquire(1, "chat.completions", [active]() {
+                    return active->stop_requested.load() || active->pause_requested.load();
+                  });
+                  if (!permit.has_value()) {
+                    return;
+                  }
+                  auto state_ptr = std::make_shared<GenerationState>(
+                      create_request_state(engine, state_id));
+                  auto logits_ptr = std::make_shared<DeviceLogits>();
+                  const auto prefill_begin = std::chrono::steady_clock::now();
+                  const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
+                  const auto prefill_end = std::chrono::steady_clock::now();
+                  record_prefill_metrics(active, prefill_tokens, prefill_begin, prefill_end);
+
+                  const auto decode_begin = std::chrono::steady_clock::now();
+                  const auto stats = engine.generate_from_logits_stream(
+                      *state_ptr,
+                      *logits_ptr,
+                      options,
+                      chunk_size,
+                      [&](int index, const std::string& chunk) {
+                        const int tokens = engine.count_tokens(chunk);
+                        active->generated_tokens.fetch_add(tokens);
+                        update_decode_metrics(active, decode_begin);
+                        return emit(index, chunk);
+                      },
+                      [active]() {
+                        return active->stop_requested.load() || active->pause_requested.load();
+                      });
+                  update_decode_metrics(active, stats.generated_tokens, stats.decode_seconds);
+                  if (active->pause_requested.load()) {
+                    RequestRegistry::PausedRequest paused;
+                    paused.id = active->id;
+                    paused.endpoint = active->endpoint;
+                    paused.model = active->model;
+                    paused.created = active->created;
+                    paused.generated_tokens = active->generated_tokens.load();
+                    paused.chunk_size = chunk_size;
+                    paused.options = options;
+                    paused.state = state_ptr;
+                    paused.logits = logits_ptr;
+                    StateCacheManager::instance().put_state(paused.id, *state_ptr);
+                    RequestRegistry::instance().put_paused(std::move(paused));
+                  }
+                },
+                [active]() {
+                  RequestRegistry::instance().finish(active);
+                });
+          }));
+          return;
+        }
+
+        std::optional<PrefillAdmissionController::Permit> permit;
+        try {
+          permit = admission->acquire(1, "chat.completions", [active]() {
+            return active->stop_requested.load() || active->pause_requested.load();
+          });
+        } catch (const PrefillBatchLimitExceeded& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(prefill_limit_error(error), k400BadRequest));
+          return;
+        }
+        if (!permit.has_value()) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error("Request cancelled"), k409Conflict));
+          return;
+        }
+        std::shared_ptr<GenerationState> state_ptr;
+        try {
+          state_ptr = std::make_shared<GenerationState>(
+              create_request_state(engine, state_id));
+        } catch (const std::exception& error) {
+          RequestRegistry::instance().finish(active);
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
+        auto logits_ptr = std::make_shared<DeviceLogits>();
+        std::string completion;
+
+        const auto prefill_begin = std::chrono::steady_clock::now();
+        const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
+        const auto prefill_end = std::chrono::steady_clock::now();
+        record_prefill_metrics(active, prefill_tokens, prefill_begin, prefill_end);
+
+        const auto decode_begin = std::chrono::steady_clock::now();
+        const auto stats = engine.generate_from_logits_stream(
+            *state_ptr,
+            *logits_ptr,
+            options,
+            parse_chunk_size(*json, 2),
+            [&](int, const std::string& chunk) {
+              completion += chunk;
+              const int tokens = engine.count_tokens(chunk);
+              active->generated_tokens.fetch_add(tokens);
+              update_decode_metrics(active, decode_begin);
+              return true;
+            },
+            [active]() {
+              return active->stop_requested.load() || active->pause_requested.load();
+            });
+        update_decode_metrics(active, stats.generated_tokens, stats.decode_seconds);
+        if (active->pause_requested.load()) {
+          RequestRegistry::PausedRequest paused;
+          paused.id = active->id;
+          paused.endpoint = active->endpoint;
+          paused.model = active->model;
+          paused.created = active->created;
+          paused.generated_tokens = active->generated_tokens.load();
+          paused.chunk_size = parse_chunk_size(*json, 2);
+          paused.options = options;
+          paused.state = state_ptr;
+          paused.logits = logits_ptr;
+          StateCacheManager::instance().put_state(paused.id, *state_ptr);
+          RequestRegistry::instance().put_paused(std::move(paused));
+        }
+        RequestRegistry::instance().finish(active);
+
+        cb(json_response(build_openai_response(engine, *json, prompt, completion)));
+      },
+      {Post});
+
+  app.registerHandler(
+      "/v1/models",
+      [&engine, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+        Json::Value body = Json::objectValue;
+        HttpResponsePtr auth_resp;
+        if (!check_password(req, body, password, auth_resp)) {
+          cb(auth_resp);
+          return;
+        }
+        cb(json_response(build_models_response(engine)));
+      },
+      {Get});
+}
+
+void register_api_routes(
+    ModelRouter& models,
+    const std::optional<std::string>& password) {
+  if (!models.dynamic_loading_enabled()) {
+    auto lease = models.acquire();
+    register_api_routes_legacy(lease.engine(), password);
+    return;
+  }
+  auto& app = drogon::app();
+  app.registerPostHandlingAdvice([](const HttpRequestPtr&, const HttpResponsePtr& resp) {
+    resp->addHeader("Access-Control-Allow-Origin", "*");
+    resp->addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    resp->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  });
+  const auto options_handler = [](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k204NoContent);
+    cb(resp);
+  };
+  for (const auto& path : {"/v1/models", "/v1/model/load", "/v1/chat/completions", "/v1/batch/completions", "/v1/tokens/count", "/v1/server/status"}) {
+    app.registerHandler(path, options_handler, {Options});
+  }
+  register_uploaded_state_routes(app, password);
+
+  app.registerHandler("/v1/models", [&models, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+    Json::Value body = Json::objectValue;
+    HttpResponsePtr auth;
+    if (!check_password(req, body, password, auth)) { cb(auth); return; }
+    cb(json_response(build_models_response(models)));
+  }, {Get});
+
+  app.registerHandler("/v1/model/load", [&models, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+    const auto json = req->getJsonObject();
+    if (!json) { cb(json_response(make_error("Invalid JSON"), k400BadRequest)); return; }
+    HttpResponsePtr auth;
+    if (!check_password(req, *json, password, auth)) { cb(auth); return; }
+    try {
+      models.load((*json).get("model", "").asString());
+      Json::Value resp;
+      resp["object"] = "model";
+      resp["id"] = models.current_model_id();
+      resp["loaded"] = true;
+      cb(json_response(std::move(resp)));
+    } catch (const std::exception& e) { cb(json_response(make_error(e.what()), k400BadRequest)); }
+  }, {Post});
+
+  app.registerHandler("/v1/server/status", [&models](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
+    Json::Value resp;
+    resp["status"] = "running";
+    resp["dynamic_loading"] = models.dynamic_loading_enabled();
+    const auto id = models.current_model_id();
+    resp["model"]["id"] = id.empty() ? Json::Value(Json::nullValue) : Json::Value(id);
+    resp["model"]["loaded"] = !id.empty();
+    cb(json_response(std::move(resp)));
+  }, {Get});
+
+  app.registerHandler("/v1/tokens/count", [&models, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+    const auto json = req->getJsonObject();
+    if (!json) { cb(json_response(make_error("Invalid JSON"), k400BadRequest)); return; }
+    HttpResponsePtr auth;
+    if (!check_password(req, *json, password, auth)) { cb(auth); return; }
+    try {
+      auto lease = models.acquire();
+      auto& engine = lease.engine();
+      std::string text = (*json).get("text", "").asString();
+      if (text.empty() && (*json).isMember("messages")) text = format_openai_prompt(*json, engine);
+      if (text.empty() && !(*json).isMember("text") && !(*json).isMember("messages")) {
+        cb(json_response(make_error("Missing text or messages"), k400BadRequest)); return;
+      }
+      Json::Value resp; resp["tokens"] = engine.count_tokens(text); cb(json_response(std::move(resp)));
+    } catch (const std::exception& e) { cb(json_response(make_error(e.what()), k400BadRequest)); }
+  }, {Post});
+
+  auto generate = [&models, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb, bool batch) {
+    const auto json = req->getJsonObject();
+    if (!json) { cb(json_response(make_error("Invalid JSON"), k400BadRequest)); return; }
+    HttpResponsePtr auth;
+    if (!check_password(req, *json, password, auth)) { cb(auth); return; }
+    try {
+      auto lease = std::make_shared<ModelRouter::Lease>(models.acquire());
+      auto& engine = lease->engine();
+      const std::string state_id = state_id_from_request(*json);
+      const std::string model = engine.model_name();
+      const auto prompts = batch
+          ? parse_contents(*json)
+          : std::vector<std::string>{format_openai_prompt(*json, engine, !state_id.empty())};
+      if (prompts.empty()) { cb(json_response(make_error("Empty prompts list"), k400BadRequest)); return; }
+      auto options = parse_options(*json);
+      if (!batch && ((*json).isMember("think_type") || (*json).isMember("think") || (*json).isMember("enable_think"))) {
+        options.force_reasoning = force_reasoning_for_think_type(parse_think_type(*json));
+      }
+      const int chunk_size = parse_chunk_size(*json, batch ? 8 : 2);
+      if ((*json).get("stream", false).asBool()) {
+        cb(make_sse_response([lease, prompts, state_id, options, model, chunk_size](ResponseStreamPtr stream) {
+          start_streaming_task(std::move(stream), "chatcmpl-rwkv-fast", model, static_cast<int>(prompts.size()),
+            [lease, prompts, state_id, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
+              auto& engine = lease->engine();
+              if (!state_id.empty()) {
+                auto state = create_request_state(
+                    engine, state_id, static_cast<int>(prompts.size()));
+                if (prompts.size() == 1) {
+                  engine.batch_generate_state_stream(prompts, state, options, chunk_size, emit);
+                } else {
+                  engine.batch_generate_stream_with_state(
+                      prompts, state, options, chunk_size, emit);
+                }
+              } else {
+                engine.batch_generate_stream(prompts, options, chunk_size, emit);
+              }
+            }, [] {});
+        }));
+        return;
+      }
+      std::vector<std::string> results;
+      if (!state_id.empty()) {
+        auto state = create_request_state(
+            engine, state_id, static_cast<int>(prompts.size()));
+        results = prompts.size() == 1
+            ? engine.batch_generate_state(prompts, state, options)
+            : engine.batch_generate_with_state(prompts, state, options);
+      } else {
+        results = engine.batch_generate(prompts, options);
+      }
+      if (batch) {
+        Json::Value resp; resp["id"] = "rwkv7-fast-batch"; resp["object"] = "chat.completion"; resp["model"] = model; resp["choices"] = build_choices(results);
+        cb(json_response(std::move(resp)));
+      } else {
+        auto resp = build_openai_response(engine, *json, prompts.front(), results.front());
+        resp["model"] = model;
+        cb(json_response(std::move(resp)));
+      }
+    } catch (const std::exception& e) { cb(json_response(make_error(e.what()), k400BadRequest)); }
+  };
+  app.registerHandler("/v1/chat/completions", [generate](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) { generate(req, std::move(cb), false); }, {Post});
+  app.registerHandler("/v1/batch/completions", [generate](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) { generate(req, std::move(cb), true); }, {Post});
+}
+
+}  // namespace rwkv7_server

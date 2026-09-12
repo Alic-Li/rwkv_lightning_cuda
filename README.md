@@ -4,6 +4,21 @@ GitHub Actions builds Linux and Windows CUDA packages on PRs and `main`. Push a
 `v*` tag to generate a draft Release with binaries and SHA-256 checksums. See
 [the release guide](docs/releasing.md) for the workflow and package contents.
 
+## Project layout
+
+The native code is organized by responsibility:
+
+- `include/rwkv/`: public headers grouped into `common`, `io`, `runtime`, `inference`, and `server` APIs.
+- `src/backend/`: GPU model backend integration.
+- `src/inference/`: tokenization, sampling, and generation orchestration.
+- `src/io/`: PTH archive and tensor readers.
+- `src/server/`: HTTP API, model routing, admission control, and state storage.
+- `src/app/`: executable entry points.
+- `assets/`: runtime data files such as the tokenizer vocabulary.
+- `cmake/`: dependency, compiler-option, and packaging modules.
+
+The root `CMakeLists.txt` only selects the GPU backend and composes these modules. Target definitions live next to their corresponding source trees in `src/CMakeLists.txt`, `tools/CMakeLists.txt`, and `test/CMakeLists.txt`.
+
 ## Build
 
 ```bash
@@ -11,8 +26,11 @@ cmake -S . -B ./build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120"
 
-cmake --build ./build -j --config Release --target bundle_rwkv_quantize bundle_rwkv_lighting_cuda bundle_rwkv_state_tune
+cmake --build ./build -j --config Release
+cmake --build ./build -j --config Release --target bundle_all
 ```
+
+`bundle_all` assembles every available runtime target below `build/bundle/`. Server and state-tuning bundles include `rwkv_vocab_v20230424.txt`; shared runtime libraries are placed in each bundle's `lib/` directory. Individual `bundle_<target>` targets remain available.
 
 ### CUDA W8A16 / W4A16 quantization
 

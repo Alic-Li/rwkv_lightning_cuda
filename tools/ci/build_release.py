@@ -83,7 +83,7 @@ def main():
             f"-DOUTPUT_DIR={bundle}", f"-DLIB_OUTPUT_DIR={lib_dir}",
             "-DCOPY_BINARY=ON", "-DSTRICT_RUNTIME_DEPS=ON",
             "-DDEPENDENCY_DIRS=" + ";".join(map(str, dependency_dirs)),
-            "-P", ROOT / "cmake/copy_runtime_deps.cmake", env=test_env)
+            "-P", ROOT / "cmake/packaging/CopyRuntimeDependencies.cmake", env=test_env)
     if WINDOWS:
         # GET_RUNTIME_DEPENDENCIES excludes System32; ship the redistributable CRT.
         redist = Path(os.environ["VCToolsRedistDir"]) / "x64"
@@ -105,7 +105,7 @@ def main():
     run("go", "build", "-trimpath", "-ldflags=-s -w", "-o",
         bundle / ("rwkv_router" + SUFFIX), ".",
         cwd=ROOT / "RWKV_Lightning_CUDA_router")
-    shutil.copy2(ROOT / "src/rwkv_vocab_v20230424.txt", bundle)
+    shutil.copy2(ROOT / "assets/rwkv_vocab_v20230424.txt", bundle)
     shutil.copy2(ROOT / "RWKV_Lightning_CUDA_router/config.example.toml",
                  bundle / "router.config.example.toml")
     shutil.copy2(ROOT / "docs/releasing.md", bundle / "RELEASING.md")

@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include "rwkv_state_cache.hpp"
+#include "rwkv/server/rwkv_state_cache.hpp"
 #include "test_common.hpp"
 
 namespace {

@@ -4,7 +4,7 @@
 #include <iostream>
 #include <thread>
 
-#include "rwkv_prefill_admission.hpp"
+#include "rwkv/server/rwkv_prefill_admission.hpp"
 #include "test_common.hpp"
 
 int main() {

@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <set>
+#include <stdexcept>
 
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -15,32 +17,52 @@ namespace {
 
 using namespace nvcuda;
 
+int current_device() {
+  int device;
+  const cudaError_t status = cudaGetDevice(&device);
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  return device;
+}
+
 const W8A16DeviceInfo& cached_device_info() {
-  static const W8A16DeviceInfo info = [] {
-    W8A16DeviceInfo result;
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) return result;
+  thread_local std::map<int, W8A16DeviceInfo> devices;
+  const int device = current_device();
+  auto it = devices.find(device);
+  if (it == devices.end()) {
     cudaDeviceProp properties{};
-    if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) return result;
-    if (cudaDeviceGetAttribute(&result.sm_count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
-      result.sm_count = properties.multiProcessorCount;
-    }
-    if (cudaDeviceGetAttribute(&result.compute_major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
-      result.compute_major = properties.major;
-    }
+    const cudaError_t status = cudaGetDeviceProperties(&properties, device);
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    W8A16DeviceInfo result{};
+    result.sm_count = properties.multiProcessorCount;
+    result.compute_major = properties.major;
     std::snprintf(result.name, sizeof(result.name), "%s", properties.name);
-    return result;
-  }();
-  return info;
+    it = devices.emplace(device, result).first;
+  }
+  return it->second;
+}
+
+// Runtime attributes belong to the current device. Thread-local bookkeeping
+// avoids a host data race; concurrent CUDA attribute calls set the same value.
+template <class Kernel>
+void configure_shared_memory(Kernel kernel, std::size_t bytes) {
+  thread_local std::set<std::pair<int, const void*>> configured;
+  const auto key = std::make_pair(current_device(), reinterpret_cast<const void*>(kernel));
+  if (configured.count(key)) return;
+  const cudaError_t status = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  configured.insert(key);
 }
 
 struct W8A16TuneKey {
+  int device;
   int K;
   int N;
   int layout;
   int m_bucket;
 
   bool operator<(const W8A16TuneKey& other) const {
+    if (device != other.device) return device < other.device;
     if (K != other.K) return K < other.K;
     if (N != other.N) return N < other.N;
     if (layout != other.layout) return layout < other.layout;
@@ -68,7 +90,7 @@ int lookup_tuned_split(int K, int N, W8BLayout layout, int M) {
   const int m_bucket = tune_m_bucket(M);
   if (m_bucket == 0) return 0;
   std::lock_guard<std::mutex> lock(g_tuning_mutex);
-  const auto it = g_tuning_splits.find({K, N, layout_key(layout), m_bucket});
+  const auto it = g_tuning_splits.find({current_device(), K, N, layout_key(layout), m_bucket});
   return it == g_tuning_splits.end() ? 0 : it->second;
 }
 
@@ -1233,17 +1255,7 @@ void launch_mma_bm64_bn128(
   const std::size_t x_stage_bytes = static_cast<std::size_t>(64) * BK * sizeof(half);
   const std::size_t b_stage_bytes = static_cast<std::size_t>(BK) * BN;
   const std::size_t shared_bytes = STAGES * (x_stage_bytes + b_stage_bytes);
-  static bool shared_limit_set = false;
-  if (!shared_limit_set) {
-    const cudaError_t status = cudaFuncSetAttribute(
-        w8a16_mma_bm64_bn128_kernel<Packed>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_bytes));
-    if (status != cudaSuccess) {
-      std::fprintf(stderr, "set W8A16 BM64 BN128 shared memory failed: %s\n", cudaGetErrorString(status));
-      std::exit(1);
-    }
-    shared_limit_set = true;
-  }
+  configure_shared_memory(w8a16_mma_bm64_bn128_kernel<Packed>, shared_bytes);
   const dim3 grid(static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_tiles), static_cast<unsigned>(split_k));
   w8a16_mma_bm64_bn128_kernel<Packed><<<grid, 256, shared_bytes, stream>>>(
       M, K, N, x, weight, scales, 0, k_tiles_total, y, scratch);
@@ -1302,17 +1314,7 @@ void launch_mma_bm128(
   const std::size_t x_stage_bytes = static_cast<std::size_t>(128) * BK * sizeof(half);
   const std::size_t b_stage_bytes = static_cast<std::size_t>(BK) * BN;
   const std::size_t shared_bytes = STAGES * (x_stage_bytes + b_stage_bytes);
-  static bool shared_limit_set = false;
-  if (!shared_limit_set) {
-    const cudaError_t status = cudaFuncSetAttribute(
-        w8a16_mma_bm128_kernel<Packed, BN>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_bytes));
-    if (status != cudaSuccess) {
-      std::fprintf(stderr, "set W8A16 BM128 shared memory failed: %s\n", cudaGetErrorString(status));
-      std::exit(1);
-    }
-    shared_limit_set = true;
-  }
+  configure_shared_memory(w8a16_mma_bm128_kernel<Packed, BN>, shared_bytes);
   const dim3 grid(static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_tiles), static_cast<unsigned>(split_k));
   w8a16_mma_bm128_kernel<Packed, BN><<<grid, 512, shared_bytes, stream>>>(
       M, K, N, x, weight, scales, 0, k_tiles_total, y, scratch);
@@ -1373,12 +1375,7 @@ void launch_mma_gemm(
   constexpr int reduction_j = BLOCK_M >= 128 ? 4 : 1;
   const std::size_t shared_bytes = STAGES * (x_stage_bytes + b_stage_bytes) +
                                    static_cast<std::size_t>(reduction_j) * 8 * 32 * 4 * sizeof(float);
-  static bool shared_limit_set = false;
-  if (!shared_limit_set) {
-    cudaFuncSetAttribute(w8a16_mma_kernel<BLOCK_M, Packed>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(shared_bytes));
-    shared_limit_set = true;
-  }
+  configure_shared_memory(w8a16_mma_kernel<BLOCK_M, Packed>, shared_bytes);
   const dim3 grid(static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_tiles), static_cast<unsigned>(split_k));
   w8a16_mma_kernel<BLOCK_M, Packed><<<grid, 256, shared_bytes, stream>>>(
       M, K, N, x, weight, scales, 0, k_tiles_total, y, scratch);
@@ -1404,7 +1401,7 @@ void rwkv7_w8a16_tuning_set(int K, int N, W8BLayout layout, int m_bucket, int sp
   const int bucket = tune_m_bucket(m_bucket);
   if (K <= 0 || N <= 0 || bucket == 0 || split_k <= 0) return;
   std::lock_guard<std::mutex> lock(g_tuning_mutex);
-  g_tuning_splits[{K, N, layout_key(layout), bucket}] = split_k;
+  g_tuning_splits[{current_device(), K, N, layout_key(layout), bucket}] = split_k;
 }
 
 int rwkv7_w8a16_tuning_get(int K, int N, W8BLayout layout, int M) {
@@ -1425,8 +1422,17 @@ void rwkv7_w8a16_linear_launch(
     std::size_t workspace_bytes,
     int force_split_k) {
   if (M <= 0 || K <= 0 || N <= 0) return;
-  assert(N % 64 == 0);
-  assert(K % 64 == 0);
+  if (N % 64 || K % 64 || !x || !qweight || !scale || !y || force_split_k < 0 ||
+      (layout != W8BLayout::NK && layout != W8BLayout::KN && layout != W8BLayout::PackedNK) ||
+      reinterpret_cast<std::uintptr_t>(x) % 16 ||
+      reinterpret_cast<std::uintptr_t>(qweight) % 16 ||
+      reinterpret_cast<std::uintptr_t>(scale) % 4 ||
+      reinterpret_cast<std::uintptr_t>(y) % 4 ||
+      (workspace && reinterpret_cast<std::uintptr_t>(workspace) % alignof(float)))
+    throw std::invalid_argument("W8A16 requires valid buffers, layout, and aligned dimensions/pointers");
+  if ((std::size_t(N) / 64) > 65535 || (std::size_t(M) + 15) / 16 > 65535 ||
+      force_split_k > 65535)
+    throw std::invalid_argument("W8A16 launch grid exceeds device limits");
   const int major = cached_device_info().compute_major;
   if (major >= 8 && (layout == W8BLayout::PackedNK || layout == W8BLayout::KN)) {
     // This exact M=32 boundary is measured, not a typo: BM64xBN128 regresses
@@ -1523,13 +1529,10 @@ void rwkv7_w8a16_linear_launch(
   }
   if (layout == W8BLayout::NK && M <= 4) {
     if (M == 1) {
-      assert(K % (128 * 16) == 0 && N % 4 == 0);
       w8a16_gemv_kernel<128, 4, 1><<<N / 4, 128, 0, stream>>>(M, K, N, x, qweight, scale, y);
     } else if (M == 2) {
-      assert(K % (128 * 16) == 0 && N % 4 == 0);
       w8a16_gemv_kernel<128, 4, 2><<<N / 4, 128, 0, stream>>>(M, K, N, x, qweight, scale, y);
     } else if (M <= 4) {
-      assert(K % (128 * 16) == 0 && N % 4 == 0);
       w8a16_gemv_kernel<128, 4, 4><<<N / 4, 128, 0, stream>>>(M, K, N, x, qweight, scale, y);
     }
     return;

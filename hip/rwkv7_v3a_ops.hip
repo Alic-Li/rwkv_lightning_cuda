@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <map>
+#include <stdexcept>
 
 #include "rwkv7_fast_v4_kernels.hip.hpp"
 
@@ -32,22 +34,37 @@ inline void check_hipblas(hipblasStatus_t status, const char* what) {
   }
 }
 
-inline hipblasHandle_t blas_handle() {
-  static hipblasHandle_t handle = [] {
-    hipblasHandle_t h = nullptr;
-    check_hipblas(hipblasCreate(&h), "hipblasCreate");
-    return h;
-  }();
-  return handle;
+// BLAS stream selection is mutable state: one handle per host thread/device.
+struct ThreadBlasHandles {
+  hipblasHandle_t blas = nullptr;
+  hipblasLtHandle_t lt = nullptr;
+  ThreadBlasHandles() {
+    check_hipblas(hipblasCreate(&blas), "hipblasCreate");
+    check_hipblas(hipblasLtCreate(&lt), "hipblasLtCreate");
+  }
+  ~ThreadBlasHandles() {
+    hipblasLtDestroy(lt);
+    hipblasDestroy(blas);
+  }
+  ThreadBlasHandles(const ThreadBlasHandles&) = delete;
+  ThreadBlasHandles& operator=(const ThreadBlasHandles&) = delete;
+};
+
+inline ThreadBlasHandles& thread_blas_handles() {
+  int device;
+  const auto status = hipGetDevice(&device);
+  if (status != hipSuccess) throw std::runtime_error(hipGetErrorString(status));
+  thread_local std::map<int, ThreadBlasHandles> handles;
+  return handles.try_emplace(device).first->second;
 }
 
-inline hipblasLtHandle_t blaslt_handle() {
-  static hipblasLtHandle_t handle = [] {
-    hipblasLtHandle_t h = nullptr;
-    check_hipblas(hipblasLtCreate(&h), "hipblasLtCreate");
-    return h;
-  }();
-  return handle;
+inline hipblasHandle_t blas_handle() { return thread_blas_handles().blas; }
+inline hipblasLtHandle_t blaslt_handle() { return thread_blas_handles().lt; }
+
+__device__ __forceinline__ half2 load_pair(const half* p) {
+  if ((reinterpret_cast<std::uintptr_t>(p) & 3u) == 0)
+    return *reinterpret_cast<const half2*>(p);
+  return __halves2half2(p[0], p[1]);
 }
 
 template <int Act>
@@ -131,6 +148,7 @@ __global__ void f16_transpose_kernel(
 
 template <int Threads>
 __device__ __forceinline__ float block_sum_t(float x) {
+  __syncthreads(); // Finish readers of the previous reduction before reuse.
   __shared__ float partial[Threads / 32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -224,8 +242,8 @@ __global__ __launch_bounds__(Threads, 2) void linear_t_f16_kernel(
   const dtype* w_row = weight_t + static_cast<int64_t>(n) * K;
   const int K2 = K >> 1;
   for (int k2 = threadIdx.x; k2 < K2; k2 += Threads) {
-    const float2 xv = __half22float2(*reinterpret_cast<const __half2*>(x_row + (k2 << 1)));
-    const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(w_row + (k2 << 1)));
+    const float2 xv = __half22float2(load_pair(x_row + (k2 << 1)));
+    const float2 wv = __half22float2(load_pair(w_row + (k2 << 1)));
     acc = fmaf(xv.x, wv.x, acc);
     acc = fmaf(xv.y, wv.y, acc);
   }
@@ -262,12 +280,12 @@ __global__ __launch_bounds__(Threads, 2) void linear_t_f16_ntile_kernel(
   const int K2 = K >> 1;
   for (int k2 = threadIdx.x; k2 < K2; k2 += Threads) {
     const int k = k2 << 1;
-    const float2 xv = __half22float2(*reinterpret_cast<const __half2*>(x_row + k));
+    const float2 xv = __half22float2(load_pair(x_row + k));
 #pragma unroll
     for (int j = 0; j < OutTile; ++j) {
       const int n = n0 + j;
       if (n < N) {
-        const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(weight_t + static_cast<int64_t>(n) * K + k));
+        const float2 wv = __half22float2(load_pair(weight_t + static_cast<int64_t>(n) * K + k));
         acc[j] = fmaf(xv.x, wv.x, acc[j]);
         acc[j] = fmaf(xv.y, wv.y, acc[j]);
       }
@@ -392,14 +410,14 @@ __global__ __launch_bounds__(Threads, 1) void linear_orig_rows_f16_kernel(
     for (int j = 0; j < OutTile; ++j) {
       const int n = n0 + j;
       wv[j] = (n < N)
-          ? __half22float2(*reinterpret_cast<const __half2*>(weight_orig + static_cast<int64_t>(n) * K + k))
+          ? __half22float2(load_pair(weight_orig + static_cast<int64_t>(n) * K + k))
           : make_float2(0.0f, 0.0f);
     }
 #pragma unroll
     for (int r = 0; r < RowTile; ++r) {
       const int m = m0 + r;
       if (m < M) {
-        const float2 xv = __half22float2(*reinterpret_cast<const __half2*>(x + static_cast<int64_t>(m) * K + k));
+        const float2 xv = __half22float2(load_pair(x + static_cast<int64_t>(m) * K + k));
 #pragma unroll
         for (int j = 0; j < OutTile; ++j) {
           acc[r][j] = fmaf(xv.x, wv[j].x, acc[r][j]);
@@ -760,14 +778,14 @@ __global__ __launch_bounds__(Threads, 2) void linear_t_act_f16_ntile_kernel(
   const int K2 = K >> 1;
   for (int k2 = threadIdx.x; k2 < K2; k2 += Threads) {
     const int k = k2 << 1;
-    float2 xv = __half22float2(*reinterpret_cast<const __half2*>(x_row + k));
+    float2 xv = __half22float2(load_pair(x_row + k));
     xv.x = apply_act<Act>(xv.x);
     xv.y = apply_act<Act>(xv.y);
 #pragma unroll
     for (int j = 0; j < OutTile; ++j) {
       const int n = n0 + j;
       if (n < N) {
-        const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(weight_t + static_cast<int64_t>(n) * K + k));
+        const float2 wv = __half22float2(load_pair(weight_t + static_cast<int64_t>(n) * K + k));
         acc[j] = fmaf(xv.x, wv.x, acc[j]);
         acc[j] = fmaf(xv.y, wv.y, acc[j]);
       }
@@ -854,8 +872,8 @@ __global__ __launch_bounds__(Threads, 2) void linear_wag_rank_in_f16_kernel(
   const int K2 = K >> 1;
   for (int k2 = threadIdx.x; k2 < K2; k2 += Threads) {
     const int k = k2 << 1;
-    const float2 xv = __half22float2(*reinterpret_cast<const __half2*>(x_row + k));
-    const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(w_row + k));
+    const float2 xv = __half22float2(load_pair(x_row + k));
+    const float2 wv = __half22float2(load_pair(w_row + k));
     acc = fmaf(xv.x, wv.x, acc);
     acc = fmaf(xv.y, wv.y, acc);
   }
@@ -923,8 +941,8 @@ __global__ __launch_bounds__(Threads, 2) void linear_wagv_rank_in_f16_kernel(
   const int K2 = K >> 1;
   for (int k2 = threadIdx.x; k2 < K2; k2 += Threads) {
     const int k = k2 << 1;
-    const float2 xv2 = __half22float2(*reinterpret_cast<const __half2*>(x_row + k));
-    const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(w_row + k));
+    const float2 xv2 = __half22float2(load_pair(x_row + k));
+    const float2 wv = __half22float2(load_pair(w_row + k));
     acc = fmaf(xv2.x, wv.x, acc);
     acc = fmaf(xv2.y, wv.y, acc);
   }
@@ -1217,12 +1235,12 @@ __global__ __launch_bounds__(Threads, 2) void linear_t_vres_f16_ntile_kernel(
   const int K2 = K >> 1;
   for (int k2 = threadIdx.x; k2 < K2; k2 += Threads) {
     const int k = k2 << 1;
-    const float2 xv = __half22float2(*reinterpret_cast<const __half2*>(x_row + k));
+    const float2 xv = __half22float2(load_pair(x_row + k));
 #pragma unroll
     for (int j = 0; j < OutTile; ++j) {
       const int n = n0 + j;
       if (n < N) {
-        const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(weight_t + static_cast<int64_t>(n) * K + k));
+        const float2 wv = __half22float2(load_pair(weight_t + static_cast<int64_t>(n) * K + k));
         acc[j] = fmaf(xv.x, wv.x, acc[j]);
         acc[j] = fmaf(xv.y, wv.y, acc[j]);
       }
@@ -2107,7 +2125,8 @@ void rwkv7_v4_emb_ln0_bf16_to_f16_launch(
 }
 
 void rwkv7_v3a_add_f16_launch(hipStream_t stream, const half* x, const half* y, half* out, long long elems) {
-  assert((elems & 1) == 0);
+  if (elems <= 0) return;
+  if (elems & 1) throw std::invalid_argument("add_f16 requires an even element count");
   constexpr int threads = 256;
   const int64_t pairs = elems >> 1;
   add_f16_kernel<<<static_cast<int>(ceil_div(pairs, threads)), threads, 0, stream>>>(
@@ -2164,6 +2183,7 @@ void rwkv7_v3a_add_last_layer_norm_f16_launch(
     hipStream_t stream, int B, int T, int C,
     const half* x, const half* residual, const half* weight, const half* bias,
     half* y, float eps) {
+  if (C <= 0 || (C & 1)) throw std::invalid_argument("fused norm requires positive even channels");
   if (C != LN_SMALL_C) {
     add_last_layer_norm_f16_generic_kernel<LN_THREADS><<<B, LN_THREADS, 0, stream>>>(
         x, residual, weight, bias, y, B, T, C, eps);
@@ -2186,6 +2206,7 @@ void rwkv7_v3a_add_layer_norm_cmix_mix_f16_launch(
     const half* x, const half* residual, half* shift_state,
     const half* weight, const half* bias, const half* x_k,
     half* x_out, half* mixed, float eps) {
+  if (C <= 0 || (C & 1)) throw std::invalid_argument("fused norm requires positive even channels");
   if (C == LN_SMALL_C) {
     add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<rows, LN_SMALL_THREADS, 0, stream>>>(
         x, residual, shift_state, weight, bias, x_k, x_out, mixed, rows, eps);
@@ -2203,6 +2224,7 @@ void rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
     const half* x_v, const half* x_a, const half* x_g,
     half* x_out, half* out_r, half* out_w, half* out_k,
     half* out_v, half* out_a, half* out_g, float eps) {
+  if (C <= 0 || (C & 1)) throw std::invalid_argument("fused norm requires positive even channels");
   if (C == LN_SMALL_C) {
     add_layer_norm_tmix_mix6_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<rows, LN_SMALL_THREADS, 0, stream>>>(
         x, residual, shift_state, weight, bias, x_r, x_w, x_k, x_v, x_a, x_g,
@@ -2405,7 +2427,7 @@ void rwkv7_v3a_linear_orig_rows_f16_launch(
   if (row_tile == 16 && out_tile == 1) return linear_orig_rows_launch_impl<16, 1>(stream, M, K, N, x, weight_orig, y);
   if (row_tile == 16 && out_tile == 2) return linear_orig_rows_launch_impl<16, 2>(stream, M, K, N, x, weight_orig, y);
   if (row_tile == 16 && out_tile == 4) return linear_orig_rows_launch_impl<16, 4>(stream, M, K, N, x, weight_orig, y);
-  assert(false && "unsupported linear_orig_rows_f16 row_tile/out_tile");
+  throw std::invalid_argument("unsupported linear_orig_rows_f16 row_tile/out_tile");
 }
 
 void rwkv7_v3a_linear_orig_rows_cfg_f16_launch(
@@ -2431,7 +2453,7 @@ void rwkv7_v3a_linear_orig_rows_cfg_f16_launch(
   if (threads == 96 && row_tile == 3 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<96, 3, 4>(stream, M, K, N, x, weight_orig, y);
   if (threads == 32 && row_tile == 3 && out_tile == 8) return linear_orig_rows_cfg_launch_impl<32, 3, 8>(stream, M, K, N, x, weight_orig, y);
   if (threads == 64 && row_tile == 3 && out_tile == 8) return linear_orig_rows_cfg_launch_impl<64, 3, 8>(stream, M, K, N, x, weight_orig, y);
-  assert(false && "unsupported linear_orig_rows_cfg_f16 threads/row_tile/out_tile");
+  throw std::invalid_argument("unsupported linear_orig_rows_cfg_f16 threads/row_tile/out_tile");
 }
 
 template <int Threads, int OutTile, bool Use4>
@@ -2439,8 +2461,8 @@ void linear_orig_row1_exact_launch_impl(
     hipStream_t stream, int M, int K, int N,
     const half* x, const half* weight_orig, half* y) {
   assert(M == 1);
-  assert((N % OutTile) == 0);
-  assert((K % (Use4 ? 4 : 2)) == 0);
+  if (N <= 0 || K <= 0 || (N % OutTile) || (K % (Use4 ? 4 : 2)))
+    throw std::invalid_argument("exact linear dimensions do not match the selected tile");
   if constexpr (Use4) {
     linear_orig_row1_exact4_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, stream>>>(K, N, x, weight_orig, y);
   } else {
@@ -2453,8 +2475,8 @@ void linear_orig_row2_exact_launch_impl(
     hipStream_t stream, int M, int K, int N,
     const half* x, const half* weight_orig, half* y) {
   assert(M == 2);
-  assert((N % OutTile) == 0);
-  assert((K % (Use4 ? 4 : 2)) == 0);
+  if (N <= 0 || K <= 0 || (N % OutTile) || (K % (Use4 ? 4 : 2)))
+    throw std::invalid_argument("exact linear dimensions do not match the selected tile");
   if constexpr (Use4) {
     linear_orig_row2_exact4_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, stream>>>(K, N, x, weight_orig, y);
   } else {
@@ -2475,7 +2497,7 @@ void rwkv7_v3a_linear_orig_rows_exact_f16_launch(
     if (use4 && threads == 256 && out_tile == 1) return linear_orig_row2_exact_launch_impl<256, 1, true>(stream, M, K, N, x, weight_orig, y);
     if (!use4 && threads == 128 && out_tile == 2) return linear_orig_row2_exact_launch_impl<128, 2, false>(stream, M, K, N, x, weight_orig, y);
   }
-  assert(false && "unsupported linear_orig_rows_exact_f16 rows/threads/out_tile/use4");
+  throw std::invalid_argument("unsupported linear_orig_rows_exact_f16 rows/threads/out_tile/use4");
 }
 
 void rwkv7_v3a_linear_t_act_f16_launch(

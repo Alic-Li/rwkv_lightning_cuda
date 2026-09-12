@@ -11,9 +11,9 @@
 #include <type_traits>
 #include <vector>
 
-#include "rwkv_gpu_runtime.hpp"
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
-#include "rwkv7_fast_v4_common.hpp"
+#include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
 
 namespace rwkv_test {
 
@@ -22,7 +22,7 @@ inline std::filesystem::path repo_root() {
 }
 
 inline std::filesystem::path vocab_path() {
-  return repo_root() / "src" / "rwkv_vocab_v20230424.txt";
+  return repo_root() / "assets" / "rwkv_vocab_v20230424.txt";
 }
 
 inline std::filesystem::path unique_temp_path(const std::string& stem) {

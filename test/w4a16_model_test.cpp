@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "rwkv_quantized.hpp"
-#include "rwkv_server_backend.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
 #include "test_common.hpp"
 
 namespace {

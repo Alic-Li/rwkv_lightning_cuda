@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdexcept>
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -46,6 +47,7 @@ __device__ __forceinline__ float warp_sum_broadcast(float x) {
 }
 
 __device__ __forceinline__ float block_sum_broadcast(float x) {
+  __syncthreads(); // Protect the previous broadcast from the next reduction.
   __shared__ float partial[BLOCK_THREADS / WARP_THREADS];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -222,10 +224,10 @@ __global__ __launch_bounds__(WARP_THREADS, 4) void wkv_fp32_v2_small_warp_kernel
   const int lane = threadIdx.x;
   const int c_base = h * N;
   const int64_t state_base =
-      static_cast<int64_t>(b_id * H + h) * N * N;
+      (static_cast<int64_t>(b_id) * H + h) * N * N;
 
   for (int t = 0; t < T; ++t) {
-    const int token = (b_id * T + t) * C + c_base;
+    const int64_t token = (static_cast<int64_t>(b_id) * T + t) * C + c_base;
     float sa = 0.0f;
     for (int j = lane; j < N; j += WARP_THREADS) {
       sa += state_ptr[state_base + j * N + row] * load_io(a_ptr, token + j);
@@ -235,7 +237,7 @@ __global__ __launch_bounds__(WARP_THREADS, 4) void wkv_fp32_v2_small_warp_kernel
     float yy = 0.0f;
     const float vv = load_io(v_ptr, token + row);
     for (int j = lane; j < N; j += WARP_THREADS) {
-      const int idx = token + j;
+      const int64_t idx = token + j;
       const int64_t state_index = state_base + j * N + row;
       const float s = state_ptr[state_index] * w_eff(load_io(w_ptr, idx)) + vv * load_io(k_ptr, idx) + sa * load_io(b_ptr, idx);
       state_ptr[state_index] = s;
@@ -266,10 +268,10 @@ __global__ __launch_bounds__(BLOCK_THREADS, 4) void wkv_fp32_v2_short_block_kern
   const int tid = threadIdx.x;
   const int c_base = h * N;
   const int64_t state_base =
-      static_cast<int64_t>(b_id * H + h) * N * N;
+      (static_cast<int64_t>(b_id) * H + h) * N * N;
 
   for (int t = 0; t < T; ++t) {
-    const int token = (b_id * T + t) * C + c_base;
+    const int64_t token = (static_cast<int64_t>(b_id) * T + t) * C + c_base;
     float sa = 0.0f;
     for (int j = tid; j < N; j += BLOCK_THREADS) {
       sa += state_ptr[state_base + j * N + row] * load_io(a_ptr, token + j);
@@ -279,7 +281,7 @@ __global__ __launch_bounds__(BLOCK_THREADS, 4) void wkv_fp32_v2_short_block_kern
     float yy = 0.0f;
     const float vv = load_io(v_ptr, token + row);
     for (int j = tid; j < N; j += BLOCK_THREADS) {
-      const int idx = token + j;
+      const int64_t idx = token + j;
       const int64_t state_index = state_base + j * N + row;
       const float s = state_ptr[state_index] * w_eff(load_io(w_ptr, idx)) + vv * load_io(k_ptr, idx) + sa * load_io(b_ptr, idx);
       state_ptr[state_index] = s;
@@ -310,7 +312,8 @@ void rwkv7_wkv_fp32io16_launch(
     const half* a,
     const half* b,
     half* y) {
-  assert(C == H * N);
+  if (B <= 0 || T <= 0 || H <= 0 || C != static_cast<int64_t>(H) * N || B > 65535 || H > 65535)
+    throw std::invalid_argument("invalid WKV dimensions or grid size");
   if (T == 1 && (mode == 2 || (mode == 0 && B == 1))) {
     wkv_fp32_kv_tile_kernel<<<dim3(H, B, N / VALUE_TILE), dim3(WARP_THREADS), 0, stream>>>(
         C,

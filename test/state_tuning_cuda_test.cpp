@@ -1,5 +1,5 @@
-#include "rwkv7_fast_v4_common.hpp"
-#include "rwkv_state_tuning.hpp"
+#include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
+#include "rwkv/runtime/rwkv_state_tuning.hpp"
 #include <array>
 #include <cmath>
 #include <iostream>

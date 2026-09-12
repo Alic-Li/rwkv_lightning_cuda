@@ -1,4 +1,4 @@
-#include "rwkv_state_tuning.hpp"
+#include "rwkv/runtime/rwkv_state_tuning.hpp"
 
 #include <cuda_runtime.h>
 
@@ -12,8 +12,8 @@
 #include <utility>
 #include <vector>
 
-#include "pth_archive.hpp"
-#include "pth_tensor.hpp"
+#include "rwkv/io/pth_archive.hpp"
+#include "rwkv/io/pth_tensor.hpp"
 
 namespace rwkv7_state_tuning {
 namespace {
