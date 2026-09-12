@@ -40,9 +40,11 @@ file(GET_RUNTIME_DEPENDENCIES
   EXECUTABLES "${INPUT_FILE}"
   RESOLVED_DEPENDENCIES_VAR resolved_deps
   UNRESOLVED_DEPENDENCIES_VAR unresolved_deps
-  POST_EXCLUDE_REGEXES
-    "^api-ms-win-"
-    "^ext-ms-win-"
+  DIRECTORIES ${DEPENDENCY_DIRS}
+  PRE_EXCLUDE_REGEXES
+    # Windows API-set contracts are resolved by the OS, not shipped as DLLs.
+    "^api-ms-"
+    "^ext-ms-"
 )
 
 function(should_skip_dep dep out_var)
@@ -95,5 +97,8 @@ file(REMOVE
 
 if(unresolved_deps)
   list(JOIN unresolved_deps ", " unresolved_text)
+  if(STRICT_RUNTIME_DEPS)
+    message(FATAL_ERROR "Unresolved runtime dependencies for ${INPUT_FILE}: ${unresolved_text}")
+  endif()
   message(WARNING "Unresolved runtime dependencies for ${INPUT_FILE}: ${unresolved_text}")
 endif()

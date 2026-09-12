@@ -1,3 +1,9 @@
+## CI / Release
+
+GitHub Actions builds Linux and Windows CUDA packages on PRs and `main`. Push a
+`v*` tag to generate a draft Release with binaries and SHA-256 checksums. See
+[the release guide](docs/releasing.md) for the workflow and package contents.
+
 ## Project layout
 
 The native code is organized by responsibility:

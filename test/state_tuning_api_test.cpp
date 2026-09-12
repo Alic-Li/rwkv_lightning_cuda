@@ -52,14 +52,16 @@ int main() {
       file << "{\"text\":\"hello\\nworld\"}\n";
       file << "{\"text\":\"\\u4f60\\u597d\"}\n";
     }
-    rwkv7_state_tuning::JsonlTextReader reader(dataset.string());
-    std::string text;
-    if (!reader.next(text) || text != "hello\nworld")
-      throw std::runtime_error("JSONL escaped text mismatch");
-    if (!reader.next(text) || text != "你好" || reader.next(text))
-      throw std::runtime_error("JSONL unicode text mismatch");
-    if (rwkv7_state_tuning::count_jsonl_rows(dataset.string()) != 2)
-      throw std::runtime_error("JSONL row count mismatch");
+    {
+      rwkv7_state_tuning::JsonlTextReader reader(dataset.string());
+      std::string text;
+      if (!reader.next(text) || text != "hello\nworld")
+        throw std::runtime_error("JSONL escaped text mismatch");
+      if (!reader.next(text) || text != "你好" || reader.next(text))
+        throw std::runtime_error("JSONL unicode text mismatch");
+      if (rwkv7_state_tuning::count_jsonl_rows(dataset.string()) != 2)
+        throw std::runtime_error("JSONL row count mismatch");
+    }  // Close file handles before deleting the fixture on Windows.
     std::filesystem::remove(dataset);
   } catch (const std::exception &error) {
     std::cerr << "state_tuning_api_test failed: " << error.what() << '\n';

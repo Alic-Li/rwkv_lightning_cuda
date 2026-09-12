@@ -1,0 +1,8 @@
+{
+  "name": "rwkv-lightning-ci",
+  "version-string": "1",
+  "dependencies": [
+    {"name": "drogon", "default-features": false},
+    "sqlite3"
+  ]
+}
