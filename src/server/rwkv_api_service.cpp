@@ -1,4 +1,4 @@
-#include "rwkv_api_service.hpp"
+#include "rwkv/server/rwkv_api_service.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -17,11 +17,11 @@
 
 #include <drogon/drogon.h>
 
-#include "rwkv_inference_engine.hpp"
-#include "rwkv_model_router.hpp"
-#include "rwkv_prefill_admission.hpp"
-#include "rwkv_state_cache.hpp"
-#include "rwkv_uploaded_state_store.hpp"
+#include "rwkv/inference/rwkv_inference_engine.hpp"
+#include "rwkv/server/rwkv_model_router.hpp"
+#include "rwkv/server/rwkv_prefill_admission.hpp"
+#include "rwkv/server/rwkv_state_cache.hpp"
+#include "rwkv/server/rwkv_uploaded_state_store.hpp"
 
 namespace rwkv7_server {
 namespace {

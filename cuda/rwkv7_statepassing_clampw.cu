@@ -1,4 +1,4 @@
-#include "rwkv_state_tuning.hpp"
+#include "rwkv/runtime/rwkv_state_tuning.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

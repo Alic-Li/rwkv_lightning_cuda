@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "rwkv_gpu_runtime.hpp"
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 namespace rwkv_sampling {
 

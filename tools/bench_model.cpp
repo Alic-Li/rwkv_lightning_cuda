@@ -10,7 +10,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "rwkv_server_backend.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
 
 int main(int argc, char** argv) {
   if (argc < 2) {

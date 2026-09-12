@@ -1,7 +1,7 @@
 #include <iostream>
 #include <vector>
 
-#include "rwkv_tokenizer.hpp"
+#include "rwkv/inference/rwkv_tokenizer.hpp"
 #include "test_common.hpp"
 
 int main() {

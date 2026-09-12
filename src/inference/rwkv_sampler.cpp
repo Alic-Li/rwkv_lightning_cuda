@@ -1,10 +1,10 @@
-#include "rwkv_sampler.hpp"
+#include "rwkv/inference/rwkv_sampler.hpp"
 
 #include <chrono>
 #include <random>
 #include <stdexcept>
 
-#include "rwkv_gpu_runtime.hpp"
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #include "utils/sampling.h"
 

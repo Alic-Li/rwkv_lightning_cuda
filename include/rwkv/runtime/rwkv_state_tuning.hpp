@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "rwkv_gpu_runtime.hpp"
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 namespace rwkv7_state_tuning {
 

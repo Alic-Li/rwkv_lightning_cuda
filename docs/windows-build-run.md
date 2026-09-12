@@ -87,13 +87,13 @@ The launcher starts an HTTP control page on `http://127.0.0.1:8088`. On Windows,
 
 ## Complete the runtime bundle
 
-The CMake bundle target copies the backend executable and many vcpkg runtime DLLs into:
+The CMake bundle target copies the backend executable, vocabulary, and detected runtime DLLs into:
 
 ```text
 build_win10_sm86\bundle\rwkv_lighting_cuda
 ```
 
-Copy the CUDA runtime DLLs and vocab file into the bundle:
+If the CUDA runtime DLLs were not discovered automatically on a particular machine, copy them into the bundle manually:
 
 ```powershell
 $bundle = "D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda"
@@ -102,7 +102,6 @@ $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"
 Copy-Item "$cudaBin\cudart64_12.dll" -Destination "$bundle\lib" -Force
 Copy-Item "$cudaBin\cublas64_12.dll" -Destination "$bundle\lib" -Force
 Copy-Item "$cudaBin\cublasLt64_12.dll" -Destination "$bundle\lib" -Force
-Copy-Item "D:\repo\rwkv_lightning_cuda\src\rwkv_vocab_v20230424.txt" -Destination "$bundle\rwkv_vocab_v20230424.txt" -Force
 ```
 
 The expected runtime bundle layout is:

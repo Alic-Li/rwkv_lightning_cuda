@@ -20,12 +20,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "pth_archive.hpp"
-#include "pth_tensor.hpp"
+#include "rwkv/io/pth_archive.hpp"
+#include "rwkv/io/pth_tensor.hpp"
 #include "rwkv_quantized.hpp"
-#include "rwkv_server_backend.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
 #include "rwkv_w4a16.cuh"
-#include "rwkv7_fast_v4_common.hpp"
+#include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
 #include "rwkv7_fast_v4_kernels.cuh"
 
 namespace {

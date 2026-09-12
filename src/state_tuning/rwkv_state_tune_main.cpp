@@ -1,7 +1,7 @@
 #include "dataset.hpp"
-#include "rwkv_server_backend.hpp"
-#include "rwkv_state_tuning.hpp"
-#include "rwkv_tokenizer.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
+#include "rwkv/runtime/rwkv_state_tuning.hpp"
+#include "rwkv/inference/rwkv_tokenizer.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

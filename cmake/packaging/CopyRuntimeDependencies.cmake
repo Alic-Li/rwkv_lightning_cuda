@@ -26,6 +26,16 @@ if(COPY_BINARY)
   file(COPY "${INPUT_FILE}" DESTINATION "${OUTPUT_DIR}")
 endif()
 
+if(DEFINED ASSET_FILES AND NOT ASSET_FILES STREQUAL "")
+  string(REPLACE "|" ";" ASSET_FILES "${ASSET_FILES}")
+  foreach(asset IN LISTS ASSET_FILES)
+    if(NOT EXISTS "${asset}")
+      message(FATAL_ERROR "Bundle asset does not exist: ${asset}")
+    endif()
+    file(COPY "${asset}" DESTINATION "${OUTPUT_DIR}")
+  endforeach()
+endif()
+
 file(GET_RUNTIME_DEPENDENCIES
   EXECUTABLES "${INPUT_FILE}"
   RESOLVED_DEPENDENCIES_VAR resolved_deps

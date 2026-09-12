@@ -6,9 +6,9 @@
 #include <utility>
 #include <vector>
 
-#include "rwkv_sampler.hpp"
-#include "rwkv_server_backend.hpp"
-#include "rwkv_tokenizer.hpp"
+#include "rwkv/inference/rwkv_sampler.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
+#include "rwkv/inference/rwkv_tokenizer.hpp"
 
 namespace rwkv7_server {
 

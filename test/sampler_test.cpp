@@ -1,7 +1,7 @@
 #include <iostream>
 #include <vector>
 
-#include "rwkv_sampler.hpp"
+#include "rwkv/inference/rwkv_sampler.hpp"
 #include "test_common.hpp"
 
 namespace {

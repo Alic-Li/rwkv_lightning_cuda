@@ -15,10 +15,10 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
-#include "pth_archive.hpp"
-#include "pth_tensor.hpp"
-#include "rwkv_server_backend.hpp"
-#include "rwkv7_fast_v4_common.hpp"
+#include "rwkv/io/pth_archive.hpp"
+#include "rwkv/io/pth_tensor.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
+#include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
 #include "rwkv7_fast_v4_kernels.hip.hpp"
 
 namespace {

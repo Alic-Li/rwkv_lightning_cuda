@@ -1,4 +1,4 @@
-#include "rwkv_uploaded_state_store.hpp"
+#include "rwkv/server/rwkv_uploaded_state_store.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -7,8 +7,8 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "pth_archive.hpp"
-#include "pth_tensor.hpp"
+#include "rwkv/io/pth_archive.hpp"
+#include "rwkv/io/pth_tensor.hpp"
 
 namespace rwkv7_server {
 namespace {

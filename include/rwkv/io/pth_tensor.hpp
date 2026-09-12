@@ -4,8 +4,8 @@
 #include <string>
 #include <vector>
 
-#include "pth_archive.hpp"
-#include "status.hpp"
+#include "rwkv/io/pth_archive.hpp"
+#include "rwkv/common/status.hpp"
 
 namespace llm_infer {
 

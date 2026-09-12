@@ -1,4 +1,4 @@
-#include "rwkv_inference_engine.hpp"
+#include "rwkv/inference/rwkv_inference_engine.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -7,7 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "rwkv_gpu_runtime.hpp"
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 namespace rwkv7_server {
 namespace {

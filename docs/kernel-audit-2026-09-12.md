@@ -44,7 +44,7 @@ FP32，按照固定 split 顺序归约；Graph 和独立 workspace 的多 stream
 
 静态检查覆盖仓库的 CUDA kernel 源文件和对应 HIP 文件，重点检查 shared-memory
 生产/消费、异步 copy 等待、warp mask、全局写入归属、向量对齐、尾维度和 launch
-分派。`src/rwkv7_fast_v4.cu` 是模型和调度集成，未定义额外 `__global__` kernel；
+分派。`src/backend/rwkv7_fast_v4.cu` 是模型和调度集成，未定义额外 `__global__` kernel；
 `tools/calibration/bandwidth.cu` 使用 CUDA memcpy，没有自定义计算 kernel。
 
 | 源码类别 | 执行覆盖 |

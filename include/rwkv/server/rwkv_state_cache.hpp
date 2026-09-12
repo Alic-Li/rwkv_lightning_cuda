@@ -10,7 +10,7 @@
 
 #include <sqlite3.h>
 
-#include "rwkv_server_backend.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
 
 namespace rwkv7_server {
 

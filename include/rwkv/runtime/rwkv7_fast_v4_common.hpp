@@ -13,10 +13,10 @@
 #include <utility>
 #include <vector>
 
-#include "rwkv_gpu_runtime.hpp"
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
-#include "pth_archive.hpp"
-#include "pth_tensor.hpp"
+#include "rwkv/io/pth_archive.hpp"
+#include "rwkv/io/pth_tensor.hpp"
 
 namespace rwkv7_fast_v4 {
 

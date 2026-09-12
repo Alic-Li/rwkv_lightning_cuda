@@ -1,4 +1,4 @@
-#include "pth_archive.hpp"
+#include "rwkv/io/pth_archive.hpp"
 
 #include <algorithm>
 #include <cstring>

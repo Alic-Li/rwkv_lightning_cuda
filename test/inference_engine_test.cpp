@@ -4,8 +4,8 @@
 #include <vector>
 
 #include "fake_backend.hpp"
-#include "rwkv_inference_engine.hpp"
-#include "rwkv_tokenizer.hpp"
+#include "rwkv/inference/rwkv_inference_engine.hpp"
+#include "rwkv/inference/rwkv_tokenizer.hpp"
 #include "test_common.hpp"
 
 namespace {

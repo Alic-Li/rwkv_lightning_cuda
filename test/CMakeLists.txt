@@ -5,7 +5,13 @@ set(RWKV_TEST_COMMON_SOURCES
 function(rwkv_add_unit_test target_name source_file)
   add_executable(${target_name} ${source_file})
   target_link_libraries(${target_name} PRIVATE rwkv7_fast_backend_core)
-  target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(${target_name} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/cuda
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/quant/modeling
+    ${PROJECT_SOURCE_DIR}/quant/gemmv
+  )
   target_compile_definitions(${target_name} PRIVATE RWKV_TEST_REPO_ROOT="${PROJECT_SOURCE_DIR}")
   if(MSVC)
     target_compile_options(${target_name} PRIVATE /O2 /utf-8 /EHsc)

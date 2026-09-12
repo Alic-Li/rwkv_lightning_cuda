@@ -1,4 +1,4 @@
-#include "rwkv_prefill_admission.hpp"
+#include "rwkv/server/rwkv_prefill_admission.hpp"
 
 #include <algorithm>
 #include <cstdio>

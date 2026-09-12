@@ -1,4 +1,4 @@
-#include "rwkv_tokenizer.hpp"
+#include "rwkv/inference/rwkv_tokenizer.hpp"
 
 #include "utils/tokenizer.h"
 

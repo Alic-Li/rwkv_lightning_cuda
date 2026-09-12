@@ -1,4 +1,4 @@
-#include "rwkv_state_tuning.hpp"
+#include "rwkv/runtime/rwkv_state_tuning.hpp"
 
 #include <limits>
 #include <stdexcept>

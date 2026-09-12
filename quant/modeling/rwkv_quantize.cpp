@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
-#include "pth_archive.hpp"
-#include "pth_tensor.hpp"
+#include "rwkv/io/pth_archive.hpp"
+#include "rwkv/io/pth_tensor.hpp"
 #include "rwkv_quantized.hpp"
 
 namespace {

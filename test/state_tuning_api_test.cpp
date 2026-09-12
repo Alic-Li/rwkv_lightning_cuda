@@ -1,8 +1,8 @@
 #include "dataset.hpp"
-#include "rwkv_state_tuning.hpp"
+#include "rwkv/runtime/rwkv_state_tuning.hpp"
 
-#include "pth_archive.hpp"
-#include "pth_tensor.hpp"
+#include "rwkv/io/pth_archive.hpp"
+#include "rwkv/io/pth_tensor.hpp"
 
 #include <filesystem>
 #include <fstream>

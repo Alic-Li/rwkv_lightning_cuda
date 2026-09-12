@@ -1,11 +1,11 @@
-#include "rwkv_model_router.hpp"
+#include "rwkv/server/rwkv_model_router.hpp"
 
 #include <algorithm>
 #include <stdexcept>
 
-#include "rwkv_inference_engine.hpp"
-#include "rwkv_server_backend.hpp"
-#include "rwkv_tokenizer.hpp"
+#include "rwkv/inference/rwkv_inference_engine.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
+#include "rwkv/inference/rwkv_tokenizer.hpp"
 
 namespace rwkv7_server {
 

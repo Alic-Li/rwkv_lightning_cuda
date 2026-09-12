@@ -7,10 +7,10 @@
 #include <string>
 #include <vector>
 
-#include "rwkv_gpu_runtime.hpp"
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
-#include "rwkv7_fast_v4_common.hpp"
-#include "rwkv_state_tuning.hpp"
+#include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
+#include "rwkv/runtime/rwkv_state_tuning.hpp"
 
 namespace rwkv7_server {
 

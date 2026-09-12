@@ -16,13 +16,13 @@
 
 #include <drogon/drogon.h>
 
-#include "rwkv_api_service.hpp"
-#include "rwkv_inference_engine.hpp"
-#include "rwkv_model_router.hpp"
-#include "rwkv_server_backend.hpp"
-#include "rwkv_state_cache.hpp"
-#include "rwkv_tokenizer.hpp"
-#include "rwkv_uploaded_state_store.hpp"
+#include "rwkv/server/rwkv_api_service.hpp"
+#include "rwkv/inference/rwkv_inference_engine.hpp"
+#include "rwkv/server/rwkv_model_router.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
+#include "rwkv/server/rwkv_state_cache.hpp"
+#include "rwkv/inference/rwkv_tokenizer.hpp"
+#include "rwkv/server/rwkv_uploaded_state_store.hpp"
 
 namespace {
 

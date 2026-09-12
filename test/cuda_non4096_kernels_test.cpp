@@ -4,7 +4,7 @@
 #include <iostream>
 #include <vector>
 
-#include "rwkv_gpu_runtime.hpp"
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #ifdef RWKV_USE_HIP
 #include "rwkv7_fast_v4_kernels.hip.hpp"

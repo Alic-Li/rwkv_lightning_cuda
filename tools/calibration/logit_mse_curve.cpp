@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
-#include "rwkv_server_backend.hpp"
-#include "rwkv_tokenizer.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
+#include "rwkv/inference/rwkv_tokenizer.hpp"
 
 namespace {
 
