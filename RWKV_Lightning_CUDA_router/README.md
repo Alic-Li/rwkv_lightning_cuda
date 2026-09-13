@@ -36,9 +36,10 @@ Transport failures mark only the affected backend unavailable for
 `failure_cooldown_seconds`; HTTP error responses are forwarded and do not mark a
 backend unhealthy because they may be valid request errors.
 
-`/state/*` requests with a `session_id` get a best-effort in-memory affinity entry
-for the lifetime of the router process. Do not place stateful traffic behind a
-router restart unless the state store is shared by all backends.
+`/state/*` requests with a `session_id` in the body or an `X-RWKV-Session-Id` header
+get a best-effort in-memory affinity entry for the lifetime of the router
+process. Do not place stateful traffic behind a router restart unless the state
+store is shared by all backends.
 
 `/v1/state/upload`, `/v1/state/list`, and `/v1/state/delete` are sent concurrently
 to every configured backend, and the router waits for every response. An upload
