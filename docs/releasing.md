@@ -98,3 +98,18 @@ artifacts and releases. You can run the Python script locally on Linux/Windows
 with CUDA in `CUDA_PATH`, the pinned vcpkg checkout in `third_party/vcpkg`, Go,
 Bun (run `bun install --frozen-lockfile` and `bun run build` in the launcher first),
 CMake, Ninja and the platform compiler available (MSVC developer shell on Windows).
+
+## Recover from GitHub API failures
+
+The publisher (`tools/ci/publish_release.py`) retries transient API failures up to
+five times with backoff. Tag and draft creation re-check server state before each
+retry, so a successful create with a lost response can resume. Release notes are
+generated separately; if that service fails, a short fallback description is used.
+Assets are uploaded individually with retries, and the release remains a draft if
+any upload fails. Already published releases are never overwritten.
+
+After changing the workflow or publisher, push the fix to `main` (or run the
+workflow on that updated commit). Re-running an old failed run uses its original
+workflow/code, not this fix. An unpublished version such as `1.4.1` can keep its
+current `VERSION`; no tag/draft deletion is required. A persistent GitHub outage
+can still exhaust retries; retry the updated run once GitHub recovers.

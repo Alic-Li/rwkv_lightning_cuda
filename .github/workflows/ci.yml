@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Test release recovery
+        run: python3 -m unittest discover -s tools/ci -p 'test_*.py'
       - name: Read and validate VERSION
         id: version
         env:
@@ -43,13 +45,7 @@ jobs:
             push:refs/heads/main|workflow_dispatch:refs/heads/main)
               # A missing release or an interrupted draft should be completed.
               # A published release means this VERSION has already shipped.
-              if gh release view "$tag" --json isDraft > release.json 2>/dev/null; then
-                if [[ "$(jq -r '.isDraft' release.json)" == "true" ]]; then
-                  should_release=true
-                fi
-              else
-                should_release=true
-              fi
+              should_release="$(RELEASE_TAG="$tag" python3 tools/ci/publish_release.py --check)"
               ;;
           esac
 
@@ -177,20 +173,5 @@ jobs:
           sed -i 's/\r$//' -- *.sha256
           sha256sum --check *.sha256
 
-          if ! git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
-            gh api --method POST "repos/$GH_REPO/git/refs" \
-              -f ref="refs/tags/$RELEASE_TAG" \
-              -f sha="$GITHUB_SHA" > /dev/null
-          fi
-
-          if gh release view "$RELEASE_TAG" --json isDraft > release.json 2>/dev/null; then
-            if [[ "$(jq -r '.isDraft' release.json)" != "true" ]]; then
-              echo "Release $RELEASE_TAG is already published; refusing to replace it" >&2
-              exit 1
-            fi
-            echo "Resuming existing draft release $RELEASE_TAG"
-          else
-            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
-          fi
-          gh release upload "$RELEASE_TAG" ./*.zip ./*.tar.gz ./*.sha256 --clobber
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+          cd ..
+          python3 tools/ci/publish_release.py
