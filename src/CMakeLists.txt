@@ -16,6 +16,7 @@ set(RWKV_CORE_HOST_SOURCES
 if(RWKV_GPU_BACKEND STREQUAL "HIP")
   set(RWKV_CORE_GPU_SOURCES
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_fast_v4.hip
+    ${PROJECT_SOURCE_DIR}/hip/rwkv_quantized.hip
     ${PROJECT_SOURCE_DIR}/hip/sampling.hip
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_v3a_ops.hip
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_fast_ops_fp16.hip

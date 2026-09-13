@@ -1,0 +1,12 @@
+# Run from the repository root with Magpie on PYTHONPATH:
+# python -m Magpie analyze -k hip/quantized-magpie.yaml --no-perf --output-dir build-hip/quant-validation/magpie
+kernel:
+  id: rwkv_w4_w8_hip
+  type: hip
+  source_files:
+    - hip/rwkv_quantized.hip
+  working_dir: .
+  compile_command: cmake --build build-hip -j 4
+  testcase_command: [ctest, --test-dir, build-hip, -R, 'w4a16|w8a16|quantized_hip_model', --output-on-failure, --no-tests=error]
+  env:
+    HIP_VISIBLE_DEVICES: '0'

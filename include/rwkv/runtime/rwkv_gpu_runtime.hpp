@@ -6,6 +6,15 @@
 
 using cudaError_t = hipError_t;
 using cudaStream_t = hipStream_t;
+using cudaGraph_t = hipGraph_t;
+using cudaGraphExec_t = hipGraphExec_t;
+#define cudaStreamBeginCapture hipStreamBeginCapture
+#define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#define cudaGraphInstantiate hipGraphInstantiate
+#define cudaGraphLaunch hipGraphLaunch
+#define cudaGraphDestroy hipGraphDestroy
+#define cudaGraphExecDestroy hipGraphExecDestroy
 constexpr auto cudaSuccess = hipSuccess;
 constexpr auto cudaMemcpyHostToDevice = hipMemcpyHostToDevice;
 constexpr auto cudaMemcpyDeviceToHost = hipMemcpyDeviceToHost;

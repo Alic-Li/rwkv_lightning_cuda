@@ -46,7 +46,9 @@ Successful short training runs do not establish full-model PyTorch gradient
 alignment or long-run convergence. BF16 WKV I/O is compiled; the numerical
 regression uses FP16 I/O, which is also the model runtime training format.
 
-The separate quantized GEMV implementations under `quant/gemmv` and their
-W8A16/W4A16 GPU tests remain CUDA-only; they are not part of this FP16/BF16
-state-tuning path. HIP model loading currently accepts BF16 PTH weights and
-converts them to FP16 runtime tensors.
+HIP inference now accepts W4A16/W8A16 `.rwkvq` archives as well as BF16 PTH
+weights. Quantized projection weights remain compressed on device; gfx1100
+uses vectorized GEMV and native RDNA3 WMMA with FP32 accumulation. See
+[quantized inference and W7900 validation](QUANTIZATION.md) for formats, tests,
+commands and measured limitations. State tuning still requires FP16/BF16 frozen
+weights and rejects quantized projections.

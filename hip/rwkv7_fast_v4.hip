@@ -20,6 +20,9 @@
 #include "rwkv/runtime/rwkv_server_backend.hpp"
 #include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
 #include "rwkv7_fast_v4_kernels.hip.hpp"
+#include "rwkv_quantized.hpp"
+#include "rwkv_w4a16.cuh"
+#include "rwkv_w8a16.cuh"
 
 namespace {
 
@@ -704,6 +707,215 @@ HipWeights load_model_weights(
   return weights;
 }
 
+void build_cpu_emb_ln0_f16_quantized(
+    HipWeights& weights,
+    const ModelDims& dims,
+    const llm_infer::QuantizedArchive& archive) {
+  const auto* emb = archive.find("emb.weight");
+  const auto* ln0_w = archive.find("blocks.0.ln0.weight");
+  const auto* ln0_b = archive.find("blocks.0.ln0.bias");
+  if (!emb || !ln0_w || !ln0_b) {
+    std::cerr << "error: quantized model is missing emb/ln0 tensors\n";
+    std::exit(1);
+  }
+  if (emb->dtype != llm_infer::QuantizedDType::kBFloat16 ||
+      ln0_w->dtype != llm_infer::QuantizedDType::kBFloat16 ||
+      ln0_b->dtype != llm_infer::QuantizedDType::kBFloat16) {
+    std::cerr << "error: emb/ln0 tensors must remain floating point in quantized model\n";
+    std::exit(1);
+  }
+  const std::size_t elems = static_cast<std::size_t>(dims.vocab) * dims.channels;
+  std::vector<std::uint8_t> emb_data, w_data, b_data;
+  require_result(archive.read_data(*emb, &emb_data).ok_status(), "read quantized emb");
+  require_result(archive.read_data(*ln0_w, &w_data).ok_status(), "read quantized ln0 weight");
+  require_result(archive.read_data(*ln0_b, &b_data).ok_status(), "read quantized ln0 bias");
+  if (emb_data.size() != elems * 2 || w_data.size() != static_cast<std::size_t>(dims.channels) * 2 ||
+      b_data.size() != static_cast<std::size_t>(dims.channels) * 2) {
+    std::cerr << "error: quantized emb/ln0 shape mismatch\n";
+    std::exit(1);
+  }
+  DeviceBuffer<std::uint16_t> gpu_emb, gpu_w, gpu_b, gpu_out;
+  gpu_emb.resize(elems, "alloc quantized emb");
+  gpu_w.resize(dims.channels, "alloc quantized ln0 weight");
+  gpu_b.resize(dims.channels, "alloc quantized ln0 bias");
+  gpu_out.resize(elems, "alloc quantized emb output");
+  check_hip(hipMemcpy(gpu_emb.p, emb_data.data(), emb_data.size(), hipMemcpyHostToDevice), "copy quantized emb");
+  check_hip(hipMemcpy(gpu_w.p, w_data.data(), w_data.size(), hipMemcpyHostToDevice), "copy quantized ln0 weight");
+  check_hip(hipMemcpy(gpu_b.p, b_data.data(), b_data.size(), hipMemcpyHostToDevice), "copy quantized ln0 bias");
+  if (emb->dtype == llm_infer::QuantizedDType::kBFloat16) {
+    rwkv7_v4_emb_ln0_bf16_to_f16_launch(nullptr, dims.vocab, dims.channels,
+                                         gpu_emb.p, gpu_w.p, gpu_b.p, gpu_out.p, kLnEps);
+  } else {
+    std::cerr << "error: float16 emb preprocessing is not supported\n";
+    std::exit(1);
+  }
+  check_hip(hipGetLastError(), "launch quantized emb+ln0 preprocess");
+  weights.cpu_emb_ln0_f16.resize(elems);
+  check_hip(hipMemcpy(weights.cpu_emb_ln0_f16.data(), gpu_out.p, elems * sizeof(std::uint16_t),
+                        hipMemcpyDeviceToHost), "copy quantized emb+ln0");
+  check_hip(hipDeviceSynchronize(), "sync quantized emb+ln0 preprocess");
+  weights.cpu_emb_bytes = weights.cpu_emb_ln0_f16.size() * sizeof(std::uint16_t);
+}
+
+
+ModelDims infer_quantized_model_dims(const llm_infer::QuantizedArchive& archive) {
+  ModelDims dimensions;
+  for (const auto& rec : archive.records()) {
+    if (rec.name == "emb.weight" && rec.shape.size() == 2) {
+      dimensions.vocab = static_cast<int>(rec.shape[0]);
+      dimensions.channels = static_cast<int>(rec.shape[1]);
+    } else if (rec.name == "blocks.0.att.r_k" && rec.shape.size() == 2) {
+      dimensions.heads = static_cast<int>(rec.shape[0]);
+      dimensions.head_size = static_cast<int>(rec.shape[1]);
+    } else if (rec.name == "blocks.0.ffn.key.weight" && rec.shape.size() == 2) {
+      dimensions.ffn = static_cast<int>(rec.shape[0]);
+    }
+    if (rec.name.rfind("blocks.", 0) == 0) {
+      const char* begin = rec.name.c_str() + 7;
+      char* end = nullptr;
+      const long layer = std::strtol(begin, &end, 10);
+      if (end && *end == '.' && layer >= 0) {
+        dimensions.layers = std::max(dimensions.layers, static_cast<int>(layer) + 1);
+      }
+    }
+  }
+  require_result(dimensions.layers > 0 && dimensions.channels > 0 && dimensions.heads > 0 &&
+                     dimensions.head_size > 0 && dimensions.vocab > 0 && dimensions.ffn > 0,
+                 "could not infer model dimensions from quantized model");
+  require_result(dimensions.channels == dimensions.heads * dimensions.head_size, "C must equal H*N");
+  require_result(dimensions.head_size == 64, "current kernels require head size 64");
+  return dimensions;
+}
+
+void load_quantized_tensor(
+    const llm_infer::QuantizedArchive& archive,
+    const llm_infer::QuantizedTensorRecord& rec,
+    GpuTensor* tensor) {
+  std::vector<std::uint8_t> data;
+  require_result(archive.read_data(rec, &data).ok_status(), "read quantized tensor " + rec.name);
+  if (rec.dtype == llm_infer::QuantizedDType::kInt4) {
+    require_result(rec.shape.size() == 2, "INT4 weight must be rank-2: " + rec.name);
+    tensor->dtype = GpuTensor::DType::I4;
+    tensor->quant_group_size = rec.quant_group_size;
+    tensor->i4.resize(data.size(), "alloc int4 weight");
+    tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int4 scales");
+    std::vector<std::uint16_t> scales;
+    require_result(archive.read_scales(rec, &scales).ok_status(), "read INT4 scales");
+    check_hip(hipMemcpy(tensor->i4.p, data.data(), data.size(), hipMemcpyHostToDevice),
+               "copy int4 weight");
+    check_hip(hipMemcpy(tensor->scale.p, scales.data(), scales.size() * sizeof(std::uint16_t),
+                          hipMemcpyHostToDevice), "copy int4 scales");
+    return;
+  }
+  if (rec.dtype == llm_infer::QuantizedDType::kInt8) {
+    tensor->dtype = GpuTensor::DType::I8;
+    tensor->i8.resize(static_cast<std::size_t>(rec.numel), "alloc int8 weight");
+    tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int8 scales");
+    std::vector<std::uint16_t> scales;
+    require_result(archive.read_scales(rec, &scales).ok_status(), "read quantized scales");
+    require_result(rec.shape.size() == 2, "INT8 weight must be rank-2: " + rec.name);
+    check_hip(hipMemcpy(tensor->i8.p, data.data(), data.size(), hipMemcpyHostToDevice), "copy raw NK int8");
+    check_hip(hipMemcpy(tensor->scale.p, scales.data(), scales.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice),
+               "copy int8 scales");
+    return;
+  }
+  tensor->dtype = GpuTensor::DType::F16;
+  tensor->f16.resize(static_cast<std::size_t>(rec.numel), "alloc floating weight");
+  DeviceBuffer<std::uint16_t> staging;
+  staging.resize(static_cast<std::size_t>(rec.numel), "alloc quantized staging");
+  check_hip(hipMemcpy(staging.p, data.data(), data.size(), hipMemcpyHostToDevice), "copy floating weight");
+  const bool transpose = should_transpose_like_v3a(rec.name);
+  if (rec.dtype == llm_infer::QuantizedDType::kFloat16 && transpose) {
+    rwkv7_v4_f16_transpose_launch(nullptr, staging.p, tensor->f16.p,
+                                   static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
+  } else if (rec.dtype == llm_infer::QuantizedDType::kFloat16) {
+    check_hip(hipMemcpy(tensor->f16.p, staging.p, data.size(), hipMemcpyDeviceToDevice),
+               "copy quantized f16 weight");
+  } else if (transpose) {
+    rwkv7_v4_bf16_to_f16_transpose_launch(nullptr, staging.p, tensor->f16.p,
+                                           static_cast<int>(rec.shape[0]), static_cast<int>(rec.shape[1]));
+  } else {
+    rwkv7_v4_bf16_to_f16_launch(nullptr, staging.p, tensor->f16.p, static_cast<long long>(rec.numel));
+  }
+  check_hip(hipGetLastError(), "preprocess quantized floating weight");
+  check_hip(hipDeviceSynchronize(), "sync quantized floating weight");
+}
+
+HipWeights load_quantized_model_weights(
+    const ModelDims& dims,
+    const llm_infer::QuantizedArchive& archive) {
+  HipWeights weights;
+  weights.dims = dims;
+  std::unordered_map<std::string, const llm_infer::QuantizedTensorRecord*> by_name;
+  for (const auto& rec : archive.records()) by_name.emplace(rec.name, &rec);
+  auto allocate = [&](const std::string& key, bool required) {
+    const auto it = by_name.find(key);
+    if (it == by_name.end()) {
+      if (required) {
+        std::cerr << "error: quantized model missing tensor: " << key << "\n";
+        std::exit(1);
+      }
+      return;
+    }
+    const auto& rec = *it->second;
+    if (rec.dtype == llm_infer::QuantizedDType::kInt4 || rec.dtype == llm_infer::QuantizedDType::kInt8) {
+      const bool linear = key == "head.weight" ||
+          ends_with(key, "att.receptance.weight") || ends_with(key, "att.key.weight") ||
+          ends_with(key, "att.value.weight") || ends_with(key, "att.output.weight") ||
+          ends_with(key, "ffn.key.weight") || ends_with(key, "ffn.value.weight");
+      if (!linear || rec.shape.size() != 2)
+        throw std::runtime_error("HIP quantization is only supported for projection matrices: " + key);
+    }
+    auto tensor = std::make_unique<GpuTensor>();
+    tensor->name = rec.name;
+    tensor->shape = rec.shape;
+    if (rec.dtype != llm_infer::QuantizedDType::kInt4 && rec.dtype != llm_infer::QuantizedDType::kInt8 && should_transpose_like_v3a(rec.name)) {
+      tensor->shape = {rec.shape[1], rec.shape[0]};
+    }
+    tensor->dtype = rec.dtype == llm_infer::QuantizedDType::kInt8
+                        ? GpuTensor::DType::I8
+                        : rec.dtype == llm_infer::QuantizedDType::kInt4
+                              ? GpuTensor::DType::I4
+                              : GpuTensor::DType::F16;
+    if (tensor->is_int8()) {
+      tensor->i8.resize(static_cast<std::size_t>(rec.numel), "alloc int8 tensor");
+      tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int8 tensor scales");
+    } else if (tensor->is_int4()) {
+      const std::size_t rows = static_cast<std::size_t>(rec.shape[0]);
+      const std::size_t cols = static_cast<std::size_t>(rec.shape[1]);
+      tensor->i4.resize(rows * (cols / 2 + cols % 2), "alloc int4 tensor");
+      tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int4 tensor scales");
+      tensor->quant_group_size = rec.quant_group_size;
+    } else {
+      tensor->f16.resize(static_cast<std::size_t>(rec.numel), "alloc quantized f16 tensor");
+    }
+    weights.tensors.emplace(key, std::move(tensor));
+  };
+  auto upload = [&](const std::string& key) {
+    const auto it = by_name.find(key);
+    if (it == by_name.end()) {
+      std::cerr << "error: quantized model missing tensor during upload: " << key << "\n";
+      std::exit(1);
+    }
+    load_quantized_tensor(archive, *it->second, weights.require_mutable(key));
+  };
+  for (const char* key : {"ln_out.weight", "ln_out.bias", "head.weight"}) allocate(key, true);
+  for (const char* key : {"ln_out.weight", "ln_out.bias", "head.weight"}) upload(key);
+  for (int layer = 0; layer < dims.layers; ++layer) {
+    for_each_layer_source_tensor(layer, [&](const std::string& key) { allocate(key, true); });
+    for_each_layer_source_tensor(layer, upload);
+    for_each_layer_t_copy(layer, [&](const std::string& key) { weights.allocate_t_copy(key); });
+    for_each_layer_t_copy(layer, [&](const std::string& key) { weights.launch_t_copy(key); });
+    check_hip(hipDeviceSynchronize(), "sync quantized layer load");
+    weights.layers.push_back(weights.layer_view(layer));
+  }
+  weights.build_global_view();
+  build_cpu_emb_ln0_f16_quantized(weights, dims, archive);
+  std::cout << "load_model quantized done tensors=" << weights.tensors.size()
+            << " gpu_mib=" << mib(weights.bytes()) << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << "\n";
+  return weights;
+}
+
 enum class LinearGroup {
   AttC2C,
   FfnKey,
@@ -962,6 +1174,22 @@ void linear_orig_layout_launch(
   rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
 }
 
+void linear_weight_launch(hipStream_t stream, const PathConfig& path, LinearGroup group,
+                          int M, int K, int N, const half* x, const GpuTensor* w,
+                          void* workspace, std::size_t bytes, half* y) {
+  if (w->is_quantized() && (w->shape.size() != 2 || w->shape[0] != N || w->shape[1] != K))
+    throw std::runtime_error("quantized projection shape mismatch: " + w->name);
+  if (w->is_int4()) {
+    rwkv7_w4a16_linear_launch(stream, M, K, N, x, w->i4.p,
+        reinterpret_cast<const half*>(w->scale.p), y, w->quant_group_size, workspace, bytes);
+  } else if (w->is_int8()) {
+    rwkv7_w8a16_linear_launch(stream, M, K, N, x, w->i8.p,
+        reinterpret_cast<const half*>(w->scale.p), W8BLayout::NK, y, workspace, bytes);
+  } else {
+    linear_orig_layout_launch(stream, path, group, M, K, N, x, hp(w), workspace, bytes, y);
+  }
+}
+
 void linear_rank_in_launch(
     hipStream_t stream,
     int rows,
@@ -1028,6 +1256,11 @@ std::string basename_without_extension(const std::string& path) {
 }
 
 HipWeights load_backend_weights(const std::string& model_path, bool chunk_load) {
+  if (llm_infer::is_quantized_archive(model_path)) {
+    auto archive = llm_infer::QuantizedArchive::open(model_path);
+    require_result(archive.ok(), archive.status().message());
+    return load_quantized_model_weights(infer_quantized_model_dims(archive.value()), archive.value());
+  }
   std::cout << "load_model mode=" << (chunk_load ? "chunked" : "whole-file");
   if (chunk_load) {
     std::cout << " chunk_mib=" << mib(kWeightLoadChunkBytes)
@@ -1214,9 +1447,9 @@ void run_backend_forward(
       pre_mix_ready = false;
     }
 
-    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xr, hp(w.att_receptance_w), lt_workspace.p, lt_workspace.n, r);
-    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xk, hp(w.att_key_w), lt_workspace.p, lt_workspace.n, k);
-    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xv, hp(w.att_value_w), lt_workspace.p, lt_workspace.n, v_base);
+    linear_weight_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xr, w.att_receptance_w, lt_workspace.p, lt_workspace.n, r);
+    linear_weight_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xk, w.att_key_w, lt_workspace.p, lt_workspace.n, k);
+    linear_weight_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xv, w.att_value_w, lt_workspace.p, lt_workspace.n, v_base);
     half* v_use = v_base;
     bool v_done = false;
 
@@ -1277,7 +1510,7 @@ void run_backend_forward(
     }
 
     rwkv7_tmix_lnx_rkvres_xg_launch(stream, B, T, C, H, y, r, k2, v_use, hp(w.att_r_k), hp(w.att_ln_x_w), hp(w.att_ln_x_b), g, y2);
-    linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, hp(w.att_output_w), lt_workspace.p, lt_workspace.n, att_out);
+    linear_weight_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, w.att_output_w, lt_workspace.p, lt_workspace.n, att_out);
     if (T == 1) {
       rwkv7_v3a_add_layer_norm_cmix_mix_f16_launch(
           stream, rows, C, x_cur, att_out, shift1, hp(w.ln2_w), hp(w.ln2_b), hp(w.ffn_x_k), x_after_att, mixed, kLnEps);
@@ -1287,8 +1520,12 @@ void run_backend_forward(
       rwkv7_cmix_mix_launch(stream, B, T, C, ln2_out, shift1, hp(w.ffn_x_k), mixed);
     }
 
-    linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, F, mixed, hp(w.ffn_key_w), lt_workspace.p, lt_workspace.n, hid);
-    if (path.cmix == CmixMode::NoFcOne) {
+    linear_weight_launch(stream, path, LinearGroup::FfnKey, rows, C, F, mixed, w.ffn_key_w, lt_workspace.p, lt_workspace.n, hid);
+    if (w.ffn_value_w->is_quantized()) {
+      rwkv7_relu_square_launch(stream, hid, hid, static_cast<long long>(rows) * F);
+      linear_weight_launch(stream, path, LinearGroup::AttC2C, rows, F, C, hid,
+                           w.ffn_value_w, lt_workspace.p, lt_workspace.n, cmix_out);
+    } else if (path.cmix == CmixMode::NoFcOne) {
       rwkv7_cmix_sparse_down_relu_one_launch(stream, C, F, hid, hp(w.ffn_value_w), cmix_out);
     } else if (path.cmix == CmixMode::NoFcRows2) {
       if (rows >= 8) {
@@ -1328,7 +1565,7 @@ void run_backend_forward(
   head_path.rows = output_rows;
   head_path.use_batched_rkv = false;
   head_path.cmix = CmixMode::Dense;
-  linear_orig_layout_launch(
+  linear_weight_launch(
       stream,
       head_path,
       LinearGroup::Head,
@@ -1336,7 +1573,7 @@ void run_backend_forward(
       C,
       V,
       final_x,
-      hp(weights.head_w),
+      weights.head_w,
       lt_workspace.p,
       lt_workspace.n,
       logits_f16);

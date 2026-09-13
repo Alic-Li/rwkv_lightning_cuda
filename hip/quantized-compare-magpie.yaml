@@ -1,0 +1,23 @@
+# Run sequentially so variants never contend for the same GPU:
+# python -m Magpie --workers 1 compare -k hip/quantized-compare-magpie.yaml --output-dir build-hip/quant-validation/magpie
+# prof_command saves unprofiled HIP-event timings to each variant's timings.csv.
+# Magpie's JSON omits custom stdout; consult those CSVs, not its winner field.
+# Magpie's
+# custom_profiling_complete flag is NOT a latency metric or a speed ranking.
+kernels:
+  - id: scalar_baseline
+    type: hip
+    source_files: [hip/rwkv_quantized.hip]
+    working_dir: .
+    compile_command: [bash, tools/check_quantized_hip.sh, scalar, build]
+    testcase_command: [bash, tools/check_quantized_hip.sh, scalar, test]
+    prof_command: [bash, tools/check_quantized_hip.sh, scalar, bench]
+    env: {HIP_VISIBLE_DEVICES: '0'}
+  - id: gfx1100_wmma
+    type: hip
+    source_files: [hip/rwkv_quantized.hip]
+    working_dir: .
+    compile_command: [bash, tools/check_quantized_hip.sh, wmma, build]
+    testcase_command: [bash, tools/check_quantized_hip.sh, wmma, test]
+    prof_command: [bash, tools/check_quantized_hip.sh, wmma, bench]
+    env: {HIP_VISIBLE_DEVICES: '0'}

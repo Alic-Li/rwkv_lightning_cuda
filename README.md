@@ -1,10 +1,11 @@
 <div align="center">
   <img src="assets/banner.png" alt="RWKV Lightning CUDA — Inference · State Tuning · Quantization · Web UI" width="820">
 
-  [![CI and Release](https://github.com/No-22-Github/rwkv_lightning_cuda/actions/workflows/ci.yml/badge.svg)](https://github.com/No-22-Github/rwkv_lightning_cuda/actions/workflows/ci.yml)
+  [![CI and Release](https://github.com/Alic-Li/rwkv_lightning_cuda/actions/workflows/ci.yml/badge.svg)](https://github.com/Alic-Li/rwkv_lightning_cuda/actions/workflows/ci.yml)
   ![C++ 20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
   ![CUDA](https://img.shields.io/badge/CUDA-12.9%20%C2%B7%2013.2-76B900?logo=nvidia&logoColor=white)
-  [![Release](https://img.shields.io/github/v/tag/No-22-Github/rwkv_lightning_cuda?sort=semver&label=release)](https://github.com/No-22-Github/rwkv_lightning_cuda/releases)
+  ![ROCm](https://img.shields.io/badge/ROCm-7.2.5-ed1c24?logo=amd&logoColor=white&style=flat&height=20)
+  [![Release](https://img.shields.io/github/v/tag/Alic-Li/rwkv_lightning_cuda?sort=semver&label=release)](https://github.com/Alic-Li/rwkv_lightning_cuda/releases)
 </div>
 
 # RWKV Lightning CUDA

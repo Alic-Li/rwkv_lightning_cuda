@@ -1,6 +1,8 @@
-# CUDA W8A16 and W4A16 quantization
+# W8A16 and W4A16 quantization
 
-This directory contains the CUDA W8A16 and W4A16 implementations used by the backend. The
+This directory contains the shared archive format and CUDA W8A16/W4A16 implementations.
+The HIP implementation is in `hip/rwkv_quantized.hip`; see
+[W7900 migration and validation](../hip/QUANTIZATION.md). The
 `rwkv_quantize` tool converts a BF16 RWKV checkpoint into a streaming `.rwkvq`
 archive. Linear tensors use either per-output-channel symmetric INT8 or grouped
 symmetric INT4; embeddings, layer norms, LoRA factors, and other non-linear
@@ -19,9 +21,14 @@ device and use W8A16 GEMV/GEMM for attention projections, FFN projections, and
 the output head. Runtime tuning selects split-K and batched kernel variants per
 GPU/model shape and persists the result in the `--tune-cache` file. INT4 tensors
 use the W4A16 GEMV/Tensor Core path and shape-based split-K selection. HIP builds
-continue to use the BF16/PTH path.
+also detect these archives and retain compressed weights on device. HIP uses raw
+NK weights, vectorized decode and gfx1100 WMMA prefill with deterministic split-K;
+CUDA PackedNK and CUDA tuning caches are not used by HIP.
 
 ## Measured result
+
+The following measurements are for CUDA; W7900 measurements are recorded separately
+in the [HIP validation report](../hip/QUANTIZATION.md).
 
 The final measurement used an NVIDIA GeForce RTX 4060 Ti 16 GB (`sm_89`) with
 the RWKV7 G1J 7.2B, context-16K model. Decode timing used independent random

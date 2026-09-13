@@ -1,7 +1,6 @@
 #pragma once
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #include <cstddef>
 #include <cstdint>

@@ -1,6 +1,7 @@
-#include <cuda_runtime.h>
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #include <cstdint>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -32,7 +33,8 @@ int main(int argc, char** argv) {
     model->forward_prefill({{0}}, state, logits);
     model->forward_decode({0}, state, logits);
     std::vector<float> host(static_cast<std::size_t>(logits.rows) * logits.vocab_size);
-    cudaMemcpy(host.data(), logits.values.p, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    rwkv7_fast_v4::check_cuda(cudaMemcpy(host.data(), logits.values.p, host.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy smoke logits");
+    for (float value : host) if (!std::isfinite(value)) throw std::runtime_error("nonfinite smoke logits");
     std::size_t best = 0;
     for (std::size_t i = 1; i < host.size(); ++i) if (host[i] > host[best]) best = i;
     std::cout << "quantized smoke ok rows=" << logits.rows << " vocab=" << logits.vocab_size

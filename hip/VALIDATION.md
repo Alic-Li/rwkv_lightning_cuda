@@ -1,5 +1,8 @@
 # HIP migration validation
 
+This file records the earlier FP16/state-tuning migration. W4A16/W8A16 were
+subsequently migrated and validated separately: [quantized inference report](QUANTIZATION.md).
+
 Validated locally on gfx1100 with ROCm HIP 7.2.53211-9999.
 
 Guidance: AMD [magpie-kernel-evaluator](https://github.com/amd/skills/tree/6916fb371d1cba40757b223cf16b4cd4912b202f/skills/magpie-kernel-evaluator).

@@ -1,4 +1,4 @@
-#include <cuda_runtime.h>
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #include <cmath>
 #include <cstdint>
