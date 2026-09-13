@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdio>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -391,7 +392,90 @@ bool check_password(
   return false;
 }
 
-std::string state_id_from_request(const Json::Value& body);
+constexpr const char* kSessionIdHeader = "X-RWKV-Session-Id";
+constexpr const char* kStateIdHeader = "X-RWKV-State-Id";
+
+std::string trim(const std::string& input) {
+  const auto begin = input.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos) {
+    return {};
+  }
+  const auto end = input.find_last_not_of(" \t\r\n");
+  return input.substr(begin, end - begin + 1);
+}
+
+// Reads a request header under both the documented and the all-lowercase wire
+// name, mirroring bearer_token(); older drogon builds look headers up
+// verbatim instead of case-insensitively.
+std::string request_header_value(const HttpRequestPtr& req, const char* name) {
+  auto value = req->getHeader(name);
+  if (!value.empty()) {
+    return value;
+  }
+  std::string lower(name);
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return req->getHeader(lower);
+}
+
+std::string state_id_from_body(const Json::Value& body) {
+  if (!body.isMember("state_id") || body["state_id"].isNull()) {
+    return {};
+  }
+  if (!body["state_id"].isString()) {
+    throw std::runtime_error("state_id must be a string");
+  }
+  return body["state_id"].asString();
+}
+
+std::string session_id_from_body(const Json::Value& body) {
+  return body.get("session_id", "").asString();
+}
+
+// Resolves an identifier that may arrive through several channels (JSON body,
+// request header, query string). Repeating the same value across channels is
+// harmless; conflicting values are ambiguous, so the request fails instead of
+// silently picking one.
+std::string resolve_identifier(
+    std::initializer_list<std::pair<std::string, std::string>> channels,
+    const std::string& field) {
+  std::string value;
+  std::string used;
+  for (const auto& channel : channels) {
+    const std::string current = trim(channel.second);
+    if (current.empty()) {
+      continue;
+    }
+    if (!used.empty()) {
+      if (current == value) {
+        continue;
+      }
+      throw std::runtime_error(
+          field + " has conflicting values in " + used + " and " +
+          channel.first + "; use only one of them");
+    }
+    used = channel.first;
+    value = current;
+  }
+  return value;
+}
+
+std::string session_id_from_request(const HttpRequestPtr& req, const Json::Value& body) {
+  return resolve_identifier(
+      {{"request body", session_id_from_body(body)},
+       {std::string(kSessionIdHeader) + " header",
+        request_header_value(req, kSessionIdHeader)}},
+      "session_id");
+}
+
+std::string state_id_from_request(const HttpRequestPtr& req, const Json::Value& body) {
+  return resolve_identifier(
+      {{"request body", state_id_from_body(body)},
+       {std::string(kStateIdHeader) + " header",
+        request_header_value(req, kStateIdHeader)}},
+      "state_id");
+}
 
 Json::Value uploaded_state_json(const UploadedStateInfo& info) {
   Json::Value item;
@@ -479,10 +563,12 @@ void register_uploaded_state_routes(
           return;
         }
         try {
-          std::string state_id = state_id_from_request(body);
-          if (state_id.empty()) {
-            state_id = req->getParameter("state_id");
-          }
+          std::string state_id = resolve_identifier(
+              {{"request body", state_id_from_body(body)},
+               {std::string(kStateIdHeader) + " header",
+                request_header_value(req, kStateIdHeader)},
+               {"query string", req->getParameter("state_id")}},
+              "state_id");
           if (state_id.empty()) {
             cb(json_response(make_error("Missing state_id"), k400BadRequest));
             return;
@@ -601,16 +687,6 @@ std::vector<std::string> parse_contents(const Json::Value& body) {
     }
   }
   return prompts;
-}
-
-std::string state_id_from_request(const Json::Value& body) {
-  if (!body.isMember("state_id") || body["state_id"].isNull()) {
-    return {};
-  }
-  if (!body["state_id"].isString()) {
-    throw std::runtime_error("state_id must be a string");
-  }
-  return body["state_id"].asString();
 }
 
 GenerationState create_request_state(
@@ -965,7 +1041,7 @@ void register_api_routes_legacy(
   app.registerPostHandlingAdvice([](const HttpRequestPtr&, const HttpResponsePtr& resp) {
     resp->addHeader("Access-Control-Allow-Origin", "*");
     resp->addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    resp->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    resp->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RWKV-Session-Id, X-RWKV-State-Id");
   });
 
   auto handle_options = [](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
@@ -1198,7 +1274,7 @@ void register_api_routes_legacy(
         }
         std::string state_id;
         try {
-          state_id = state_id_from_request(*json);
+          state_id = state_id_from_request(req, *json);
         } catch (const std::exception& error) {
           cb(json_response(make_error(error.what()), k400BadRequest));
           return;
@@ -1341,7 +1417,7 @@ void register_api_routes_legacy(
         }
         std::string state_id;
         try {
-          state_id = state_id_from_request(*json);
+          state_id = state_id_from_request(req, *json);
         } catch (const std::exception& error) {
           cb(json_response(make_error(error.what()), k400BadRequest));
           return;
@@ -1417,10 +1493,16 @@ void register_api_routes_legacy(
           return;
         }
 
-        const auto session_id = (*json).get("session_id", "").asString();
+        std::string session_id;
+        try {
+          session_id = session_id_from_request(req, *json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
         std::string state_id;
         try {
-          state_id = state_id_from_request(*json);
+          state_id = state_id_from_request(req, *json);
         } catch (const std::exception& error) {
           cb(json_response(make_error(error.what()), k400BadRequest));
           return;
@@ -1585,7 +1667,13 @@ void register_api_routes_legacy(
           return;
         }
 
-        const auto session_id = (*json).get("session_id", "").asString();
+        std::string session_id;
+        try {
+          session_id = session_id_from_request(req, *json);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
         if (session_id.empty()) {
           cb(json_response(make_error("Missing session_id"), k400BadRequest));
           return;
@@ -1615,7 +1703,7 @@ void register_api_routes_legacy(
 
         std::string state_id;
         try {
-          state_id = state_id_from_request(*json);
+          state_id = state_id_from_request(req, *json);
         } catch (const std::exception& error) {
           cb(json_response(make_error(error.what()), k400BadRequest));
           return;
@@ -1792,7 +1880,7 @@ void register_api_routes(
   app.registerPostHandlingAdvice([](const HttpRequestPtr&, const HttpResponsePtr& resp) {
     resp->addHeader("Access-Control-Allow-Origin", "*");
     resp->addHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    resp->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    resp->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RWKV-Session-Id, X-RWKV-State-Id");
   });
   const auto options_handler = [](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& cb) {
     auto resp = HttpResponse::newHttpResponse();
@@ -1861,7 +1949,7 @@ void register_api_routes(
     try {
       auto lease = std::make_shared<ModelRouter::Lease>(models.acquire());
       auto& engine = lease->engine();
-      const std::string state_id = state_id_from_request(*json);
+      const std::string state_id = state_id_from_request(req, *json);
       const std::string model = engine.model_name();
       const auto prompts = batch
           ? parse_contents(*json)

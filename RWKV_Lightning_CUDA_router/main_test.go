@@ -23,10 +23,30 @@ func TestBatchSize(t *testing.T) {
 		{"/v1/models", `{"contents":["a","b"]}`, 1},
 	}
 	for _, tt := range tests {
-		got, _ := batchSize(tt.path, []byte(tt.body))
+		got, _ := batchSize(httptest.NewRequest(http.MethodPost, tt.path, nil), []byte(tt.body))
 		if got != tt.want {
 			t.Errorf("%s: got %d, want %d", tt.path, got, tt.want)
 		}
+	}
+}
+
+func TestBatchSizeSessionHeaderFallback(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/state/chat/completions", nil)
+	req.Header.Set("X-RWKV-Session-Id", "session-header")
+	if _, got := batchSize(req, []byte(`{"contents":["a"]}`)); got != "session-header" {
+		t.Fatalf("header fallback got %q", got)
+	}
+	if _, got := batchSize(req, []byte(`{"contents":["a"],"session_id":"session-body"}`)); got != "session-body" {
+		t.Fatalf("body session alone got %q", got)
+	}
+	reqWithout := httptest.NewRequest(http.MethodPost, "/state/chat/completions", nil)
+	if _, got := batchSize(reqWithout, []byte(`{"contents":["a"]}`)); got != "" {
+		t.Fatalf("no channel got %q", got)
+	}
+	other := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	other.Header.Set("X-RWKV-Session-Id", "session-header")
+	if _, got := batchSize(other, nil); got != "" {
+		t.Fatalf("non-affinity path must not read session headers, got %q", got)
 	}
 }
 
@@ -74,6 +94,66 @@ func TestStateIDFromBody(t *testing.T) {
 	}
 	if got := stateIDFromBody("/v1/state/upload", []byte(`{"state_id":"ignored"}`)); got != "" {
 		t.Fatalf("multipart upload body should not be parsed, got %q", got)
+	}
+}
+
+func TestRequestStateID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/batch/completions?state_id=state-query", nil)
+	if got := requestStateID(req, []byte(`{}`)); got != "state-query" {
+		t.Fatalf("query fallback got %q", got)
+	}
+	req.URL.RawQuery = ""
+	req.Header.Set("X-RWKV-State-Id", "state-header")
+	if got := requestStateID(req, []byte(`{}`)); got != "state-header" {
+		t.Fatalf("header fallback got %q", got)
+	}
+	if got := requestStateID(req, []byte(`{"state_id":"state-body"}`)); got != "state-body" {
+		t.Fatalf("body alone got %q", got)
+	}
+	upload := httptest.NewRequest(http.MethodPost, "/v1/state/upload", nil)
+	upload.Header.Set("X-RWKV-State-Id", "state-header")
+	if got := requestStateID(upload, nil); got != "" {
+		t.Fatalf("upload must not read state ids, got %q", got)
+	}
+}
+
+func TestProxySessionHeaderAffinity(t *testing.T) {
+	var mu sync.Mutex
+	requests := map[string]int{}
+	newBackend := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requests[name]++
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		}))
+	}
+	serverA, serverB := newBackend("a"), newBackend("b")
+	defer serverA.Close()
+	defer serverB.Close()
+	urlA, _ := url.Parse(serverA.URL)
+	urlB, _ := url.Parse(serverB.URL)
+	p := &proxy{
+		scheduler: &scheduler{
+			backends: []*backend{{name: "a", baseURL: urlA, weight: 1}, {name: "b", baseURL: urlB, weight: 1}},
+			sessions: map[string]*backend{},
+		},
+		client: serverA.Client(),
+	}
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/state/chat/completions", strings.NewReader(`{"contents":["hi"]}`))
+		req.Header.Set("X-RWKV-Session-Id", "session-header")
+		resp := httptest.NewRecorder()
+		p.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("request %d returned %d", i, resp.Code)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests["a"] != 2 || requests["b"] != 0 {
+		t.Fatalf("header session was not pinned to one backend: %+v", requests)
 	}
 }
 

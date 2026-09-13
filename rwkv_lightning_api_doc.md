@@ -286,6 +286,10 @@ curl -X POST 'http://127.0.0.1:8000/translate/v1/batch-translate' \
 
 ### 8. Stateful completion
 
+`session_id` 既可以在 JSON 请求体中提供，也可以通过 `X-RWKV-Session-Id` 请求头传递
+（适用于 `/state/chat/completions` 与 `/state/delete`）。同一请求中两者给出互相冲突的
+值会返回 HTTP `400`，重复相同值则接受；服务不会静默选择其中一个。
+
 state manager 使用三级缓存：
 
 - L1：VRAM，默认最多 16 个 state；

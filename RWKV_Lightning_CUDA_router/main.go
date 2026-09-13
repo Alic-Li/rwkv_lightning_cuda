@@ -175,11 +175,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveSynchronizedState(w, r, body)
 		return
 	}
-	bsz, session := batchSize(r.URL.Path, body)
-	stateID := stateIDFromBody(r.URL.Path, body)
-	if stateID == "" {
-		stateID = r.URL.Query().Get("state_id")
-	}
+	bsz, session := batchSize(r, body)
+	stateID := requestStateID(r, body)
 	b, release, err := p.scheduler.acquire(bsz, session, stateID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -333,6 +330,20 @@ func stateIDFromBody(path string, body []byte) string {
 	return payload.StateID
 }
 
+func requestStateID(r *http.Request, body []byte) string {
+	if r.URL.Path == "/v1/state/upload" {
+		return ""
+	}
+	stateID := stateIDFromBody(r.URL.Path, body)
+	if stateID == "" {
+		stateID = r.URL.Query().Get("state_id")
+	}
+	if stateID == "" {
+		stateID = strings.TrimSpace(r.Header.Get("X-RWKV-State-Id"))
+	}
+	return stateID
+}
+
 type flushingWriter struct{ http.ResponseWriter }
 
 func (w flushingWriter) Write(p []byte) (int, error) {
@@ -361,8 +372,13 @@ func (p *proxy) readBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-func batchSize(path string, body []byte) (int64, string) {
-	if !strings.HasPrefix(path, "/state/") && !strings.Contains(path, "completion") && !strings.Contains(path, "translate") && !strings.Contains(path, "FIM") && !strings.Contains(path, "big_batch") {
+func usesSessionAffinity(path string) bool {
+	return strings.HasPrefix(path, "/state/") || strings.Contains(path, "completion") || strings.Contains(path, "translate") || strings.Contains(path, "FIM") || strings.Contains(path, "big_batch")
+}
+
+func batchSize(r *http.Request, body []byte) (int64, string) {
+	path := r.URL.Path
+	if !usesSessionAffinity(path) {
 		return 1, ""
 	}
 	var payload map[string]json.RawMessage
@@ -372,6 +388,9 @@ func batchSize(path string, body []byte) (int64, string) {
 	session := ""
 	if raw := payload["session_id"]; raw != nil {
 		_ = json.Unmarshal(raw, &session)
+	}
+	if session == "" {
+		session = strings.TrimSpace(r.Header.Get("X-RWKV-Session-Id"))
 	}
 	for _, key := range []string{"contents", "text_list", "prompts", "inputs"} {
 		var values []json.RawMessage
