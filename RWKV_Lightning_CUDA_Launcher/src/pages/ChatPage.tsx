@@ -16,7 +16,8 @@ import { useChat, type ChatMessage } from "../stores/chat";
 import { useRuntime } from "../stores/runtime";
 import { useSettings } from "../stores/settings";
 import { GenerationSettings } from "../components/GenerationSettings";
-import { CopyButton } from "../components/common";
+import { StateManager } from "../components/StateManager";
+import { CopyButton, Dialog } from "../components/common";
 const Message = memo(function Message({ message }: { message: ChatMessage }) {
   return (
     <article className={`message ${message.role}`}>
@@ -52,6 +53,8 @@ export function ChatPage() {
   const { conversations, selected, active, send, stop } = useChat();
   const conversation = conversations.find((c) => c.id === selected);
   const [text, setText] = useState("");
+  const [statesOpen, setStatesOpen] = useState(false);
+  const setValues = useSettings((s) => s.set);
   const [settings, setSettings] = useState(false);
   const runtime = useRuntime((s) => s.runtime);
   const baseURL = useSettings((s) => s.values.baseURL);
@@ -132,6 +135,11 @@ export function ChatPage() {
           )}
         </div>
       </div>
+      {statesOpen && (
+        <Dialog title="Server states" onClose={() => setStatesOpen(false)}>
+          <StateManager key={baseURL} />
+        </Dialog>
+      )}
       <div className="composer-wrap">
         <form
           className="composer"
@@ -175,6 +183,29 @@ export function ChatPage() {
               <SlidersHorizontal size={14} />
               <span>T {generation.temperature}</span>
             </button>
+            <button
+              type="button"
+              className="state-chip"
+              title={generation.state_id || "Manage server states"}
+              onClick={() => setStatesOpen(true)}
+            >
+              State: {generation.state_id || "None"}
+            </button>
+            <label className="thinking-toggle">
+              <input
+                type="checkbox"
+                checked={!["fast", "none"].includes(generation.think_type)}
+                onChange={(e) =>
+                  setValues({
+                    generation: {
+                      ...generation,
+                      think_type: e.target.checked ? "free" : "fast",
+                    },
+                  })
+                }
+              />
+              Thinking
+            </label>
             <div className="spacer" />
             {conversation?.messages.some((m) => m.role === "user") &&
               !active && (

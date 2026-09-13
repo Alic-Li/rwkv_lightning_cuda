@@ -37,3 +37,7 @@ RWKV_Lightning_CUDA_router/rwkv_router.exe
 # CI dependency cache and release packages
 .vcpkg-cache/
 dist/
+
+# Keep the launcher web assets versioned, including new hashed filenames.
+!RWKV_Lightning_CUDA_Launcher/dist/
+!RWKV_Lightning_CUDA_Launcher/dist/**

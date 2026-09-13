@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Build and package CUDA releases on GitHub's Linux/Windows x64 runners."""
 import hashlib
-import json
 import os
 from pathlib import Path
 import platform
@@ -45,7 +44,7 @@ def main():
     version = package_version()
     cuda_tag = "cuda" + ".".join(os.environ.get("CUDA_VERSION", "12.9.0").split(".")[:2])
     name = f"rwkv-lightning-{version}-{'windows' if WINDOWS else 'linux'}-x64-{cuda_tag}"
-    bundle = BUILD / "release" / name
+    bundle = BUILD / "bundle" / "rwkv_lighting_cuda"
     if bundle.exists():
         shutil.rmtree(bundle)
     bundle.mkdir(parents=True)
@@ -108,24 +107,8 @@ def main():
     run("go", "build", "-trimpath", "-ldflags=-s -w", "-o",
         bundle / ("rwkv_launcher" + SUFFIX), "main.go",
         cwd=ROOT / "RWKV_Lightning_CUDA_Launcher")
-    run("go", "build", "-trimpath", "-ldflags=-s -w", "-o",
-        bundle / ("rwkv_router" + SUFFIX), ".",
-        cwd=ROOT / "RWKV_Lightning_CUDA_router")
+    shutil.copytree(ROOT / "RWKV_Lightning_CUDA_Launcher/dist", bundle / "dist")
     shutil.copy2(ROOT / "assets/rwkv_vocab_v20230424.txt", bundle)
-    shutil.copy2(ROOT / "RWKV_Lightning_CUDA_router/config.example.toml",
-                 bundle / "router.config.example.toml")
-    shutil.copy2(ROOT / "docs/releasing.md", bundle / "RELEASING.md")
-    shutil.copy2(ROOT / "README.md", bundle)
-    (bundle / "BUILD-INFO.json").write_text(json.dumps({
-        "version": version,
-        "commit": os.environ.get("GITHUB_SHA", "local"),
-        "ref": os.environ.get("GITHUB_REF", "local"),
-        "cuda": os.environ.get("CUDA_VERSION", "12.9.0"),
-        "architectures": ARCHS.split(";"),
-        "runner": platform.platform(),
-        "cpu_tests": list(CPU_TESTS),
-        "gpu_tests_run": False,
-    }, indent=2) + "\n", encoding="utf-8")
     # Check relocated CLIs with a clean library path, without loading a model.
     smoke_env = os.environ.copy()
     smoke_env.pop("LD_LIBRARY_PATH", None)
@@ -137,7 +120,7 @@ def main():
     dist = ROOT / "dist"
     dist.mkdir(exist_ok=True)
     archive = Path(shutil.make_archive(str(dist / name), "zip" if WINDOWS else "gztar",
-                                       root_dir=bundle.parent, base_dir=name))
+                                       root_dir=bundle.parent, base_dir=bundle.name))
     with archive.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     # Write bytes so Windows does not translate the LF to CRLF. GNU

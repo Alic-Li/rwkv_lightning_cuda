@@ -150,3 +150,68 @@ it("renders every workspace route without a client render exception", async () =
     expect(html).not.toContain("dangerouslySetInnerHTML");
   }
 });
+
+it("sends the selected initial state and explicit thinking mode with chat history", async () => {
+  const requests: Record<string, unknown>[] = [];
+  fetchSpy.mockImplementation(async (url, init) => {
+    expect(String(url)).toBe("/v1/chat/completions");
+    requests.push(JSON.parse(String(init?.body)));
+    return output("answer");
+  });
+  useSettings.getState().set({
+    generation: {
+      ...useSettings.getState().values.generation,
+      state_id: "roleplay.pth",
+    },
+  });
+  await useChat.getState().send("Hello");
+  expect(requests[0].state_id).toBe("roleplay.pth");
+  expect(requests[0].think_type).toBe("fast");
+  useSettings.getState().set({
+    generation: {
+      ...useSettings.getState().values.generation,
+      think_type: "free",
+    },
+  });
+  await useChat.getState().send("Continue");
+  expect(requests[1].think_type).toBe("free");
+  expect(requests[1].messages).toEqual([
+    { role: "user", content: "Hello" },
+    { role: "assistant", content: "answer" },
+    { role: "user", content: "Continue" },
+  ]);
+});
+
+it("uploads multipart states and authenticates list/delete requests", async () => {
+  const { RWKVClient } = await import("../src/lib/api/client");
+  const client = new RWKVClient("http://backend/", "secret");
+  const calls: { url: string; init?: RequestInit }[] = [];
+  fetchSpy.mockImplementation(async (url, init) => {
+    calls.push({ url: String(url), init });
+    return Response.json({ state_id: "test.pth", data: [], deleted: true });
+  });
+  await client.uploadState(new File(["checkpoint"], "test.pth"));
+  await client.listStates();
+  await client.deleteState("test.pth");
+  expect(calls.map((c) => c.url)).toEqual([
+    "http://backend/v1/state/upload",
+    "http://backend/v1/state/list",
+    "http://backend/v1/state/delete",
+  ]);
+  expect(calls[0].init?.body).toBeInstanceOf(FormData);
+  expect((calls[0].init?.body as FormData).get("file")).toBeInstanceOf(File);
+  expect(new Headers(calls[0].init?.headers).has("Content-Type")).toBe(false);
+  for (const call of calls)
+    expect(new Headers(call.init?.headers).get("Authorization")).toBe(
+      "Bearer secret",
+    );
+  expect(JSON.parse(String(calls[2].init?.body))).toEqual({
+    state_id: "test.pth",
+  });
+  fetchSpy.mockImplementation(
+    async () => new Response("invalid checkpoint", { status: 400 }),
+  );
+  await expect(
+    client.uploadState(new File(["bad"], "bad.pth")),
+  ).rejects.toThrow("invalid checkpoint");
+});

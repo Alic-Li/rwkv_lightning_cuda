@@ -18,6 +18,13 @@ export async function request<T>(
     throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   return response.json() as Promise<T>;
 }
+export interface UploadedState {
+  state_id: string;
+  filename: string;
+  size_bytes: number;
+  tensor_count: number;
+  created: number;
+}
 export class RWKVClient {
   constructor(
     public baseURL = "",
@@ -60,6 +67,37 @@ export class RWKVClient {
       `${this.baseURL.replace(/\/$/, "")}/v1/chat/completions`,
       body,
       signal,
+      this.key,
+    );
+  }
+  listStates(signal?: AbortSignal) {
+    return request<{ data: UploadedState[] }>(
+      `${this.baseURL.replace(/\/$/, "")}/v1/state/list`,
+      undefined,
+      signal,
+      this.key,
+    );
+  }
+  async uploadState(file: File) {
+    const body = new FormData();
+    body.append("file", file);
+    const response = await fetch(
+      `${this.baseURL.replace(/\/$/, "")}/v1/state/upload`,
+      {
+        method: "POST",
+        headers: this.key ? { Authorization: `Bearer ${this.key}` } : {},
+        body,
+      },
+    );
+    if (!response.ok)
+      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    return response.json() as Promise<UploadedState>;
+  }
+  deleteState(state_id: string) {
+    return request<{ state_id: string; deleted: boolean }>(
+      `${this.baseURL.replace(/\/$/, "")}/v1/state/delete`,
+      { state_id },
+      undefined,
       this.key,
     );
   }

@@ -1127,3 +1127,29 @@ kbd {
 .window-footer {
   font-size: 10px;
 }
+
+.composer-tools {
+  flex-wrap: wrap;
+}
+.composer-tools .state-chip {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thinking-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+}
+.thinking-toggle input {
+  width: auto;
+  margin: 0;
+}
+.state-manager {
+  overflow-wrap: anywhere;
+}
+.state-manager > .panel {
+  margin-top: 12px;
+}

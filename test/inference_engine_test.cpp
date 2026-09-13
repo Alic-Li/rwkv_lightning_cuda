@@ -69,7 +69,7 @@ int main() {
             "SYS",
             {{"User", "Q1"}, {"Assistant", "A1"}, {"User", "Q2"}},
             false),
-        std::string("System: SYS\n\nUser: Q1\n\nAssistant: A1\n\nUser: Q2\n\nAssistant: <think>\n</think"));
+        std::string("System: SYS\n\nUser: Q1\n\nAssistant: A1\n\nUser: Q2\n\nAssistant: <think></think"));
     TEST_EQ(
         engine.format_openai_prompt("SYS", {{"User", "Q"}}, true),
         std::string("System: SYS\n\nUser: Q\n\nAssistant: <think"));

@@ -36,7 +36,7 @@ Windows release 中位于可执行文件旁的 DLL 也应保留；旧 Launcher �
 
 运行 `./rwkv_launcher`（Windows 为 `./rwkv_launcher.exe`），访问 **http://127.0.0.1:8088**。程序默认打开系统浏览器；设置 `RWKV_LAUNCHER_NO_BROWSER=1` 可禁用自动打开。
 
-`dist/` 是纯静态输出，使用 `//go:embed dist/*` 编入 Go 二进制。生产环境不需要 Bun 或 Node.js。仓库中保留生成的 `dist/`，因此现有 release 脚本的 `go build ... main.go` 仍可使用；修改前端后必须重新执行 `bun run build`，将源码、锁文件和更新后的 `dist/` 一起提交。
+`dist/` 是纯静态输出，使用 `//go:embed dist/*` 编入 Go 二进制。生产环境不需要 Bun 或 Node.js。仓库中保留生成的 `dist/`，CI 会使用锁文件重新安装依赖、测试并构建前端，再编译 Go 并将 `dist/` 放入发布目录；修改前端后必须重新执行 `bun run build`，将源码、锁文件和更新后的 `dist/` 一起提交。
 
 路由使用 `/#/chat`、`/#/translate`、`/#/state-tuning`、`/#/runtime`、`/#/settings`，无需服务端 SPA fallback。不要用 `file://` 打开 `dist/index.html`。
 
@@ -68,6 +68,17 @@ Vite 将 `/api`、`/v1` 和 `/logs` 转发到 `127.0.0.1:8088`。生产流量直
 ## 与当前原生代码的兼容说明
 
 事实来源为仓库 `README.md`、`rwkv_lightning_api_doc.md`、`src/server/rwkv_api_service.cpp`、`src/app/rwkv_fast_server.cpp`、`src/state_tuning/rwkv_state_tune_main.cpp` 和 `dataset.cpp`。
+
+### Chat 初始化 state 与思考
+
+Chat 输入框的 State 按钮可以上传 `.pth`、刷新和查看服务端 state 列表（ID、大小、tensor 数和上传时间）、选择初始 state，以及确认删除。上传成功后自动选中，删除当前选中的 state 后恢复默认初始化。请求携带所选 `state_id`，服务端从该 state 初始化，再处理完整会话历史。state 属于当前服务进程，重启后需要重新上传。
+
+Chat 仍调用 `/v1/chat/completions`，服务端内部执行 batch 生成。默认 `think_type=fast`，输入框 Thinking 开关开启后使用 `free`，实际单轮格式如下（末尾故意不补 `>`）：
+
+```text
+快思考：User: {用户输入}\n\nAssistant: <think></think
+启用思考：User: {用户输入}\n\nAssistant: <think
+```
 
 ### 原始翻译续写
 

@@ -38,17 +38,33 @@ HIP/ROCm and ARM builds are not included in this workflow.
 
 ## Package contents and use
 
-Each archive contains the server (`rwkv_lighting_cuda`, preserving its existing
-spelling), launcher, quantizer, state-tuning CLI, router, example router config,
-vocabulary, runtime libraries and `BUILD-INFO.json`. Models are not included.
+Each archive contains a single `rwkv_lighting_cuda/` directory, staged at
+`build/bundle/rwkv_lighting_cuda/`:
+
+```text
+rwkv_lighting_cuda/
+├── dist/
+│   ├── assets/
+│   └── index.html
+├── lib/                  # Linux runtime dependencies
+├── rwkv_launcher
+├── rwkv_lighting_cuda
+├── rwkv_quantize
+├── rwkv_state_tune
+└── rwkv_vocab_v20230424.txt
+```
+
+CI installs frontend dependencies from `bun.lock`, runs lint/tests, and rebuilds
+`dist/` before compiling the launcher. The same frontend is embedded in the Go
+executable and copied into the archive. Asset hashes and library names vary with
+the build and CUDA version; they are not hardcoded. Windows executables use `.exe`
+and runtime DLLs sit beside them. Models and the optional router are not included.
 
 Extract the whole directory, change into it, and run `rwkv_launcher` (Windows:
 `rwkv_launcher.exe`). The launcher uses the included vocabulary by default.
-Windows DLLs are beside the executables; Linux libraries are in `lib/` and resolved
-using the executables' origin-relative RPATH. The router is a separate optional
-process; start it with `rwkv_router --config router.config.example.toml` after
-editing that example. Pass `--vocab ./rwkv_vocab_v20230424.txt` when using the
-state-tuning CLI (its compiled default points to the build machine's source tree).
+Linux libraries are resolved using the executables' origin-relative RPATH.
+Pass `--vocab ./rwkv_vocab_v20230424.txt` when using the state-tuning CLI
+(its compiled default points to the build machine's source tree).
 
 The target machine needs an NVIDIA driver compatible with the CUDA version of the
 package (12.9 or 13.2) and its GPU. Linux packages require glibc 2.35 or newer.
@@ -74,11 +90,11 @@ runtime dependencies and runs each relocated C++ CLI's `--help` as a smoke check
 
 Hosted runners have no CUDA GPU. Kernel correctness, inference, GPU state tuning
 and performance still require validation on a GPU before publishing; CI does not
-claim these tests passed. `BUILD-INFO.json` records this limitation alongside the
-source commit and compiled architectures. CTest logs are uploaded even on failure.
+claim these tests passed. CTest logs are uploaded even on failure.
 
 Implementation: `tools/ci/build_release.py` builds/tests/packages both platforms;
 `tools/ci/vcpkg.json` lists dependencies; the workflow handles provisioning, caching,
 artifacts and releases. You can run the Python script locally on Linux/Windows
 with CUDA in `CUDA_PATH`, the pinned vcpkg checkout in `third_party/vcpkg`, Go,
+Bun (run `bun install --frozen-lockfile` and `bun run build` in the launcher first),
 CMake, Ninja and the platform compiler available (MSVC developer shell on Windows).
