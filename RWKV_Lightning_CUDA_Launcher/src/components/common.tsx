@@ -63,11 +63,13 @@ export function PathField({
   value,
   onChange,
   placeholder,
+  directory = false,
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
+  directory?: boolean;
 }) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -88,7 +90,9 @@ export function PathField({
               setBusy(true);
               setError("");
               try {
-                const { path } = await launcher.pickFile();
+                const { path } = directory
+                  ? await launcher.pickDirectory()
+                  : await launcher.pickFile();
                 if (path) onChange(path);
               } catch (e) {
                 setError(String(e));

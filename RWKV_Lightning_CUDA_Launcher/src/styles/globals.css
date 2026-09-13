@@ -1,6 +1,6 @@
 :root {
   font-family: Inter, "Segoe UI", system-ui, sans-serif;
-  font-size: 13px;
+  font-size: 14px;
   font-synthesis: none;
   color: var(--text);
   background: var(--bg);
@@ -41,6 +41,27 @@
 }
 * {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--accent) 55%, var(--border))
+    transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  min-height: 34px;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 48%, var(--surface-elevated));
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent) 72%, var(--surface-elevated));
+  background-clip: padding-box;
 }
 body {
   margin: 0;
@@ -360,6 +381,12 @@ fieldset {
   color: var(--text-secondary);
   font-size: 12px;
 }
+.inline-warning {
+  margin: 4px 0 10px;
+  color: var(--warning);
+  font-size: 13px;
+  line-height: 1.6;
+}
 details > summary {
   display: flex;
   align-items: center;
@@ -547,6 +574,105 @@ progress::-moz-progress-bar {
   display: block;
   padding: 15px 0;
   overflow-wrap: anywhere;
+}
+.tuning-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.tuning-overview > div {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 9px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  color: var(--text-muted);
+}
+.tuning-overview > div.ready {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 28%, var(--border));
+}
+.tuning-overview svg {
+  grid-row: span 2;
+  margin-top: 2px;
+}
+.tuning-overview span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.tuning-overview strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 12px;
+}
+.preset-grid button {
+  justify-content: flex-start;
+  min-height: 58px;
+  padding: 11px 13px;
+  text-align: left;
+}
+.preset-grid button > span {
+  display: grid;
+  gap: 3px;
+}
+.preset-grid small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.training-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 16px;
+}
+.training-summary > div {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg) 56%, transparent);
+}
+.training-summary span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.training-summary strong {
+  font-size: 15px;
+  font-weight: 550;
+}
+.command-preview {
+  margin-bottom: 18px;
+  padding: 0 18px 15px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 58%, transparent);
+}
+.command-preview pre {
+  max-height: 180px;
+  margin: 4px 0 10px;
+}
+@media (max-width: 900px) {
+  .tuning-overview,
+  .preset-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 560px) {
+  .tuning-overview,
+  .preset-grid,
+  .training-summary {
+    grid-template-columns: 1fr;
+  }
 }
 .settings-page {
   max-width: 940px;

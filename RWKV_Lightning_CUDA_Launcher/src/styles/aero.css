@@ -627,7 +627,7 @@ kbd {
   color: var(--text-muted);
 }
 .translate-page {
-  max-width: 1500px;
+  max-width: 1640px;
 }
 .translation-bar {
   display: flex;
@@ -638,11 +638,15 @@ kbd {
 }
 .translation-bar .field {
   margin: 0;
-  max-width: 190px;
+  width: min(250px, 28vw);
+  max-width: 250px;
 }
-.translation-bar > svg {
-  margin-top: 20px;
-  color: var(--text-muted);
+.language-swap {
+  align-self: flex-end;
+  width: 38px;
+  padding: 6px;
+  margin-bottom: 1px;
+  color: var(--accent);
 }
 .translation-bar > button {
   align-self: flex-end;
@@ -655,7 +659,12 @@ kbd {
   width: 110px;
 }
 .translate-options .field > span:first-child {
-  font-size: 10px;
+  font-size: 12px;
+}
+.line-chunk-note {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 .translate-columns {
   display: grid;
@@ -688,20 +697,21 @@ kbd {
   text-align: right;
 }
 .editor-panel > textarea {
-  height: 420px;
+  height: 560px;
   flex: 1;
-  min-height: 320px;
+  min-height: 460px;
   border: 0;
   background: transparent;
   padding: 20px;
-  font-size: 13px;
+  font-size: 15px;
+  line-height: 1.85;
   resize: vertical;
 }
 .translation-preview {
-  height: 370px;
+  height: 510px;
   overflow: auto;
   padding: 20px;
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.85;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -710,7 +720,7 @@ kbd {
 .translation-chunk {
   display: flex;
   gap: 12px;
-  margin-bottom: 20px;
+  margin-bottom: 24px;
   content-visibility: auto;
   contain-intrinsic-size: auto 120px;
 }
@@ -719,7 +729,7 @@ kbd {
   min-width: 0;
 }
 .chunk-number {
-  font: 9px monospace;
+  font: 11px monospace;
   color: var(--text-muted);
   padding-top: 5px;
 }
@@ -763,7 +773,7 @@ kbd {
 .translation-stats {
   display: flex;
   justify-content: space-between;
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-muted);
   margin: 13px 0 24px;
 }
@@ -1066,4 +1076,54 @@ kbd {
     transition: none !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Readability pass: keep secondary chrome compact while avoiding tiny labels. */
+.brand strong {
+  font-size: 14px;
+}
+.titlebar-page,
+.top-model,
+.runtime-controls button,
+.status,
+.history-item .history-title,
+.runtime-card strong,
+.suggestions strong,
+.model-chip,
+.message-tools button,
+.preview-empty > span,
+.output-tools button,
+.chunk-button {
+  font-size: 12px;
+}
+.theme-select > span,
+.history-heading,
+.workspace-heading .muted,
+.runtime-card > span:last-child,
+.composer-tools > button,
+.composer-caption,
+.message-label,
+.message-tools span,
+.editor-heading > span,
+.chunk-button small {
+  font-size: 11px;
+}
+.nav-item,
+.workspace-heading,
+.history-empty,
+.history-item .history-title,
+.composer > textarea,
+.suggestions span,
+.page-heading p {
+  font-size: 13px;
+}
+.markdown {
+  font-size: 15px;
+}
+.editor-heading h2 {
+  font-size: 14px;
+}
+.sidebar-caption,
+.window-footer {
+  font-size: 10px;
 }

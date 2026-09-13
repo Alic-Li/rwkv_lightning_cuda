@@ -26,6 +26,14 @@ const output = (text: string, done = true) =>
     `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: text } }] })}\n\n${done ? "data: [DONE]\n\n" : ""}`,
     { headers: { "Content-Type": "text/event-stream" } },
   );
+const completion = (texts: string[]) =>
+  Response.json({
+    choices: texts.map((text, index) => ({
+      index,
+      message: { role: "assistant", content: text },
+      finish_reason: "stop",
+    })),
+  });
 afterEach(() => {
   useChat.getState().clear();
   useTranslate.getState().clear();
@@ -65,20 +73,25 @@ it("stores credentials only in memory", () => {
   );
   expect([...values.values()].join("")).not.toContain("private-api-key");
 });
-it("streams each translation through chat URL and saves ordered results", async () => {
+it("translates each line without streaming and saves ordered results", async () => {
   const urls: string[] = [];
   const prompts: string[] = [];
   fetchSpy.mockImplementation(async (url, init) => {
     urls.push(String(url));
     const body = JSON.parse(String(init?.body));
-    prompts.push(body.contents[0]);
-    return output(`translated-${prompts.length}`);
+    prompts.push(...body.contents);
+    expect(body.stream).toBe(false);
+    return completion(
+      body.contents.map(
+        (_: string, index: number) => `translated-${index + 1}`,
+      ),
+    );
   });
   useTranslate
     .getState()
-    .set({ source: "Hello world. ".repeat(30), target: 64, concurrency: 3 });
+    .set({ source: "First line\nSecond line\nThird line", concurrency: 3 });
   await useTranslate.getState().run();
-  expect(urls.length).toBeGreaterThan(2);
+  expect(urls).toHaveLength(1);
   expect(urls.every((u) => u === "/v1/chat/completions")).toBe(true);
   expect(
     prompts.every(
@@ -89,6 +102,25 @@ it("streams each translation through chat URL and saves ordered results", async 
     true,
   );
   expect(values.get("rwkv-translation-v1")).toContain("translated-1");
+});
+it("caps each native translation batch at 128 lines", async () => {
+  const sizes: number[] = [];
+  fetchSpy.mockImplementation(async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    sizes.push(body.contents.length);
+    return completion(body.contents.map((text: string) => `done:${text}`));
+  });
+  useTranslate.getState().set({
+    source: Array.from({ length: 130 }, (_, index) => `line ${index}`).join(
+      "\n",
+    ),
+    concurrency: 128,
+  });
+  await useTranslate.getState().run();
+  expect(sizes).toEqual([128, 2]);
+  expect(useTranslate.getState().chunks.every((c) => c.status === "done")).toBe(
+    true,
+  );
 });
 it("does not silently wrap raw translation with remote native chat templates", async () => {
   useSettings.getState().set({ baseURL: "http://127.0.0.1:8000" });

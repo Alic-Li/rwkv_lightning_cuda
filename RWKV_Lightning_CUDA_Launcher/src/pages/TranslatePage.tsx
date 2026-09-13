@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import {
   ArrowRight,
+  ArrowLeftRight,
   Play,
   Square,
   FileCode,
@@ -11,6 +12,7 @@ import { useTranslate, translationBody } from "../stores/translate";
 import { useSettings } from "../stores/settings";
 import { useRuntime } from "../stores/runtime";
 import { chunkText, translationPrompt } from "../lib/translate/chunk";
+import { languages, normalizeLanguage } from "../lib/translate/languages";
 import { orderedMerge, type TranslateChunk } from "../lib/translate/scheduler";
 import {
   CopyButton,
@@ -19,41 +21,33 @@ import {
   Field,
   download,
 } from "../components/common";
-export const languages = [
-  "Auto",
-  "English",
-  "Chinese",
-  "Simplified Chinese",
-  "Traditional Chinese",
-  "Japanese",
-  "Korean",
-  "French",
-  "German",
-  "Spanish",
-  "Portuguese",
-  "Russian",
-  "Italian",
-];
 export function LanguageInput({
   label,
   value,
   onChange,
   disabled = false,
+  fallback = "English",
 }: {
   label: string;
   value: string;
   onChange: (s: string) => void;
   disabled?: boolean;
+  fallback?: string;
 }) {
+  const selected = normalizeLanguage(value, fallback);
   return (
     <Field label={label}>
-      <input
-        list="languages"
-        value={value}
+      <select
+        value={selected}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
-        placeholder="Custom language name"
-      />
+      >
+        {languages.map((language) => (
+          <option key={language} value={language}>
+            {language}
+          </option>
+        ))}
+      </select>
     </Field>
   );
 }
@@ -91,17 +85,18 @@ export function TranslatePage() {
   const [inspect, setInspect] = useState<number | null>(null);
   const [check, setCheck] = useState(false);
   const [listPage, setListPage] = useState(0);
-  const sourceLang = job.from || values.sourceLanguage,
-    targetLang = job.to || values.targetLanguage;
-  const concurrency = job.concurrency || values.concurrency,
-    target = job.target || values.chunkTarget;
+  const sourceValue = job.from || values.sourceLanguage;
+  const targetValue = job.to || values.targetLanguage;
+  const sourceLang = normalizeLanguage(sourceValue, "English");
+  const targetLang = normalizeLanguage(targetValue, "Chinese");
+  const concurrency = job.concurrency || values.concurrency;
   const estimate = useMemo(() => {
     try {
-      return chunkText(job.source, target);
+      return chunkText(job.source);
     } catch {
       return [];
     }
-  }, [job.source, target]);
+  }, [job.source]);
   const done = job.chunks.filter((c) => c.status === "done").length;
   const failed = job.chunks.filter((c) => c.status === "error").length;
   const output = orderedMerge(job.chunks);
@@ -136,13 +131,8 @@ export function TranslatePage() {
             Translate long documents with independent, concurrent continuations.
           </p>
         </div>
-        <span className="tag">{concurrency} workers</span>
+        <span className="tag">Batch size {concurrency}</span>
       </header>
-      <datalist id="languages">
-        {languages.map((l) => (
-          <option key={l} value={l} />
-        ))}
-      </datalist>
       <div className="translation-bar panel">
         <LanguageInput
           label="Source language"
@@ -150,17 +140,30 @@ export function TranslatePage() {
           onChange={(from) => job.set({ from })}
           disabled={job.busy}
         />
-        <ArrowRight size={18} />
+        <button
+          className="language-swap"
+          title="Swap source and target languages"
+          disabled={job.busy}
+          onClick={() => job.set({ from: targetLang, to: sourceLang })}
+        >
+          <ArrowLeftRight size={17} />
+        </button>
         <LanguageInput
           label="Target language"
           value={targetLang}
+          fallback="Chinese"
           onChange={(to) => job.set({ to })}
           disabled={job.busy}
         />
         <div className="spacer" />
         <button
           className="primary"
-          disabled={job.busy || !job.source.trim() || !ready}
+          disabled={
+            job.busy ||
+            !job.source.trim() ||
+            !ready ||
+            sourceLang === targetLang
+          }
           onClick={() => void job.run()}
         >
           <Play size={14} /> Start translation
@@ -170,6 +173,9 @@ export function TranslatePage() {
         </button>
       </div>
       <ErrorPanel error={job.error} />
+      {sourceLang === targetLang && (
+        <p className="notice">Choose two different translation languages.</p>
+      )}
       {!ready && (
         <p className="notice">
           Start the local runtime and load a model before translating.{" "}
@@ -178,28 +184,22 @@ export function TranslatePage() {
       )}
       <div className="toolbar translate-options">
         <Field
-          label="Concurrency"
-          hint="Frontend hard limit; the runtime independently admits requests according to VRAM."
+          label="Batch size"
+          hint="Number of line prompts sent together in one native batch request. Maximum: 128."
         >
           <input
             type="number"
             min="1"
-            max="64"
+            max="128"
             value={concurrency}
             disabled={job.busy}
             onChange={(e) => job.set({ concurrency: Number(e.target.value) })}
           />
         </Field>
-        <Field label="Chunk target (characters)">
-          <input
-            type="number"
-            min="32"
-            step="1"
-            value={target}
-            disabled={job.busy}
-            onChange={(e) => job.set({ target: Number(e.target.value) })}
-          />
-        </Field>
+        <span className="line-chunk-note">
+          One non-empty line = one translation task · Up to {concurrency} lines
+          per request · Results appear by completed batch
+        </span>
         <div className="spacer" />
         <button onClick={() => setCheck(true)}>
           <FileCode size={14} /> Check request
@@ -215,7 +215,6 @@ export function TranslatePage() {
               from: values.sourceLanguage,
               to: values.targetLanguage,
               concurrency: values.concurrency,
-              target: values.chunkTarget,
             });
           }}
         >
@@ -228,7 +227,7 @@ export function TranslatePage() {
             <h2>Source</h2>
             <span>
               {job.source.length.toLocaleString()} chars · {estimate.length}{" "}
-              estimated chunks
+              line chunks
             </span>
           </div>
           <textarea
@@ -236,7 +235,7 @@ export function TranslatePage() {
             value={job.source}
             disabled={job.busy}
             onChange={(e) => job.set({ source: e.target.value })}
-            placeholder="Paste a long document here.\n\nRWKV will translate it with parallel short requests."
+            placeholder="Paste text here. Put each translation unit on its own line.\n\nEvery non-empty line is translated independently."
           />
         </section>
         <section className="editor-panel">

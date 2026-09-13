@@ -49,6 +49,20 @@ export class RWKVClient {
       throw new Error("Backend did not return an SSE stream");
     return readSSE(response.body, signal, onEvent);
   }
+  completeChat(body: unknown, signal: AbortSignal) {
+    return request<{
+      choices: {
+        index: number;
+        message?: { role?: string; content?: string };
+        finish_reason?: string;
+      }[];
+    }>(
+      `${this.baseURL.replace(/\/$/, "")}/v1/chat/completions`,
+      body,
+      signal,
+      this.key,
+    );
+  }
   loadModel(model: string) {
     return request(
       `${this.baseURL}/v1/model/load`,

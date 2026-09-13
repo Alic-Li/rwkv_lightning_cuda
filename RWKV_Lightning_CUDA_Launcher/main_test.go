@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -88,6 +89,16 @@ func TestTuningArgs(t *testing.T) {
 	if _, e = tuningArgs(req); e == nil {
 		t.Fatal("accepted zero LR")
 	}
+	req.LR = 1
+	req.BatchSize = 129
+	if _, e = tuningArgs(req); e == nil {
+		t.Fatal("accepted batch size above 128")
+	}
+	req.BatchSize = 1
+	req.Chunk = req.Ctx + 1
+	if _, e = tuningArgs(req); e == nil {
+		t.Fatal("accepted recompute chunk above context length")
+	}
 }
 func TestProcessLogsAndProgress(t *testing.T) {
 	t.Setenv("RWKV_TEST_CHILD", "logs")
@@ -139,6 +150,14 @@ func TestProcessStopAndMutualExclusion(t *testing.T) {
 func TestReadinessIsReal(t *testing.T) {
 	t.Setenv("RWKV_TEST_CHILD", "wait")
 	l := newLauncher()
+	unused, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.config.Port = fmt.Sprint(unused.Addr().(*net.TCPAddr).Port)
+	if err := unused.Close(); err != nil {
+		t.Fatal(err)
+	}
 	exe, _ := os.Executable()
 	if e := l.runtime.launch(exe, nil, ""); e != nil {
 		t.Fatal(e)

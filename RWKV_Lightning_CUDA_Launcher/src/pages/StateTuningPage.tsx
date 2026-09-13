@@ -1,5 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Play, Square, FolderOpen } from "lucide-react";
+import {
+  Play,
+  Square,
+  FolderOpen,
+  CheckCircle2,
+  Circle,
+  RotateCcw,
+  Zap,
+  Terminal,
+} from "lucide-react";
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import {
@@ -20,70 +29,80 @@ import {
   CopyButton,
 } from "../components/common";
 const useTuningForm = create(
-  persist<{ config: TuningConfig; set: (v: Partial<TuningConfig>) => void }>(
+  persist<{
+    config: TuningConfig;
+    set: (v: Partial<TuningConfig>) => void;
+    resetParameters: () => void;
+  }>(
     (set) => ({
       config: defaultTuning,
       set: (v) => set((s) => ({ config: { ...s.config, ...v } })),
+      resetParameters: () =>
+        set((s) => ({
+          config: {
+            ...defaultTuning,
+            model: s.config.model,
+            data: s.config.data,
+            output: s.config.output,
+            vocab: s.config.vocab,
+          },
+        })),
     }),
-    { name: "rwkv-tuning-form-v1", storage: createJSONStorage(() => storage) },
+    { name: "rwkv-tuning-form-v2", storage: createJSONStorage(() => storage) },
   ),
 );
 const numeric: {
   key: keyof TuningConfig;
   label: string;
   min: number;
-  step?: number;
+  max?: number;
+  step?: number | "any";
   hint: string;
 }[] = [
-  {
-    key: "epochs",
-    label: "Epochs",
-    min: 1,
-    hint: "Dataset passes. Default: 1.",
-  },
-  {
-    key: "max_steps",
-    label: "Max steps",
-    min: 0,
-    hint: "Optimizer updates; 0 means no step cap.",
-  },
-  {
-    key: "lr",
-    label: "Learning rate",
-    min: 0.0000001,
-    step: 0.0001,
-    hint: "Initial learning rate. CLI default: 1.0.",
-  },
-  {
-    key: "lr_final",
-    label: "Final learning rate",
-    min: 0.0000001,
-    step: 0.0001,
-    hint: "Final learning rate. Default: 0.01.",
-  },
   {
     key: "ctx",
     label: "Context length",
     min: 1,
-    hint: "Maximum tokens per sample. Default: 128.",
+    hint: "Maximum tokens per sample. Recommended default: 512.",
   },
   {
     key: "chunk",
     label: "Recompute chunk",
     min: 1,
-    hint: "Activation recompute length. Default: 64.",
+    hint: "Activation recompute length. Recommended default: 128.",
   },
   {
     key: "batch_size",
-    label: "Samples per update",
+    label: "Batch size",
     min: 1,
-    hint: "Sequential gradient accumulation, not parallel GPU batches. Default: 1.",
+    max: 128,
+    hint: "Samples accumulated per optimizer update. Range: 1–128; default: 16.",
+  },
+  {
+    key: "epochs",
+    label: "Epochs",
+    min: 1,
+    hint: "Number of complete dataset passes. Default: 1.",
+  },
+  {
+    key: "lr",
+    label: "Learning rate",
+    min: 0.0000001,
+    step: "any",
+    hint: "Initial learning rate. Recommended default: 0.0005.",
+  },
+  {
+    key: "lr_final",
+    label: "Final learning rate",
+    min: 0.0000001,
+    step: "any",
+    hint: "Learning rate at the end of training. Recommended default: 0.0001.",
   },
   {
     key: "save_every",
     label: "Save every N steps",
     min: 0,
-    hint: "Periodic state checkpoints. 0 disables periodic saving.",
+    hint: "Periodic state checkpoints. Default: every 100 updates; 0 disables it.",
   },
   {
     key: "warmup_steps",
@@ -92,14 +111,59 @@ const numeric: {
     hint: "Linear warmup updates. Default: 10.",
   },
   {
+    key: "max_steps",
+    label: "Max steps",
+    min: 0,
+    hint: "Optional optimizer-update cap. 0 runs all configured epochs.",
+  },
+  {
     key: "seed",
     label: "Seed",
     min: 0,
     hint: "Deterministic seed. Default: 1234.",
   },
 ];
+const recommendedParameters: Partial<TuningConfig> = {
+  ctx: 512,
+  chunk: 128,
+  epochs: 1,
+  batch_size: 16,
+  lr: 0.0005,
+  lr_final: 0.0001,
+  warmup_steps: 10,
+  save_every: 100,
+  max_steps: 0,
+  seed: 1234,
+};
+const parameterPresets: {
+  label: string;
+  hint: string;
+  values: Partial<TuningConfig>;
+}[] = [
+  {
+    label: "Recommended",
+    hint: "Balanced starting point",
+    values: {},
+  },
+  {
+    label: "Low memory",
+    hint: "Smaller context and batch",
+    values: { ctx: 256, chunk: 64, batch_size: 4 },
+  },
+  {
+    label: "Quick check",
+    hint: "Short pipeline validation",
+    values: {
+      ctx: 128,
+      chunk: 64,
+      batch_size: 2,
+      max_steps: 10,
+      save_every: 5,
+    },
+  },
+];
 export function StateTuningPage() {
-  const { config, set } = useTuningForm();
+  const { config, set, resetParameters } = useTuningForm();
   const form = useRef<HTMLFormElement>(null);
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -127,12 +191,60 @@ export function StateTuningPage() {
   const losses = state.losses || [];
   const min = Math.min(...losses.map((p) => p.loss)),
     max = Math.max(...losses.map((p) => p.loss));
+  const datasetReady = validated?.path === config.data;
+  const pathsReady = Boolean(config.model && config.data && config.output);
+  const parametersReady =
+    config.ctx > 0 &&
+    config.chunk > 0 &&
+    config.chunk <= config.ctx &&
+    config.epochs > 0 &&
+    config.batch_size > 0 &&
+    config.batch_size <= 128 &&
+    config.lr > 0 &&
+    config.lr_final > 0 &&
+    config.max_steps >= 0 &&
+    config.warmup_steps >= 0 &&
+    config.save_every >= 0 &&
+    config.seed >= 0;
+  const canStart =
+    connected &&
+    pathsReady &&
+    parametersReady &&
+    !busy &&
+    !state.running &&
+    state.available !== false;
+  const fullUpdateEstimate = datasetReady
+    ? Math.ceil(validated.samples / config.batch_size) * config.epochs
+    : 0;
+  const estimatedUpdates = config.max_steps
+    ? Math.min(fullUpdateEstimate, config.max_steps)
+    : fullUpdateEstimate;
+  const commandPreview = [
+    "rwkv_state_tune",
+    `--model ${JSON.stringify(config.model || "MODEL.pth")}`,
+    `--data ${JSON.stringify(config.data || "DATA.jsonl")}`,
+    `--output ${JSON.stringify(config.output)}`,
+    config.vocab ? `--vocab ${JSON.stringify(config.vocab)}` : "",
+    `--ctx ${config.ctx}`,
+    `--chunk ${config.chunk}`,
+    `--epochs ${config.epochs}`,
+    `--lr ${config.lr}`,
+    `--lr-final ${config.lr_final}`,
+    `--warmup-steps ${config.warmup_steps}`,
+    `--save-every ${config.save_every}`,
+    `--batch-size ${config.batch_size}`,
+    `--max-steps ${config.max_steps}`,
+    `--seed ${config.seed}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
   const start = async (stopRuntime = false) => {
     setBusy(true);
     setError("");
     setConfirm(false);
     try {
-      await tuning.validate(config.data);
+      const result = await tuning.validate(config.data);
+      setValidated({ path: config.data, samples: result.samples });
       if (stopRuntime) await launcher.stop();
       await tuning.start(config);
       await refresh();
@@ -149,7 +261,8 @@ export function StateTuningPage() {
         required
         value={config[f.key]}
         min={f.min}
-        step={f.step || 1}
+        max={f.max}
+        step={f.step ?? 1}
         onChange={(e) => set({ [f.key]: Number(e.target.value) })}
       />
     </Field>
@@ -171,17 +284,76 @@ export function StateTuningPage() {
           Launcher to enable training.
         </p>
       )}
+      <section className="tuning-overview" aria-label="State tuning readiness">
+        {[
+          [
+            pathsReady,
+            "Files",
+            pathsReady ? "Paths ready" : "Choose model, data and output",
+          ],
+          [
+            datasetReady,
+            "Dataset",
+            datasetReady
+              ? `${validated.samples.toLocaleString()} valid samples`
+              : "Run dataset validation",
+          ],
+          [
+            parametersReady,
+            "Parameters",
+            parametersReady
+              ? `${config.ctx} ctx · batch ${config.batch_size}`
+              : "Review invalid values",
+          ],
+          [
+            state.running,
+            "Trainer",
+            state.running ? "Training in progress" : state.status,
+          ],
+        ].map(([ready, label, detail]) => (
+          <div className={ready ? "ready" : ""} key={String(label)}>
+            {ready ? <CheckCircle2 size={17} /> : <Circle size={17} />}
+            <span>{label}</span>
+            <strong>{detail}</strong>
+          </div>
+        ))}
+      </section>
       <form
         ref={form}
         onSubmit={(e) => {
           e.preventDefault();
-          if (!connected || busy || state.running || state.available === false)
-            return;
+          if (!canStart) return;
           if (runtime.running) setConfirm(true);
           else void start();
         }}
       >
         <fieldset disabled={busy || state.running}>
+          <Panel title="Quick setup" hint="PRESETS">
+            <div className="preset-grid">
+              {parameterPresets.map((preset) => (
+                <button
+                  type="button"
+                  key={preset.label}
+                  onClick={() =>
+                    set({ ...recommendedParameters, ...preset.values })
+                  }
+                >
+                  <Zap size={15} />
+                  <span>
+                    <strong>{preset.label}</strong>
+                    <small>{preset.hint}</small>
+                  </span>
+                </button>
+              ))}
+              <button type="button" onClick={resetParameters}>
+                <RotateCcw size={15} />
+                <span>
+                  <strong>Reset parameters</strong>
+                  <small>Restore recommended defaults</small>
+                </span>
+              </button>
+            </div>
+          </Panel>
           <div className="form-grid runtime-grid">
             <Panel title="Base model & dataset" hint="01">
               <PathField
@@ -233,6 +405,17 @@ export function StateTuningPage() {
             </Panel>
             <Panel title="Training" hint="02">
               <div className="form-grid">{inputs.slice(0, 6)}</div>
+              {config.chunk > config.ctx && (
+                <p className="inline-warning">
+                  Recompute chunk should not be larger than context length.
+                </p>
+              )}
+              {config.lr > 0.01 && (
+                <p className="inline-warning">
+                  This learning rate is unusually high for state tuning and may
+                  make loss diverge.
+                </p>
+              )}
               <details>
                 <summary>Advanced training</summary>
                 <div className="form-grid">{inputs.slice(6)}</div>
@@ -240,28 +423,52 @@ export function StateTuningPage() {
             </Panel>
           </div>
           <Panel title="State checkpoints" hint="03">
-            <Field label="Output directory">
-              <input
-                value={config.output}
-                required
-                onChange={(e) => set({ output: e.target.value })}
-              />
-            </Field>
+            <PathField
+              label="Output directory"
+              value={config.output}
+              directory
+              placeholder="./state_output"
+              onChange={(output) => set({ output })}
+            />
             <p className="muted small">
               Saved as <code>state-step-XXXXXXXX.pth</code> and{" "}
               <code>state-final.pth</code>. These contain trained state tensors,
               not model weights or optimizer state. The current CLI does not
               support checkpoint resume.
             </p>
+            <div className="training-summary">
+              <div>
+                <span>Validated samples</span>
+                <strong>
+                  {datasetReady ? validated.samples.toLocaleString() : "—"}
+                </strong>
+              </div>
+              <div>
+                <span>Estimated updates</span>
+                <strong>
+                  {estimatedUpdates ? estimatedUpdates.toLocaleString() : "—"}
+                </strong>
+              </div>
+              <div>
+                <span>Checkpoint interval</span>
+                <strong>
+                  {config.save_every
+                    ? `${config.save_every} steps`
+                    : "Final only"}
+                </strong>
+              </div>
+            </div>
           </Panel>
+          <details className="command-preview">
+            <summary>
+              <Terminal size={15} /> Command preview
+            </summary>
+            <pre>{commandPreview}</pre>
+            <CopyButton text={commandPreview} label="Copy command" />
+          </details>
         </fieldset>
         <div className="action-strip">
-          <button
-            className="primary"
-            disabled={
-              !connected || busy || state.running || state.available === false
-            }
-          >
+          <button className="primary" disabled={!canStart}>
             <Play size={14} /> {busy ? "Starting…" : "Start state tuning"}
           </button>
           <button
@@ -282,12 +489,20 @@ export function StateTuningPage() {
             <Square size={13} /> Stop training
           </button>
           <span className="muted">
-            {state.status} · Inference and tuning run one at a time.
+            {!connected
+              ? "Launcher unavailable"
+              : !pathsReady
+                ? "Choose all required paths"
+                : !parametersReady
+                  ? "Review training parameters"
+                  : `${state.status} · Ctrl/⌘ + Enter to start`}
           </span>
         </div>
       </form>
       {progress && (
-        <Panel title="Training progress">
+        <Panel
+          title={`Training progress · ${Math.round((progress.step / Math.max(progress.total, 1)) * 100)}%`}
+        >
           <progress value={progress.step} max={progress.total} />
           <div className="metrics">
             {[

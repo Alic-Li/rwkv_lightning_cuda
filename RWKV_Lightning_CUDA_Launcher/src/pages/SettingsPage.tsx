@@ -4,7 +4,7 @@ import { useChat } from "../stores/chat";
 import { useTranslate } from "../stores/translate";
 import { Panel, Field, Dialog } from "../components/common";
 import { GenerationSettings } from "../components/GenerationSettings";
-import { LanguageInput, languages } from "./TranslatePage";
+import { LanguageInput } from "./TranslatePage";
 import { ThemeControl } from "../components/ThemeControl";
 export function SettingsPage() {
   const { values, set, reset } = useSettings();
@@ -60,11 +60,6 @@ export function SettingsPage() {
         </p>
       </Panel>
       <Panel title="Translation defaults">
-        <datalist id="languages">
-          {languages.map((l) => (
-            <option key={l} value={l} />
-          ))}
-        </datalist>
         <div className="form-grid">
           <LanguageInput
             label="Source language"
@@ -74,28 +69,22 @@ export function SettingsPage() {
           <LanguageInput
             label="Target language"
             value={values.targetLanguage}
+            fallback="Chinese"
             onChange={(targetLanguage) => set({ targetLanguage })}
           />
-          <Field label="Concurrency">
+          <Field label="Translation batch size">
             <input
               type="number"
               min="1"
-              max="64"
+              max="128"
               value={values.concurrency}
               onChange={(e) => set({ concurrency: Number(e.target.value) })}
             />
           </Field>
-          <Field label="Chunk target (characters)">
-            <input
-              type="number"
-              min="32"
-              value={values.chunkTarget}
-              onChange={(e) => set({ chunkTarget: Number(e.target.value) })}
-            />
-          </Field>
         </div>
         <p className="small muted">
-          Auto is a literal prompt language name; no language detector is run.
+          Every non-empty source line is translated independently. Finished
+          lines appear as complete results instead of token-by-token streaming.
         </p>
       </Panel>
       <Panel title="Generation defaults">

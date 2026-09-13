@@ -7,6 +7,8 @@ import {
   type TranslateChunk,
 } from "../src/lib/translate/scheduler";
 import { resolveTheme } from "../src/stores/settings";
+import { defaultTuning } from "../src/lib/api/launcher";
+import { normalizeLanguage } from "../src/lib/translate/languages";
 const stream = (parts: string[]) =>
   new ReadableStream<Uint8Array>({
     start(c) {
@@ -106,19 +108,20 @@ describe("SSE framing and disconnect semantics", () => {
     expect(canceled).toBe(true);
   });
 });
-describe("translation segmentation", () => {
-  it("preserves normalized content and sentence boundaries", () => {
-    const text =
-      "First sentence. Second sentence!\r\n\r\n你好，世界。下一段内容！\n" +
-      "A longer sentence about recurrent inference. ".repeat(8);
-    const chunks = chunkText(text, 70);
-    expect(chunks.join("")).toBe(text.replace(/\r\n/g, "\n").trim());
-    expect(chunks.length).toBeGreaterThan(2);
-    expect(chunks.every((c) => c.length <= 140)).toBe(true);
+describe("translation line segmentation", () => {
+  it("creates one task per non-empty normalized line", () => {
+    const chunks = chunkText(
+      " First sentence. Second sentence!\r\n\r\n你好，世界。下一段内容！\n final line ",
+    );
+    expect(chunks).toEqual([
+      "First sentence. Second sentence!",
+      "你好，世界。下一段内容！",
+      "final line",
+    ]);
   });
-  it("preserves long Unicode and punctuation-only input", () => {
+  it("keeps long lines intact and ignores blank lines", () => {
     for (const text of ["🙂".repeat(500), "!?。！？\n\n", "x".repeat(1000)])
-      expect(chunkText(text, 32).join("")).toBe(text.trim());
+      expect(chunkText(text).join("")).toBe(text.trim());
     expect(chunkText("")).toEqual([]);
   });
   it("uses exact language-name continuation prompts", () => {
@@ -128,6 +131,10 @@ describe("translation segmentation", () => {
     expect(translationPrompt("你好", "Chinese", "Custom Language")).toBe(
       "Chinese: 你好\n\nCustom Language:",
     );
+  });
+  it("normalizes removed or unknown saved language values", () => {
+    expect(normalizeLanguage("Japanese", "English")).toBe("Japanese");
+    expect(normalizeLanguage("Auto", "English")).toBe("English");
   });
 });
 const chunks = (n: number): TranslateChunk[] =>
@@ -213,7 +220,7 @@ describe("worker scheduler", () => {
     expect(list[2].status).toBe("done");
   });
   it("rejects invalid concurrency", () => {
-    for (const concurrency of [0, -1, 65, 1.5, NaN])
+    for (const concurrency of [0, -1, 129, 1.5, NaN])
       expect(() =>
         createTranslationScheduler({
           chunks: [],
@@ -233,4 +240,27 @@ describe("theme selection", () => {
     expect(resolveTheme("system", false)).toBe("dark");
     expect(resolveTheme("invalid", true)).toBe("dark");
   });
+});
+
+it("uses the recommended state tuning defaults", () => {
+  expect(defaultTuning).toMatchObject({
+    ctx: 512,
+    chunk: 128,
+    epochs: 1,
+    lr: 0.0005,
+    lr_final: 0.0001,
+    warmup_steps: 10,
+    save_every: 100,
+    batch_size: 16,
+  });
+});
+
+it("allows arbitrary positive learning-rate decimals in the tuning form", async () => {
+  const { createElement } = await import("react");
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { StateTuningPage } = await import("../src/pages/StateTuningPage");
+  const html = renderToStaticMarkup(createElement(StateTuningPage));
+  expect(html.match(/step="any"/g)).toHaveLength(2);
+  expect(html).toContain('value="0.0005"');
+  expect(html).toContain('value="0.0001"');
 });

@@ -42,7 +42,6 @@ export const defaults = {
   sourceLanguage: "English",
   targetLanguage: "Chinese",
   concurrency: 8,
-  chunkTarget: 800,
   generation: defaultGeneration,
 };
 

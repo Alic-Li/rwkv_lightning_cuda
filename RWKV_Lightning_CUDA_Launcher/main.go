@@ -472,7 +472,10 @@ func tuningArgs(req tuneRequest) ([]string, error) {
 	if strings.TrimSpace(req.Output) == "" {
 		return nil, fmt.Errorf("output directory is required")
 	}
-	if req.Ctx < 1 || req.Chunk < 1 || req.Epochs < 1 || req.BatchSize < 1 || req.LR <= 0 || req.LRFinal <= 0 || req.MaxSteps < 0 || req.WarmupSteps < 0 || req.SaveEvery < 0 || req.Seed < 0 {
+	if req.BatchSize < 1 || req.BatchSize > 128 {
+		return nil, fmt.Errorf("batch size must be between 1 and 128")
+	}
+	if req.Ctx < 1 || req.Chunk < 1 || req.Chunk > req.Ctx || req.Epochs < 1 || req.LR <= 0 || req.LRFinal <= 0 || req.MaxSteps < 0 || req.WarmupSteps < 0 || req.SaveEvery < 0 || req.Seed < 0 {
 		return nil, fmt.Errorf("invalid training parameter; sizes and learning rates must be positive, counts nonnegative")
 	}
 	args := []string{"--model", req.Model, "--data", req.Data, "--output", req.Output}
@@ -592,6 +595,14 @@ func (l *launcher) handler() http.Handler {
 	}
 	api("/api/pick-file", "POST", func(w http.ResponseWriter, r *http.Request) error {
 		path, e := pickFile()
+		if e != nil {
+			return e
+		}
+		writeJSON(w, 200, map[string]any{"path": path})
+		return nil
+	})
+	api("/api/pick-directory", "POST", func(w http.ResponseWriter, r *http.Request) error {
+		path, e := pickDirectory()
 		if e != nil {
 			return e
 		}
@@ -832,6 +843,30 @@ func pickFile() (string, error) {
 			}
 		}
 		return "", fmt.Errorf("no native file picker found; install zenity/kdialog/yad or type path manually")
+	}
+}
+
+func pickDirectory() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		ps := `Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }`
+		out, err := exec.Command("powershell", "-NoProfile", "-STA", "-Command", ps).Output()
+		return strings.TrimSpace(string(out)), err
+	case "darwin":
+		out, err := exec.Command("osascript", "-e", `POSIX path of (choose folder)`).Output()
+		return strings.TrimSpace(string(out)), err
+	default:
+		for _, tool := range [][]string{
+			{"zenity", "--file-selection", "--directory"},
+			{"kdialog", "--getexistingdirectory", "."},
+			{"yad", "--file-selection", "--directory"},
+		} {
+			if _, err := exec.LookPath(tool[0]); err == nil {
+				out, err := exec.Command(tool[0], tool[1:]...).Output()
+				return strings.TrimSpace(string(out)), err
+			}
+		}
+		return "", fmt.Errorf("no native folder picker found; install zenity/kdialog/yad or type path manually")
 	}
 }
 

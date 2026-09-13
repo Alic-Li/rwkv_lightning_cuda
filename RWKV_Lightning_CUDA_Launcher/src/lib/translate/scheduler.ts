@@ -17,9 +17,9 @@ export function createTranslationScheduler(options: {
   if (
     !Number.isInteger(options.concurrency) ||
     options.concurrency < 1 ||
-    options.concurrency > 64
+    options.concurrency > 128
   )
-    throw new Error("Concurrency must be an integer from 1 to 64");
+    throw new Error("Batch size must be an integer from 1 to 128");
   const controller = new AbortController();
   let cursor = 0;
   const run = async () => {

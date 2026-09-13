@@ -83,11 +83,11 @@ Translate: browser /v1/chat/completions + contents (每次一个 prompt)
         → native  /v1/batch/completions
 ```
 
-仅当 body 有 `contents` 且没有 `messages` 时适配，body 不变。多个单 prompt 请求由前端 worker pool 调度，**不调用任何专用 Translation API**。检查请求窗口明确显示这个映射。直接连接未经适配的远程 CUDA Chat 地址时，翻译页面会拒绝发送，避免默默改变 prompt 语义。
+仅当 body 有 `contents` 且没有 `messages` 时适配，body 不变。翻译以每个非空输入行为一个 chunk，前端按 1–128 的 batch size 分组，每组作为一个原生 batch 请求执行，**不调用任何专用 Translation API**。检查请求窗口明确显示这个映射。直接连接未经适配的远程 CUDA Chat 地址时，翻译页面会拒绝发送，避免默默改变 prompt 语义。
 
-翻译 sampler 采用当前兼容翻译实现中的参数：`max_tokens=2048`、`temperature=1`、`top_k=1`、`top_p=0`、presence/frequency penalty=0、`stop_tokens=[0]`；流式 `chunk_size=8`。普通 Chat 默认采样字段来自 CUDA API 文档，停止 token 为整数数组。
+翻译 sampler 采用当前兼容翻译实现中的参数：`max_tokens=2048`、`temperature=1`、`top_k=1`、`top_p=0`、presence/frequency penalty=0、`stop_tokens=[0]`。翻译请求使用 `stream=false`，每行完成后一次显示完整结果；普通 Chat 仍使用流式输出。
 
-当前原生 SSE 的收尾 `finish_reason` 通常统一为 `stop`，不能区分 EOS、长度上限和管理性停止；UI 保存原值，不虚构原因。当前 SSE 不返回标准 usage，因此翻译统计使用真实字符数和耗时，不伪造 token 数。
+当前原生补全响应的 `finish_reason` 通常统一为 `stop`，不能区分 EOS、长度上限和管理性停止；UI 保存原值，不虚构原因。响应不返回标准 usage，因此翻译统计使用真实字符数和耗时，不伪造 token 数。
 
 ### Runtime
 
@@ -97,19 +97,19 @@ Translate: browser /v1/chat/completions + contents (每次一个 prompt)
 
 ### State Tuning
 
-实际 CLI 默认值（不同于 README 中的示例值）：
+Launcher WebUI 默认训练参数（启动时会完整传给 CLI）：
 
 | 字段 | CLI | 默认值 |
 |---|---|---:|
-| Context length | `--ctx` | 128 |
-| Recompute chunk | `--chunk` | 64 |
+| Context length | `--ctx` | 512 |
+| Recompute chunk | `--chunk` | 128 |
 | Epochs | `--epochs` | 1 |
-| Samples per update | `--batch-size` | 1 |
+| Samples per update | `--batch-size` | 16 |
 | Max updates | `--max-steps` | 0，无上限 |
-| Learning rate | `--lr` | 1.0 |
-| Final learning rate | `--lr-final` | 0.01 |
+| Learning rate | `--lr` | 0.0005 |
+| Final learning rate | `--lr-final` | 0.0001 |
 | Warmup | `--warmup-steps` | 10 |
-| Save interval | `--save-every` | 0，不定期保存 |
+| Save interval | `--save-every` | 100 |
 | Seed | `--seed` | 1234 |
 
 训练只接受 BF16 `.pth` 基础模型，CUDA 专用；不会将 state 文件误称为基础模型。最终是否具有正确 tensor 结构由原生加载器验证。Checkpoint 只有 FP32 state tensors，不含 optimizer；**实际 CLI 没有 resume 参数**，因此界面没有伪造恢复功能。日志中的 epoch 值为 CLI 原值，不伪造小数 epoch。
@@ -127,6 +127,7 @@ Translate: browser /v1/chat/completions + contents (每次一个 prompt)
 | POST | `/api/stop` | 等待运行进程退出 |
 | POST | `/api/restart` | 使用上次实际启动配置停止并重启 |
 | POST | `/api/pick-file` | 原生宿主机文件选择；无图形环境时明确报错，可手动输入路径 |
+| POST | `/api/pick-directory` | 原生宿主机目录选择，用于训练输出目录 |
 | GET | `/logs` | 保留旧 Runtime SSE 日志入口 |
 | GET | `/api/tuning/status` | 训练状态、可执行文件是否存在、日志、进度、loss 数据、checkpoint |
 | POST | `/api/tuning/validate` | `{"path":"..."}`，返回有效样本数或准确行号错误 |

@@ -78,15 +78,15 @@ export const defaultTuning: TuningConfig = {
   data: "",
   output: "./state_output",
   vocab: "./rwkv_vocab_v20230424.txt",
-  ctx: 128,
-  chunk: 64,
+  ctx: 512,
+  chunk: 128,
   epochs: 1,
-  batch_size: 1,
+  batch_size: 16,
   max_steps: 0,
-  lr: 1,
-  lr_final: 0.01,
+  lr: 0.0005,
+  lr_final: 0.0001,
   warmup_steps: 10,
-  save_every: 0,
+  save_every: 100,
   seed: 1234,
 };
 export class LauncherClient {
@@ -104,6 +104,9 @@ export class LauncherClient {
   }
   pickFile() {
     return request<{ path: string }>("/api/pick-file", {});
+  }
+  pickDirectory() {
+    return request<{ path: string }>("/api/pick-directory", {});
   }
 }
 export class StateTuningClient {

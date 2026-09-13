@@ -1,15 +1,13 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { chunkText, translationPrompt } from "../lib/translate/chunk";
-import {
-  createTranslationScheduler,
-  type TranslateChunk,
-} from "../lib/translate/scheduler";
+import { normalizeLanguage } from "../lib/translate/languages";
+import type { TranslateChunk } from "../lib/translate/scheduler";
 import { RWKVClient } from "../lib/api/client";
 import { useSettings, useSecret, storage } from "./settings";
-export const translationBody = (prompt: string) => ({
-  contents: [prompt],
-  stream: true,
+export const translationBody = (prompt: string | string[]) => ({
+  contents: Array.isArray(prompt) ? prompt : [prompt],
+  stream: false,
   max_tokens: 2048,
   temperature: 1,
   top_k: 1,
@@ -18,7 +16,6 @@ export const translationBody = (prompt: string) => ({
   alpha_frequency: 0,
   alpha_decay: 0.996,
   stop_tokens: [0],
-  chunk_size: 8,
 });
 interface Job {
   source: string;
@@ -29,15 +26,14 @@ interface Job {
   from: string;
   to: string;
   concurrency: number;
-  target: number;
   set: (
-    v: Partial<Pick<Job, "source" | "from" | "to" | "concurrency" | "target">>,
+    v: Partial<Pick<Job, "source" | "from" | "to" | "concurrency">>,
   ) => void;
   run: (ids?: number[]) => Promise<void>;
   stop: () => void;
   clear: () => void;
 }
-let scheduler: ReturnType<typeof createTranslationScheduler> | undefined;
+let activeController: AbortController | undefined;
 export const useTranslate = create(
   persist<Job>(
     (set, get) => ({
@@ -49,9 +45,8 @@ export const useTranslate = create(
       from: "",
       to: "",
       concurrency: 0,
-      target: 0,
       set: (v) => set(v),
-      stop: () => scheduler?.stop(),
+      stop: () => activeController?.abort(),
       clear: () => {
         if (!get().busy) set({ source: "", chunks: [], error: "", elapsed: 0 });
       },
@@ -67,19 +62,25 @@ export const useTranslate = create(
           });
           return;
         }
-        const from = state.from || v.sourceLanguage,
-          to = state.to || v.targetLanguage;
-        const limit = state.concurrency || v.concurrency,
-          target = state.target || v.chunkTarget;
+        const from = normalizeLanguage(
+            state.from || v.sourceLanguage,
+            "English",
+          ),
+          to = normalizeLanguage(state.to || v.targetLanguage, "Chinese");
+        const limit = state.concurrency || v.concurrency;
         if (!from.trim() || !to.trim()) {
           set({ error: "Both language names are required." });
+          return;
+        }
+        if (from === to) {
+          set({ error: "Source and target languages must be different." });
           return;
         }
         let chunks: TranslateChunk[];
         try {
           chunks = ids
             ? state.chunks.map((c) => ({ ...c }))
-            : chunkText(state.source, target).map((source, id) => ({
+            : chunkText(state.source).map((source, id) => ({
                 id,
                 source,
                 prompt: translationPrompt(source, from, to),
@@ -91,39 +92,65 @@ export const useTranslate = create(
             ? chunks.filter((c) => ids.includes(c.id))
             : chunks;
           const started = performance.now();
-          let timer: ReturnType<typeof setTimeout> | undefined;
           const publish = () => {
-            timer = undefined;
             set({
               chunks: chunks.map((c) => ({ ...c })),
               elapsed: (performance.now() - started) / 1000,
             });
           };
           const client = new RWKVClient("", useSecret.getState().key);
-          scheduler = createTranslationScheduler({
-            chunks: selected,
-            concurrency: limit,
-            onProgress: () => {
-              if (!timer) timer = setTimeout(publish, 100);
-            },
-            execute: async (c, signal) =>
-              client.streamChat(translationBody(c.prompt), signal, (event) => {
-                for (const choice of event.choices || []) {
-                  c.translated += choice.delta?.content || "";
-                  if (choice.finish_reason)
-                    c.finishReason = choice.finish_reason;
-                }
-                if (!timer) timer = setTimeout(publish, 100);
-              }),
-          });
+          if (!Number.isInteger(limit) || limit < 1 || limit > 128)
+            throw new Error("Batch size must be an integer from 1 to 128");
+          const controller = new AbortController();
+          activeController = controller;
           set({ chunks: chunks.map((c) => ({ ...c })), busy: true, error: "" });
-          await scheduler.run();
-          clearTimeout(timer);
+          for (let offset = 0; offset < selected.length; offset += limit) {
+            const batch = selected.slice(offset, offset + limit);
+            for (const chunk of batch) {
+              chunk.status = "running";
+              chunk.error = undefined;
+              chunk.translated = "";
+            }
+            publish();
+            const batchStarted = performance.now();
+            try {
+              const result = await client.completeChat(
+                translationBody(batch.map((chunk) => chunk.prompt)),
+                controller.signal,
+              );
+              const choices = new Map(
+                (result.choices || []).map((choice) => [choice.index, choice]),
+              );
+              for (const [index, chunk] of batch.entries()) {
+                const choice = choices.get(index);
+                if (!choice?.message?.content)
+                  throw new Error(
+                    `Backend returned no result for line ${chunk.id + 1}`,
+                  );
+                chunk.translated = choice.message.content;
+                chunk.finishReason = choice.finish_reason;
+                chunk.status = "done";
+              }
+            } catch (e) {
+              for (const chunk of batch) {
+                if (chunk.status === "done") continue;
+                chunk.status = controller.signal.aborted ? "pending" : "error";
+                chunk.error = controller.signal.aborted
+                  ? "Stopped. Retry to continue."
+                  : String(e);
+              }
+              if (controller.signal.aborted) break;
+            } finally {
+              const elapsed = (performance.now() - batchStarted) / 1000;
+              for (const chunk of batch) chunk.elapsed = elapsed;
+              publish();
+            }
+          }
           publish();
         } catch (e) {
           set({ error: String(e) });
         } finally {
-          scheduler = undefined;
+          activeController = undefined;
           set({ busy: false });
         }
       },
