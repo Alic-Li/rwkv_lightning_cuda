@@ -23,7 +23,8 @@ std::vector<std::vector<float>> build_logits_steps(
 }
 
 std::vector<std::vector<float>> build_force_reasoning_logits_steps() {
-  const int vocab_size = 755;
+  // The GPU sampler operates on float4 vocabulary tiles.
+  const int vocab_size = 756;
   std::vector<std::vector<float>> steps;
   for (size_t i = 0; i < 3; ++i) {
     std::vector<float> logits(static_cast<std::size_t>(vocab_size), -100.0f);
@@ -56,6 +57,8 @@ int main() {
     for (int token_id : answer_ids) {
       vocab_size = std::max(vocab_size, token_id + 1);
     }
+
+    vocab_size = (vocab_size + 3) / 4 * 4;
 
     auto fake_backend = std::make_shared<rwkv_test::FakeModelBackend>(
         build_logits_steps(answer_ids, vocab_size),

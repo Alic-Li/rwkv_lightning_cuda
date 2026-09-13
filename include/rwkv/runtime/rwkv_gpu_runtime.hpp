@@ -20,6 +20,10 @@ constexpr auto cudaMemcpyDeviceToDevice = hipMemcpyDeviceToDevice;
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemset hipMemset
+#define cudaMemsetAsync hipMemsetAsync
+#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamNonBlocking hipStreamNonBlocking
+#define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamSynchronize hipStreamSynchronize
 #else
 #include <cuda_fp16.h>

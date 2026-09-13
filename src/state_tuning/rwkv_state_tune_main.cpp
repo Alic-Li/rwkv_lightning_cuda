@@ -3,8 +3,7 @@
 #include "rwkv/runtime/rwkv_state_tuning.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -32,6 +31,7 @@ struct Options {
   std::string data;
   std::string output;
   std::string vocab = RWKV_STATE_TUNE_DEFAULT_VOCAB;
+  bool chunk_load = false;
   int ctx = 128;
   int chunk = 64;
   int epochs = 1;
@@ -50,6 +50,7 @@ struct Options {
   std::cerr
       << "Usage: " << program << " --model MODEL.pth --data TRAIN.jsonl "
       << "--output DIR [options]\n"
+      << "  --chunk-load          load model weights in bounded staging chunks\n"
       << "  --vocab PATH          RWKV vocab file\n"
       << "  --ctx N               maximum tokens per JSONL sample (default "
          "128)\n"
@@ -108,6 +109,8 @@ Options parse(int argc, char **argv) {
     const std::string arg = argv[i];
     if (arg == "--help" || arg == "-h")
       usage(argv[0]);
+    else if (arg == "--chunk-load")
+      out.chunk_load = true;
     else if (arg == "--model")
       out.model = value(i, argc, argv);
     else if (arg == "--data")
@@ -273,7 +276,7 @@ int main(int argc, char **argv) {
     rwkv7_server::TrieTokenizer tokenizer;
     if (tokenizer.load(options.vocab) != rwkv7_server::kTokenizerSuccess)
       throw std::runtime_error("failed to load tokenizer: " + options.vocab);
-    rwkv7_server::ModelBackend model(options.model, false, false, "off");
+    rwkv7_server::ModelBackend model(options.model, false, options.chunk_load, "off");
     const auto frozen = model.state_tuning_model_view();
     const int L = frozen.layers;
     const int C = frozen.channels;

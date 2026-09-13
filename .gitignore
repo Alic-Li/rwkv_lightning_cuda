@@ -34,6 +34,8 @@ RWKV_Lightning_CUDA_router/rwkv_router.exe
 
 *.tune
 
+html_vibe_rwkv_clean.jsonl
+
 # CI dependency cache and release packages
 .vcpkg-cache/
 dist/

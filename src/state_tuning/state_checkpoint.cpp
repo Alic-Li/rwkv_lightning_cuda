@@ -1,6 +1,6 @@
 #include "rwkv/runtime/rwkv_state_tuning.hpp"
 
-#include <cuda_runtime.h>
+#include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #include <cstdint>
 #include <cstring>

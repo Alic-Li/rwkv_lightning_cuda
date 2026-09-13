@@ -9,7 +9,7 @@
 
 namespace rwkv7_state_tuning {
 
-// This is a deliberately small pointer-based CUDA API. It has no torch
+// This is a deliberately small pointer-based GPU API. It has no torch
 // dependency and, by construction, has nowhere to return a weight gradient.
 enum class IoType : std::uint8_t { F16, BF16 };
 

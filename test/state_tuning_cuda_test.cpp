@@ -199,7 +199,37 @@ int main() {
     auto dg = download(dlogits);
     near(__half2float(dg[0]), (1.0 / 1024 - 1) / 6, 1e-4, "CE target gradient");
     near(__half2float(dg[1]), 1.0 / 6144, 1e-7, "CE other gradient");
-    std::cout << "WKV finite differences, chunk adjoint, LN and CE passed\n";
+    // Reduction across independent samples, including accumulation, then Adam.
+    DeviceBuffer<float> per_sample, reduced, parameter, moment1, moment2;
+    std::vector<float> hg(2 * S), hp(S, 0.25f);
+    for (int i = 0; i < 2 * S; ++i)
+      hg[i] = 0.03f * std::sin(i * 0.17f);
+    upload(per_sample, hg);
+    upload(reduced, std::vector<float>(S, 99.0f));
+    reduce_state_gradient_f32(nullptr, 2, 1, N, per_sample.p, reduced.p, false);
+    reduce_state_gradient_f32(nullptr, 2, 1, N, per_sample.p, reduced.p, true);
+    auto reduced_host = download(reduced);
+    for (int i = 0; i < S; ++i)
+      near(reduced_host[i], 2.0 * (hg[i] + hg[S + i]), 2e-8, "batch reduction");
+    upload(parameter, hp);
+    upload(moment1, std::vector<float>(S, 0.0f));
+    upload(moment2, std::vector<float>(S, 0.0f));
+    AdamConfig config;
+    config.weight_decay = 0.1f;
+    adam_update_state_f32(nullptr, parameter.p, reduced.p, moment1.p, moment2.p,
+                          S, 1, config, true);
+    const auto actual_parameter = download(parameter);
+    const auto actual_m = download(moment1), actual_v = download(moment2);
+    const auto cleared = download(reduced);
+    for (int i = 0; i < S; ++i) {
+      const double g = reduced_host[i] + config.weight_decay * hp[i];
+      near(actual_parameter[i], hp[i] - config.learning_rate * g /
+           (std::abs(g) + config.epsilon), 1e-7, "Adam parameter");
+      near(actual_m[i], (1.0 - config.beta1) * g, 1e-8, "Adam first moment");
+      near(actual_v[i], (1.0 - config.beta2) * g * g, 1e-10, "Adam second moment");
+      near(cleared[i], 0, 0, "Adam gradient clearing");
+    }
+    std::cout << "WKV finite differences, chunk adjoint, LN, CE, reduction and Adam passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;

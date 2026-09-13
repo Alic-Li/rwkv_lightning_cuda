@@ -22,6 +22,19 @@ if(RWKV_GPU_BACKEND STREQUAL "HIP")
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_wkv_fp16_v2.hip
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_wkv_fp32_v2.hip
   )
+  if(RWKV7_STATE_TUNING)
+    list(APPEND RWKV_CORE_GPU_SOURCES
+      ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cpp
+      ${PROJECT_SOURCE_DIR}/hip/rwkv7_statepassing_clampw.hip
+      ${PROJECT_SOURCE_DIR}/hip/backward_kernels.hip
+      ${PROJECT_SOURCE_DIR}/hip/block_backward.hip
+      ${PROJECT_SOURCE_DIR}/hip/block_forward.hip
+      ${PROJECT_SOURCE_DIR}/hip/training_kernels.hip
+      ${PROJECT_SOURCE_DIR}/hip/model_forward.hip
+      state_tuning/model_backward.cpp
+      state_tuning/state_checkpoint.cpp
+    )
+  endif()
 else()
   set(RWKV_CORE_GPU_SOURCES
     backend/rwkv7_fast_v4.cu
@@ -82,7 +95,7 @@ else()
 endif()
 rwkv_optimize_backend_target(rwkv7_fast_backend_core)
 
-if(RWKV_GPU_BACKEND STREQUAL "CUDA" AND RWKV7_STATE_TUNING)
+if(RWKV7_STATE_TUNING)
   add_executable(rwkv_state_tune
     state_tuning/rwkv_state_tune_main.cpp
     state_tuning/dataset.cpp

@@ -1,7 +1,7 @@
 # RWKV-7 state-tuning sidecar
 
 This directory is intentionally not a general training framework. It adds a
-CUDA-only reverse path for frozen FP16 runtime weights; BF16 model archives are
+CUDA/HIP reverse path for frozen FP16 runtime weights; BF16 model archives are
 still converted by the existing loader to the same FP16 runtime representation.
 No function in the sidecar has a weight-gradient output.
 
@@ -36,7 +36,7 @@ accumulates later-layer value-residual gradients and consumes them in layer 0.
 
 ## Execution and limits
 
-- CUDA, head size 64.
+- CUDA or ROCm/HIP, head size 64.
 - FP16 compute with FP32 WKV state and optimizer tensors.
 - No W8A16/INT8 training path.
 - Samples are truncated only at `--ctx`. `--chunk` controls activation memory.
@@ -54,7 +54,7 @@ accumulates later-layer value-residual gradients and consumes them in layer 0.
 
 ## Standalone CLI
 
-The CUDA build produces `rwkv_state_tune`. It streams JSONL records containing
+Both GPU backends produce `rwkv_state_tune`. It streams JSONL records containing
 exactly one `text` field, tokenizes each record, applies causal next-token loss,
 and performs one state-only Adam update per batch:
 
@@ -78,6 +78,9 @@ Checkpoints contain only FP32 `blocks.N.att.time_state` tensors in PyTorch
 used by inference before publishing it as `state-step-XXXXXXXX.pth` or
 `state-final.pth`.
 
-The CUDA regression test checks WKV input/state derivatives against CPU double
+The GPU regression test checks WKV input/state derivatives against CPU double
 finite differences and verifies the chunk boundary adjoint. Full model
 PyTorch gradient alignment remains a separate validation task.
+
+For ROCm build commands and a tested training example, see [HIP backend](../../hip/README.md).
+Use `--chunk-load` to bound weight-loading staging buffers for large models.

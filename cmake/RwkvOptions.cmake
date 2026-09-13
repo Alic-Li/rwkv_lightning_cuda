@@ -3,7 +3,7 @@ include_guard(GLOBAL)
 option(RWKV7_FAST_V4_GC_SECTIONS "Enable section garbage collection to reduce binary size" ON)
 option(RWKV7_FAST_V4_AUTO_STRIP "Strip release executables after linking when possible" ON)
 option(RWKV7_FAST_BUILD_TESTS "Build unit tests" ON)
-option(RWKV7_STATE_TUNING "Build the CUDA state-tuning backward sidecar" ON)
+option(RWKV7_STATE_TUNING "Build the GPU state-tuning backward sidecar" ON)
 option(RWKV7_FAST_V4_MSVC_LTCG "Enable MSVC link-time code generation" OFF)
 
 set(CMAKE_CXX_STANDARD 17)

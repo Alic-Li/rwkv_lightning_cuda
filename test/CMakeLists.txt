@@ -8,6 +8,7 @@ function(rwkv_add_unit_test target_name source_file)
   target_include_directories(${target_name} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/cuda
+    ${PROJECT_SOURCE_DIR}/hip
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/quant/modeling
     ${PROJECT_SOURCE_DIR}/quant/gemmv
@@ -29,8 +30,10 @@ rwkv_add_unit_test(rwkv_state_cache_test ${CMAKE_CURRENT_SOURCE_DIR}/state_cache
 rwkv_add_unit_test(rwkv_inference_engine_test ${CMAKE_CURRENT_SOURCE_DIR}/inference_engine_test.cpp)
 rwkv_add_unit_test(rwkv_prefill_admission_test ${CMAKE_CURRENT_SOURCE_DIR}/prefill_admission_test.cpp)
 rwkv_add_unit_test(rwkv_cuda_non4096_kernels_test ${CMAKE_CURRENT_SOURCE_DIR}/cuda_non4096_kernels_test.cpp)
-rwkv_add_unit_test(rwkv_w8a16_kernels_test ${CMAKE_CURRENT_SOURCE_DIR}/w8a16_kernels_test.cpp)
-if(RWKV_GPU_BACKEND STREQUAL "CUDA" AND RWKV7_STATE_TUNING)
+if(RWKV_GPU_BACKEND STREQUAL "CUDA")
+  rwkv_add_unit_test(rwkv_w8a16_kernels_test ${CMAKE_CURRENT_SOURCE_DIR}/w8a16_kernels_test.cpp)
+endif()
+if(RWKV7_STATE_TUNING)
   rwkv_add_unit_test(rwkv_state_tuning_cuda_test ${CMAKE_CURRENT_SOURCE_DIR}/state_tuning_cuda_test.cpp)
   set_tests_properties(rwkv_state_tuning_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
   rwkv_add_unit_test(rwkv_state_tuning_api_test ${CMAKE_CURRENT_SOURCE_DIR}/state_tuning_api_test.cpp)
