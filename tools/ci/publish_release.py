@@ -51,7 +51,8 @@ class Publisher:
         args = ["api", f"{self.prefix}/{path}", "--method", method]
         if payload is not None:
             args += ["--input", "-"]
-        return json.loads(gh(*args, payload=payload))
+        output = gh(*args, payload=payload)
+        return json.loads(output) if output.strip() else None
 
     def lookup(self, path):
         try:
@@ -62,7 +63,43 @@ class Publisher:
             raise
 
     def release(self):
-        return self.lookup(f"releases/tags/{quote(self.tag, safe='')}")
+        release = self.lookup(f"releases/tags/{quote(self.tag, safe='')}")
+        if release is not None:
+            return release
+        # Tag lookup can omit drafts. Authenticated listing includes accessible drafts.
+        return next((r for r in self.pages("releases") if r["tag_name"] == self.tag), None)
+
+    def pages(self, path):
+        page = 1
+        while True:
+            items = retry(lambda: self.api(f"{path}?per_page=100&page={page}"))
+            yield from items
+            if len(items) < 100:
+                break
+            page += 1
+
+    def upload_asset(self, release, asset):
+        def upload():
+            current = retry(lambda: self.api(f"releases/{release['id']}"))
+            if not current["draft"]:
+                raise RuntimeError("Release is already published; refusing to replace assets")
+            # Remove same-name assets, including starter files left by failed uploads.
+            for existing in self.pages(f"releases/{release['id']}/assets"):
+                if existing["name"] == asset.name:
+                    try:
+                        self.api(f"releases/assets/{existing['id']}", method="DELETE")
+                    except GitHubError as error:
+                        if error.status != 404:
+                            raise
+            upload_url = release["upload_url"].split("{", 1)[0]
+            response = json.loads(gh(
+                "api", f"{upload_url}?name={quote(asset.name, safe='')}",
+                "--method", "POST", "--header", "Content-Type: application/octet-stream",
+                "--input", str(asset),
+            ))
+            if response.get("state") != "uploaded" or response.get("size") != asset.stat().st_size:
+                raise GitHubError(f"Incomplete upload: {asset.name}")
+        retry(upload)
 
     def ensure_tag(self):
         def ensure():
@@ -104,8 +141,7 @@ class Publisher:
             retry(lambda: self.api(release_path, {"body": notes}, "PATCH"))
         for asset in assets:
             print(f"Uploading {asset.name}", flush=True)
-            retry(lambda: gh("release", "upload", self.tag, str(asset),
-                             "--repo", self.repo, "--clobber"))
+            self.upload_asset(release, asset)
         # PATCH is idempotent, including when publishing succeeded but its response was lost.
         retry(lambda: self.api(release_path, {"draft": False, "make_latest": "true"}, "PATCH"))
         print(f"Published {self.tag}")

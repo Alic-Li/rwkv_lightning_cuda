@@ -39,7 +39,7 @@ class PublishTests(unittest.TestCase):
                 self.publisher.ensure_draft()
 
     def test_only_404_means_missing(self):
-        with patch.object(self.publisher, "api", side_effect=GitHubError("HTTP 404")):
+        with patch.object(self.publisher, "api", side_effect=[GitHubError("HTTP 404"), []]):
             self.assertIsNone(self.publisher.release())
         for status in (401, 403, 500):
             with patch.object(self.publisher, "api", side_effect=GitHubError(f"HTTP {status}")):
@@ -51,6 +51,34 @@ class PublishTests(unittest.TestCase):
             with self.assertRaises(GitHubError):
                 retry(call)
             self.assertEqual(call.call_count, 1)
+
+    def test_draft_found_via_list_when_tag_lookup_is_missing(self):
+        draft = {"id": 42, "draft": True, "tag_name": "v1.4.1"}
+        with patch.object(self.publisher, "api", side_effect=[GitHubError("HTTP 404"), [draft]]):
+            self.assertEqual(self.publisher.release(), draft)
+
+    def test_upload_uses_url_and_cleans_failed_asset_on_retry(self):
+        release = {"id": 42, "upload_url": "https://uploads.github.com/repos/owner/repo/releases/42/assets{?name,label}"}
+        with tempfile.TemporaryDirectory() as tmp:
+            asset = Path(tmp) / "package test.zip"
+            asset.write_bytes(b"zip")
+            with patch.object(self.publisher, "api", side_effect=[
+                {"draft": True}, [],
+                {"draft": True}, [{"id": 7, "name": asset.name}], None,
+            ]) as api, patch("publish_release.gh", side_effect=[
+                GitHubError("HTTP 502"), '{"state":"uploaded","size":3}',
+            ]) as command:
+                self.publisher.upload_asset(release, asset)
+                self.assertEqual(command.call_count, 2)
+                args = command.call_args.args
+                self.assertEqual(args[0], "api")
+                self.assertIn("/releases/42/assets?name=package%20test.zip", args[1])
+                self.assertEqual(args[-2:], ("--input", str(asset)))
+                api.assert_any_call("releases/assets/7", method="DELETE")
+
+    def test_delete_accepts_empty_204_response(self):
+        with patch("publish_release.gh", return_value=""):
+            self.assertIsNone(self.publisher.api("releases/assets/7", method="DELETE"))
 
     def run_publish(self, upload_failure=False):
         calls = []
@@ -66,7 +94,7 @@ class PublishTests(unittest.TestCase):
             with patch.object(self.publisher, "ensure_tag"), patch.object(
                 self.publisher, "ensure_draft", return_value={"id": 42, "draft": True}
             ), patch.object(self.publisher, "api", side_effect=api), patch(
-                "publish_release.gh", side_effect=GitHubError("HTTP 500") if upload_failure else None
+                "publish_release.Publisher.upload_asset", side_effect=GitHubError("HTTP 500") if upload_failure else None
             ):
                 if upload_failure:
                     with self.assertRaises(GitHubError):

@@ -105,7 +105,12 @@ The publisher (`tools/ci/publish_release.py`) retries transient API failures up 
 five times with backoff. Tag and draft creation re-check server state before each
 retry, so a successful create with a lost response can resume. Release notes are
 generated separately; if that service fails, a short fallback description is used.
-Assets are uploaded individually with retries, and the release remains a draft if
+Assets are uploaded through the REST `upload_url` returned by the release API,
+using its numeric release ID rather than resolving the tag again through
+`gh release upload`. Same-name assets (including incomplete uploads) are removed
+before retrying. Tag lookup also falls back to paginated release listing to find
+existing drafts. Uploads are checked for completed state and file size.
+The release remains a draft if
 any upload fails. Already published releases are never overwritten.
 
 After changing the workflow or publisher, push the fix to `main` (or run the
