@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -11,6 +11,7 @@ import {
   ScanLine,
   Zap,
   SlidersHorizontal,
+  ExternalLink,
 } from "lucide-react";
 import { useChat, type ChatMessage } from "../stores/chat";
 import { useRuntime } from "../stores/runtime";
@@ -18,7 +19,17 @@ import { useSettings } from "../stores/settings";
 import { GenerationSettings } from "../components/GenerationSettings";
 import { StateManager } from "../components/StateManager";
 import { CopyButton, Dialog } from "../components/common";
-const Message = memo(function Message({ message }: { message: ChatMessage }) {
+import { extractHTMLDocuments, openHTMLPreview } from "../lib/chat/html";
+export const Message = memo(function Message({
+  message,
+}: {
+  message: ChatMessage;
+}) {
+  const htmlDocuments = useMemo(
+    () =>
+      message.role === "assistant" ? extractHTMLDocuments(message.content) : [],
+    [message.content, message.role],
+  );
   return (
     <article className={`message ${message.role}`}>
       <div className="message-label">
@@ -42,6 +53,16 @@ const Message = memo(function Message({ message }: { message: ChatMessage }) {
       )}
       <div className="message-tools">
         <CopyButton text={message.content} />
+        {htmlDocuments.length > 0 && (
+          <button
+            type="button"
+            title="Open the generated HTML in a new browser tab"
+            onClick={() => openHTMLPreview(htmlDocuments.at(-1)!)}
+          >
+            <ExternalLink size={14} /> Preview HTML
+            {htmlDocuments.length > 1 ? ` (${htmlDocuments.length})` : ""}
+          </button>
+        )}
         {message.finishReason && (
           <span>finish_reason: {message.finishReason}</span>
         )}

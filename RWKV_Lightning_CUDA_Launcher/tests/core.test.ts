@@ -9,6 +9,11 @@ import {
 import { resolveTheme } from "../src/stores/settings";
 import { defaultTuning } from "../src/lib/api/launcher";
 import { normalizeLanguage } from "../src/lib/translate/languages";
+import {
+  buildHTMLPreviewDocument,
+  extractHTMLDocuments,
+} from "../src/lib/chat/html";
+import { suggestedQuantizedPath } from "../src/lib/api/launcher";
 const stream = (parts: string[]) =>
   new ReadableStream<Uint8Array>({
     start(c) {
@@ -240,6 +245,55 @@ describe("theme selection", () => {
     expect(resolveTheme("system", false)).toBe("dark");
     expect(resolveTheme("invalid", true)).toBe("dark");
   });
+});
+
+describe("generated HTML previews", () => {
+  it("extracts fenced and complete raw HTML without matching prose", () => {
+    expect(
+      extractHTMLDocuments(
+        "Here you go:\n```html\n<!doctype html><h1>Hello</h1>\n```",
+      ),
+    ).toEqual(["<!doctype html><h1>Hello</h1>"]);
+    expect(extractHTMLDocuments("<html><body>raw</body></html>")).toEqual([
+      "<html><body>raw</body></html>",
+    ]);
+    expect(extractHTMLDocuments("Use an <html> element.")).toEqual([]);
+    expect(extractHTMLDocuments("```html\n<div>unfinished</div>")).toEqual([]);
+  });
+  it("renders generated markup in an isolated sandboxed iframe", () => {
+    const preview = buildHTMLPreviewDocument(
+      '<script>document.body.textContent="ok"</script>',
+    );
+    expect(preview).toContain(
+      'sandbox="allow-scripts allow-forms allow-modals"',
+    );
+    expect(preview).not.toContain("allow-same-origin");
+    expect(preview).toContain("&lt;script&gt;");
+  });
+  it("adds the preview action only to assistant HTML messages", async () => {
+    const { createElement } = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { Message } = await import("../src/pages/ChatPage");
+    const html = renderToStaticMarkup(
+      createElement(Message, {
+        message: {
+          id: "answer",
+          role: "assistant",
+          content: "```html\n<!doctype html><h1>Preview</h1>\n```",
+        },
+      }),
+    );
+    expect(html).toContain("Preview HTML");
+  });
+});
+
+it("suggests quantized model names for both formats", () => {
+  expect(suggestedQuantizedPath("/models/demo.pth", "w4a16")).toBe(
+    "/models/demo.w4a16.rwkvq",
+  );
+  expect(suggestedQuantizedPath("C:\\models\\DEMO.PTH", "w8a16")).toBe(
+    "C:\\models\\DEMO.w8a16.rwkvq",
+  );
 });
 
 it("uses the recommended state tuning defaults", () => {

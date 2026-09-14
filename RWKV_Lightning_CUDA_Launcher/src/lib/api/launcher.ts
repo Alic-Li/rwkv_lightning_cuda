@@ -37,6 +37,28 @@ export interface ProcessStatus {
   losses?: { step: number; loss: number }[];
   available?: boolean;
 }
+export interface QuantizationStatus extends ProcessStatus {
+  output_path?: string;
+}
+export interface QuantizationConfig {
+  input_path: string;
+  output_path: string;
+  format: "w8a16" | "w4a16";
+  group_size: 32 | 128;
+}
+export const defaultQuantization: QuantizationConfig = {
+  input_path: "",
+  output_path: "",
+  format: "w4a16",
+  group_size: 128,
+};
+export function suggestedQuantizedPath(
+  input: string,
+  format: QuantizationConfig["format"],
+) {
+  const base = input.replace(/\.pth$/i, "");
+  return base ? `${base}.${format}.rwkvq` : "";
+}
 export interface RuntimeState extends ProcessStatus {
   config?: RuntimeConfig;
   base_url?: string;
@@ -130,5 +152,21 @@ export class StateTuningClient {
     return request("/api/tuning/open-folder", {});
   }
 }
+export class QuantizationClient {
+  getStatus(signal?: AbortSignal) {
+    return request<QuantizationStatus>(
+      "/api/quantization/status",
+      undefined,
+      signal,
+    );
+  }
+  start(config: QuantizationConfig) {
+    return request("/api/quantization/start", config);
+  }
+  stop() {
+    return request("/api/quantization/stop", {});
+  }
+}
 export const launcher = new LauncherClient();
 export const tuning = new StateTuningClient();
+export const quantization = new QuantizationClient();

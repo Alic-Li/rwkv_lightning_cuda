@@ -133,23 +133,26 @@ Launcher WebUI 默认训练参数（启动时会完整传给 CLI）：
 
 新增的控制接口在 `main.go` 实现，不是对原生 API 的假设。所有 POST 都发送 JSON，失败返回实际 `{"error":"..."}` 与 HTTP 错误码。
 
-| Method | Path                      | 行为                                                            |
-| ------ | ------------------------- | --------------------------------------------------------------- |
-| GET    | `/api/status`             | 进程状态、真实 backend status、脱敏配置、最近 2000 行日志       |
-| POST   | `/api/start`              | RuntimeConfig；验证路径/端口并启动                              |
-| POST   | `/api/stop`               | 等待运行进程退出                                                |
-| POST   | `/api/restart`            | 使用上次实际启动配置停止并重启                                  |
-| POST   | `/api/pick-file`          | 原生宿主机文件选择；无图形环境时明确报错，可手动输入路径        |
-| POST   | `/api/pick-directory`     | 原生宿主机目录选择，用于训练输出目录                            |
-| GET    | `/logs`                   | 保留旧 Runtime SSE 日志入口                                     |
-| GET    | `/api/tuning/status`      | 训练状态、可执行文件是否存在、日志、进度、loss 数据、checkpoint |
-| POST   | `/api/tuning/validate`    | `{"path":"..."}`，返回有效样本数或准确行号错误                  |
-| POST   | `/api/tuning/start`       | TuningConfig，启动真实 `rwkv_state_tune`                        |
-| POST   | `/api/tuning/stop`        | 停止训练进程                                                    |
-| POST   | `/api/tuning/open-folder` | 打开最近实际保存 checkpoint 所在文件夹                          |
-| \*     | `/v1/*`                   | 转发到本 Launcher 管理的原生 backend，SSE 即时 flush            |
+| Method | Path                       | 行为                                                            |
+| ------ | -------------------------- | --------------------------------------------------------------- |
+| GET    | `/api/status`              | 进程状态、真实 backend status、脱敏配置、最近 2000 行日志       |
+| POST   | `/api/start`               | RuntimeConfig；验证路径/端口并启动                              |
+| POST   | `/api/stop`                | 等待运行进程退出                                                |
+| POST   | `/api/restart`             | 使用上次实际启动配置停止并重启                                  |
+| POST   | `/api/pick-file`           | 原生宿主机文件选择；无图形环境时明确报错，可手动输入路径        |
+| POST   | `/api/pick-directory`      | 原生宿主机目录选择，用于训练输出目录                            |
+| GET    | `/logs`                    | 保留旧 Runtime SSE 日志入口                                     |
+| GET    | `/api/tuning/status`       | 训练状态、可执行文件是否存在、日志、进度、loss 数据、checkpoint |
+| POST   | `/api/tuning/validate`     | `{"path":"..."}`，返回有效样本数或准确行号错误                  |
+| POST   | `/api/tuning/start`        | TuningConfig，启动真实 `rwkv_state_tune`                        |
+| POST   | `/api/tuning/stop`         | 停止训练进程                                                    |
+| POST   | `/api/tuning/open-folder`  | 打开最近实际保存 checkpoint 所在文件夹                          |
+| GET    | `/api/quantization/status` | 量化进程状态、工具可用性、输出路径与日志                        |
+| POST   | `/api/quantization/start`  | 启动 W8A16 或 W4A16 `.pth` → `.rwkvq` 转换                      |
+| POST   | `/api/quantization/stop`   | 停止量化进程                                                    |
+| \*     | `/v1/*`                    | 转发到本 Launcher 管理的原生 backend，SSE 即时 flush            |
 
-完整 TypeScript payload 见 `src/lib/api/launcher.ts`。推理接口沿用项目文档，没有新增原生 CLI flag。静态和控制服务仅绑定 loopback，并验证 Host / Origin；不允许从外站操作本地进程。Markdown 不解析原始 HTML。
+完整 TypeScript payload 见 `src/lib/api/launcher.ts`。推理接口沿用项目文档，没有新增原生 CLI flag。静态和控制服务仅绑定 loopback，并验证 Host / Origin；不允许从外站操作本地进程。Markdown 不直接解析原始 HTML；助手输出完整 HTML 或闭合的 `html` fence 时会出现新标签页预览按钮，生成内容运行在不带同源权限的 sandbox iframe 中。
 
 ## 验证
 

@@ -108,6 +108,38 @@ func TestTuningArgs(t *testing.T) {
 		t.Fatal("accepted unsupported optimizer")
 	}
 }
+func TestQuantizationArgs(t *testing.T) {
+	input := testFile(t, "model.pth", "model")
+	output := filepath.Join(t.TempDir(), "model.w4a16.rwkvq")
+	args, err := quantizationArgs(quantizeRequest{InputPath: input, OutputPath: output, Format: "w4a16", GroupSize: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--format", "w4a16", "--group-size", "32", input, output}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("%v", args)
+	}
+	args, err = quantizationArgs(quantizeRequest{InputPath: input, OutputPath: filepath.Join(t.TempDir(), "model.w8a16.rwkvq"), Format: "w8a16", GroupSize: 128})
+	if err != nil || strings.Contains(strings.Join(args, " "), "group-size") {
+		t.Fatalf("%v %v", args, err)
+	}
+	for _, req := range []quantizeRequest{
+		{InputPath: input, OutputPath: output, Format: "w4a16", GroupSize: 64},
+		{InputPath: input, OutputPath: output, Format: "fp8", GroupSize: 128},
+		{InputPath: input, OutputPath: filepath.Join(t.TempDir(), "model.bin"), Format: "w8a16"},
+		{InputPath: testFile(t, "model.rwkvq", "model"), OutputPath: output, Format: "w8a16"},
+	} {
+		if _, err = quantizationArgs(req); err == nil {
+			t.Fatalf("accepted invalid request: %+v", req)
+		}
+	}
+	if err = os.WriteFile(output, []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = quantizationArgs(quantizeRequest{InputPath: input, OutputPath: output, Format: "w4a16", GroupSize: 128}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatal("accepted existing output", err)
+	}
+}
 func TestProcessLogsAndProgress(t *testing.T) {
 	t.Setenv("RWKV_TEST_CHILD", "logs")
 	p := newProcess()

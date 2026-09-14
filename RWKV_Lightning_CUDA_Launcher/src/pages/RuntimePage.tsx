@@ -1,6 +1,17 @@
 import { useEffect, useState } from "react";
-import { Cpu, FolderOpen, SlidersHorizontal } from "lucide-react";
-import { useRuntime, useRuntimeForm } from "../stores/runtime";
+import {
+  Archive,
+  Cpu,
+  FolderOpen,
+  LoaderCircle,
+  SlidersHorizontal,
+  Square,
+} from "lucide-react";
+import {
+  useQuantizationForm,
+  useRuntime,
+  useRuntimeForm,
+} from "../stores/runtime";
 import { useSecret } from "../stores/settings";
 import { RWKVClient } from "../lib/api/client";
 import {
@@ -11,9 +22,20 @@ import {
   ErrorPanel,
 } from "../components/common";
 import { RuntimeControls, RuntimeBadge } from "../components/RuntimeControls";
+import { suggestedQuantizedPath } from "../lib/api/launcher";
 export function RuntimePage() {
   const { config, set, recent } = useRuntimeForm();
-  const { runtime, error, connected } = useRuntime();
+  const quantize = useQuantizationForm((s) => s.config);
+  const setQuantize = useQuantizationForm((s) => s.set);
+  const {
+    runtime,
+    quantization,
+    quantizationBusy,
+    quantizationError,
+    quantizationAction,
+    error,
+    connected,
+  } = useRuntime();
   const key = useSecret((s) => s.key);
   const [models, setModels] = useState<string[]>([]);
   const [selected, setSelected] = useState("");
@@ -192,6 +214,147 @@ export function RuntimePage() {
           </p>
         </Panel>
       </div>
+      <Panel title="Model quantization" hint="W8A16 / W4A16">
+        <div className="device-info">
+          <Archive size={22} />
+          <div>
+            <strong>Convert a BF16 checkpoint</strong>
+            <p>
+              Create a smaller .rwkvq model that the CUDA runtime detects
+              automatically.
+            </p>
+          </div>
+        </div>
+        <div className="form-grid">
+          <PathField
+            label="BF16 input model (.pth)"
+            value={quantize.input_path}
+            onChange={(input_path) =>
+              setQuantize({
+                input_path,
+                output_path: suggestedQuantizedPath(
+                  input_path,
+                  quantize.format,
+                ),
+              })
+            }
+          />
+          <Field
+            label="Quantized output (.rwkvq)"
+            hint="A new file is required; existing files are never overwritten."
+          >
+            <input
+              value={quantize.output_path}
+              onChange={(e) => setQuantize({ output_path: e.target.value })}
+              placeholder="/path/to/model.w4a16.rwkvq"
+            />
+          </Field>
+          <Field label="Weight format">
+            <select
+              value={quantize.format}
+              onChange={(e) => {
+                const format = e.target.value as "w8a16" | "w4a16";
+                setQuantize({
+                  format,
+                  output_path: suggestedQuantizedPath(
+                    quantize.input_path,
+                    format,
+                  ),
+                });
+              }}
+            >
+              <option value="w4a16">W4A16 · smallest (recommended)</option>
+              <option value="w8a16">W8A16 · higher fidelity</option>
+            </select>
+          </Field>
+          <Field
+            label="W4 group size"
+            hint="128 uses less space; 32 keeps more per-group precision."
+          >
+            <select
+              disabled={quantize.format !== "w4a16"}
+              value={quantize.group_size}
+              onChange={(e) =>
+                setQuantize({ group_size: Number(e.target.value) as 32 | 128 })
+              }
+            >
+              <option value="128">128 · recommended</option>
+              <option value="32">32 · higher fidelity</option>
+            </select>
+          </Field>
+        </div>
+        <div className="toolbar quantization-actions">
+          <button
+            type="button"
+            onClick={() => {
+              const input_path = config.model_path;
+              setQuantize({
+                input_path,
+                output_path: suggestedQuantizedPath(
+                  input_path,
+                  quantize.format,
+                ),
+              });
+            }}
+            disabled={
+              quantization.running ||
+              !config.model_path.toLowerCase().endsWith(".pth")
+            }
+          >
+            Use current model
+          </button>
+          {quantization.running ? (
+            <button
+              type="button"
+              disabled={quantizationBusy}
+              onClick={() => void quantizationAction("stop")}
+            >
+              <Square size={13} /> Stop quantization
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="primary"
+              disabled={
+                !connected ||
+                quantizationBusy ||
+                quantization.available === false ||
+                !quantize.input_path.trim() ||
+                !quantize.output_path.trim()
+              }
+              onClick={() => void quantizationAction("start")}
+            >
+              {quantizationBusy ? (
+                <LoaderCircle size={13} className="spin" />
+              ) : (
+                <Archive size={13} />
+              )}{" "}
+              Quantize model
+            </button>
+          )}
+          {quantization.status === "completed" && quantization.output_path && (
+            <button
+              type="button"
+              onClick={() => set({ model_path: quantization.output_path! })}
+            >
+              Use quantized model
+            </button>
+          )}
+          <span className="muted small" role="status">
+            {quantization.running
+              ? `Quantizing · ${Math.round(quantization.elapsed)}s`
+              : quantization.status === "completed"
+                ? "Quantization completed"
+                : quantization.available === false
+                  ? "rwkv_quantize is not included beside the Launcher."
+                  : "Conversion runs locally and may use substantial RAM."}
+          </span>
+        </div>
+        <ErrorPanel error={quantizationError || quantization.error} />
+        {quantization.logs.length > 0 && (
+          <Console lines={quantization.logs} title="Quantization logs" />
+        )}
+      </Panel>
       <div className="action-strip">
         <RuntimeControls />
         <span className="muted">

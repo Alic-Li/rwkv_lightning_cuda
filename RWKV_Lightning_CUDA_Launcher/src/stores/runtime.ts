@@ -4,9 +4,13 @@ import {
   defaultRuntime,
   launcher,
   tuning,
+  quantization,
+  defaultQuantization,
   type RuntimeState,
   type RuntimeConfig,
   type ProcessStatus,
+  type QuantizationStatus,
+  type QuantizationConfig,
 } from "../lib/api/launcher";
 import { storage } from "./settings";
 export const useRuntimeForm = create(
@@ -35,6 +39,21 @@ export const useRuntimeForm = create(
     },
   ),
 );
+export const useQuantizationForm = create(
+  persist<{
+    config: QuantizationConfig;
+    set: (v: Partial<QuantizationConfig>) => void;
+  }>(
+    (set) => ({
+      config: defaultQuantization,
+      set: (v) => set((s) => ({ config: { ...s.config, ...v } })),
+    }),
+    {
+      name: "rwkv-quantization-form-v1",
+      storage: createJSONStorage(() => storage),
+    },
+  ),
+);
 let synchronized = false;
 const empty: ProcessStatus = {
   status: "offline",
@@ -46,22 +65,30 @@ const empty: ProcessStatus = {
 export const useRuntime = create<{
   runtime: RuntimeState;
   tuning: ProcessStatus;
+  quantization: QuantizationStatus;
   connected: boolean;
   busy: boolean;
+  quantizationBusy: boolean;
   error: string;
+  quantizationError: string;
   refresh: () => Promise<void>;
   action: (action: "start" | "stop" | "restart") => Promise<void>;
+  quantizationAction: (action: "start" | "stop") => Promise<void>;
 }>((set) => ({
   runtime: empty,
   tuning: empty,
+  quantization: empty,
   connected: false,
   busy: false,
+  quantizationBusy: false,
   error: "",
+  quantizationError: "",
   refresh: async () => {
     try {
-      const [runtime, state] = await Promise.all([
+      const [runtime, state, quantizationState] = await Promise.all([
         launcher.getStatus(AbortSignal.timeout(4000)),
         tuning.getStatus(AbortSignal.timeout(4000)),
+        quantization.getStatus(AbortSignal.timeout(4000)),
       ]);
       if (!synchronized) {
         synchronized = true;
@@ -71,7 +98,13 @@ export const useRuntime = create<{
             password: useRuntimeForm.getState().config.password,
           });
       }
-      set({ runtime, tuning: state, connected: true, error: "" });
+      set({
+        runtime,
+        tuning: state,
+        quantization: quantizationState,
+        connected: true,
+        error: "",
+      });
     } catch (e) {
       set({ connected: false, error: String(e) });
     }
@@ -88,6 +121,19 @@ export const useRuntime = create<{
       set({ error: String(e) });
     } finally {
       set({ busy: false });
+    }
+  },
+  quantizationAction: async (action) => {
+    set({ quantizationBusy: true, quantizationError: "" });
+    try {
+      if (action === "start")
+        await quantization.start(useQuantizationForm.getState().config);
+      else await quantization.stop();
+      await useRuntime.getState().refresh();
+    } catch (e) {
+      set({ quantizationError: String(e) });
+    } finally {
+      set({ quantizationBusy: false });
     }
   },
 }));

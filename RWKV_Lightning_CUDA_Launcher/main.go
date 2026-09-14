@@ -64,6 +64,12 @@ type tuneRequest struct {
 	Optimizer   string  `json:"optimizer"`
 	WKVTape     bool    `json:"wkv_tape"`
 }
+type quantizeRequest struct {
+	InputPath  string `json:"input_path"`
+	OutputPath string `json:"output_path"`
+	Format     string `json:"format"`
+	GroupSize  int    `json:"group_size"`
+}
 type process struct {
 	mu         sync.Mutex
 	cmd        *exec.Cmd
@@ -292,14 +298,16 @@ func (p *process) sse(w http.ResponseWriter, r *http.Request) {
 }
 
 type launcher struct {
-	mu      sync.Mutex
-	runtime *process
-	tuning  *process
-	config  startRequest
+	mu                 sync.Mutex
+	runtime            *process
+	tuning             *process
+	quantization       *process
+	config             startRequest
+	quantizationOutput string
 }
 
 func newLauncher() *launcher {
-	return &launcher{runtime: newProcess(), tuning: newProcess(), config: startRequest{Port: defaultPort, VocabPath: defaultVocabPath, ChunkSize: 128, StateDBPath: "rwkv_sessions.db"}}
+	return &launcher{runtime: newProcess(), tuning: newProcess(), quantization: newProcess(), config: startRequest{Port: defaultPort, VocabPath: defaultVocabPath, ChunkSize: 128, StateDBPath: "rwkv_sessions.db"}}
 }
 func existingPath(path string, dir bool) error {
 	if strings.TrimSpace(path) == "" {
@@ -505,6 +513,59 @@ func tuningArgs(req tuneRequest) ([]string, error) {
 	args = append(args, "--lr", strconv.FormatFloat(req.LR, 'g', -1, 64), "--lr-final", strconv.FormatFloat(req.LRFinal, 'g', -1, 64))
 	return args, nil
 }
+func quantizationArgs(req quantizeRequest) ([]string, error) {
+	if err := existingPath(req.InputPath, false); err != nil {
+		return nil, fmt.Errorf("input model: %w", err)
+	}
+	if !strings.EqualFold(filepath.Ext(req.InputPath), ".pth") {
+		return nil, fmt.Errorf("quantization requires a BF16 .pth input model")
+	}
+	if strings.TrimSpace(req.OutputPath) == "" {
+		return nil, fmt.Errorf("output path is required")
+	}
+	if !strings.EqualFold(filepath.Ext(req.OutputPath), ".rwkvq") {
+		return nil, fmt.Errorf("quantized output must use the .rwkvq extension")
+	}
+	input := req.InputPath
+	if !filepath.IsAbs(input) {
+		input = filepath.Join(appDir(), input)
+	}
+	output := req.OutputPath
+	if !filepath.IsAbs(output) {
+		output = filepath.Join(appDir(), output)
+	}
+	input = filepath.Clean(input)
+	output = filepath.Clean(output)
+	if strings.EqualFold(input, output) {
+		return nil, fmt.Errorf("input and output paths must differ")
+	}
+	parent := filepath.Dir(output)
+	if err := existingPath(parent, true); err != nil {
+		return nil, fmt.Errorf("output directory: %w", err)
+	}
+	if _, err := os.Stat(output); err == nil {
+		return nil, fmt.Errorf("output already exists: %s", output)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("output: %w", err)
+	}
+	if req.Format == "" {
+		req.Format = "w4a16"
+	}
+	if req.Format != "w8a16" && req.Format != "w4a16" {
+		return nil, fmt.Errorf("format must be w8a16 or w4a16")
+	}
+	args := []string{"--format", req.Format}
+	if req.Format == "w4a16" {
+		if req.GroupSize == 0 {
+			req.GroupSize = 128
+		}
+		if req.GroupSize != 32 && req.GroupSize != 128 {
+			return nil, fmt.Errorf("W4A16 group size must be 32 or 128")
+		}
+		args = append(args, "--group-size", strconv.Itoa(req.GroupSize))
+	}
+	return append(args, req.InputPath, req.OutputPath), nil
+}
 func (l *launcher) proxy(w http.ResponseWriter, r *http.Request) {
 	l.mu.Lock()
 	config := l.config
@@ -707,6 +768,58 @@ func (l *launcher) handler() http.Handler {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return nil
 	})
+	api("/api/quantization/status", "GET", func(w http.ResponseWriter, r *http.Request) error {
+		out := l.quantization.snapshot()
+		name := "rwkv_quantize"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		_, err := os.Stat(filepath.Join(appDir(), name))
+		out["available"] = err == nil
+		l.mu.Lock()
+		out["output_path"] = l.quantizationOutput
+		l.mu.Unlock()
+		writeJSON(w, 200, out)
+		return nil
+	})
+	api("/api/quantization/start", "POST", func(w http.ResponseWriter, r *http.Request) error {
+		var req quantizeRequest
+		if e := decode(w, r, &req); e != nil {
+			return e
+		}
+		args, e := quantizationArgs(req)
+		if e != nil {
+			return e
+		}
+		name := "rwkv_quantize"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		exe := filepath.Join(appDir(), name)
+		if e = existingPath(exe, false); e != nil {
+			return fmt.Errorf("quantizer is unavailable: %w", e)
+		}
+		if e = l.quantization.launch(exe, args, ""); e != nil {
+			return e
+		}
+		l.quantization.mu.Lock()
+		if l.quantization.cmd != nil {
+			l.quantization.state = "running"
+		}
+		l.quantization.mu.Unlock()
+		l.mu.Lock()
+		l.quantizationOutput = req.OutputPath
+		l.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return nil
+	})
+	api("/api/quantization/stop", "POST", func(w http.ResponseWriter, r *http.Request) error {
+		if e := l.quantization.stop(); e != nil {
+			return e
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return nil
+	})
 	mux.HandleFunc("/logs", l.runtime.sse)
 	mux.HandleFunc("/v1/", l.proxy)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -750,6 +863,7 @@ func main() {
 		l.mu.Lock()
 		_ = l.runtime.stop()
 		_ = l.tuning.stop()
+		_ = l.quantization.stop()
 		l.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
