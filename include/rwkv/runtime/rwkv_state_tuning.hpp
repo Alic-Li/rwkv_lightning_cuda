@@ -31,6 +31,7 @@ std::size_t wkv_tape_elements(const WkvShape &shape);
 
 // r/w/k/v/a/b/y are [B,T,H,N]. w is the raw clamp-w input including w0.
 // Initial/final states use the inference physical ABI [B,H,K,V].
+// An empty tape disables recording for forward only.
 void wkv_forward(cudaStream_t stream, IoType io_type, const WkvShape &shape,
                  const float *initial_state, const void *r, const void *w,
                  const void *k, const void *v, const void *a, const void *b,
@@ -172,6 +173,10 @@ struct BlockTapeView {
   half *ln2 = nullptr;
   half *ffn_hid = nullptr;
   WkvTapeView wkv;
+  // Optional replay mode: owned initial state and shared final-state scratch.
+  // wkv storage may be shared by blocks executed sequentially on one stream.
+  float *wkv_replay_initial = nullptr;
+  float *wkv_replay_final = nullptr;
 };
 
 std::size_t
@@ -264,6 +269,20 @@ const half *model_backward_state_only(
 void reduce_state_gradient_f32(cudaStream_t stream, int batch, int heads,
                                int head_size, const float *per_batch_gradient,
                                float *state_gradient, bool accumulate);
+
+// Each contiguous 64x64 state matrix is orthogonalized independently.
+struct MuonConfig {
+  float learning_rate = 0.02f;
+  float momentum = 0.95f;
+  int ns_steps = 5;
+  bool nesterov = true;
+  float weight_decay = 0.0f;
+};
+
+void muon_update_state_f32(cudaStream_t stream, float *time_state,
+                           float *gradient, float *momentum,
+                           std::size_t elements, const MuonConfig &config,
+                           bool zero_gradient);
 
 struct AdamConfig {
   float learning_rate = 1.0e-3f;

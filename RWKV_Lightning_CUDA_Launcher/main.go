@@ -61,6 +61,8 @@ type tuneRequest struct {
 	WarmupSteps int     `json:"warmup_steps"`
 	SaveEvery   int     `json:"save_every"`
 	Seed        int     `json:"seed"`
+	Optimizer   string  `json:"optimizer"`
+	WKVTape     bool    `json:"wkv_tape"`
 }
 type process struct {
 	mu         sync.Mutex
@@ -475,10 +477,19 @@ func tuningArgs(req tuneRequest) ([]string, error) {
 	if req.BatchSize < 1 || req.BatchSize > 128 {
 		return nil, fmt.Errorf("batch size must be between 1 and 128")
 	}
+	if req.Optimizer == "" {
+		req.Optimizer = "adam"
+	}
+	if req.Optimizer != "adam" && req.Optimizer != "muon" {
+		return nil, fmt.Errorf("optimizer must be adam or muon")
+	}
 	if req.Ctx < 1 || req.Chunk < 1 || req.Chunk > req.Ctx || req.Epochs < 1 || req.LR <= 0 || req.LRFinal <= 0 || req.MaxSteps < 0 || req.WarmupSteps < 0 || req.SaveEvery < 0 || req.Seed < 0 {
 		return nil, fmt.Errorf("invalid training parameter; sizes and learning rates must be positive, counts nonnegative")
 	}
-	args := []string{"--model", req.Model, "--data", req.Data, "--output", req.Output}
+	args := []string{"--model", req.Model, "--data", req.Data, "--output", req.Output, "--optimizer", req.Optimizer}
+	if req.WKVTape {
+		args = append(args, "--wkv_tape")
+	}
 	if req.Vocab != "" {
 		if err := existingPath(req.Vocab, false); err != nil {
 			return nil, err

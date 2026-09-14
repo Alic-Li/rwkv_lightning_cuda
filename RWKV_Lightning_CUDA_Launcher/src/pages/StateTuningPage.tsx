@@ -134,6 +134,8 @@ const recommendedParameters: Partial<TuningConfig> = {
   save_every: 100,
   max_steps: 0,
   seed: 1234,
+  optimizer: "adam",
+  wkv_tape: false,
 };
 const parameterPresets: {
   label: string;
@@ -164,6 +166,8 @@ const parameterPresets: {
 ];
 export function StateTuningPage() {
   const { config, set, resetParameters } = useTuningForm();
+  // Persisted v2 forms created before these options existed have no optimizer.
+  const optimizer = config.optimizer === "muon" ? "muon" : "adam";
   const form = useRef<HTMLFormElement>(null);
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -205,7 +209,8 @@ export function StateTuningPage() {
     config.max_steps >= 0 &&
     config.warmup_steps >= 0 &&
     config.save_every >= 0 &&
-    config.seed >= 0;
+    config.seed >= 0 &&
+    (optimizer === "adam" || optimizer === "muon");
   const canStart =
     connected &&
     pathsReady &&
@@ -225,6 +230,8 @@ export function StateTuningPage() {
     `--data ${JSON.stringify(config.data || "DATA.jsonl")}`,
     `--output ${JSON.stringify(config.output)}`,
     config.vocab ? `--vocab ${JSON.stringify(config.vocab)}` : "",
+    `--optimizer ${optimizer}`,
+    config.wkv_tape ? "--wkv_tape" : "",
     `--ctx ${config.ctx}`,
     `--chunk ${config.chunk}`,
     `--epochs ${config.epochs}`,
@@ -259,7 +266,7 @@ export function StateTuningPage() {
       <input
         type="number"
         required
-        value={config[f.key]}
+        value={Number(config[f.key])}
         min={f.min}
         max={f.max}
         step={f.step ?? 1}
@@ -404,6 +411,35 @@ export function StateTuningPage() {
               />
             </Panel>
             <Panel title="Training" hint="02">
+              <div className="form-grid">
+                <Field
+                  label="Optimizer"
+                  hint="Adam preserves the original behavior. Muon orthogonalizes each 64×64 state matrix."
+                >
+                  <select
+                    value={optimizer}
+                    onChange={(e) =>
+                      set({ optimizer: e.target.value as "adam" | "muon" })
+                    }
+                  >
+                    <option value="adam">Adam</option>
+                    <option value="muon">Muon</option>
+                  </select>
+                </Field>
+                <Field
+                  label="Shared WKV tape"
+                  hint="Recompute WKV per layer during backward to reduce GPU memory usage."
+                >
+                  <label className="thinking-toggle">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(config.wkv_tape)}
+                      onChange={(e) => set({ wkv_tape: e.target.checked })}
+                    />
+                    Enable <code>--wkv_tape</code>
+                  </label>
+                </Field>
+              </div>
               <div className="form-grid">{inputs.slice(0, 6)}</div>
               {config.chunk > config.ctx && (
                 <p className="inline-warning">

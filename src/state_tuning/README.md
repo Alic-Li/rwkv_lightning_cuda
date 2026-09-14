@@ -46,17 +46,17 @@ accumulates later-layer value-residual gradients and consumes them in layer 0.
 - One chunk activation tape is reused. Boundary checkpoints currently remain
   on GPU, so their memory grows with the number of chunks.
 - `--batch-size N` (alias `--batch`) accumulates N independent samples
-  sequentially, then runs one Adam update. This supports variable lengths
+  sequentially, then runs one optimizer update. This supports variable lengths
   without padding; it does not execute samples in parallel on GPU. Loss and
   gradients are weighted by the total number of valid tokens in the batch.
-- Nonfinite loss/dState stops training before Adam, preserving the last good
+- Nonfinite loss/dState stops training before the optimizer, preserving the last good
   optimizer state. The progress bar reports updates, loss, tokens/s, and ETA.
 
 ## Standalone CLI
 
 Both GPU backends produce `rwkv_state_tune`. It streams JSONL records containing
 exactly one `text` field, tokenizes each record, applies causal next-token loss,
-and performs one state-only Adam update per batch:
+and performs one state-only optimizer update per batch:
 
 ```bash
 ./build/rwkv_state_tune \
@@ -84,3 +84,45 @@ PyTorch gradient alignment remains a separate validation task.
 
 For ROCm build commands and a tested training example, see [HIP backend](../../hip/README.md).
 Use `--chunk-load` to bound weight-loading staging buffers for large models.
+
+### Optimizer selection
+
+`rwkv_state_tune --optimizer adam` explicitly selects the existing Adam
+optimizer; omitting `--optimizer` also uses Adam. Use `--optimizer muon` to
+apply Muon independently to each layer/head's 64×64 time-state matrix.
+All other model parameters remain frozen.
+
+The CUDA FP32 implementation follows [KellerJordan/Muon](https://github.com/KellerJordan/Muon):
+momentum 0.95, Nesterov enabled, five quintic Newton–Schulz iterations,
+and no weight decay in the CLI. Unlike the reference's BF16 orthogonalization,
+this implementation performs orthogonalization in FP32.
+Both optimizers use the existing `--lr`, `--lr-final`, and `--warmup-steps`
+schedule, including its unchanged defaults (1.0, 0.01, 10). Muon and Adam
+learning rates are not interchangeable; set these explicitly when comparing
+runs. For example, append `--optimizer muon --lr 0.02 --lr-final 0.002` to
+an existing training command as a starting point for tuning.
+
+### Shared WKV tape
+
+Append `--wkv_tape` to enable layer-shared FP32 WKV tape, independently of
+`--optimizer adam|muon`. Without this flag the original per-layer tape path
+remains active.
+
+Forward saves each layer's chunk initial WKV state and skips per-token WKV
+state recording. Immediately before each block backward, its WKV recurrence
+is replayed from the saved state into one shared tape. Linear layers and FFN
+are not replayed by this option. All layers execute sequentially on the same
+stream; chunk boundary gradients remain connected.
+
+For L layers, H heads and T=min(ctx,chunk), WKV tape-related storage changes
+from `4*L*H*T*64*64` bytes to `4*H*64*64*(T+L+1)` bytes (shared tape,
+per-layer initial states, and shared final-state scratch). This trades an
+additional WKV forward recurrence per backward block for lower memory.
+Other activations, weights, and GPU chunk-boundary checkpoints are unchanged;
+very small chunks or a single layer may not benefit.
+
+```bash
+./build/rwkv_state_tune --model /path/to/model.pth \
+  --data /path/to/train.jsonl --output ./state_output \
+  --ctx 2048 --chunk 256 --optimizer adam --wkv_tape
+```

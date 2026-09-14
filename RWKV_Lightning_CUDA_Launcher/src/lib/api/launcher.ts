@@ -72,6 +72,8 @@ export interface TuningConfig {
   warmup_steps: number;
   save_every: number;
   seed: number;
+  optimizer: "adam" | "muon";
+  wkv_tape: boolean;
 }
 export const defaultTuning: TuningConfig = {
   model: "",
@@ -88,6 +90,8 @@ export const defaultTuning: TuningConfig = {
   warmup_steps: 10,
   save_every: 100,
   seed: 1234,
+  optimizer: "adam",
+  wkv_tape: false,
 };
 export class LauncherClient {
   getStatus(signal?: AbortSignal) {

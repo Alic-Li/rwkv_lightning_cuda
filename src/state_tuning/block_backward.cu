@@ -249,6 +249,14 @@ void block_backward_state_only(cudaStream_t stream, const half *grad_out,
       throw std::invalid_argument("nonzero layer requires rank_v");
   }
 
+  // Regenerate only this layer's WKV history just before consuming it.
+  if (tape.wkv_replay_initial) {
+    wkv_forward(stream, IoType::F16, {tape.batch, tape.time, w.heads, kN},
+                tape.wkv_replay_initial, tape.r, tape.raw_w, tape.wkv_k,
+                tape.v, tape.neg_kk, tape.kka, tape.wkv_y,
+                tape.wkv_replay_final, tape.wkv);
+  }
+
   const int rows = tape.batch * tape.time;
   const int C = w.channels;
   const std::size_t R = static_cast<std::size_t>(rows) * C;

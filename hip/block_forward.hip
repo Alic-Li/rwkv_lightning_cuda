@@ -261,9 +261,19 @@ void block_forward_state_tuning_f16(hipStream_t stream, int B, int T,
 
   rwkv7_tmix_kk_a_gate_launch(stream, B, T, C, w.heads, tape.k, w.k_k, w.a0,
                               a12, w.k_a, tape.wkv_k, tape.neg_kk, tape.kka);
+  if (tape.wkv_replay_initial) {
+    if (!tape.wkv_replay_final)
+      throw std::invalid_argument("missing WKV replay final-state scratch");
+    const auto error = hipMemcpyAsync(
+        tape.wkv_replay_initial, initial_state,
+        static_cast<std::size_t>(B) * w.heads * kN * kN * sizeof(float),
+        hipMemcpyDeviceToDevice, stream);
+    if (error != hipSuccess)
+      throw std::runtime_error(hipGetErrorString(error));
+  }
   wkv_forward(stream, IoType::F16, {B, T, w.heads, kN}, initial_state, tape.r,
               tape.raw_w, tape.wkv_k, tape.v, tape.neg_kk, tape.kka, tape.wkv_y,
-              final_state, tape.wkv);
+              final_state, tape.wkv_replay_initial ? WkvTapeView{} : tape.wkv);
 
   group_norm_forward_kernel<<<rows * w.heads, kN, 0, stream>>>(
       w.heads, tape.wkv_y, w.att_group_norm_weight, w.att_group_norm_bias,

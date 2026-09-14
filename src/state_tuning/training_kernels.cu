@@ -118,6 +118,77 @@ __global__ void adam_kernel(float *__restrict__ parameter,
     gradient[i] = 0.0f;
 }
 
+// FP32 implementation of KellerJordan/Muon's momentum and quintic
+// Newton-Schulz update: https://github.com/KellerJordan/Muon.
+// One block per square state matrix; square matrices need no aspect scaling.
+__global__ void muon_kernel(float *parameter, float *gradient, float *momentum,
+                            MuonConfig config, bool zero_gradient) {
+  __shared__ float x[4096], a[4096], scratch[8];
+  const std::size_t base = static_cast<std::size_t>(blockIdx.x) * 4096;
+  float maximum = 0.0f;
+  for (int i = threadIdx.x; i < 4096; i += kThreads) {
+    const float g = gradient[base + i];
+    const float m = config.momentum * momentum[base + i] +
+                    (1.0f - config.momentum) * g;
+    momentum[base + i] = m;
+    x[i] = config.nesterov ? (1.0f - config.momentum) * g +
+                                config.momentum * m : m;
+    maximum = fmaxf(maximum, fabsf(x[i]));
+  }
+  // Scaled Frobenius norm avoids overflow for large finite gradients.
+  maximum = block_reduce(maximum, scratch, true);
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < 4096; i += kThreads) {
+    x[i] = maximum > 0.0f ? x[i] / maximum : 0.0f;
+    sum += x[i] * x[i];
+  }
+  sum = block_reduce(sum, scratch, false);
+  const float denominator = sqrtf(sum) +
+      (maximum > 0.0f ? 1e-7f / maximum : 1.0f);
+  for (int i = threadIdx.x; i < 4096; i += kThreads)
+    x[i] /= denominator;
+  __syncthreads();
+  for (int step = 0; step < config.ns_steps; ++step) {
+    for (int i = threadIdx.x; i < 4096; i += kThreads) {
+      float dot = 0.0f;
+      for (int k = 0; k < 64; ++k)
+        dot += x[(i / 64) * 64 + k] * x[(i % 64) * 64 + k];
+      a[i] = dot;
+    }
+    __syncthreads();
+    float next[16];
+    for (int j = 0; j < 16; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      float dot = 0.0f;
+      for (int k = 0; k < 64; ++k)
+        dot += a[(i / 64) * 64 + k] * a[k * 64 + i % 64];
+      next[j] = -4.7750f * a[i] + 2.0315f * dot;
+    }
+    __syncthreads();
+    for (int j = 0; j < 16; ++j)
+      a[threadIdx.x + j * kThreads] = next[j];
+    __syncthreads();
+    for (int j = 0; j < 16; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      float dot = 0.0f;
+      for (int k = 0; k < 64; ++k)
+        dot += a[(i / 64) * 64 + k] * x[k * 64 + i % 64];
+      next[j] = 3.4445f * x[i] + dot;
+    }
+    __syncthreads();
+    for (int j = 0; j < 16; ++j)
+      x[threadIdx.x + j * kThreads] = next[j];
+    __syncthreads();
+  }
+  for (int i = threadIdx.x; i < 4096; i += kThreads) {
+    parameter[base + i] = parameter[base + i] *
+        (1.0f - config.learning_rate * config.weight_decay) -
+        config.learning_rate * x[i];
+    if (zero_gradient)
+      gradient[base + i] = 0.0f;
+  }
+}
+
 int blocks(std::size_t n) {
   return static_cast<int>((n + kThreads - 1) / kThreads);
 }
@@ -159,6 +230,24 @@ void reduce_state_gradient_f32(cudaStream_t stream, int batch, int heads,
       static_cast<std::size_t>(heads) * head_size * head_size;
   reduce_state_kernel<<<blocks(lane), kThreads, 0, stream>>>(
       batch, lane, per_batch_gradient, state_gradient, accumulate);
+}
+
+void muon_update_state_f32(cudaStream_t stream, float *time_state,
+                           float *gradient, float *momentum,
+                           std::size_t elements, const MuonConfig &config,
+                           bool zero_gradient) {
+  if (!time_state || !gradient || !momentum || elements == 0 ||
+      elements % 4096 != 0 || elements / 4096 > 2147483647ULL ||
+      !std::isfinite(config.learning_rate) || config.learning_rate <= 0.0f ||
+      !std::isfinite(config.momentum) || config.momentum < 0.0f ||
+      config.momentum >= 1.0f || config.ns_steps <= 0 ||
+      !std::isfinite(config.weight_decay) || config.weight_decay < 0.0f)
+    throw std::invalid_argument("invalid state Muon arguments");
+  muon_kernel<<<static_cast<int>(elements / 4096), kThreads, 0, stream>>>(
+      time_state, gradient, momentum, config, zero_gradient);
+  const cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(error));
 }
 
 void adam_update_state_f32(cudaStream_t stream, float *time_state,

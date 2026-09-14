@@ -31,7 +31,9 @@ struct Options {
   std::string data;
   std::string output;
   std::string vocab = RWKV_STATE_TUNE_DEFAULT_VOCAB;
+  std::string optimizer = "adam";
   bool chunk_load = false;
+  bool wkv_tape = false;
   int ctx = 128;
   int chunk = 64;
   int epochs = 1;
@@ -50,6 +52,7 @@ struct Options {
   std::cerr
       << "Usage: " << program << " --model MODEL.pth --data TRAIN.jsonl "
       << "--output DIR [options]\n"
+      << "  --wkv_tape            share WKV tape across layers with recomputation\n"
       << "  --chunk-load          load model weights in bounded staging chunks\n"
       << "  --vocab PATH          RWKV vocab file\n"
       << "  --ctx N               maximum tokens per JSONL sample (default "
@@ -60,6 +63,7 @@ struct Options {
       << "  --batch-size N        samples per update, accumulated sequentially "
          "(default 1)\n"
       << "  --max-steps N         stop after N optimizer updates\n"
+      << "  --optimizer adam|muon optimizer (default adam)\n"
       << "  --lr FLOAT            initial learning rate (default 1.0)\n"
       << "  --lr-final FLOAT      final learning rate (default 0.01)\n"
       << "  --warmup-steps N      linear warmup updates (default 10)\n"
@@ -109,6 +113,8 @@ Options parse(int argc, char **argv) {
     const std::string arg = argv[i];
     if (arg == "--help" || arg == "-h")
       usage(argv[0]);
+    else if (arg == "--wkv_tape")
+      out.wkv_tape = true;
     else if (arg == "--chunk-load")
       out.chunk_load = true;
     else if (arg == "--model")
@@ -129,6 +135,8 @@ Options parse(int argc, char **argv) {
       out.batch_size = integer<int>(value(i, argc, argv), "batch-size");
     else if (arg == "--max-steps")
       out.max_steps = integer<std::uint64_t>(value(i, argc, argv), "max-steps");
+    else if (arg == "--optimizer")
+      out.optimizer = value(i, argc, argv);
     else if (arg == "--lr")
       out.lr = real(value(i, argc, argv), "lr");
     else if (arg == "--lr-final")
@@ -144,6 +152,8 @@ Options parse(int argc, char **argv) {
     else
       usage(argv[0], "unknown option: " + arg);
   }
+  if (out.optimizer != "adam" && out.optimizer != "muon")
+    usage(argv[0], "optimizer must be adam or muon");
   if (out.model.empty() || out.data.empty() || out.output.empty())
     usage(argv[0], "--model, --data and --output are required");
   if (out.ctx <= 0 || out.chunk <= 0 || out.epochs <= 0 ||
@@ -174,10 +184,11 @@ struct OwnedTape {
   DeviceBuffer<half> x, ln1, r, raw_w, k, v_base, v, alpha, neg_kk, wkv_k, kka,
       w1_tanh, g1_sigmoid, v_gate, wkv_y, att_group_norm, att_gate, x_after_att,
       ln2, ffn_hid;
-  DeviceBuffer<float> wkv_states;
+  DeviceBuffer<float> wkv_states, wkv_initial;
   BlockTapeView view;
 
-  void allocate(int time, const FrozenBlockWeights &w, half *v_first) {
+  void allocate(int time, const FrozenBlockWeights &w, half *v_first,
+                float *shared_tape, float *shared_final) {
     const std::size_t row = static_cast<std::size_t>(time) * w.channels;
     auto alloc = [row](DeviceBuffer<half> &buffer, const char *name) {
       buffer.resize(row, name);
@@ -206,8 +217,15 @@ struct OwnedTape {
     alloc(ln2, "tune tape ln2");
     ffn_hid.resize(static_cast<std::size_t>(time) * w.ffn, "tune tape ffn hid");
     const rwkv7_state_tuning::WkvShape shape{1, time, w.heads, 64};
-    wkv_states.resize(rwkv7_state_tuning::wkv_tape_elements(shape),
-                      "tune WKV exact tape");
+    const auto tape_elements = rwkv7_state_tuning::wkv_tape_elements(shape);
+    if (shared_tape) {
+      wkv_initial.resize(static_cast<std::size_t>(w.heads) * 64 * 64,
+                         "tune WKV replay initial");
+      view.wkv_replay_initial = wkv_initial.p;
+      view.wkv_replay_final = shared_final;
+    } else {
+      wkv_states.resize(tape_elements, "tune WKV exact tape");
+    }
     view.batch = 1;
     view.time = time;
     view.x = x.p;
@@ -231,7 +249,7 @@ struct OwnedTape {
     view.x_after_att = x_after_att.p;
     view.ln2 = ln2.p;
     view.ffn_hid = ffn_hid.p;
-    view.wkv = {wkv_states.p, wkv_states.n};
+    view.wkv = {shared_tape ? shared_tape : wkv_states.p, tape_elements};
   }
 };
 
@@ -318,7 +336,8 @@ int main(int argc, char **argv) {
     time_state.resize(state_count, "tune time_state");
     state_gradient.resize(state_count, "tune dState");
     adam_m.resize(state_count, "tune Adam m");
-    adam_v.resize(state_count, "tune Adam v");
+    if (options.optimizer == "adam")
+      adam_v.resize(state_count, "tune Adam v");
     per_batch_state_gradient.resize(state_count, "tune per-batch dState");
     state_batch.resize(state_lane, "tune expanded state");
     state_final.resize(state_lane, "tune final state");
@@ -326,15 +345,25 @@ int main(int argc, char **argv) {
     time_state.zero("zero tune time_state");
     state_gradient.zero("zero tune dState");
     adam_m.zero("zero tune Adam m");
-    adam_v.zero("zero tune Adam v");
+    if (options.optimizer == "adam")
+      adam_v.zero("zero tune Adam v");
+    std::cout << "Optimizer: " << options.optimizer << '\n';
 
+    DeviceBuffer<float> shared_wkv_tape, shared_wkv_final;
+    if (options.wkv_tape) {
+      shared_wkv_tape.resize(rwkv7_state_tuning::wkv_tape_elements(
+          {1, max_time, H, N}), "shared WKV tape");
+      shared_wkv_final.resize(state_lane, "shared WKV replay final");
+      std::cout << "WKV tape: shared across layers (recompute)\n";
+    }
     std::vector<OwnedTape> owned(static_cast<std::size_t>(L));
     std::vector<BlockTapeView> tapes(static_cast<std::size_t>(L));
     std::vector<BlockBackwardState> backward(static_cast<std::size_t>(L));
     std::size_t workspace_count = 0;
     for (int layer = 0; layer < L; ++layer) {
       owned[static_cast<std::size_t>(layer)].allocate(
-          max_time, frozen.blocks[static_cast<std::size_t>(layer)], v_first.p);
+          max_time, frozen.blocks[static_cast<std::size_t>(layer)], v_first.p,
+          shared_wkv_tape.p, shared_wkv_final.p);
       tapes[static_cast<std::size_t>(layer)] =
           owned[static_cast<std::size_t>(layer)].view;
       workspace_count = std::max(
@@ -524,11 +553,19 @@ int main(int argc, char **argv) {
               "copy batch gradient");
         const std::uint64_t next_step = global_step + 1;
         const float lr = learning_rate(options, next_step, planned);
-        rwkv7_state_tuning::AdamConfig adam;
-        adam.learning_rate = lr;
-        rwkv7_state_tuning::adam_update_state_f32(
-            stream.value, time_state.p, state_gradient.p, adam_m.p, adam_v.p,
-            state_count, next_step, adam, true);
+        if (options.optimizer == "muon") {
+          rwkv7_state_tuning::MuonConfig muon;
+          muon.learning_rate = lr;
+          rwkv7_state_tuning::muon_update_state_f32(
+              stream.value, time_state.p, state_gradient.p, adam_m.p,
+              state_count, muon, true);
+        } else {
+          rwkv7_state_tuning::AdamConfig adam;
+          adam.learning_rate = lr;
+          rwkv7_state_tuning::adam_update_state_f32(
+              stream.value, time_state.p, state_gradient.p, adam_m.p, adam_v.p,
+              state_count, next_step, adam, true);
+        }
         check(cudaStreamSynchronize(stream.value), "optimizer update");
         global_step = next_step;
         processed_tokens += batch_tokens;

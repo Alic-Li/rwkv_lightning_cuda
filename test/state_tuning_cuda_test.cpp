@@ -119,6 +119,41 @@ int main() {
       near(whole_ds[i], (plus - minus) / 0.002, 2e-6,
            "WKV state finite difference");
     }
+    // Simulate sequential layers reusing a tape: discard its old contents,
+    // forward without recording, then replay before consuming gradients.
+    const auto saved_y = download(y);
+    const auto saved_final = download(st);
+    std::array<std::vector<half>, 6> saved_grad;
+    for (int p = 0; p < 6; ++p)
+      saved_grad[p] = download(grad[p]);
+    upload(tape, std::vector<float>(T * S, 123.0f));
+    wkv_forward(nullptr, IoType::F16, {1, T, 1, N}, s0.p, gpu[0].p, gpu[1].p,
+                gpu[2].p, gpu[3].p, gpu[4].p, gpu[5].p, y.p, st.p, {});
+    auto no_tape_y = download(y);
+    auto no_tape_final = download(st);
+    for (int i = 0; i < E; ++i)
+      near(__half2float(no_tape_y[i]), __half2float(saved_y[i]), 0,
+           "no-tape forward output");
+    for (int i = 0; i < S; ++i)
+      near(no_tape_final[i], saved_final[i], 0, "no-tape final state");
+    for (float v : download(tape))
+      near(v, 123, 0, "no-tape recording disabled");
+    wkv_forward(nullptr, IoType::F16, {1, T, 1, N}, s0.p, gpu[0].p, gpu[1].p,
+                gpu[2].p, gpu[3].p, gpu[4].p, gpu[5].p, y.p, st.p,
+                {tape.p, tape.n});
+    wkv_backward_input(nullptr, IoType::F16, {1, T, 1, N}, gpu[0].p, gpu[1].p,
+                       gpu[2].p, gpu[3].p, gpu[4].p, gpu[5].p, dy.p, dst.p,
+                       {tape.p, tape.n}, ds0.p, grad[0].p, grad[1].p, grad[2].p,
+                       grad[3].p, grad[4].p, grad[5].p);
+    auto replay_ds = download(ds0);
+    for (int i = 0; i < S; ++i)
+      near(replay_ds[i], whole_ds[i], 0, "replay state gradient");
+    for (int p = 0; p < 6; ++p) {
+      auto actual = download(grad[p]);
+      for (int i = 0; i < E; ++i)
+        near(__half2float(actual[i]), __half2float(saved_grad[p][i]), 0,
+             "replay input gradient");
+    }
     // A nonzero terminal state adjoint must flow from chunk 1 into chunk 0.
     DeviceBuffer<float> boundary, short_tape, short_ds;
     boundary.resize(S, "boundary");
@@ -229,7 +264,82 @@ int main() {
       near(actual_v[i], (1.0 - config.beta2) * g * g, 1e-10, "Adam second moment");
       near(cleared[i], 0, 0, "Adam gradient clearing");
     }
-    std::cout << "WKV finite differences, chunk adjoint, LN, CE, reduction and Adam passed\n";
+    // Independent double-precision reference on two dense matrices and a zero
+    // matrix, across steps (momentum persistence and per-head normalization).
+    std::vector<float> mg(3 * S), mp(3 * S, 0.25f);
+    std::vector<double> reference(mp.begin(), mp.end()), velocity(3 * S, 0.0);
+    upload(parameter, mp);
+    upload(moment1, std::vector<float>(3 * S, 0.0f));
+    MuonConfig muon;
+    muon.weight_decay = 0.1f;
+    for (int step = 0; step < 3; ++step) {
+      muon.nesterov = step != 2;
+      for (int i = 0; i < 3 * S; ++i)
+        mg[i] = i < 2 * S ? 0.03f * std::sin(i * 1.731 + step * 0.4) +
+            ((i % S) / N == i % N ? 0.1f : 0.0f) : 0.0f;
+      upload(reduced, mg);
+      for (int head = 0; head < 3; ++head) {
+        std::vector<double> x(S), a(S), b(S), next(S);
+        double norm = 0.0;
+        for (int i = 0; i < S; ++i) {
+          const int index = head * S + i;
+          velocity[index] = muon.momentum * velocity[index] +
+              (1.0 - muon.momentum) * mg[index];
+          x[i] = muon.nesterov ? (1.0 - muon.momentum) * mg[index] +
+              muon.momentum * velocity[index] : velocity[index];
+          norm += x[i] * x[i];
+        }
+        for (auto &v : x)
+          v /= std::sqrt(norm) + 1e-7;
+        for (int iteration = 0; iteration < muon.ns_steps; ++iteration) {
+          for (int r = 0; r < N; ++r)
+            for (int c = 0; c < N; ++c) {
+              double dot = 0;
+              for (int k = 0; k < N; ++k)
+                dot += x[r * N + k] * x[c * N + k];
+              a[r * N + c] = dot;
+            }
+          for (int r = 0; r < N; ++r)
+            for (int c = 0; c < N; ++c) {
+              double dot = 0;
+              for (int k = 0; k < N; ++k)
+                dot += a[r * N + k] * a[k * N + c];
+              b[r * N + c] = -4.775 * a[r * N + c] + 2.0315 * dot;
+            }
+          for (int r = 0; r < N; ++r)
+            for (int c = 0; c < N; ++c) {
+              double dot = 0;
+              for (int k = 0; k < N; ++k)
+                dot += b[r * N + k] * x[k * N + c];
+              next[r * N + c] = 3.4445 * x[r * N + c] + dot;
+            }
+          x.swap(next);
+        }
+        for (int i = 0; i < S; ++i)
+          reference[head * S + i] = reference[head * S + i] *
+              (1.0 - muon.learning_rate * muon.weight_decay) -
+              muon.learning_rate * x[i];
+      }
+      muon_update_state_f32(nullptr, parameter.p, reduced.p, moment1.p,
+                            mg.size(), muon, step != 1);
+      auto actual = download(parameter), momentum = download(moment1);
+      auto remaining = download(reduced);
+      for (int i = 0; i < 3 * S; ++i) {
+        near(actual[i], reference[i], 2e-6, "Muon parameter");
+        near(momentum[i], velocity[i], 1e-8, "Muon momentum");
+        near(remaining[i], step != 1 ? 0.0f : mg[i], 0, "Muon gradient");
+      }
+    }
+    bool rejected = false;
+    try {
+      muon_update_state_f32(nullptr, parameter.p, reduced.p, moment1.p,
+                            S - 1, muon, true);
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    if (!rejected)
+      throw std::runtime_error("Muon accepted incomplete state matrix");
+    std::cout << "WKV finite differences, chunk adjoint, LN, CE, reduction, Adam and Muon passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;

@@ -252,7 +252,20 @@ it("uses the recommended state tuning defaults", () => {
     warmup_steps: 10,
     save_every: 100,
     batch_size: 16,
+    optimizer: "adam",
+    wkv_tape: false,
   });
+});
+
+it("shows optimizer and shared WKV tape controls", async () => {
+  const { createElement } = await import("react");
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { StateTuningPage } = await import("../src/pages/StateTuningPage");
+  const html = renderToStaticMarkup(createElement(StateTuningPage));
+  expect(html).toContain('<option value="adam" selected="">Adam</option>');
+  expect(html).toContain('<option value="muon">Muon</option>');
+  expect(html).toContain("Shared WKV tape");
+  expect(html).toContain("--optimizer adam");
 });
 
 it("allows arbitrary positive learning-rate decimals in the tuning form", async () => {

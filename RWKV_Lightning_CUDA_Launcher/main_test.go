@@ -77,12 +77,15 @@ func TestDatasetValidation(t *testing.T) {
 	}
 }
 func TestTuningArgs(t *testing.T) {
-	req := tuneRequest{Model: testFile(t, "model.pth", ""), Data: testFile(t, "data.jsonl", "{\"text\":\"hello\"}\n"), Output: "output with spaces", Ctx: 128, Chunk: 64, Epochs: 1, BatchSize: 1, LR: 1, LRFinal: .01, WarmupSteps: 10, Seed: 1234}
+	req := tuneRequest{Model: testFile(t, "model.pth", ""), Data: testFile(t, "data.jsonl", "{\"text\":\"hello\"}\n"), Output: "output with spaces", Ctx: 128, Chunk: 64, Epochs: 1, BatchSize: 1, LR: 1, LRFinal: .01, WarmupSteps: 10, Seed: 1234, Optimizer: "muon", WKVTape: true}
 	args, e := tuningArgs(req)
 	if e != nil {
 		t.Fatal(e)
 	}
 	if !strings.Contains(strings.Join(args, " "), "--ctx 128 --chunk 64 --epochs 1 --batch-size 1 --max-steps 0") {
+		t.Fatal(args)
+	}
+	if !strings.Contains(strings.Join(args, " "), "--optimizer muon --wkv_tape") {
 		t.Fatal(args)
 	}
 	req.LR = 0
@@ -98,6 +101,11 @@ func TestTuningArgs(t *testing.T) {
 	req.Chunk = req.Ctx + 1
 	if _, e = tuningArgs(req); e == nil {
 		t.Fatal("accepted recompute chunk above context length")
+	}
+	req.Chunk = 64
+	req.Optimizer = "sgd"
+	if _, e = tuningArgs(req); e == nil {
+		t.Fatal("accepted unsupported optimizer")
 	}
 }
 func TestProcessLogsAndProgress(t *testing.T) {

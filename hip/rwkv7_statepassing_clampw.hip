@@ -59,7 +59,8 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
     const long long tape_base = (bh * T + t) * kN * kN;
 #pragma unroll
     for (int key = 0; key < kN; ++key) {
-      state_before[tape_base + key * kN + value] = state[key];
+      if (state_before)
+        state_before[tape_base + key * kN + value] = state[key];
     }
     __syncthreads();
     r[value] = as_float(r_ptr[token + value]);
@@ -226,7 +227,10 @@ void wkv_forward(hipStream_t stream, IoType io_type, const WkvShape &shape,
                  const float *initial_state, const void *r, const void *w,
                  const void *k, const void *v, const void *a, const void *b,
                  void *y, float *final_state, WkvTapeView tape) {
-  validate(shape, tape);
+  if (tape.state_before || tape.state_before_elements)
+    validate(shape, tape);
+  else
+    (void)wkv_tape_elements(shape); // Validate shape even without recording.
   if (!initial_state || !r || !w || !k || !v || !a || !b || !y ||
       !final_state) {
     throw std::invalid_argument("null state-tuning WKV forward pointer");
