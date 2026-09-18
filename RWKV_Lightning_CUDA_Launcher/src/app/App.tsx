@@ -28,7 +28,7 @@ import { ThemeControl } from "../components/ThemeControl";
 const routes = [
   { id: "chat", label: "Chat", icon: MessageSquare },
   { id: "translate", label: "Parallel Translate", icon: Languages },
-  { id: "state-tuning", label: "State Tuning", icon: ScanLine },
+  { id: "state-tuning", label: "State / MiSS Training", icon: ScanLine },
   { id: "runtime", label: "Runtime", icon: Cpu },
   { id: "settings", label: "Settings", icon: Settings },
 ];

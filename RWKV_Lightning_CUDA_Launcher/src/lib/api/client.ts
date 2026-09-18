@@ -25,6 +25,41 @@ export interface UploadedState {
   tensor_count: number;
   created: number;
 }
+export interface AdapterEntry {
+  id: string;
+  version: string;
+  manifest: { rank: number; scale: number; targets: unknown[] };
+}
+export function adapterFields(v: {
+  adapter_id?: string;
+  adapter_version?: string;
+  adapter_scale?: string;
+}) {
+  if (!v.adapter_id?.trim()) return {};
+  const scale = v.adapter_scale?.trim();
+  if (scale && !Number.isFinite(Number(scale)))
+    throw new Error("Adapter scale must be finite");
+  return {
+    adapter_id: v.adapter_id.trim(),
+    ...(v.adapter_version?.trim()
+      ? { adapter_version: v.adapter_version.trim() }
+      : {}),
+    ...(scale ? { adapter_scale: Number(scale) } : {}),
+  };
+}
+export function generationBody<
+  T extends {
+    adapter_id?: string;
+    adapter_version?: string;
+    adapter_scale?: string;
+  },
+>(v: T) {
+  const { adapter_id, adapter_version, adapter_scale, ...rest } = v;
+  return {
+    ...rest,
+    ...adapterFields({ adapter_id, adapter_version, adapter_scale }),
+  };
+}
 export class RWKVClient {
   constructor(
     public baseURL = "",
@@ -77,6 +112,59 @@ export class RWKVClient {
       signal,
       this.key,
     );
+  }
+  listAdapters(signal?: AbortSignal) {
+    return request<{
+      data: AdapterEntry[];
+      ram_bytes: number;
+      gpu_bytes: number;
+      uploads: number;
+    }>(
+      `${this.baseURL.replace(/\/$/, "")}/v1/adapters`,
+      undefined,
+      signal,
+      this.key,
+    );
+  }
+  registerAdapter(adapter_id: string, path: string) {
+    return request<{ adapter_id: string; version: string }>(
+      `${this.baseURL.replace(/\/$/, "")}/v1/adapters`,
+      { adapter_id, path },
+      undefined,
+      this.key,
+    );
+  }
+  async uploadAdapter(adapter_id: string, file: File, metadata?: File) {
+    const body = new FormData();
+    body.append("adapter_id", adapter_id);
+    body.append("file", file);
+    if (metadata) body.append("metadata", metadata, "checkpoint.json");
+    const response = await fetch(
+      `${this.baseURL.replace(/\/$/, "")}/v1/adapters`,
+      {
+        method: "POST",
+        headers: this.key ? { Authorization: `Bearer ${this.key}` } : {},
+        body,
+      },
+    );
+    if (!response.ok)
+      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    return response.json() as Promise<{ adapter_id: string; version: string }>;
+  }
+  async deleteAdapter(adapter_id: string, adapter_version: string) {
+    const response = await fetch(
+      `${this.baseURL.replace(/\/$/, "")}/v1/adapters`,
+      {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          ...(this.key ? { Authorization: `Bearer ${this.key}` } : {}),
+        },
+        body: JSON.stringify({ adapter_id, adapter_version }),
+      },
+    );
+    if (!response.ok)
+      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   }
   async uploadState(file: File) {
     const body = new FormData();

@@ -129,16 +129,19 @@ multipart upload request.
 
 ## MiSS adapter lifecycle and request fields
 
-Register an exported MiSS inference directory on the **server filesystem** before
-using it. `path` is a server-side directory containing `adapter.json` and
-`adapter.pth`, not a client-side path. There is no multipart adapter upload
-endpoint. Registration returns `{"version":"<content SHA-256>"}`. Registration
+Register a server-side PTH path or upload a local PTH using multipart form data.
+Both `adapter-final.pth` and new checkpoint `training.pth` files are supported.
+Legacy two-file inference directories also work. Registration returns
+`{"adapter_id":"task-a","version":"<content SHA-256>"}`. Registration
 validates and caches the package in CPU RAM; it does not upload weights to GPU.
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
   -H "Content-Type: application/json" \
-  --data '{"adapter_id":"task-a","path":"/absolute/path/miss_output/adapter"}'
+  --data '{"adapter_id":"task-a","path":"/absolute/path/miss_output/checkpoint-100/training.pth"}'
+
+curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
+  -F 'adapter_id=task-a' -F 'file=@miss_output/adapter-final.pth'
 
 curl -sS "${AUTH_HEADER[@]}" "http://127.0.0.1:8000/v1/adapters"
 ```
@@ -146,6 +149,13 @@ curl -sS "${AUTH_HEADER[@]}" "http://127.0.0.1:8000/v1/adapters"
 All generation endpoints accept `adapter_id`, optional `adapter_version`, and
 optional `adapter_scale`. The first request uploads the complete adapter to the
 GPU; prefill and decode reuse it without per-layer or per-token transfers.
+
+New PTH files carry their manifest inside the archive. Old training checkpoints
+need the sibling `checkpoint.json`; for remote upload add
+`-F 'metadata=@miss_output/checkpoint-100/checkpoint.json'` alongside the PTH.
+Upload staging files are removed after registration; only FP16 D remains cached.
+Use bearer-header authentication for multipart uploads when password protection
+is enabled. HTTP request-body limits also apply to uploaded checkpoint files.
 
 ```json
 {

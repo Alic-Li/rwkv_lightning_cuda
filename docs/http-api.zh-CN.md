@@ -156,23 +156,30 @@ curl -sS "${AUTH_HEADER[@]}" -X DELETE \
 
 ### 注册：`POST /v1/adapters`
 
-MiSS 当前没有 multipart 文件上传接口，也没有 `/v1/adapters/upload` 路由。
-先把训练导出的 `adapter/` 目录放到**服务端能访问的文件系统**，再用 JSON 注册。
-`path` 是服务端目录，不是调用 curl 的客户端路径；建议使用绝对路径。
-目录中必须包含 `adapter.json` 和 `adapter.pth`，不能用训练检查点目录代替。
+同一个接口支持 JSON 注册服务端 PTH 路径，以及 multipart 直接上传本地 PTH。
+可使用 `adapter-final.pth` 或新 checkpoint 中的 `training.pth`。
+`path` 是服务端路径，建议使用绝对路径；原来的双文件推理目录也兼容。
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
   -H "Content-Type: application/json" \
-  --data '{"adapter_id":"task-a","path":"/absolute/path/miss_output/adapter"}'
+  --data '{"adapter_id":"task-a","path":"/absolute/path/miss_output/checkpoint-100/training.pth"}'
+
+curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
+  -F 'adapter_id=task-a' -F 'file=@miss_output/adapter-final.pth'
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `adapter_id` | string | 是 | 非空的适配器名称，后续生成、删除时使用 |
-| `path` | string | 是 | 服务端的 MiSS 推理包目录 |
+| `path` | string | JSON 注册时必填 | 服务端 PTH 路径或旧推理包目录；multipart 使用 `file` |
 
-成功返回 `{"version":"<内容的 SHA-256 版本>"}`。同一 ID 可以注册多个内容版本，
+新 PTH 内嵌元数据，单独上传即可。旧训练 checkpoint 需要同目录的 `checkpoint.json`；
+远程上传旧文件时再添加 `-F 'metadata=@miss_output/checkpoint-100/checkpoint.json'`。
+临时上传文件在注册后删除，RAM 只缓存 FP16 D，不保留梯度和优化器张量。
+启用密码时，multipart 请求使用 Bearer header 鉴权；上传文件受 HTTP 请求体大小限制。
+
+成功返回 `{"adapter_id":"task-a","version":"<内容的 SHA-256 版本>"}`。同一 ID 可以注册多个内容版本，
 最近注册的版本作为默认版本。注册会校验格式、形状、元数据和内容哈希并缓存到 CPU RAM，
 此时不上传 GPU；无效包或 RAM 预算不足等错误返回 HTTP 400。
 生成时还会检查推理包中的基模指纹是否与实际加载的模型匹配，不匹配则拒绝使用。

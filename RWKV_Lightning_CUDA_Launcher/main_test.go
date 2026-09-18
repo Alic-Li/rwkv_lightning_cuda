@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -139,6 +141,158 @@ func TestQuantizationArgs(t *testing.T) {
 	if _, err = quantizationArgs(quantizeRequest{InputPath: input, OutputPath: output, Format: "w4a16", GroupSize: 128}); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatal("accepted existing output", err)
 	}
+}
+
+func TestMissTuningArgs(t *testing.T) {
+	req := tuneRequest{Method: "miss", Model: testFile(t, "base.pth", ""), Data: testFile(t, "data.jsonl", "{\"text\":\"hello\"}\n"), Output: "miss output", Ctx: 4096, Chunk: 1024, Epochs: 1, BatchSize: 8, LR: .0001, LRFinal: .00001, Rank: 16, Alpha: 16, Targets: "all", WKVTape: true, Resume: t.TempDir(), State: testFile(t, "state.pth", "")}
+	args, err := tuningArgs(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, part := range []string{"--rank 16 --alpha 16 --targets all", "--resume " + req.Resume, "--state " + req.State, "--optimizer adam", "--wkv_tape"} {
+		if !strings.Contains(joined, part) {
+			t.Fatal(args)
+		}
+	}
+	for _, bad := range []string{"bad.weight", "ffn.key.weight,ffn.key.weight", ""} {
+		req.Targets = bad
+		if _, err = tuningArgs(req); err == nil {
+			t.Fatal("accepted invalid targets", bad)
+		}
+	}
+	req.Targets = "ffn.value.weight"
+	req.Optimizer = "muon"
+	if _, err = tuningArgs(req); err == nil {
+		t.Fatal("accepted MiSS Muon")
+	}
+	req.Optimizer = "adam"
+	req.Rank = 0
+	if _, err = tuningArgs(req); err == nil {
+		t.Fatal("accepted rank zero")
+	}
+	req.Rank = 16
+	req.Method = "unknown"
+	if _, err = tuningArgs(req); err == nil {
+		t.Fatal("accepted unknown method")
+	}
+}
+
+// Opt-in real CUDA integration using fixtures produced by tools/check_miss.py.
+func TestNativeMissLifecycle(t *testing.T) {
+	build, fixture := os.Getenv("RWKV_NATIVE_BUILD"), os.Getenv("RWKV_NATIVE_FIXTURE")
+	if build == "" || fixture == "" {
+		t.Skip("set RWKV_NATIVE_BUILD and RWKV_NATIVE_FIXTURE for native GPU test")
+	}
+	for _, name := range []string{"rwkv_miss_tune", "rwkv_lighting_cuda"} {
+		path := filepath.Join(appDir(), name)
+		if err := os.Symlink(filepath.Join(build, name), path); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(path)
+	}
+	l := newLauncher()
+	defer l.runtime.stop()
+	defer l.tuning.stop()
+	call := func(method, path string, body any) map[string]any {
+		t.Helper()
+		var data io.Reader
+		if body != nil {
+			raw, _ := json.Marshal(body)
+			data = bytes.NewReader(raw)
+		}
+		r := httptest.NewRequest(method, "http://127.0.0.1:10721"+path, data)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		l.handler().ServeHTTP(w, r)
+		if w.Code != 200 {
+			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
+		}
+		var out map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	wait := func() {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			s := call("GET", "/api/tuning/status", nil)
+			if s["running"] == false {
+				if s["status"] != "completed" {
+					t.Fatal(s)
+				}
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatal("native training timed out")
+	}
+	cfg := tuneRequest{Method: "miss", Model: filepath.Join(fixture, "tiny.pth"), Data: filepath.Join(fixture, "train.jsonl"), Vocab: filepath.Join(fixture, "vocab.txt"), Output: filepath.Join(t.TempDir(), "first"), Ctx: 30, Chunk: 7, Epochs: 4, BatchSize: 2, MaxSteps: 1, LR: .003, LRFinal: .003, SaveEvery: 1, Seed: 1234, Rank: 8, Alpha: 8, Targets: "all", Optimizer: "adam", WKVTape: true}
+	if call("GET", "/api/tuning/status", nil)["miss_available"] != true {
+		t.Fatal("missing trainer detection")
+	}
+	call("POST", "/api/tuning/start", cfg)
+	wait()
+	cfg.Resume = filepath.Join(cfg.Output, "checkpoint-1")
+	cfg.Output = filepath.Join(t.TempDir(), "resumed")
+	cfg.MaxSteps = 2
+	call("POST", "/api/tuning/start", cfg)
+	wait()
+	final := filepath.Join(cfg.Output, "adapter-final.pth")
+	if call("GET", "/api/tuning/status", nil)["checkpoint"] != final {
+		t.Fatal("missing final export path")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	listener.Close()
+	call("POST", "/api/start", startRequest{ModelPath: cfg.Model, VocabPath: cfg.Vocab, Port: port, Password: "miss-test-password", ChunkSize: 32, UseWKV32: true, StateDBPath: filepath.Join(t.TempDir(), "state.db")})
+	deadline := time.Now().Add(30 * time.Second)
+	for l.status()["status"] != "ready" {
+		if time.Now().After(deadline) {
+			t.Fatal(l.status())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var payload bytes.Buffer
+	writer := multipart.NewWriter(&payload)
+	writer.WriteField("adapter_id", "test")
+	part, _ := writer.CreateFormFile("file", "training.pth")
+	file, err := os.Open(filepath.Join(cfg.Output, "checkpoint-2", "training.pth"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.Copy(part, file)
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.Close()
+	r := httptest.NewRequest("POST", "http://127.0.0.1:10721/v1/adapters", &payload)
+	r.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+	l.handler().ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	stats := call("GET", "/v1/adapters", nil)
+	if stats["uploads"] != float64(0) {
+		t.Fatal(stats)
+	}
+	var registration map[string]string
+	json.Unmarshal(w.Body.Bytes(), &registration)
+	body := map[string]any{"contents": []string{"abcabc"}, "adapter_id": "test", "adapter_version": registration["version"], "adapter_scale": 1, "max_tokens": 1, "temperature": 1, "top_k": 1, "stop_tokens": []int{}, "stream": false}
+	call("POST", "/v1/chat/completions", body)
+	call("POST", "/v1/chat/completions", body)
+	if call("GET", "/v1/adapters", nil)["uploads"] != float64(1) {
+		t.Fatal("repeated adapter H2D")
+	}
+	call("DELETE", "/v1/adapters", map[string]string{"adapter_id": "test", "adapter_version": registration["version"]})
+	call("POST", "/api/stop", map[string]any{})
 }
 func TestProcessLogsAndProgress(t *testing.T) {
 	t.Setenv("RWKV_TEST_CHILD", "logs")

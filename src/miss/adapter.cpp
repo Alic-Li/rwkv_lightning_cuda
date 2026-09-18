@@ -75,6 +75,44 @@ std::string content_version(const Json::Value &manifest,
   h.add(data.data(), data.size() * 2);
   return h.finish();
 }
+Json::Value adapter_manifest(Json::Value m, const std::vector<HostTensor> &ts,
+                             const std::vector<std::uint16_t> &data) {
+  m["format_version"] = 1;
+  m["method"] = "miss";
+  m["dtype"] = "float16";
+  m["layout"] = "modulo_rank_zero_pad";
+  m["kind"] = "inference_adapter";
+  m["targets"] = Json::Value(Json::arrayValue);
+  for (const auto &t : ts) {
+    Json::Value v;
+    v["name"] = tensor_name(t);
+    v["layer"] = t.layer;
+    v["target"] = target_names[t.target];
+    v["in_features"] = t.in;
+    v["shape"].append(t.out);
+    v["shape"].append(t.rank);
+    m["targets"].append(v);
+  }
+  m["content_version"] = content_version(m, data);
+  return m;
+}
+void save_adapter_pth(const std::string &path, Json::Value m,
+                      const std::vector<HostTensor> &ts,
+                      const std::vector<std::uint16_t> &data) {
+  if (std::filesystem::exists(path))
+    throw std::runtime_error("adapter destination already exists: " + path);
+  std::vector<llm_infer::WriteTensor> write;
+  for (const auto &t : ts) {
+    const size_t n = size_t(t.out) * t.rank;
+    if (t.offset + n > data.size())
+      throw std::runtime_error("adapter data bounds");
+    llm_infer::WriteTensor w{tensor_name(t), {t.out, t.rank}, true, {}};
+    w.data.resize(n * 2);
+    std::memcpy(w.data.data(), data.data() + t.offset, n * 2);
+    write.push_back(std::move(w));
+  }
+  llm_infer::write_pth(path, write, json(adapter_manifest(m, ts, data)));
+}
 void save_package(const std::string &dir, Json::Value m,
                   const std::vector<HostTensor> &ts,
                   const std::vector<std::uint16_t> &data) {
@@ -121,22 +159,95 @@ void save_package(const std::string &dir, Json::Value m,
 }
 std::shared_ptr<const Package> load_package(const std::string &dir,
                                             size_t max_bytes) {
-  if (std::filesystem::file_size(dir + "/adapter.json") > (8ULL << 20) ||
-      std::filesystem::file_size(dir + "/adapter.pth") >
-          max_bytes + (8ULL << 20))
-    throw std::runtime_error("adapter package exceeds admission budget");
+  const bool single = std::filesystem::is_regular_file(dir);
+  const auto path = single ? dir : dir + "/adapter.pth";
+  // Stream the archive: optimizer tensors must never be loaded into the RAM cache.
+  auto archive = llm_infer::PthArchive::open(path, true);
+  if (!archive.ok())
+    throw std::runtime_error(archive.status().message());
+  auto records = llm_infer::parse_pth_tensor_records(archive.value());
+  if (!records.ok())
+    throw std::runtime_error(records.status().message());
+  std::set<std::string> record_names;
+  for (const auto &record : records.value())
+    if (!record_names.insert(record.name).second)
+      throw std::runtime_error("duplicate adapter/checkpoint tensor");
   auto p = std::make_shared<Package>();
-  std::ifstream f(dir + "/adapter.json");
   Json::CharReaderBuilder reader;
   std::string errors;
-  if (!f || !Json::parseFromStream(reader, f, &p->manifest, &errors))
-    throw std::runtime_error("invalid adapter manifest: " + errors);
+  bool training = false, legacy = false;
+  if (single && archive.value().find_entry("archive/miss.json")) {
+    const auto *entry = archive.value().find_entry("archive/miss.json");
+    if (entry->uncompressed_size > (8ULL << 20))
+      throw std::runtime_error("adapter manifest too large");
+    auto bytes = archive.value().read_stored_entry(*entry);
+    if (!bytes.ok()) throw std::runtime_error(bytes.status().message());
+    std::istringstream f(std::string(bytes.value().begin(), bytes.value().end()));
+    if (!Json::parseFromStream(reader, f, &p->manifest, &errors))
+      throw std::runtime_error("invalid embedded MiSS manifest");
+    const auto source = p->manifest.get("tensor_source", "D").asString();
+    if (source != "D" && source != "master")
+      throw std::runtime_error("unsupported adapter tensor source");
+    training = source == "master";
+    p->manifest.removeMember("tensor_source");
+  } else if (single && std::filesystem::exists(
+                          std::filesystem::path(dir).parent_path() / "checkpoint.json")) {
+    // Legacy checkpoint metadata lives beside training.pth.
+    const auto meta = std::filesystem::path(dir).parent_path() / "checkpoint.json";
+    if (std::filesystem::file_size(meta) > (8ULL << 20))
+      throw std::runtime_error("checkpoint metadata too large");
+    std::ifstream f(meta);
+    Json::Value checkpoint;
+    if (!Json::parseFromStream(reader, f, &checkpoint, &errors) ||
+        checkpoint["kind"] != "miss_training_checkpoint" ||
+        checkpoint["tensor_digest"].asString() != fingerprint_file(dir))
+      throw std::runtime_error("invalid legacy MiSS checkpoint");
+    const auto &config = checkpoint["config"];
+    Json::Value m;
+    m["rank"] = config["rank"];
+    m["alpha"] = config["alpha"];
+    if (m["rank"].asInt() <= 0) throw std::runtime_error("invalid rank");
+    m["scale"] = config["alpha"].asFloat() / m["rank"].asInt();
+    m["base_fingerprint"] = config["base_fingerprint"];
+    std::vector<HostTensor> ts;
+    int channels = 0, hidden = 0;
+    for (const auto &r : records.value()) {
+      if (r.name.size() < 9 || r.name.substr(r.name.size()-9) != ".D.master") continue;
+      if (r.shape.size() != 2) throw std::runtime_error("invalid master D shape");
+      for (int i=0; i<TargetCount; ++i) {
+        const std::string suffix = std::string(".") + target_names[i] + ".D.master";
+        if (r.name.size() <= suffix.size() + 7 || r.name.compare(0,7,"blocks.") ||
+            r.name.substr(r.name.size()-suffix.size()) != suffix) continue;
+        auto layer = r.name.substr(7,r.name.size()-suffix.size()-7);
+        if (layer.find_first_not_of("0123456789") != std::string::npos)
+          throw std::runtime_error("invalid layer name");
+        HostTensor t{std::stoi(layer),i,0,int(r.shape[0]),int(r.shape[1]),0};
+        if (i == FfnKey) hidden = t.out; else channels = t.out;
+        ts.push_back(t);
+      }
+    }
+    for (auto &t : ts) {
+      t.in = t.target == FfnValue ? hidden : channels;
+      if (!t.in) throw std::runtime_error("legacy checkpoint lacks input widths; re-export with embedded metadata");
+    }
+    p->manifest = adapter_manifest(m,ts,{});
+    training = legacy = true;
+  } else {
+    const auto meta = single ? std::filesystem::path(dir).parent_path() / "adapter.json"
+                             : std::filesystem::path(dir) / "adapter.json";
+    if (!std::filesystem::exists(meta))
+      throw std::runtime_error("PTH has no embedded MiSS metadata; legacy checkpoints require sibling checkpoint.json (or upload it as a second file)");
+    if (std::filesystem::file_size(meta) > (8ULL << 20))
+      throw std::runtime_error("adapter manifest too large");
+    std::ifstream f(meta);
+    if (!Json::parseFromStream(reader,f,&p->manifest,&errors))
+      throw std::runtime_error("invalid adapter manifest: " + errors);
+  }
   const auto &m = p->manifest;
   if (m["format_version"] != 1 || m["method"] != "miss" ||
       m["dtype"] != "float16" || m["layout"] != "modulo_rank_zero_pad" ||
       m["kind"] != "inference_adapter")
-    throw std::runtime_error("unsupported adapter format (training checkpoints "
-                             "cannot be registered)");
+    throw std::runtime_error("unsupported adapter format");
   int rank = m["rank"].asInt();
   p->scale = m["scale"].asFloat();
   p->base = m["base_fingerprint"].asString();
@@ -147,13 +258,7 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
       p->version.size() != 64 || !m["targets"].isArray() ||
       m["targets"].empty())
     throw std::runtime_error("invalid adapter metadata");
-  auto archive = llm_infer::PthArchive::open(dir + "/adapter.pth");
-  if (!archive.ok())
-    throw std::runtime_error(archive.status().message());
-  auto records = llm_infer::parse_pth_tensor_records(archive.value());
-  if (!records.ok())
-    throw std::runtime_error(records.status().message());
-  if (records.value().size() != m["targets"].size())
+  if (records.value().size() != m["targets"].size() * (training ? 4 : 1) + (training ? 1 : 0))
     throw std::runtime_error("adapter tensor count mismatch");
   std::set<std::pair<int, int>> seen;
   for (const auto &v : m["targets"]) {
@@ -176,9 +281,9 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
     if (v["name"].asString() != name)
       throw std::runtime_error("adapter target name mismatch");
     auto r = std::find_if(records.value().begin(), records.value().end(),
-                          [&](const auto &r) { return r.name == name; });
+                          [&](const auto &r) { return r.name == name + (training ? ".master" : ""); });
     if (r == records.value().end() ||
-        r->dtype != llm_infer::TensorDType::kFloat16 ||
+        r->dtype != (training ? llm_infer::TensorDType::kFloat32 : llm_infer::TensorDType::kFloat16) ||
         r->shape != std::vector<int64_t>{t.out, t.rank})
       throw std::runtime_error("adapter tensor shape/dtype mismatch");
     auto data =
@@ -188,9 +293,16 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
     for (float x : data.value().values)
       if (!std::isfinite(x))
         throw std::runtime_error("nonfinite adapter weight");
+    for (auto x : data.value().values_f16)
+      if (!std::isfinite(llm_infer::f16_bits_to_float(x)))
+        throw std::runtime_error("adapter weight overflows FP16");
     p->data.insert(p->data.end(), data.value().values_f16.begin(),
                    data.value().values_f16.end());
     p->tensors.push_back(t);
+  }
+  if (legacy) {
+    p->version = content_version(m, p->data);
+    p->manifest["content_version"] = p->version;
   }
   if (content_version(m, p->data) != p->version)
     throw std::runtime_error("adapter content digest mismatch");

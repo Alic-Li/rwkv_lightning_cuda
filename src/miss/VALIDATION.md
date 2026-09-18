@@ -8,6 +8,21 @@ PyTorch 2.14.0+cu130. ROCm SDK and AMD device were unavailable.
 
 ## Correctness
 
+Single-file adapter registration validation:
+
+- Final export is `adapter-final.pth`; new training PTH files embed their MiSS
+  manifest without changing the checkpoint tensor dictionary or resume layout.
+- HTTP path registration and multipart upload accept standalone final/checkpoint
+  PTH files; legacy checkpoint paths read the sibling JSON. Legacy remote uploads
+  can include that JSON as a second file.
+- Final and checkpoint registrations produce identical content versions and
+  generation outputs. Multiple IDs share only the FP16 D payload in RAM, with
+  zero GPU uploads at registration and one upload across repeated generation.
+- Corrupt embedded metadata is rejected without increasing cache residency.
+- The real 7.2B `build/nora_output/checkpoint-100/training.pth` registered in RAM;
+  its final export was converted to `build/nora_output/adapter-final.pth` and
+  retained the original inference package's content version.
+
 - CTest: 15 passing GPU/host tests. The fixture-dependent model executable
   skips its argument-free CTest invocation. Running it explicitly with the
   generated fixture passed FP16 prefill/decode, concurrency, and reload.

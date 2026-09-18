@@ -101,16 +101,24 @@ Adam 动量、初始状态、优化器步数、调度总步数、数据集轮次
 
 续训时保持相同训练配置，添加 `--resume checkpoint-N` 并使用新的输出目录。
 程序会检查模型、数据、词表、初始状态的指纹以及调度设置。
-成功完成后始终将推理包导出至 `output/adapter`，不会覆盖已有推理包或检查点。
+成功完成后导出单文件 `output/adapter-final.pth`，不会覆盖已有文件或检查点。
+路径相对于启动命令时的工作目录解析。
 
 ## 推理包
 
-推理目录**只包含推理权重和元数据**：
+最终 PTH 包含 FP16 D 和文件内部的 `archive/miss.json` 元数据，仍可用
+`torch.load` 读取。新 checkpoint 的 `training.pth` 也内嵌推理所需元数据，
+可以独立上传或注册；程序只提取 `.D.master` 并转为 FP16 缓存，
+梯度和 Adam 张量不进入 adapter RAM/GPU 缓存。续训仍读取完整 checkpoint 目录。
+
+旧 `training.pth` 注册时读取同目录的 `checkpoint.json`；上传旧文件时需同时
+上传该 JSON。旧文件若仅训练 FFN value，可能缺少输入宽度信息，需要重新导出。
+原来的双文件推理目录仍兼容：
 
 - `adapter.json`：`format_version=1`、`kind=inference_adapter`、`method=miss`、`dtype=float16`、`layout=modulo_rank_zero_pad`、来源基模 SHA-256、rank、alpha、scale、目标名称、层号、输入宽度、D 形状，以及 `content_version`（不含版本字段的规范化清单与 FP16 D 的 SHA-256）。
 - `adapter.pth`：PyTorch 可读取的 FP16 张量，名称如 `blocks.N.att.key.weight.D`，使用原始 `[out,rank]` 布局。
 
-训练检查点不能注册为推理适配器。加载器检查格式、形状、重复目标、有限值和内容哈希，
+加载器检查格式、形状、重复目标、有限值和内容哈希，
 来源基模指纹必须匹配。加载模型时、请求可以绑定适配器之前，会一次性计算基模指纹，
 因此启动时增加一次顺序读取模型文件计算哈希的过程。
 `rwkv_quantize` 写入 `output.rwkvq.source.json`，将量化文件哈希绑定到来源 PTH；
@@ -122,7 +130,7 @@ Adam 动量、初始状态、优化器步数、调度总步数、数据集轮次
 
 注册、列表、删除、鉴权和生成请求示例统一维护在
 [HTTP API 中文文档](../../docs/http-api.zh-CN.md#miss-适配器注册列表与删除)。
-注册读取服务端的推理目录，没有 multipart 适配器文件上传端点。
+注册支持服务端 PTH 路径、旧推理目录，或在 `POST /v1/adapters` 直接 multipart 上传。
 删除注册后，已有请求句柄仍有效，新请求无法查找已删除版本。
 
 GPU 缓存未命中时，使用锁页暂存内存和非阻塞复制流，一次性上传整段连续的 D 数据。

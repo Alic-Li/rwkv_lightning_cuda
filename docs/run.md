@@ -125,7 +125,8 @@ periodic resumable checkpoints, and a separate inference export:
   --save-every 100 --wkv_tape
 ```
 
-Register `miss_output/adapter` through `POST /v1/adapters`, then add
+Register or upload `miss_output/adapter-final.pth` (or a checkpoint's
+`training.pth`) through `POST /v1/adapters`, then add
 `adapter_id` and optional `adapter_version` or `adapter_scale` to a generation
 request. Registration validates the package in CPU RAM; its complete weights
 are uploaded to GPU once on the first request. See the

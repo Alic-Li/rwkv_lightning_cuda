@@ -110,12 +110,24 @@ at update boundaries, where accumulated gradients have been cleared.
 
 Resume with the same training configuration and `--resume checkpoint-N`;
 use a new output directory. Model/data/vocabulary/initial-state fingerprints
-and schedule settings are checked. Inference always exports to `output/adapter`
+and schedule settings are checked. Inference always exports to `output/adapter-final.pth`
 on successful completion. Existing output packages/checkpoints are not overwritten.
 
 ## Inference package
 
-An inference directory contains **only inference weights and metadata**:
+The final single PTH contains FP16 D tensors and an embedded `archive/miss.json`
+manifest (not an optimizer tensor). It remains readable with `torch.load`.
+New `checkpoint-N/training.pth` files embed the same inference metadata and can
+also be registered or uploaded independently. The loader reads only `.D.master`
+from a training checkpoint and converts it to FP16; gradient and optimizer
+tensors stay out of the RAM/GPU adapter caches. Resume still uses the complete
+checkpoint directory and its original FP32 tensors.
+
+Legacy `training.pth` files need their sibling `checkpoint.json` for registration;
+when uploading an old checkpoint, include that JSON as a second multipart file.
+Legacy checkpoints containing only FFN value targets may lack the input width
+needed for inference and require re-export. Original two-file packages remain
+supported:
 
 - `adapter.json`: format_version=1, kind=inference_adapter, method=miss,
   dtype=float16, layout=modulo_rank_zero_pad, source base SHA-256, rank,
@@ -124,8 +136,7 @@ An inference directory contains **only inference weights and metadata**:
 - `adapter.pth`: torch-readable FP16 tensors named
   `blocks.N.att.key.weight.D`, etc., in original `[out,rank]` layout.
 
-Training checkpoints cannot be registered as inference adapters. The loader
-checks format, shapes, duplicate targets, finite values and content hash.
+The loader checks format, shapes, duplicate targets, finite values and content hash.
 Source base fingerprints must match. The base fingerprint is captured once
 when loading the model, before requests can bind adapters; this adds a
 sequential model-file hash read at startup. `rwkv_quantize` writes
@@ -140,7 +151,7 @@ uses the existing unquantized FP16 runtime representation of BF16 archives.
 Registration, listing, deletion, authentication, and generation request examples
 are maintained in the [HTTP API guide](../../docs/http-api.zh-CN.md#miss-适配器注册列表与删除)
 ([English](../../docs/http-api.md)). Registration reads an inference directory on
-the server; there is no multipart adapter-upload endpoint. Existing request
+the server or accepts a multipart PTH upload at `POST /v1/adapters`. Existing request
 handles survive deletion, while new lookups of deleted versions fail.
 
 GPU miss uploads the entire contiguous D collection once using pinned staging

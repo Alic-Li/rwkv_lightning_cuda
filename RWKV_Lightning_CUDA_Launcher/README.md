@@ -28,6 +28,7 @@ runtime-directory/
 ├── rwkv_launcher[.exe]
 ├── rwkv_lighting_cuda[.exe]
 ├── rwkv_state_tune[.exe]       # 可选；CUDA 构建的训练程序
+├── rwkv_miss_tune[.exe]        # 可选；MiSS adapter 训练程序
 ├── rwkv_vocab_v20230424.txt
 └── lib/                      # 保留现有 bundle 的动态库布局
 ```
@@ -125,7 +126,26 @@ Launcher WebUI 默认训练参数（启动时会完整传给 CLI）：
 | Optimizer           | `--optimizer adam\|muon` |      adam |
 | Shared WKV tape     | `--wkv_tape`             |      关闭 |
 
-训练只接受 BF16 `.pth` 基础模型，CUDA 专用；不会将 state 文件误称为基础模型。最终是否具有正确 tensor 结构由原生加载器验证。Checkpoint 只有 FP32 state tensors，不含 optimizer；**实际 CLI 没有 resume 参数**，因此界面没有伪造恢复功能。日志中的 epoch 值为 CLI 原值，不伪造小数 epoch。
+State tuning 使用 `.pth` 基础模型，最终张量结构由原生加载器验证。State checkpoint 只有 FP32 state tensors，不含 optimizer，State 模式不提供续训恢复。日志中的 epoch 值为 CLI 原值。
+
+### MiSS 训练与推理
+
+在 **State / MiSS Training** 页面将 Method 切换为 **MiSS adapter**，Launcher 会启动同目录的 `rwkv_miss_tune`。
+提供 rank、alpha、六类 Linear targets、初始 state、checkpoint 续训目录，以及原有 ctx/chunk、梯度累积 batch、学习率和 WKV tape 设置。
+默认 rank=16、alpha=16、targets=all、lr=0.0001、lr-final=0.00001。基模冻结，只训练 D；`batch_size` 沿用 microbatch 梯度累积。
+恢复时选择 `checkpoint-N` 目录，保持原模型、数据与训练配置，并选择新的输出目录。
+周期保存仍为 `checkpoint-N/{checkpoint.json,training.pth}`；结束生成单个 `adapter-final.pth`。
+
+在 Chat 的 **MiSS** 按钮、Parallel Translate 的 MiSS 面板或 Settings 的 **MiSS adapters** 面板中：
+
+- 指定 adapter ID，上传最终 PTH 或新 checkpoint 的 `training.pth`；旧 checkpoint 可附带 `checkpoint.json`。
+- 也可填写服务器已有文件的绝对路径注册。
+- 注册只缓存 D 到服务器 RAM；首次调用才装入 GPU。
+- 选择具体内容版本，并按需覆盖 scale；留空使用默认值，0 保留为显式零。
+- Chat 和 Parallel Translate 的新请求均携带所选 `adapter_id/adapter_version/adapter_scale`；运行中的请求不受切换影响。
+- 可刷新列表、删除指定版本和查看 RAM/GPU 驻留量及 H2D 次数。服务器重启后需重新注册。
+
+管理本地 runtime 时，Go 自动透传其鉴权信息；连接远程服务器时使用 Settings 中的 API key。
 
 两个原生程序各自申请 GPU，没有跨进程资源协调；仓库没有规定必须互斥。本 Launcher 为避免默认启动两份模型而选择**串行资源策略**：训练与本 Launcher 管理的推理互斥，训练前可确认 Stop & Start；Go 侧也强制检查。不会停止 Launcher 之外的 GPU 进程。Stop 会终止训练，保留此前实际写出的 checkpoint，不声称已保存尚未落盘的更新。
 
@@ -144,7 +164,7 @@ Launcher WebUI 默认训练参数（启动时会完整传给 CLI）：
 | GET    | `/logs`                    | 保留旧 Runtime SSE 日志入口                                     |
 | GET    | `/api/tuning/status`       | 训练状态、可执行文件是否存在、日志、进度、loss 数据、checkpoint |
 | POST   | `/api/tuning/validate`     | `{"path":"..."}`，返回有效样本数或准确行号错误                  |
-| POST   | `/api/tuning/start`        | TuningConfig，启动真实 `rwkv_state_tune`                        |
+| POST   | `/api/tuning/start`        | TuningConfig，按 method=state/miss 启动对应训练程序             |
 | POST   | `/api/tuning/stop`         | 停止训练进程                                                    |
 | POST   | `/api/tuning/open-folder`  | 打开最近实际保存 checkpoint 所在文件夹                          |
 | GET    | `/api/quantization/status` | 量化进程状态、工具可用性、输出路径与日志                        |

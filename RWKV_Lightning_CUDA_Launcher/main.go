@@ -47,6 +47,12 @@ type startRequest struct {
 	TuneCache            string `json:"tune_cache"`
 }
 type tuneRequest struct {
+	Method      string  `json:"method"`
+	Rank        int     `json:"rank"`
+	Alpha       float64 `json:"alpha"`
+	Targets     string  `json:"targets"`
+	State       string  `json:"state"`
+	Resume      string  `json:"resume"`
 	Model       string  `json:"model"`
 	Data        string  `json:"data"`
 	Output      string  `json:"output"`
@@ -470,6 +476,9 @@ func validateDataset(path string) (int, error) {
 	return count, nil
 }
 func tuningArgs(req tuneRequest) ([]string, error) {
+	if req.Method != "" && req.Method != "state" && req.Method != "miss" {
+		return nil, fmt.Errorf("training method must be state or miss")
+	}
 	if err := existingPath(req.Model, false); err != nil {
 		return nil, err
 	}
@@ -495,6 +504,34 @@ func tuningArgs(req tuneRequest) ([]string, error) {
 		return nil, fmt.Errorf("invalid training parameter; sizes and learning rates must be positive, counts nonnegative")
 	}
 	args := []string{"--model", req.Model, "--data", req.Data, "--output", req.Output, "--optimizer", req.Optimizer}
+	if req.Method == "miss" {
+		if req.Optimizer != "adam" || req.Rank < 1 || req.Rank > 1024 {
+			return nil, fmt.Errorf("MiSS requires Adam and rank between 1 and 1024")
+		}
+		allowed := map[string]bool{"att.receptance.weight": true, "att.key.weight": true, "att.value.weight": true, "att.output.weight": true, "ffn.key.weight": true, "ffn.value.weight": true}
+		seen := map[string]bool{}
+		if req.Targets != "all" {
+			for _, target := range strings.Split(req.Targets, ",") {
+				if !allowed[target] || seen[target] {
+					return nil, fmt.Errorf("invalid or duplicate MiSS target: %s", target)
+				}
+				seen[target] = true
+			}
+		}
+		args = append(args, "--rank", strconv.Itoa(req.Rank), "--alpha", strconv.FormatFloat(req.Alpha, 'g', -1, 64), "--targets", req.Targets)
+		if req.State != "" {
+			if err := existingPath(req.State, false); err != nil {
+				return nil, err
+			}
+			args = append(args, "--state", req.State)
+		}
+		if req.Resume != "" {
+			if err := existingPath(req.Resume, true); err != nil {
+				return nil, err
+			}
+			args = append(args, "--resume", req.Resume)
+		}
+	}
 	if req.WKVTape {
 		args = append(args, "--wkv_tape")
 	}
@@ -703,6 +740,12 @@ func (l *launcher) handler() http.Handler {
 		}
 		_, err := os.Stat(filepath.Join(appDir(), name))
 		out["available"] = err == nil
+		missName := "rwkv_miss_tune"
+		if runtime.GOOS == "windows" {
+			missName += ".exe"
+		}
+		_, missErr := os.Stat(filepath.Join(appDir(), missName))
+		out["miss_available"] = missErr == nil
 		writeJSON(w, 200, out)
 		return nil
 	})
@@ -721,6 +764,9 @@ func (l *launcher) handler() http.Handler {
 			return fmt.Errorf("inference is using the GPU; stop inference before starting tuning")
 		}
 		name := "rwkv_state_tune"
+		if req.Method == "miss" {
+			name = "rwkv_miss_tune"
+		}
 		if runtime.GOOS == "windows" {
 			name += ".exe"
 		}

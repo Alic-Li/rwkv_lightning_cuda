@@ -89,20 +89,20 @@ const numeric: {
     label: "Learning rate",
     min: 0.0000001,
     step: "any",
-    hint: "Initial learning rate. Recommended default: 0.0005.",
+    hint: "Initial learning rate; MiSS default: 0.0001, state default: 0.0005.",
   },
   {
     key: "lr_final",
     label: "Final learning rate",
     min: 0.0000001,
     step: "any",
-    hint: "Learning rate at the end of training. Recommended default: 0.0001.",
+    hint: "Final learning rate; MiSS default: 0.00001, state default: 0.0001.",
   },
   {
     key: "save_every",
     label: "Save every N steps",
     min: 0,
-    hint: "Periodic state checkpoints. Default: every 100 updates; 0 disables it.",
+    hint: "Periodic checkpoints. Default: every 100 updates; 0 disables it.",
   },
   {
     key: "warmup_steps",
@@ -165,7 +165,9 @@ const parameterPresets: {
   },
 ];
 export function StateTuningPage() {
-  const { config, set, resetParameters } = useTuningForm();
+  const { config: saved, set, resetParameters } = useTuningForm();
+  const config = { ...defaultTuning, ...saved };
+  const miss = config.method === "miss";
   // Persisted v2 forms created before these options existed have no optimizer.
   const optimizer = config.optimizer === "muon" ? "muon" : "adam";
   const form = useRef<HTMLFormElement>(null);
@@ -184,6 +186,7 @@ export function StateTuningPage() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
   const { runtime, tuning: state, connected, refresh } = useRuntime();
+  const available = miss ? state.miss_available : state.available;
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirm, setConfirm] = useState(false);
@@ -210,14 +213,20 @@ export function StateTuningPage() {
     config.warmup_steps >= 0 &&
     config.save_every >= 0 &&
     config.seed >= 0 &&
-    (optimizer === "adam" || optimizer === "muon");
+    (optimizer === "adam" || optimizer === "muon") &&
+    (!miss ||
+      (Number.isInteger(config.rank) &&
+        config.rank > 0 &&
+        config.rank <= 1024 &&
+        Number.isFinite(config.alpha) &&
+        Boolean(config.targets.trim())));
   const canStart =
     connected &&
     pathsReady &&
     parametersReady &&
     !busy &&
     !state.running &&
-    state.available !== false;
+    available !== false;
   const fullUpdateEstimate = datasetReady
     ? Math.ceil(validated.samples / config.batch_size) * config.epochs
     : 0;
@@ -225,12 +234,17 @@ export function StateTuningPage() {
     ? Math.min(fullUpdateEstimate, config.max_steps)
     : fullUpdateEstimate;
   const commandPreview = [
-    "rwkv_state_tune",
+    miss ? "rwkv_miss_tune" : "rwkv_state_tune",
+    miss
+      ? `--rank ${config.rank} --alpha ${config.alpha} --targets ${JSON.stringify(config.targets)}`
+      : "",
+    miss && config.state ? `--state ${JSON.stringify(config.state)}` : "",
+    miss && config.resume ? `--resume ${JSON.stringify(config.resume)}` : "",
     `--model ${JSON.stringify(config.model || "MODEL.pth")}`,
     `--data ${JSON.stringify(config.data || "DATA.jsonl")}`,
     `--output ${JSON.stringify(config.output)}`,
     config.vocab ? `--vocab ${JSON.stringify(config.vocab)}` : "",
-    `--optimizer ${optimizer}`,
+    `--optimizer ${miss ? "adam" : optimizer}`,
     config.wkv_tape ? "--wkv_tape" : "",
     `--ctx ${config.ctx}`,
     `--chunk ${config.chunk}`,
@@ -253,7 +267,7 @@ export function StateTuningPage() {
       const result = await tuning.validate(config.data);
       setValidated({ path: config.data, samples: result.samples });
       if (stopRuntime) await launcher.stop();
-      await tuning.start(config);
+      await tuning.start({ ...config, optimizer: miss ? "adam" : optimizer });
       await refresh();
     } catch (e) {
       setError(String(e));
@@ -278,17 +292,21 @@ export function StateTuningPage() {
     <div className="page">
       <header className="page-heading">
         <div>
-          <div className="eyebrow">STATE, NOT WEIGHTS</div>
-          <h1>State Tuning</h1>
-          <p>Train a reusable RWKV state from a JSONL dataset.</p>
+          <div className="eyebrow">FROZEN BASE TRAINING</div>
+          <h1>{miss ? "MiSS Training" : "State Tuning"}</h1>
+          <p>
+            {miss
+              ? "Train compact MiSS adapters with chunked state passing."
+              : "Train a reusable RWKV state from a JSONL dataset."}
+          </p>
         </div>
         <span className="tag">CUDA · BF16 .pth</span>
       </header>
       <ErrorPanel error={error || state.error} />
-      {state.available === false && (
+      {available === false && (
         <p className="notice">
-          Place the CUDA <code>rwkv_state_tune</code> executable next to this
-          Launcher to enable training.
+          Place the <code>{miss ? "rwkv_miss_tune" : "rwkv_state_tune"}</code>{" "}
+          executable next to this Launcher to enable training.
         </p>
       )}
       <section className="tuning-overview" aria-label="State tuning readiness">
@@ -335,14 +353,126 @@ export function StateTuningPage() {
         }}
       >
         <fieldset disabled={busy || state.running}>
+          <Panel title="Training method">
+            <Field label="Method">
+              <select
+                value={config.method}
+                onChange={(e) => {
+                  const method = e.target.value as "state" | "miss";
+                  set({
+                    method,
+                    optimizer: "adam",
+                    resume: "",
+                    output:
+                      method === "miss" ? "./miss_output" : "./state_output",
+                    lr: method === "miss" ? 0.0001 : defaultTuning.lr,
+                    lr_final:
+                      method === "miss" ? 0.00001 : defaultTuning.lr_final,
+                  });
+                }}
+              >
+                <option value="state">State tuning</option>
+                <option value="miss">MiSS adapter</option>
+              </select>
+            </Field>
+            {miss && (
+              <>
+                <div className="form-grid">
+                  <Field label="Rank">
+                    <input
+                      type="number"
+                      min={1}
+                      max={1024}
+                      required
+                      value={config.rank}
+                      onChange={(e) => set({ rank: Number(e.target.value) })}
+                    />
+                  </Field>
+                  <Field
+                    label="Alpha"
+                    hint="Effective scale = alpha / rank. Set alpha equal to rank for scale 1."
+                  >
+                    <input
+                      type="number"
+                      step="any"
+                      required
+                      value={config.alpha}
+                      onChange={(e) => set({ alpha: Number(e.target.value) })}
+                    />
+                  </Field>
+                </div>
+                <Field
+                  label="Targets"
+                  hint="all, or comma-separated att.receptance.weight, att.key.weight, att.value.weight, att.output.weight, ffn.key.weight, ffn.value.weight"
+                >
+                  <input
+                    required
+                    value={config.targets}
+                    onChange={(e) => set({ targets: e.target.value })}
+                  />
+                </Field>
+                <PathField
+                  label="Initial state (.pth, optional)"
+                  value={config.state}
+                  onChange={(state) => set({ state })}
+                />
+                <PathField
+                  label="Resume checkpoint directory (optional)"
+                  directory
+                  value={config.resume}
+                  onChange={(resume) => set({ resume })}
+                />
+                <p className="small muted">
+                  Resume with the original model, data, rank, targets and
+                  schedule, and a new output directory. Batch size accumulates
+                  independent microbatches before one update.
+                </p>
+              </>
+            )}
+          </Panel>
           <Panel title="Quick setup" hint="PRESETS">
             <div className="preset-grid">
+              {miss && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    set({
+                      ctx: 4096,
+                      chunk: 1024,
+                      batch_size: 8,
+                      epochs: 1,
+                      rank: 16,
+                      alpha: 16,
+                      targets: "all",
+                      lr: 0.0001,
+                      lr_final: 0.00001,
+                      warmup_steps: 10,
+                      save_every: 100,
+                      max_steps: 0,
+                      optimizer: "adam",
+                      wkv_tape: true,
+                    })
+                  }
+                >
+                  <Zap size={15} />
+                  <span>
+                    <strong>MiSS 4096</strong>
+                    <small>
+                      Rank 16 · chunk 1024 · batch 8 · shared WKV tape
+                    </small>
+                  </span>
+                </button>
+              )}
               {parameterPresets.map((preset) => (
                 <button
                   type="button"
                   key={preset.label}
                   onClick={() =>
-                    set({ ...recommendedParameters, ...preset.values })
+                    set({
+                      ...recommendedParameters,
+                      ...(miss ? { lr: 0.0001, lr_final: 0.00001 } : {}),
+                      ...preset.values,
+                    })
                   }
                 >
                   <Zap size={15} />
@@ -352,7 +482,14 @@ export function StateTuningPage() {
                   </span>
                 </button>
               ))}
-              <button type="button" onClick={resetParameters}>
+              <button
+                type="button"
+                onClick={() => {
+                  resetParameters();
+                  if (miss)
+                    set({ method: "miss", lr: 0.0001, lr_final: 0.00001 });
+                }}
+              >
                 <RotateCcw size={15} />
                 <span>
                   <strong>Reset parameters</strong>
@@ -417,7 +554,8 @@ export function StateTuningPage() {
                   hint="Adam preserves the original behavior. Muon orthogonalizes each 64×64 state matrix."
                 >
                   <select
-                    value={optimizer}
+                    value={miss ? "adam" : optimizer}
+                    disabled={miss}
                     onChange={(e) =>
                       set({ optimizer: e.target.value as "adam" | "muon" })
                     }
@@ -458,7 +596,10 @@ export function StateTuningPage() {
               </details>
             </Panel>
           </div>
-          <Panel title="State checkpoints" hint="03">
+          <Panel
+            title={miss ? "Adapter checkpoints" : "State checkpoints"}
+            hint="03"
+          >
             <PathField
               label="Output directory"
               value={config.output}
@@ -466,12 +607,21 @@ export function StateTuningPage() {
               placeholder="./state_output"
               onChange={(output) => set({ output })}
             />
-            <p className="muted small">
-              Saved as <code>state-step-XXXXXXXX.pth</code> and{" "}
-              <code>state-final.pth</code>. These contain trained state tensors,
-              not model weights or optimizer state. The current CLI does not
-              support checkpoint resume.
-            </p>
+            {miss ? (
+              <p className="muted small">
+                Resumable checkpoints: <code>checkpoint-N/training.pth</code>{" "}
+                and <code>checkpoint.json</code>. Final export:{" "}
+                <code>adapter-final.pth</code>. Register or upload either PTH in
+                the MiSS adapters panel for inference.
+              </p>
+            ) : (
+              <p className="muted small">
+                Saved as <code>state-step-XXXXXXXX.pth</code> and{" "}
+                <code>state-final.pth</code>. These contain trained state
+                tensors, not model weights or optimizer state. The current CLI
+                does not support checkpoint resume.
+              </p>
+            )}
             <div className="training-summary">
               <div>
                 <span>Validated samples</span>
@@ -505,7 +655,12 @@ export function StateTuningPage() {
         </fieldset>
         <div className="action-strip">
           <button className="primary" disabled={!canStart}>
-            <Play size={14} /> {busy ? "Starting…" : "Start state tuning"}
+            <Play size={14} />{" "}
+            {busy
+              ? "Starting…"
+              : miss
+                ? "Start MiSS training"
+                : "Start state tuning"}
           </button>
           <button
             type="button"
@@ -590,7 +745,7 @@ export function StateTuningPage() {
           title={
             state.status === "completed"
               ? "Training completed"
-              : "Latest saved state"
+              : "Latest checkpoint"
           }
         >
           <code className="checkpoint-path">{state.checkpoint}</code>
@@ -618,7 +773,7 @@ export function StateTuningPage() {
         >
           <p>
             Inference is currently using the GPU. The Launcher will stop it,
-            validate the dataset, then start state tuning.
+            validate the dataset, then start training.
           </p>
           <p className="muted">
             This is a Launcher resource policy; the native executables do not

@@ -12,6 +12,9 @@ export const storage = {
   removeItem: (name: string) => localStorage.removeItem(name),
 };
 export interface GenerationSettings {
+  adapter_id?: string;
+  adapter_version?: string;
+  adapter_scale?: string;
   temperature: number;
   top_p: number;
   top_k: number;
@@ -25,6 +28,9 @@ export interface GenerationSettings {
 }
 export type ThemeMode = "dark" | "light" | "system";
 export const defaultGeneration: GenerationSettings = {
+  adapter_id: "",
+  adapter_version: "",
+  adapter_scale: "",
   temperature: 1,
   top_p: 0.3,
   top_k: 20,

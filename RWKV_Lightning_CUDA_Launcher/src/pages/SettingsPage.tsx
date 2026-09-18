@@ -6,6 +6,7 @@ import { Panel, Field, Dialog } from "../components/common";
 import { GenerationSettings } from "../components/GenerationSettings";
 import { LanguageInput } from "./TranslatePage";
 import { ThemeControl } from "../components/ThemeControl";
+import { AdapterManager } from "../components/AdapterManager";
 export function SettingsPage() {
   const { values, set, reset } = useSettings();
   const { key, setKey } = useSecret();
@@ -89,6 +90,9 @@ export function SettingsPage() {
       </Panel>
       <Panel title="Generation defaults">
         <GenerationSettings />
+      </Panel>
+      <Panel title="MiSS adapters">
+        <AdapterManager key={values.baseURL} />
       </Panel>
       <Panel title="Local storage">
         <p className="muted">

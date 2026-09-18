@@ -40,6 +40,60 @@ afterEach(() => {
   useSettings.getState().reset();
   useSecret.getState().setKey("");
 });
+it("sends MiSS selection with both chat and translation", async () => {
+  const store = useSettings.getState();
+  store.set({
+    generation: {
+      ...store.values.generation,
+      adapter_id: "html",
+      adapter_version: "v1",
+      adapter_scale: "0",
+    },
+  });
+  const sent: Record<string, unknown>[] = [];
+  fetchSpy.mockImplementation(async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    sent.push(body);
+    return body.stream ? output("ok") : completion(["译文"]);
+  });
+  await useChat.getState().send("hello");
+  useTranslate
+    .getState()
+    .set({ source: "hello", from: "English", to: "Chinese", concurrency: 1 });
+  await useTranslate.getState().run();
+  expect(sent).toHaveLength(2);
+  for (const body of sent) {
+    expect(body.adapter_id).toBe("html");
+    expect(body.adapter_version).toBe("v1");
+    expect(body.adapter_scale).toBe(0);
+  }
+});
+it("uploads MiSS PTH and legacy JSON with bearer auth and deletes a specific version", async () => {
+  const { RWKVClient } = await import("../src/lib/api/client");
+  let init: RequestInit | undefined;
+  fetchSpy.mockImplementation(async (_url, options) => {
+    init = options;
+    return Response.json({ adapter_id: "html", version: "v1" });
+  });
+  const client = new RWKVClient("http://localhost:8000", "secret");
+  await client.uploadAdapter(
+    "html",
+    new File(["pth"], "training.pth"),
+    new File(["{}"], "checkpoint.json"),
+  );
+  expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer secret");
+  expect(new Headers(init?.headers).get("Content-Type")).toBeNull();
+  expect((init?.body as FormData).get("adapter_id")).toBe("html");
+  expect(((init?.body as FormData).get("metadata") as File).name).toBe(
+    "checkpoint.json",
+  );
+  await client.deleteAdapter("html", "v1");
+  expect(init?.method).toBe("DELETE");
+  expect(JSON.parse(String(init?.body))).toEqual({
+    adapter_id: "html",
+    adapter_version: "v1",
+  });
+});
 it("saves streamed chat and retries without duplicating user messages", async () => {
   let sent: Record<string, unknown> = {};
   fetchSpy.mockImplementation(async (_url, init) => {

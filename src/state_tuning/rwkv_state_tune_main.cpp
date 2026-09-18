@@ -732,7 +732,7 @@ int main(int argc, char **argv) {
     std::cout << '\n';
 #ifdef RWKV_MISS_TUNE
     const std::string final_path =
-        (std::filesystem::path(options.output) / "adapter").string();
+        (std::filesystem::path(options.output) / "adapter-final.pth").string();
     miss.export_adapter(final_path);
 #else
     const std::string final_path =
@@ -740,7 +740,7 @@ int main(int argc, char **argv) {
     rwkv7_state_tuning::save_state_checkpoint_pth(final_path, stream.value, L,
                                                   H, N, time_state.p);
 #endif
-    std::cout << "saved: " << final_path << '\n';
+    std::cout << "saved: " << std::filesystem::absolute(final_path).string() << '\n';
     std::cout << "complete: steps=" << global_step
               << " skipped_short_samples=" << skipped
               << " seed=" << options.seed << '\n';

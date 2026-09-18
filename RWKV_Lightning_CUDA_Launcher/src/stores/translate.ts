@@ -3,7 +3,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import { chunkText, translationPrompt } from "../lib/translate/chunk";
 import { normalizeLanguage } from "../lib/translate/languages";
 import type { TranslateChunk } from "../lib/translate/scheduler";
-import { RWKVClient } from "../lib/api/client";
+import { RWKVClient, adapterFields } from "../lib/api/client";
 import { useSettings, useSecret, storage } from "./settings";
 export const translationBody = (prompt: string | string[]) => ({
   contents: Array.isArray(prompt) ? prompt : [prompt],
@@ -115,7 +115,10 @@ export const useTranslate = create(
             const batchStarted = performance.now();
             try {
               const result = await client.completeChat(
-                translationBody(batch.map((chunk) => chunk.prompt)),
+                {
+                  ...translationBody(batch.map((chunk) => chunk.prompt)),
+                  ...adapterFields(v.generation),
+                },
                 controller.signal,
               );
               const choices = new Map(

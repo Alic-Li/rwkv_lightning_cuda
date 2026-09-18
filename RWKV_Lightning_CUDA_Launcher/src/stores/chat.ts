@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import { RWKVClient } from "../lib/api/client";
+import { RWKVClient, generationBody } from "../lib/api/client";
 import {
   useSettings,
   useSecret,
@@ -134,7 +134,7 @@ export const useChat = create(
           const v = useSettings.getState().values;
           await new RWKVClient(v.baseURL, useSecret.getState().key).streamChat(
             {
-              ...settings,
+              ...generationBody(settings),
               stream: true,
               stop_tokens: [0, 261, 24281],
               messages: messages.map(({ role, content }) => ({

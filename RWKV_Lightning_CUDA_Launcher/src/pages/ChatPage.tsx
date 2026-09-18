@@ -18,6 +18,7 @@ import { useRuntime } from "../stores/runtime";
 import { useSettings } from "../stores/settings";
 import { GenerationSettings } from "../components/GenerationSettings";
 import { StateManager } from "../components/StateManager";
+import { AdapterManager } from "../components/AdapterManager";
 import { CopyButton, Dialog } from "../components/common";
 import { extractHTMLDocuments, openHTMLPreview } from "../lib/chat/html";
 export const Message = memo(function Message({
@@ -75,6 +76,7 @@ export function ChatPage() {
   const conversation = conversations.find((c) => c.id === selected);
   const [text, setText] = useState("");
   const [statesOpen, setStatesOpen] = useState(false);
+  const [adaptersOpen, setAdaptersOpen] = useState(false);
   const setValues = useSettings((s) => s.set);
   const [settings, setSettings] = useState(false);
   const runtime = useRuntime((s) => s.runtime);
@@ -161,6 +163,11 @@ export function ChatPage() {
           <StateManager key={baseURL} />
         </Dialog>
       )}
+      {adaptersOpen && (
+        <Dialog title="MiSS adapters" onClose={() => setAdaptersOpen(false)}>
+          <AdapterManager key={baseURL} />
+        </Dialog>
+      )}
       <div className="composer-wrap">
         <form
           className="composer"
@@ -211,6 +218,9 @@ export function ChatPage() {
               onClick={() => setStatesOpen(true)}
             >
               State: {generation.state_id || "None"}
+            </button>
+            <button type="button" onClick={() => setAdaptersOpen(true)}>
+              MiSS: {generation.adapter_id || "None"}
             </button>
             <label className="thinking-toggle">
               <input

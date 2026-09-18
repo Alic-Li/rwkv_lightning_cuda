@@ -119,7 +119,19 @@ void Trainer::checkpoint(const std::string &dir, uint64_t step, int epoch,
       add(name(t) + "." + p.first, p.second + t.offset, {t.out, t.rank},
           size_t(t.out) * rank_);
   add("initial_state", initial, {int(states)}, states);
-  llm_infer::write_pth(dir + ".tmp/training.pth", ts);
+  std::vector<uint16_t> forward(forward_.n);
+  check(cudaMemcpyAsync(forward.data(), forward_.p, forward.size() * 2,
+                        cudaMemcpyDeviceToHost, stream_));
+  check(cudaStreamSynchronize(stream_));
+  Json::Value manifest;
+  manifest["rank"] = rank_;
+  manifest["alpha"] = alpha_;
+  manifest["scale"] = alpha_ / rank_;
+  manifest["base_fingerprint"] = config_["base_fingerprint"];
+  manifest = adapter_manifest(manifest, targets_, forward);
+  manifest["tensor_source"] = "master";
+  llm_infer::write_pth(dir + ".tmp/training.pth", ts,
+                      Json::writeString(Json::StreamWriterBuilder{}, manifest));
   Json::Value m;
   m["kind"] = "miss_training_checkpoint";
   m["format_version"] = 1;
@@ -210,6 +222,6 @@ void Trainer::export_adapter(const std::string &dir) {
   m["alpha"] = alpha_;
   m["scale"] = alpha_ / rank_;
   m["base_fingerprint"] = config_["base_fingerprint"];
-  save_package(dir, m, targets_, data);
+  save_adapter_pth(dir, m, targets_, data);
 }
 } // namespace rwkv7_miss

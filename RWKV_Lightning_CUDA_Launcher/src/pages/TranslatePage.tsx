@@ -10,6 +10,8 @@ import {
 } from "lucide-react";
 import { useTranslate, translationBody } from "../stores/translate";
 import { useSettings } from "../stores/settings";
+import { adapterFields } from "../lib/api/client";
+import { AdapterManager } from "../components/AdapterManager";
 import { useRuntime } from "../stores/runtime";
 import { chunkText, translationPrompt } from "../lib/translate/chunk";
 import { languages, normalizeLanguage } from "../lib/translate/languages";
@@ -133,6 +135,12 @@ export function TranslatePage() {
         </div>
         <span className="tag">Batch size {concurrency}</span>
       </header>
+      <details className="panel">
+        <summary>
+          MiSS adapter: {values.generation.adapter_id || "None"}
+        </summary>
+        <AdapterManager key={values.baseURL} />
+      </details>
       <div className="translation-bar panel">
         <LanguageInput
           label="Source language"
@@ -370,8 +378,26 @@ export function TranslatePage() {
           <h3>Prompt</h3>
           <pre>{prompt}</pre>
           <h3>Request body</h3>
-          <pre>{JSON.stringify(translationBody(prompt), null, 2)}</pre>
-          <CopyButton text={JSON.stringify(translationBody(prompt), null, 2)} />
+          <pre>
+            {JSON.stringify(
+              {
+                ...translationBody(prompt),
+                ...adapterFields(values.generation),
+              },
+              null,
+              2,
+            )}
+          </pre>
+          <CopyButton
+            text={JSON.stringify(
+              {
+                ...translationBody(prompt),
+                ...adapterFields(values.generation),
+              },
+              null,
+              2,
+            )}
+          />
         </Dialog>
       )}
       {selected && (

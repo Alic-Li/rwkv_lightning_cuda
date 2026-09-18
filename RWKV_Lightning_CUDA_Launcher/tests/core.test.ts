@@ -14,6 +14,32 @@ import {
   extractHTMLDocuments,
 } from "../src/lib/chat/html";
 import { suggestedQuantizedPath } from "../src/lib/api/launcher";
+import { adapterFields, generationBody } from "../src/lib/api/client";
+it("omits unset adapter fields and preserves explicit zero scale", () => {
+  expect(
+    adapterFields({
+      adapter_id: "",
+      adapter_version: "stale",
+      adapter_scale: "1",
+    }),
+  ).toEqual({});
+  expect(adapterFields({ adapter_id: "html", adapter_scale: "" })).toEqual({
+    adapter_id: "html",
+  });
+  expect(
+    adapterFields({
+      adapter_id: "html",
+      adapter_version: "v1",
+      adapter_scale: "0",
+    }),
+  ).toEqual({ adapter_id: "html", adapter_version: "v1", adapter_scale: 0 });
+  expect(() =>
+    adapterFields({ adapter_id: "html", adapter_scale: "NaN" }),
+  ).toThrow();
+  expect(
+    generationBody({ adapter_id: "", adapter_scale: "", state_id: "initial" }),
+  ).toEqual({ state_id: "initial" });
+});
 const stream = (parts: string[]) =>
   new ReadableStream<Uint8Array>({
     start(c) {

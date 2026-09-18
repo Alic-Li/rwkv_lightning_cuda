@@ -24,6 +24,11 @@ std::string fingerprint_file(const std::string &);
 std::string new_runtime_identity();
 std::string content_version(const Json::Value &,
                             const std::vector<std::uint16_t> &);
+Json::Value adapter_manifest(Json::Value, const std::vector<HostTensor> &,
+                            const std::vector<std::uint16_t> &);
+void save_adapter_pth(const std::string &, Json::Value,
+                      const std::vector<HostTensor> &,
+                      const std::vector<std::uint16_t> &);
 std::shared_ptr<const Package> load_package(const std::string &directory,
                                             std::size_t max_bytes = 1ULL << 30);
 void save_package(const std::string &directory, Json::Value manifest,

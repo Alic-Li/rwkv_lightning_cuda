@@ -36,6 +36,7 @@ export interface ProcessStatus {
   };
   losses?: { step: number; loss: number }[];
   available?: boolean;
+  miss_available?: boolean;
 }
 export interface QuantizationStatus extends ProcessStatus {
   output_path?: string;
@@ -80,6 +81,12 @@ export const defaultRuntime: RuntimeConfig = {
   tune_cache: "",
 };
 export interface TuningConfig {
+  method: "state" | "miss";
+  rank: number;
+  alpha: number;
+  targets: string;
+  state: string;
+  resume: string;
   model: string;
   data: string;
   output: string;
@@ -98,6 +105,12 @@ export interface TuningConfig {
   wkv_tape: boolean;
 }
 export const defaultTuning: TuningConfig = {
+  method: "state",
+  rank: 16,
+  alpha: 16,
+  targets: "all",
+  state: "",
+  resume: "",
   model: "",
   data: "",
   output: "./state_output",

@@ -114,7 +114,8 @@ checkpoint，以及与训练 checkpoint 分离的推理导出：
   --save-every 100 --wkv_tape
 ```
 
-通过 `POST /v1/adapters` 注册 `miss_output/adapter`，然后在生成请求中传入
+通过 `POST /v1/adapters` 上传或注册 `miss_output/adapter-final.pth`
+（也可使用 checkpoint 的 `training.pth`），然后在生成请求中传入
 `adapter_id`，并按需指定 `adapter_version` 或 `adapter_scale`。注册阶段只在 CPU
 RAM 中校验和缓存；第一次请求时才把整个 adapter 一次性上传到 GPU。checkpoint
 续训、推理包身份、缓存预算、性能分析和验收说明见

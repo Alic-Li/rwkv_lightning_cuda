@@ -95,8 +95,8 @@ run('continuous',7,4);run('partial',7,2);run('resumed',7,4,'partial/checkpoint-2
 x=torch.load(a.work/'continuous/checkpoint-4/training.pth',weights_only=True)
 y=torch.load(a.work/'resumed/checkpoint-4/training.pth',weights_only=True)
 for k in x: torch.testing.assert_close(x[k],y[k],atol=0,rtol=0)
-x=torch.load(a.work/'continuous/adapter/adapter.pth',weights_only=True)
-y=torch.load(a.work/'resumed/adapter/adapter.pth',weights_only=True)
+x=torch.load(a.work/'continuous/adapter-final.pth',weights_only=True)
+y=torch.load(a.work/'resumed/adapter-final.pth',weights_only=True)
 for k in x: torch.testing.assert_close(x[k],y[k],atol=0,rtol=0)
 log=run('learn',7,16)
 import re
@@ -113,9 +113,9 @@ for fmt in ['fp16','w8a16','w4a16']:
             subprocess.run([a.build/'rwkv_quantize','--format',fmt,a.work/'tiny.pth',model],check=True,stdout=log)
     output=a.work/('logits-'+fmt+'.pth')
     with (a.work/('runtime-'+fmt+'.log')).open('w') as log:
-        subprocess.run([a.build/'test/rwkv_miss_model_test',model,a.work/'learn/adapter',output],check=True,stdout=log)
+        subprocess.run([a.build/'test/rwkv_miss_model_test',model,a.work/'learn/adapter-final.pth',output],check=True,stdout=log)
     if fmt=='fp16':
-        adapter=torch.load(a.work/'learn/adapter/adapter.pth',weights_only=True)
+        adapter=torch.load(a.work/'learn/adapter-final.pth',weights_only=True)
         adapter={k:v.float() for k,v in adapter.items()}
         ref=forward(w,adapter,torch.tensor([98,99,100,98,99,100,98,99,100]),8)
         actual=torch.load(output,weights_only=True)['logits']
