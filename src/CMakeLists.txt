@@ -103,9 +103,38 @@ endif()
 rwkv_optimize_backend_target(rwkv7_fast_backend_core)
 
 if(RWKV7_STATE_TUNING)
-  add_executable(rwkv_miss_tune state_tuning/rwkv_state_tune_main.cpp state_tuning/dataset.cpp miss/trainer.cpp)
+  set(BF16_GPU_SOURCES bf16_training/ops.cu
+    bf16_training/backward_kernels.cu bf16_training/block_forward.cu
+    bf16_training/block_backward.cu bf16_training/model_forward.cu
+    bf16_training/training_kernels.cu bf16_training/miss_kernels.cu)
+  if(RWKV_GPU_BACKEND STREQUAL "HIP")
+    set_source_files_properties(${BF16_GPU_SOURCES} PROPERTIES LANGUAGE HIP)
+    list(APPEND BF16_GPU_SOURCES ${PROJECT_SOURCE_DIR}/hip/rwkv7_statepassing_clampw.hip)
+  else()
+    list(APPEND BF16_GPU_SOURCES ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cu)
+  endif()
+  add_library(rwkv_bf16_training STATIC ${BF16_GPU_SOURCES}
+    bf16_training/model.cpp bf16_training/model_backward.cpp
+    ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cpp bf16_training/format.cpp
+    io/pth_archive.cpp io/pth_tensor.cpp io/pth_writer.cpp io/fingerprint.cpp
+    inference/rwkv_tokenizer.cpp utils/tokenizer.cpp)
+  target_include_directories(rwkv_bf16_training PUBLIC ${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/bf16_training PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  target_link_libraries(rwkv_bf16_training PUBLIC ${RWKV_JSON_TARGET} OpenSSL::Crypto)
+  if(RWKV_GPU_BACKEND STREQUAL "HIP")
+    target_compile_definitions(rwkv_bf16_training PUBLIC RWKV_USE_HIP)
+    target_link_libraries(rwkv_bf16_training PUBLIC hip::host roc::hipblas)
+  else()
+    target_link_libraries(rwkv_bf16_training PUBLIC CUDA::cublas CUDA::cudart)
+    set_property(TARGET rwkv_bf16_training PROPERTY CUDA_RUNTIME_LIBRARY Shared)
+  endif()
+  rwkv_optimize_backend_target(rwkv_bf16_training)
+endif()
+
+if(RWKV7_STATE_TUNING)
+  add_executable(rwkv_miss_tune bf16_training/main.cpp state_tuning/dataset.cpp bf16_training/trainer.cpp)
   target_include_directories(rwkv_miss_tune PRIVATE state_tuning)
-  target_link_libraries(rwkv_miss_tune PRIVATE rwkv::backend)
+  target_link_libraries(rwkv_miss_tune PRIVATE rwkv_bf16_training)
   target_compile_definitions(rwkv_miss_tune PRIVATE RWKV_MISS_TUNE
     RWKV_STATE_TUNE_DEFAULT_VOCAB="${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt")
   rwkv_optimize_target(rwkv_miss_tune)
@@ -113,11 +142,11 @@ if(RWKV7_STATE_TUNING)
     ASSETS ${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt
   )
   add_executable(rwkv_state_tune
-    state_tuning/rwkv_state_tune_main.cpp
+    bf16_training/main.cpp
     state_tuning/dataset.cpp
   )
   target_include_directories(rwkv_state_tune PRIVATE state_tuning)
-  target_link_libraries(rwkv_state_tune PRIVATE rwkv::backend)
+  target_link_libraries(rwkv_state_tune PRIVATE rwkv_bf16_training)
   target_compile_definitions(rwkv_state_tune PRIVATE
     RWKV_STATE_TUNE_DEFAULT_VOCAB="${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt"
   )

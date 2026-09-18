@@ -155,20 +155,21 @@ void write_pth(const std::string &path,
   std::vector<Entry> entries;
   for (size_t i = 0; i < tensors.size(); ++i) {
     const auto &t = tensors[i];
+    if (t.fp16 && t.bf16) throw std::invalid_argument("ambiguous PTH dtype");
     size_t n = 1;
     for (int d : t.shape) {
       if (d <= 0 || n > size_t(INT32_MAX) / d)
         throw std::invalid_argument("invalid PTH shape");
       n *= d;
     }
-    if (t.data.size() != n * (t.fp16 ? 2 : 4))
+    if (t.data.size() != n * ((t.fp16 || t.bf16) ? 2 : 4))
       throw std::invalid_argument("PTH data size mismatch");
     pickle_string(p, t.name);
     pickle_global(p, "torch._utils", "_rebuild_tensor_v2");
     p.push_back('(');
     p.push_back('(');
     pickle_string(p, "storage");
-    pickle_global(p, "torch", t.fp16 ? "HalfStorage" : "FloatStorage");
+    pickle_global(p, "torch", t.bf16 ? "BFloat16Storage" : (t.fp16 ? "HalfStorage" : "FloatStorage"));
     pickle_string(p, std::to_string(i));
     pickle_string(p, "cpu");
     pickle_int(p, n);

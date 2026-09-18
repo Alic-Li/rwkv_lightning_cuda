@@ -1,0 +1,274 @@
+// Copied from src/state_tuning; independent BF16 training implementation.
+#include "training.hpp"
+
+#include "runtime.hpp"
+
+#include <cfloat>
+#include <cmath>
+#include <stdexcept>
+
+namespace rwkv_bf16_training {
+namespace {
+
+constexpr int kThreads = 256;
+
+__device__ __forceinline__ float warp_max(float x) {
+#pragma unroll
+  for (int offset = 16; offset; offset >>= 1) {
+    x = fmaxf(x, __shfl_down_sync(0xffffffffu, x, offset));
+  }
+  return x;
+}
+
+__device__ __forceinline__ float warp_sum(float x) {
+#pragma unroll
+  for (int offset = 16; offset; offset >>= 1) {
+    x += __shfl_down_sync(0xffffffffu, x, offset);
+  }
+  return x;
+}
+
+__device__ float block_reduce(float value, float *scratch, bool maximum) {
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  value = maximum ? warp_max(value) : warp_sum(value);
+  if (lane == 0)
+    scratch[warp] = value;
+  __syncthreads();
+  value = threadIdx.x < (blockDim.x >> 5) ? scratch[lane]
+                                          : (maximum ? -FLT_MAX : 0.0f);
+  if (warp == 0)
+    value = maximum ? warp_max(value) : warp_sum(value);
+  if (threadIdx.x == 0)
+    scratch[0] = value;
+  __syncthreads();
+  return scratch[0];
+}
+
+__global__ void xent_kernel(int vocab, const bf16 *__restrict__ logits,
+                            const int *__restrict__ targets, int ignore_index,
+                            float scale, float *__restrict__ loss,
+                            bf16 *__restrict__ d_logits) {
+  const int row = blockIdx.x;
+  const int target = targets[row];
+  const long long base = static_cast<long long>(row) * vocab;
+  __shared__ float scratch[8];
+  float local_max = -FLT_MAX;
+  for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
+    local_max = fmaxf(local_max, to_float(logits[base + token]));
+  }
+  const float max_logit = block_reduce(local_max, scratch, true);
+  float local_sum = 0.0f;
+  for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
+    local_sum += expf(to_float(logits[base + token]) - max_logit);
+  }
+  const float sum = block_reduce(local_sum, scratch, false);
+  const bool ignored = target == ignore_index;
+  for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
+    const float probability =
+        expf(to_float(logits[base + token]) - max_logit) / sum;
+    const float gradient =
+        ignored ? 0.0f
+                : (probability - (token == target ? 1.0f : 0.0f)) * scale;
+    d_logits[base + token] = to_bf16(gradient);
+  }
+  if (threadIdx.x == 0 && !ignored) {
+    atomicAdd(loss, (logf(sum) + max_logit - to_float(logits[base + target])) *
+                        scale);
+  }
+}
+
+__global__ void reduce_state_kernel(int B, std::size_t lane,
+                                    const float *__restrict__ source,
+                                    float *__restrict__ destination,
+                                    bool accumulate) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= lane)
+    return;
+  float value = accumulate ? destination[i] : 0.0f;
+  for (int batch = 0; batch < B; ++batch) {
+    value += source[static_cast<std::size_t>(batch) * lane + i];
+  }
+  destination[i] = value;
+}
+
+__global__ void adam_kernel(float *__restrict__ parameter,
+                            float *__restrict__ gradient,
+                            float *__restrict__ moment1,
+                            float *__restrict__ moment2, std::size_t elements,
+                            float lr, float beta1, float beta2, float inv_bias1,
+                            float inv_bias2, float epsilon, float weight_decay,
+                            bool zero_gradient) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= elements)
+    return;
+  float g = gradient[i];
+  if (weight_decay != 0.0f)
+    g += weight_decay * parameter[i];
+  const float m = beta1 * moment1[i] + (1.0f - beta1) * g;
+  const float v = beta2 * moment2[i] + (1.0f - beta2) * g * g;
+  moment1[i] = m;
+  moment2[i] = v;
+  parameter[i] -= lr * (m * inv_bias1) / (sqrtf(v * inv_bias2) + epsilon);
+  if (zero_gradient)
+    gradient[i] = 0.0f;
+}
+
+// FP32 implementation of KellerJordan/Muon's momentum and quintic
+// Newton-Schulz update: https://github.com/KellerJordan/Muon.
+// One block per square state matrix; square matrices need no aspect scaling.
+__global__ void muon_kernel(float *parameter, float *gradient, float *momentum,
+                            MuonConfig config, bool zero_gradient) {
+  __shared__ float x[4096], a[4096], scratch[8];
+  const std::size_t base = static_cast<std::size_t>(blockIdx.x) * 4096;
+  float maximum = 0.0f;
+  for (int i = threadIdx.x; i < 4096; i += kThreads) {
+    const float g = gradient[base + i];
+    const float m =
+        config.momentum * momentum[base + i] + (1.0f - config.momentum) * g;
+    momentum[base + i] = m;
+    x[i] = config.nesterov ? (1.0f - config.momentum) * g + config.momentum * m
+                           : m;
+    maximum = fmaxf(maximum, fabsf(x[i]));
+  }
+  // Scaled Frobenius norm avoids overflow for large finite gradients.
+  maximum = block_reduce(maximum, scratch, true);
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < 4096; i += kThreads) {
+    x[i] = maximum > 0.0f ? x[i] / maximum : 0.0f;
+    sum += x[i] * x[i];
+  }
+  sum = block_reduce(sum, scratch, false);
+  const float denominator =
+      sqrtf(sum) + (maximum > 0.0f ? 1e-7f / maximum : 1.0f);
+  for (int i = threadIdx.x; i < 4096; i += kThreads)
+    x[i] /= denominator;
+  __syncthreads();
+  for (int step = 0; step < config.ns_steps; ++step) {
+    for (int i = threadIdx.x; i < 4096; i += kThreads) {
+      float dot = 0.0f;
+      for (int k = 0; k < 64; ++k)
+        dot += x[(i / 64) * 64 + k] * x[(i % 64) * 64 + k];
+      a[i] = dot;
+    }
+    __syncthreads();
+    float next[16];
+    for (int j = 0; j < 16; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      float dot = 0.0f;
+      for (int k = 0; k < 64; ++k)
+        dot += a[(i / 64) * 64 + k] * a[k * 64 + i % 64];
+      next[j] = -4.7750f * a[i] + 2.0315f * dot;
+    }
+    __syncthreads();
+    for (int j = 0; j < 16; ++j)
+      a[threadIdx.x + j * kThreads] = next[j];
+    __syncthreads();
+    for (int j = 0; j < 16; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      float dot = 0.0f;
+      for (int k = 0; k < 64; ++k)
+        dot += a[(i / 64) * 64 + k] * x[k * 64 + i % 64];
+      next[j] = 3.4445f * x[i] + dot;
+    }
+    __syncthreads();
+    for (int j = 0; j < 16; ++j)
+      x[threadIdx.x + j * kThreads] = next[j];
+    __syncthreads();
+  }
+  for (int i = threadIdx.x; i < 4096; i += kThreads) {
+    parameter[base + i] =
+        parameter[base + i] *
+            (1.0f - config.learning_rate * config.weight_decay) -
+        config.learning_rate * x[i];
+    if (zero_gradient)
+      gradient[base + i] = 0.0f;
+  }
+}
+
+int blocks(std::size_t n) {
+  return static_cast<int>((n + kThreads - 1) / kThreads);
+}
+
+} // namespace
+
+void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
+                                         int vocab, const bf16 *logits,
+                                         const int *targets, int ignore_index,
+                                         float *loss, bf16 *d_logits,
+                                         float gradient_scale) {
+  if (rows <= 0 || vocab <= 0 || !logits || !targets || !loss || !d_logits ||
+      !std::isfinite(gradient_scale) || gradient_scale <= 0) {
+    throw std::invalid_argument("invalid cross entropy arguments");
+  }
+  int valid = rows;
+  if (ignore_index >= 0) {
+    // The normal state-tuning path uses dense labels. Keeping ignore support
+    // exact would require a tiny count reduction, so use a count supplied by
+    // the caller only when no ignore index is active.
+    throw std::invalid_argument(
+        "ignore_index is not supported by the first exact short-context path");
+  }
+  const cudaError_t error = cudaMemsetAsync(loss, 0, sizeof(float), stream);
+  if (error != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(error));
+  xent_kernel<<<rows, kThreads, 0, stream>>>(
+      vocab, logits, targets, ignore_index, gradient_scale / valid, loss,
+      d_logits);
+}
+
+void reduce_state_gradient_f32(cudaStream_t stream, int batch, int heads,
+                               int head_size, const float *per_batch_gradient,
+                               float *state_gradient, bool accumulate) {
+  if (batch <= 0 || heads <= 0 || head_size <= 0 || !per_batch_gradient ||
+      !state_gradient) {
+    throw std::invalid_argument("invalid state gradient reduction arguments");
+  }
+  const std::size_t lane =
+      static_cast<std::size_t>(heads) * head_size * head_size;
+  reduce_state_kernel<<<blocks(lane), kThreads, 0, stream>>>(
+      batch, lane, per_batch_gradient, state_gradient, accumulate);
+}
+
+void muon_update_state_f32(cudaStream_t stream, float *time_state,
+                           float *gradient, float *momentum,
+                           std::size_t elements, const MuonConfig &config,
+                           bool zero_gradient) {
+  if (!time_state || !gradient || !momentum || elements == 0 ||
+      elements % 4096 != 0 || elements / 4096 > 2147483647ULL ||
+      !std::isfinite(config.learning_rate) || config.learning_rate <= 0.0f ||
+      !std::isfinite(config.momentum) || config.momentum < 0.0f ||
+      config.momentum >= 1.0f || config.ns_steps <= 0 ||
+      !std::isfinite(config.weight_decay) || config.weight_decay < 0.0f)
+    throw std::invalid_argument("invalid state Muon arguments");
+  muon_kernel<<<static_cast<int>(elements / 4096), kThreads, 0, stream>>>(
+      time_state, gradient, momentum, config, zero_gradient);
+  const cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void adam_update_state_f32(cudaStream_t stream, float *time_state,
+                           float *gradient, float *moment1, float *moment2,
+                           std::size_t elements, std::uint64_t step,
+                           const AdamConfig &config, bool zero_gradient) {
+  if (!time_state || !gradient || !moment1 || !moment2 || elements == 0 ||
+      step == 0 || config.learning_rate <= 0.0f || config.beta1 < 0.0f ||
+      config.beta1 >= 1.0f || config.beta2 < 0.0f || config.beta2 >= 1.0f ||
+      config.epsilon <= 0.0f) {
+    throw std::invalid_argument("invalid state Adam arguments");
+  }
+  const float inv_bias1 =
+      1.0f / (1.0f - std::pow(config.beta1, static_cast<float>(step)));
+  const float inv_bias2 =
+      1.0f / (1.0f - std::pow(config.beta2, static_cast<float>(step)));
+  adam_kernel<<<blocks(elements), kThreads, 0, stream>>>(
+      time_state, gradient, moment1, moment2, elements, config.learning_rate,
+      config.beta1, config.beta2, inv_bias1, inv_bias2, config.epsilon,
+      config.weight_decay, zero_gradient);
+}
+
+} // namespace rwkv_bf16_training

@@ -79,7 +79,7 @@ Json::Value adapter_manifest(Json::Value m, const std::vector<HostTensor> &ts,
                              const std::vector<std::uint16_t> &data) {
   m["format_version"] = 1;
   m["method"] = "miss";
-  m["dtype"] = "float16";
+  if (m["dtype"] != "bfloat16") m["dtype"] = "float16";
   m["layout"] = "modulo_rank_zero_pad";
   m["kind"] = "inference_adapter";
   m["targets"] = Json::Value(Json::arrayValue);
@@ -106,7 +106,8 @@ void save_adapter_pth(const std::string &path, Json::Value m,
     const size_t n = size_t(t.out) * t.rank;
     if (t.offset + n > data.size())
       throw std::runtime_error("adapter data bounds");
-    llm_infer::WriteTensor w{tensor_name(t), {t.out, t.rank}, true, {}};
+    llm_infer::WriteTensor w{tensor_name(t), {t.out, t.rank}, m["dtype"] != "bfloat16", {}};
+    w.bf16 = m["dtype"] == "bfloat16";
     w.data.resize(n * 2);
     std::memcpy(w.data.data(), data.data() + t.offset, n * 2);
     write.push_back(std::move(w));
@@ -124,7 +125,7 @@ void save_package(const std::string &dir, Json::Value m,
   std::filesystem::create_directories(temp);
   m["format_version"] = 1;
   m["method"] = "miss";
-  m["dtype"] = "float16";
+  if (m["dtype"] != "bfloat16") m["dtype"] = "float16";
   m["layout"] = "modulo_rank_zero_pad";
   m["kind"] = "inference_adapter";
   m["targets"] = Json::Value(Json::arrayValue);
@@ -141,7 +142,8 @@ void save_package(const std::string &dir, Json::Value m,
     const auto n = size_t(t.out) * t.rank;
     if (t.offset + n > data.size())
       throw std::runtime_error("adapter data bounds");
-    llm_infer::WriteTensor w{tensor_name(t), {t.out, t.rank}, true, {}};
+    llm_infer::WriteTensor w{tensor_name(t), {t.out, t.rank}, m["dtype"] != "bfloat16", {}};
+    w.bf16 = m["dtype"] == "bfloat16";
     w.data.resize(n * 2);
     std::memcpy(w.data.data(), data.data() + t.offset, n * 2);
     write.push_back(std::move(w));
@@ -245,9 +247,10 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
   }
   const auto &m = p->manifest;
   if (m["format_version"] != 1 || m["method"] != "miss" ||
-      m["dtype"] != "float16" || m["layout"] != "modulo_rank_zero_pad" ||
+      (m["dtype"] != "float16" && m["dtype"] != "bfloat16") || m["layout"] != "modulo_rank_zero_pad" ||
       m["kind"] != "inference_adapter")
     throw std::runtime_error("unsupported adapter format");
+  const bool bf16_storage = m["dtype"] == "bfloat16";
   int rank = m["rank"].asInt();
   p->scale = m["scale"].asFloat();
   p->base = m["base_fingerprint"].asString();
@@ -283,11 +286,11 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
     auto r = std::find_if(records.value().begin(), records.value().end(),
                           [&](const auto &r) { return r.name == name + (training ? ".master" : ""); });
     if (r == records.value().end() ||
-        r->dtype != (training ? llm_infer::TensorDType::kFloat32 : llm_infer::TensorDType::kFloat16) ||
+        r->dtype != (training ? llm_infer::TensorDType::kFloat32 : (bf16_storage ? llm_infer::TensorDType::kBFloat16 : llm_infer::TensorDType::kFloat16)) ||
         r->shape != std::vector<int64_t>{t.out, t.rank})
       throw std::runtime_error("adapter tensor shape/dtype mismatch");
     auto data =
-        llm_infer::load_tensor_select(archive.value(), *r, false, true, true);
+        llm_infer::load_tensor_select(archive.value(), *r, bf16_storage, !bf16_storage, true);
     if (!data.ok())
       throw std::runtime_error(data.status().message());
     for (float x : data.value().values)
@@ -296,8 +299,13 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
     for (auto x : data.value().values_f16)
       if (!std::isfinite(llm_infer::f16_bits_to_float(x)))
         throw std::runtime_error("adapter weight overflows FP16");
-    p->data.insert(p->data.end(), data.value().values_f16.begin(),
-                   data.value().values_f16.end());
+    const auto &native = bf16_storage ? data.value().values_bf16 : data.value().values_f16;
+    for (auto bits : native) {
+      const float x = bf16_storage ? llm_infer::bf16_bits_to_float(bits) : llm_infer::f16_bits_to_float(bits);
+      if (!std::isfinite(x) || std::abs(x) > 65504.0f)
+        throw std::runtime_error("adapter cannot be represented by the FP16 inference runtime");
+    }
+    p->data.insert(p->data.end(), native.begin(), native.end());
     p->tensors.push_back(t);
   }
   if (legacy) {
@@ -436,7 +444,12 @@ std::shared_ptr<const GpuLease> AdapterCache::acquire(const AdapterHandle &h,
   cudaEvent_t begin = nullptr, end = nullptr;
   try {
     check(cudaHostAlloc(&pinned, bytes, cudaHostAllocDefault));
-    std::memcpy(pinned, h.package->data.data(), bytes);
+    if (h.package->manifest["dtype"] == "bfloat16") {
+      auto *target = static_cast<uint16_t *>(pinned);
+      for (size_t i = 0; i < h.package->data.size(); ++i)
+        target[i] = llm_infer::float_to_f16_bits(llm_infer::bf16_bits_to_float(h.package->data[i]));
+    } else
+      std::memcpy(pinned, h.package->data.data(), bytes);
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     check(cudaEventCreate(&begin));
     check(cudaEventCreate(&end));

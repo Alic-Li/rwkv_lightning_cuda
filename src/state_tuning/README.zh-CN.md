@@ -1,6 +1,10 @@
-# RWKV-7 状态微调模块
+# RWKV-7 原 FP16 状态微调模块
 
 [English](README.md) | 简体中文
+
+> 当前 `rwkv_state_tune` 和 `rwkv_miss_tune` 已切换到独立的
+> [BF16 训练 backbone](../bf16_training/README.md)。下文描述本目录保留的旧 FP16
+> 实现，不代表当前训练二进制的数值路径。当前训练与导出使用 BF16，主参数和优化器使用 FP32。
 
 本目录不是通用训练框架，而是为冻结的 FP16 运行时权重提供 CUDA/HIP 反向计算路径。
 BF16 模型文件仍由现有加载器转换为相同的 FP16 运行时表示。所有函数均不计算冻结基模

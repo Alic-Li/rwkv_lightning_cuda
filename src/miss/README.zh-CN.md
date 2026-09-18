@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-FP16 基模保持冻结，只有 `D[out, rank]` 接收参数梯度。本实现采用
+训练使用独立的 [BF16 backbone](../bf16_training/README.md)。BF16 基模保持冻结，只有 `D[out, rank]` 接收参数梯度。本实现采用
 [论文](https://arxiv.org/pdf/2409.15371) 和 [参考项目](https://github.com/Joluck/MiSS)
 中的高效 MiSS 形式，不存储或训练 A。
 
@@ -24,7 +24,9 @@ FP16 基模保持冻结，只有 `D[out, rank]` 接收参数梯度。本实现�
 `Y = base_linear(X) + scale * S @ D.T`，其中 `scale = alpha / rank`。
 支持秩 1–1024，每次调用最多 65535 行。
 
-前向和 dX 使用 FP16 D；D 的主副本、累积 dD 和 Adam 动量使用 FP32。
+BF16 训练不使用 loss scaling，也不再提供 `--loss-scale` 参数。
+续训严格匹配当前 checkpoint 配置，不兼容或迁移旧 `loss_scale` 字段。
+训练前向和 dX 使用 BF16 D；D 的主副本、累积 dD 和 Adam 动量使用 FP32。
 归约与投影均以 FP32 累加。在一次 Adam 更新前，dD 累积所有分块和样本的梯度；
 不分配或计算基模 dW。反向向冻结基模的 dX 加上 `scale * (G @ D)[..., k % rank]`。
 
@@ -106,17 +108,17 @@ Adam 动量、初始状态、优化器步数、调度总步数、数据集轮次
 
 ## 推理包
 
-最终 PTH 包含 FP16 D 和文件内部的 `archive/miss.json` 元数据，仍可用
+最终 PTH 包含 BF16 D 和文件内部的 `archive/miss.json` 元数据，仍可用
 `torch.load` 读取。新 checkpoint 的 `training.pth` 也内嵌推理所需元数据，
-可以独立上传或注册；程序只提取 `.D.master` 并转为 FP16 缓存，
+可以独立上传或注册；程序只提取 `.D.master` 并按声明精度转为 D 缓存在 RAM；GPU miss 时才转换为 FP16 推理表示，
 梯度和 Adam 张量不进入 adapter RAM/GPU 缓存。续训仍读取完整 checkpoint 目录。
 
 旧 `training.pth` 注册时读取同目录的 `checkpoint.json`；上传旧文件时需同时
 上传该 JSON。旧文件若仅训练 FFN value，可能缺少输入宽度信息，需要重新导出。
 原来的双文件推理目录仍兼容：
 
-- `adapter.json`：`format_version=1`、`kind=inference_adapter`、`method=miss`、`dtype=float16`、`layout=modulo_rank_zero_pad`、来源基模 SHA-256、rank、alpha、scale、目标名称、层号、输入宽度、D 形状，以及 `content_version`（不含版本字段的规范化清单与 FP16 D 的 SHA-256）。
-- `adapter.pth`：PyTorch 可读取的 FP16 张量，名称如 `blocks.N.att.key.weight.D`，使用原始 `[out,rank]` 布局。
+- `adapter.json`：`format_version=1`、`kind=inference_adapter`、`method=miss`、`dtype=bfloat16`（也接受旧 `float16` 包）、`layout=modulo_rank_zero_pad`、来源基模 SHA-256、rank、alpha、scale、目标名称、层号、输入宽度、D 形状，以及 `content_version`（不含版本字段的规范化清单与声明精度的 D 的 SHA-256）。
+- `adapter.pth`：PyTorch 可读取的 BF16 张量，名称如 `blocks.N.att.key.weight.D`，使用原始 `[out,rank]` 布局。
 
 加载器检查格式、形状、重复目标、有限值和内容哈希，
 来源基模指纹必须匹配。加载模型时、请求可以绑定适配器之前，会一次性计算基模指纹，

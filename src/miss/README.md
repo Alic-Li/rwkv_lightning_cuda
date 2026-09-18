@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-The FP16 base remains frozen. Only `D[out, rank]` receives parameter gradients.
+The BF16 training base remains frozen. Only `D[out, rank]` receives parameter gradients.
 This implements the efficient MiSS form from [the paper](https://arxiv.org/pdf/2409.15371)
 and [reference project](https://github.com/Joluck/MiSS), with no stored or trained A.
 
@@ -25,7 +25,8 @@ The final partial block is implicitly zero padded, including when rank > K.
 `Y = base_linear(X) + scale * S @ D.T`, with `scale = alpha / rank`.
 Ranks 1–1024 and up to 65535 rows per invocation are supported.
 
-D is FP16 for forward and dX; master D, accumulated dD and Adam moments are
+Training uses the independent [BF16 backbone](../bf16_training/README.md).
+D is BF16 for forward and dX; master D, accumulated dD and Adam moments are
 FP32. Reduction and projection accumulate in FP32. dD accumulates over every
 chunk and sample before one Adam update; no base dW is allocated or computed.
 Backward adds `scale * (G @ D)[..., k % rank]` to the frozen base dX.
@@ -99,6 +100,12 @@ interrupted run preserves that horizon. Batch size currently processes samples
 sequentially and accumulates valid-token-weighted gradients. It is not a
 parallel GPU batch, which can limit utilization on large GPUs.
 
+BF16 training uses unscaled backward with no `--loss-scale` option; intermediate
+gradients remain BF16 and parameter gradients accumulate in FP32. The backbone
+and loader do not reuse FP16 inference weights. Exact resume requires a BF16
+training checkpoint with the same configuration; old FP16-backbone checkpoints
+remain usable for inference but cannot silently resume under different arithmetic.
+
 ### Checkpoints and resume
 
 Checkpoints are directories `checkpoint-N/{checkpoint.json,training.pth}`.
@@ -115,11 +122,12 @@ on successful completion. Existing output packages/checkpoints are not overwritt
 
 ## Inference package
 
-The final single PTH contains FP16 D tensors and an embedded `archive/miss.json`
+The final single PTH contains BF16 D tensors and an embedded `archive/miss.json`
 manifest (not an optimizer tensor). It remains readable with `torch.load`.
 New `checkpoint-N/training.pth` files embed the same inference metadata and can
 also be registered or uploaded independently. The loader reads only `.D.master`
-from a training checkpoint and converts it to FP16; gradient and optimizer
+from a training checkpoint and converts it to the manifest dtype in RAM;
+BF16 D is converted to FP16 only at inference GPU admission. Gradient and optimizer
 tensors stay out of the RAM/GPU adapter caches. Resume still uses the complete
 checkpoint directory and its original FP32 tensors.
 
@@ -130,10 +138,10 @@ needed for inference and require re-export. Original two-file packages remain
 supported:
 
 - `adapter.json`: format_version=1, kind=inference_adapter, method=miss,
-  dtype=float16, layout=modulo_rank_zero_pad, source base SHA-256, rank,
+  dtype=bfloat16 (legacy float16 is also accepted), layout=modulo_rank_zero_pad, source base SHA-256, rank,
   alpha, scale, target names, layer numbers, input widths, D shapes,
-  content_version (SHA-256 of canonical manifest without the version and FP16 D).
-- `adapter.pth`: torch-readable FP16 tensors named
+  content_version (SHA-256 of canonical manifest without the version and native-dtype D bytes).
+- `adapter.pth`: torch-readable BF16 tensors named
   `blocks.N.att.key.weight.D`, etc., in original `[out,rank]` layout.
 
 The loader checks format, shapes, duplicate targets, finite values and content hash.
@@ -144,7 +152,7 @@ sequential model-file hash read at startup. `rwkv_quantize` writes
 keep this file beside the quantized model to reuse an adapter trained on its
 FP16 runtime source. Older quantized models need to be requantized to obtain
 this provenance file. Quantized base **inference** is supported; training still
-uses the existing unquantized FP16 runtime representation of BF16 archives.
+uses a separate native BF16 backbone with streamed BF16/FP32/FP16 input conversion.
 
 ## HTTP API and caches
 
@@ -247,3 +255,6 @@ remain acceptance work.
 
 See [the validation record](VALIDATION.md) for measured errors, microbenchmark
 results and the exact remaining acceptance limits.
+
+See the [FP16 gradient precision investigation](../../docs/training-precision-investigation.md)
+for real-model failure reproduction and validation.

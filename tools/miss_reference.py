@@ -2,8 +2,8 @@
 import torch
 import torch.nn.functional as F
 
-def forward(weights, adapters, tokens, rank, scale=1):
-    q = lambda x: x.half().float()
+def forward(weights, adapters, tokens, rank, scale=1, dtype=torch.float16):
+    q = lambda x: x.to(dtype).float()
     w = {k: q(v.float()) for k, v in weights.items()}
     C = w['emb.weight'].shape[1]
     H = C // 64

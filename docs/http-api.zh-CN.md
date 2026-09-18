@@ -176,7 +176,7 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
 
 新 PTH 内嵌元数据，单独上传即可。旧训练 checkpoint 需要同目录的 `checkpoint.json`；
 远程上传旧文件时再添加 `-F 'metadata=@miss_output/checkpoint-100/checkpoint.json'`。
-临时上传文件在注册后删除，RAM 只缓存 FP16 D，不保留梯度和优化器张量。
+临时上传文件在注册后删除，RAM 只缓存声明精度的 BF16/FP16 D，不保留梯度和优化器张量。BF16 D 在 GPU miss 时于 pinned staging 中转换一次，供 FP16 推理使用。
 启用密码时，multipart 请求使用 Bearer header 鉴权；上传文件受 HTTP 请求体大小限制。
 
 成功返回 `{"adapter_id":"task-a","version":"<内容的 SHA-256 版本>"}`。同一 ID 可以注册多个内容版本，

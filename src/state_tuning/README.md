@@ -1,6 +1,15 @@
-# RWKV-7 state-tuning sidecar
+# RWKV-7 state tuning (legacy FP16 implementation)
 
 English | [简体中文](README.zh-CN.md)
+
+The active `rwkv_state_tune` and `rwkv_miss_tune` binaries now use the independent
+[native BF16 training backbone](../bf16_training/README.md). It keeps chunk/state
+passing and microbatch accumulation, streams base tensors into BF16, and exports
+BF16 state/adapter files. WKV directly reuses the standard operator in `cuda/`.
+
+The implementation details below describe the retained FP16 sidecar,
+not the current CLI's numerical path. The dataset
+reader remains shared; FP16 sidecar tests continue to cover existing consumers.
 
 This directory is intentionally not a general training framework. It adds a
 CUDA/HIP reverse path for frozen FP16 runtime weights; BF16 model archives are
@@ -129,3 +138,6 @@ very small chunks or a single layer may not benefit.
   --data /path/to/train.jsonl --output ./state_output \
   --ctx 2048 --chunk 256 --optimizer adam --wkv_tape
 ```
+
+See the [FP16 gradient precision investigation](../../docs/training-precision-investigation.md)
+for real-model failure reproduction and validation.

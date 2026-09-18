@@ -24,6 +24,8 @@ state tuning, a multi-backend Go router, and a Go desktop launcher with a Web UI
 - **MiSS adapters&peft** — train one compact `D` matrix per target linear, then load adapters per request without modifying shared model weights.
 - **Batteries included** — weighted least-inflight load-balancing router and a desktop launcher with Web UI.
 
+Both training binaries use the independent [BF16 training backbone](src/bf16_training/README.md), with streamed base loading, native state passing and BF16 exports. Inference keeps its existing FP16/quantized paths.
+
 ## Quick Start
 
 ```bash

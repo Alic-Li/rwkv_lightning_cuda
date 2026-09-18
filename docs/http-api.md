@@ -153,7 +153,7 @@ GPU; prefill and decode reuse it without per-layer or per-token transfers.
 New PTH files carry their manifest inside the archive. Old training checkpoints
 need the sibling `checkpoint.json`; for remote upload add
 `-F 'metadata=@miss_output/checkpoint-100/checkpoint.json'` alongside the PTH.
-Upload staging files are removed after registration; only FP16 D remains cached.
+Upload staging files are removed after registration; only D in its declared BF16/FP16 precision remains cached; BF16 D is converted once in pinned staging on GPU admission.
 Use bearer-header authentication for multipart uploads when password protection
 is enabled. HTTP request-body limits also apply to uploaded checkpoint files.
 
