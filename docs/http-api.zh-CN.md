@@ -54,6 +54,45 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/tokens/count" \
   --data '{"messages":[{"role":"user","content":"hello"}]}'
 ```
 
+## MiSS adapter 生命周期与请求字段
+
+使用前先注册导出的 MiSS 推理目录。注册只会在 CPU RAM 中校验和缓存推理包，不会
+立即上传 GPU：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/adapters" \
+  -H "Content-Type: application/json" \
+  --data '{"adapter_id":"task-a","path":"/absolute/path/miss_output/adapter"}'
+
+curl -sS "http://127.0.0.1:8000/v1/adapters"
+```
+
+所有生成接口都接受 `adapter_id`，以及可选的 `adapter_version` 和
+`adapter_scale`。第一次请求会把完整 adapter 上传到 GPU，后续 prefill 和 decode
+复用同一份显存，不会逐层或逐 token 传输。
+
+```json
+{
+  "adapter_id": "task-a",
+  "adapter_version": "sha256-content-version",
+  "adapter_scale": 1.0
+}
+```
+
+省略 `adapter_version` 时，请求准入会绑定当时最新的注册版本；`adapter_scale` 是
+绝对有效 scale 覆盖值。有状态会话按照基模运行实例、adapter 内容版本、scale、初始
+state 和 WKV 精度隔离，不兼容的缓存 state 会被拒绝。请求释放不可变 handle 后可删除
+注册：
+
+```bash
+curl -sS -X DELETE "http://127.0.0.1:8000/v1/adapters" \
+  -H "Content-Type: application/json" \
+  --data '{"adapter_id":"task-a"}'
+```
+
+列表响应包含 RAM/GPU hit、miss、上传次数、H2D 时间、驻留字节数和 adapter 显存
+峰值。推理包格式与缓存预算详见 [MiSS 文档](../src/miss/README.md)。
+
 ## Chat completions
 
 OpenAI 风格的聊天接口。`stream:false` 时返回单个 JSON 响应。

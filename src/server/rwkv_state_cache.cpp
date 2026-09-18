@@ -1,5 +1,6 @@
 #include "rwkv/server/rwkv_state_cache.hpp"
 
+#include <algorithm>
 #include <ctime>
 #include <stdexcept>
 
@@ -127,10 +128,25 @@ void StateCacheManager::init_db() {
       throw std::runtime_error("failed to migrate sqlite schema: " + msg);
     }
   }
+  err = nullptr;
+  if (sqlite3_exec(
+          db_,
+          "ALTER TABLE sessions ADD COLUMN identity TEXT NOT NULL DEFAULT ''",
+          nullptr, nullptr, &err) != SQLITE_OK) {
+    const std::string msg = err ? err : "";
+    sqlite3_free(err);
+    if (msg.find("duplicate column name") == std::string::npos)
+      throw std::runtime_error("identity schema migration: " + msg);
+  }
 }
 
 StateCacheManager::HostState StateCacheManager::copy_to_host(const GenerationState& state) const {
   HostState host;
+  host.adapter = state.adapter;
+  host.effective_key = state.effective_key;
+  host.adapter_identity = state.adapter_identity;
+  host.initial_state_identity = state.initial_state_identity;
+  host.advanced = state.advanced;
   host.batch_size = state.batch_size;
   host.wkv32 = state.wkv32;
   host.shift = copy_half_buffer_to_host(state.shift);
@@ -154,6 +170,11 @@ StateCacheManager::HostState StateCacheManager::copy_to_host(const GenerationSta
 
 GenerationState StateCacheManager::copy_to_device(const HostState& state) const {
   GenerationState device;
+  device.adapter = state.adapter;
+  device.effective_key = state.effective_key;
+  device.adapter_identity = state.adapter_identity;
+  device.initial_state_identity = state.initial_state_identity;
+  device.advanced = state.advanced;
   device.batch_size = state.batch_size;
   device.wkv32 = state.wkv32;
   copy_half_buffer_to_device(state.shift, device.shift, "copy shift to device");
@@ -177,6 +198,11 @@ GenerationState StateCacheManager::copy_to_device(const HostState& state) const 
 
 std::shared_ptr<GenerationState> StateCacheManager::clone_device_state(const GenerationState& state) const {
   auto clone = std::make_shared<GenerationState>();
+  clone->adapter = state.adapter;
+  clone->effective_key = state.effective_key;
+  clone->adapter_identity = state.adapter_identity;
+  clone->initial_state_identity = state.initial_state_identity;
+  clone->advanced = state.advanced;
   clone->batch_size = state.batch_size;
   clone->wkv32 = state.wkv32;
   clone->shift.resize(state.shift.n, "clone shift");
@@ -267,10 +293,10 @@ void StateCacheManager::evict_l2_if_needed_locked() {
 
 void StateCacheManager::persist_state_locked(const std::string& session_id, const HostState& state) {
   sqlite3_stmt* stmt = nullptr;
-  const char* sql =
-      "INSERT OR REPLACE INTO sessions "
-      "(session_id, batch_size, shift_blob, wkv_blob, wkv32, elapsed_blob, last_updated) "
-      "VALUES (?, ?, ?, ?, ?, ?, ?)";
+  const char *sql = "INSERT OR REPLACE INTO sessions "
+                    "(session_id, batch_size, shift_blob, wkv_blob, wkv32, "
+                    "elapsed_blob, last_updated, identity) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
   sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
   sqlite3_bind_text(stmt, 1, session_id.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int(stmt, 2, state.batch_size);
@@ -287,6 +313,14 @@ void StateCacheManager::persist_state_locked(const std::string& session_id, cons
   sqlite3_bind_blob(
       stmt, 6, state.elapsed.data(), static_cast<int>(state.elapsed.size() * sizeof(int)), SQLITE_TRANSIENT);
   sqlite3_bind_double(stmt, 7, static_cast<double>(time(nullptr)));
+  Json::Value meta;
+  meta["effective"] = state.effective_key;
+  meta["adapter"] = state.adapter_identity;
+  meta["initial"] = state.initial_state_identity;
+  meta["advanced"] = state.advanced;
+  Json::StreamWriterBuilder writer;
+  const auto identity = Json::writeString(writer, meta);
+  sqlite3_bind_text(stmt, 8, identity.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_step(stmt);
   sqlite3_finalize(stmt);
 }
@@ -295,13 +329,30 @@ std::optional<StateCacheManager::HostState> StateCacheManager::load_state_locked
   sqlite3_stmt* stmt = nullptr;
   sqlite3_prepare_v2(
       db_,
-      "SELECT batch_size, shift_blob, wkv_blob, wkv32, elapsed_blob FROM sessions WHERE session_id = ?",
-      -1,
-      &stmt,
-      nullptr);
+      "SELECT batch_size, shift_blob, wkv_blob, wkv32, elapsed_blob, identity "
+      "FROM sessions WHERE session_id = ?",
+      -1, &stmt, nullptr);
   sqlite3_bind_text(stmt, 1, session_id.c_str(), -1, SQLITE_TRANSIENT);
   HostState state;
   if (sqlite3_step(stmt) == SQLITE_ROW) {
+    const auto *identity =
+        reinterpret_cast<const char *>(sqlite3_column_text(stmt, 5));
+    if (identity && *identity) {
+      Json::CharReaderBuilder builder;
+      auto reader = std::unique_ptr<Json::CharReader>(builder.newCharReader());
+      Json::Value meta;
+      std::string error;
+      const std::string text(identity);
+      if (!reader->parse(text.data(), text.data() + text.size(), &meta,
+                         &error)) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("invalid state identity");
+      }
+      state.effective_key = meta["effective"].asString();
+      state.adapter_identity = meta["adapter"].asString();
+      state.initial_state_identity = meta["initial"].asString();
+      state.advanced = meta["advanced"].asBool();
+    }
     state.batch_size = sqlite3_column_int(stmt, 0);
     const auto* shift_blob = static_cast<const uint16_t*>(sqlite3_column_blob(stmt, 1));
     const void* wkv_blob = sqlite3_column_blob(stmt, 2);
@@ -325,6 +376,10 @@ std::optional<StateCacheManager::HostState> StateCacheManager::load_state_locked
     if (elapsed_blob != nullptr && elapsed_bytes > 0) {
       state.elapsed.assign(elapsed_blob, elapsed_blob + elapsed_bytes / static_cast<int>(sizeof(int)));
     }
+    if (state.effective_key.empty() &&
+        std::any_of(state.elapsed.begin(), state.elapsed.end(),
+                    [](int n) { return n > 0; }))
+      state.advanced = true;
     sqlite3_finalize(stmt);
     return state;
   }

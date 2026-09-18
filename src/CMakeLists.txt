@@ -3,6 +3,9 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 set(RWKV_CORE_HOST_SOURCES
   io/pth_archive.cpp
   io/pth_tensor.cpp
+  io/pth_writer.cpp
+  io/fingerprint.cpp
+  miss/adapter.cpp
   ${PROJECT_SOURCE_DIR}/quant/modeling/rwkv_quantized.cpp
   inference/rwkv_tokenizer.cpp
   utils/tokenizer.cpp
@@ -18,6 +21,7 @@ if(RWKV_GPU_BACKEND STREQUAL "HIP")
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_fast_v4.hip
     ${PROJECT_SOURCE_DIR}/hip/rwkv_quantized.hip
     ${PROJECT_SOURCE_DIR}/hip/sampling.hip
+    ${PROJECT_SOURCE_DIR}/hip/miss_kernels.hip
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_v3a_ops.hip
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_fast_ops_fp16.hip
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_wkv_fp16_v2.hip
@@ -40,6 +44,7 @@ else()
   set(RWKV_CORE_GPU_SOURCES
     backend/rwkv7_fast_v4.cu
     utils/sampling.cu
+    miss/kernels.cu
     ${PROJECT_SOURCE_DIR}/cuda/rwkv7_v3a_ops.cu
     ${PROJECT_SOURCE_DIR}/cuda/rwkv7_fast_ops_fp16.cu
     ${PROJECT_SOURCE_DIR}/cuda/rwkv7_wkv_fp16_v2.cu
@@ -67,6 +72,7 @@ add_library(rwkv7_fast_backend_core STATIC
   ${RWKV_CORE_GPU_SOURCES}
 )
 add_library(rwkv::backend ALIAS rwkv7_fast_backend_core)
+target_link_libraries(rwkv7_fast_backend_core PUBLIC ${RWKV_JSON_TARGET} OpenSSL::Crypto)
 
 target_include_directories(rwkv7_fast_backend_core
   PUBLIC ${PROJECT_SOURCE_DIR}/include
@@ -97,6 +103,15 @@ endif()
 rwkv_optimize_backend_target(rwkv7_fast_backend_core)
 
 if(RWKV7_STATE_TUNING)
+  add_executable(rwkv_miss_tune state_tuning/rwkv_state_tune_main.cpp state_tuning/dataset.cpp miss/trainer.cpp)
+  target_include_directories(rwkv_miss_tune PRIVATE state_tuning)
+  target_link_libraries(rwkv_miss_tune PRIVATE rwkv::backend)
+  target_compile_definitions(rwkv_miss_tune PRIVATE RWKV_MISS_TUNE
+    RWKV_STATE_TUNE_DEFAULT_VOCAB="${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt")
+  rwkv_optimize_target(rwkv_miss_tune)
+  rwkv_configure_runtime_bundle(rwkv_miss_tune
+    ASSETS ${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt
+  )
   add_executable(rwkv_state_tune
     state_tuning/rwkv_state_tune_main.cpp
     state_tuning/dataset.cpp

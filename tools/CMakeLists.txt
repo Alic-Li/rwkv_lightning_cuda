@@ -16,12 +16,14 @@ add_executable(rwkv_quantize
   ${PROJECT_SOURCE_DIR}/quant/modeling/rwkv_quantize.cpp
   ${PROJECT_SOURCE_DIR}/src/io/pth_archive.cpp
   ${PROJECT_SOURCE_DIR}/src/io/pth_tensor.cpp
+  ${PROJECT_SOURCE_DIR}/src/io/fingerprint.cpp
   ${PROJECT_SOURCE_DIR}/quant/modeling/rwkv_quantized.cpp
 )
 target_include_directories(rwkv_quantize PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/quant/modeling
 )
+target_link_libraries(rwkv_quantize PRIVATE ${RWKV_JSON_TARGET} OpenSSL::Crypto)
 rwkv_optimize_target(rwkv_quantize)
 rwkv_configure_runtime_bundle(rwkv_quantize)
 
@@ -45,3 +47,5 @@ if(RWKV_GPU_BACKEND STREQUAL "CUDA")
   set_property(TARGET rwkv_calibration_bandwidth PROPERTY CUDA_RUNTIME_LIBRARY Shared)
   rwkv_optimize_target(rwkv_calibration_bandwidth)
 endif()
+
+rwkv_add_tool(rwkv_miss_bench bench_miss.cpp)

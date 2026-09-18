@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -7,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "rwkv/runtime/rwkv_adapter.hpp"
 #include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
@@ -33,6 +35,7 @@ enum class ThinkType {
 };
 
 struct GenerateOptions {
+  std::shared_ptr<const rwkv7_miss::AdapterHandle> adapter;
   int max_tokens = 8192;
   std::vector<int64_t> stop_tokens{0, 261, 24281};
   double temperature = 1.0;
@@ -46,6 +49,16 @@ struct GenerateOptions {
 };
 
 struct GenerationState {
+  std::shared_ptr<const rwkv7_miss::AdapterHandle> adapter;
+  std::shared_ptr<const rwkv7_miss::GpuLease> adapter_gpu;
+  std::string effective_key;
+  std::string adapter_identity;
+  std::string initial_state_identity = "zero";
+  bool advanced = false;
+  bool adapter_cold = false;
+  double adapter_h2d_ms = 0;
+  std::size_t observed_device_vram_peak = 0;
+  std::chrono::steady_clock::time_point request_started{};
   int batch_size = 0;
   bool wkv32 = false;
   rwkv7_fast_v4::DeviceBuffer<half> shift;
@@ -59,6 +72,18 @@ struct GenerationState {
   GenerationState(GenerationState&&) noexcept = default;
   GenerationState& operator=(GenerationState&&) noexcept = default;
 };
+
+inline void
+bind_adapter(GenerationState &state,
+             const std::shared_ptr<const rwkv7_miss::AdapterHandle> &adapter) {
+  const auto id = adapter ? adapter->identity : std::string{};
+  if (state.advanced && state.adapter_identity != id)
+    throw std::runtime_error("state belongs to another adapter/version/scale");
+  if (state.adapter_identity != id)
+    state.adapter_gpu.reset();
+  state.adapter = adapter;
+  state.adapter_identity = id;
+}
 
 struct DeviceLogits {
   int rows = 0;
@@ -110,6 +135,7 @@ class IModelBackend {
   virtual int vocab_size() const = 0;
   virtual const std::string& model_path() const = 0;
   virtual const std::string& model_name() const = 0;
+  virtual std::string runtime_identity() const { return model_path(); }
 };
 
 class ModelBackend final : public IModelBackend {
@@ -156,6 +182,8 @@ class ModelBackend final : public IModelBackend {
   int vocab_size() const override;
   const std::string& model_path() const override;
   const std::string& model_name() const override;
+  std::string runtime_identity() const override;
+  const std::string &base_fingerprint() const;
 
   // Read-only FP16 views for the optional state-tuning sidecar. The returned
   // pointers remain owned by this backend and are valid for its lifetime.

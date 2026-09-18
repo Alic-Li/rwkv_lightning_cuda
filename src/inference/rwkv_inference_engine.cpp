@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <iostream>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -11,6 +13,49 @@
 
 namespace rwkv7_server {
 namespace {
+
+// One JSON record per adapter request. TTFT includes admission/H2D/prefill;
+// TPOT measures sample-to-sample wall time. VRAM is sampled device usage,
+// including other processes, not an allocator-level per-request peak.
+struct AdapterMetrics {
+  GenerationState &state;
+  int tokens = 0;
+  std::chrono::steady_clock::time_point first{}, last{};
+  explicit AdapterMetrics(GenerationState &s) : state(s) {}
+  void token() {
+    if (!state.adapter)
+      return;
+    last = std::chrono::steady_clock::now();
+    if (!tokens)
+      first = last;
+    ++tokens;
+  }
+  ~AdapterMetrics() {
+    if (!state.adapter || !tokens)
+      return;
+    Json::Value m;
+    m["event"] = "miss_request_metrics";
+    m["adapter_version"] = state.adapter->package->version;
+    m["gpu_cache"] = state.adapter_cold ? "cold" : "hot";
+    m["h2d_ms"] = state.adapter_h2d_ms;
+    m["ttft_ms"] =
+        std::chrono::duration<double, std::milli>(first - state.request_started)
+            .count();
+    m["tpot_ms"] =
+        tokens > 1
+            ? std::chrono::duration<double, std::milli>(last - first).count() /
+                  (tokens - 1)
+            : 0;
+    m["sample_steps"] = tokens;
+    m["observed_device_vram_peak_bytes"] =
+        Json::UInt64(state.observed_device_vram_peak);
+    Json::StreamWriterBuilder w;
+    w["indentation"] = "";
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::clog << Json::writeString(w, m) << '\n';
+  }
+};
 
 constexpr int kForceReasoningMaskStartStep = 1;
 constexpr int kForceReasoningMaskEndStep = 2;
@@ -341,6 +386,8 @@ std::string InferenceEngine::generate_one(
       int stream_index,
       int chunk_size,
       const ControlCallback& should_stop) const {
+  bind_adapter(state, options.adapter);
+  AdapterMetrics adapter_metrics(state);
   DeviceLogits logits;
   prefill_prompt(prompt, state, logits);
 
@@ -354,6 +401,7 @@ std::string InferenceEngine::generate_one(
       break;
     }
     const int token = sample_with_options_mask(logits, penalties, options, step);
+    adapter_metrics.token();
     if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
       break;
     }
@@ -401,6 +449,8 @@ std::vector<std::string> InferenceEngine::batch_generate_with_state(
     const std::vector<std::string>& prompts,
     GenerationState& state,
     const GenerateOptions& options) const {
+  bind_adapter(state, options.adapter);
+  AdapterMetrics adapter_metrics(state);
   if (prompts.empty()) {
     return {};
   }
@@ -424,6 +474,7 @@ std::vector<std::string> InferenceEngine::batch_generate_with_state(
 
   for (int step = 0; step < options.max_tokens && active > 0; ++step) {
     const auto sampled_tokens = sample_batch_with_options_mask(logits, penalties, options, step);
+    adapter_metrics.token();
     for (size_t i = 0; i < sampled_tokens.size(); ++i) {
       if (finished[i]) {
         decode_batch[i] = fallback_token;
@@ -490,6 +541,8 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
     const StreamCallback& emit,
     const ControlCallback& should_stop,
     const StatsCallback& on_prefill_complete) const {
+  bind_adapter(state, options.adapter);
+  AdapterMetrics adapter_metrics(state);
   GenerationStats stats;
   if (prompts.empty()) {
     return stats;
@@ -529,6 +582,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
       break;
     }
     const auto sampled_tokens = sample_batch_with_options_mask(logits, penalties, options, step);
+    adapter_metrics.token();
     for (size_t i = 0; i < sampled_tokens.size(); ++i) {
       if (finished[i]) {
         decode_batch[i] = fallback_token;
@@ -625,6 +679,8 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
     int chunk_size,
     const StreamCallback& emit,
     const ControlCallback& should_stop) const {
+  bind_adapter(state, options.adapter);
+  AdapterMetrics adapter_metrics(state);
   if (state.batch_size != 1 || logits.rows != 1) {
     throw std::runtime_error("logit continuation only supports single prompt batch");
   }
@@ -642,6 +698,7 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
     }
 
     const int token = sample_with_options_mask(logits, penalties, options, step);
+    adapter_metrics.token();
     if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
       stats.stop_token = true;
       break;

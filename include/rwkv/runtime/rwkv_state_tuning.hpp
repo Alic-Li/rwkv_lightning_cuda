@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rwkv/runtime/rwkv_miss.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -10,7 +11,8 @@
 namespace rwkv7_state_tuning {
 
 // This is a deliberately small pointer-based GPU API. It has no torch
-// dependency and, by construction, has nowhere to return a weight gradient.
+// dependency and no frozen-base weight-gradient output. MiSS views contain
+// optional FP32 adapter-only gradient accumulators.
 enum class IoType : std::uint8_t { F16, BF16 };
 
 struct WkvShape {
@@ -91,6 +93,7 @@ void add_inplace_f16(cudaStream_t stream, half *destination, const half *source,
 // and FFN key are original [N,K]; low-rank and FFN value matrices are runtime
 // [K,N]. Biases are omitted because frozen affine biases do not affect dX.
 struct FrozenBlockWeights {
+  rwkv7_miss::Block miss{}; // request/training-owned view, never LayerWeights
   int channels = 0;
   int heads = 0;
   int ffn = 0;
@@ -149,6 +152,7 @@ struct FrozenModelView {
 // Activations required by one block backward. The state-tuning forward
 // recorder owns these buffers; no activation is attached to inference state.
 struct BlockTapeView {
+  std::array<float *, rwkv7_miss::TargetCount> miss_reduced{};
   int batch = 0;
   int time = 0;
   half *x = nullptr;

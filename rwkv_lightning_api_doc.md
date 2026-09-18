@@ -623,6 +623,9 @@ Authorization: Bearer your-password
 | `GET` | `/v1/models` | 查询已加载和可加载模型 | 否 |
 | `POST` | `/v1/model/load` | 显式加载或切换模型（仅动态模式） | 否 |
 | `POST` | `/v1/tokens/count` | 计算 token 数 | 否 |
+| `POST` | `/v1/adapters` | 注册 MiSS 推理 adapter 到 CPU RAM | 否 |
+| `GET` | `/v1/adapters` | 列出 adapter、版本与缓存指标 | 否 |
+| `DELETE` | `/v1/adapters` | 删除 adapter 注册 | 否 |
 | `POST` | `/v1/chat/completions` | OpenAI 风格单请求聊天补全 | 是 |
 | `POST` | `/v1/batch/completions` | 多 prompt 批量补全 | 是 |
 | `POST` | `/translate/v1/batch-translate` | 批量翻译 | 否 |
@@ -657,10 +660,30 @@ Authorization: Bearer your-password
 | `stream` | boolean | `false` | 是否使用 SSE。 |
 | `chunk_size` | integer | 因路由而异 | 流式输出累计多少 token 后发送一次；小于 `1` 时按 `1` 处理。 |
 | `force_reasoning` | boolean | `false` | 启用内部 reasoning token mask。聊天接口使用 think 字段时会覆盖此值。 |
+| `adapter_id` | string | 无 | 绑定已注册的 MiSS adapter；一个请求或 batch 只能绑定一个 adapter。 |
+| `adapter_version` | string | 最新注册版本 | 可选的内容版本；请求准入时固定，不会在生成中途切换。 |
+| `adapter_scale` | number | manifest scale | 可选的绝对有效 scale 覆盖值。 |
 | `password` | string | 无 | 可选的 JSON 鉴权凭据。 |
 
 `chunk_size` 是输出刷新粒度，不是 prefill 分块。prefill 分块由进程启动参数
 `--chunk-size` 全局控制，默认 `128`。
+
+MiSS 推理包必须是 `adapter.json + adapter.pth` 目录，不能使用训练 checkpoint
+目录代替。注册时只校验并缓存 CPU RAM，第一次生成时才把该版本的全部 D 张量一次性
+上传 GPU。注册、查询和删除示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/adapters \
+  -H 'Content-Type: application/json' \
+  -d '{"adapter_id":"task-a","path":"/absolute/path/miss_output/adapter"}'
+curl http://127.0.0.1:8000/v1/adapters
+curl -X DELETE http://127.0.0.1:8000/v1/adapters \
+  -H 'Content-Type: application/json' -d '{"adapter_id":"task-a"}'
+```
+
+有状态缓存会把基模运行实例、adapter 内容版本、有效 scale、初始 state 和 WKV 精度
+一起纳入身份；切换 adapter 后不会复用不兼容 state。完整格式、版本生命周期与预算环境
+变量见 [`src/miss/README.md`](src/miss/README.md)。
 
 ### 5. Thinking 模式
 

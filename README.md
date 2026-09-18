@@ -10,6 +10,8 @@
 
 # RWKV Lightning CUDA
 
+[中文说明](README_zh.md)
+
 High-performance RWKV-7 inference server for NVIDIA CUDA GPUs, with an AMD HIP
 fallback path. It ships OpenAI-style and native batch APIs with streaming SSE,
 an L1/L2/SQLite session state cache, W8A16/W4A16 quantized serving, standalone
@@ -19,6 +21,7 @@ state tuning, a multi-backend Go router, and a Go desktop launcher with a Web UI
 - **Session state cache** — reuse conversation states across L1 VRAM, L2 RAM, and SQLite persistence; uploaded `.pth` states work with every generation endpoint.
 - **Quantization** — W4A16/W8A16 `.rwkvq` checkpoints with packed INT4/INT8 weights on device.
 - **State tuning** — train `time_state` blocks standalone from JSONL data without touching linear weights.
+- **MiSS adapters&peft** — train one compact `D` matrix per target linear, then load adapters per request without modifying shared model weights.
 - **Batteries included** — weighted least-inflight load-balancing router and a desktop launcher with Web UI.
 
 ## Quick Start
@@ -45,14 +48,13 @@ are described in the [build guide](docs/build.md).
 
 ## Documentation
 
-The build, run, and API guides are each available in English and Chinese; every
-page links to its translation at the top.
-
 | Guide | Description |
 |---|---|
-| [Build](docs/build.md) · [构建](docs/build.zh-CN.md) | CMake build for CUDA and ROCm, W8A16/W4A16 quantization tool, Go launcher; step-by-step [Windows guide](docs/windows-build-run.md) |
-| [Run](docs/run.md) · [运行](docs/run.zh-CN.md) | Server flags, Windows runtime, dynamic model loading, standalone state tuning |
-| [HTTP API](docs/http-api.md) · [中文](docs/http-api.zh-CN.md) | curl examples for every endpoint; complete reference in [rwkv_lightning_api_doc.md](rwkv_lightning_api_doc.md) |
+| [Build](docs/build.md) | CMake build for CUDA and ROCm, W8A16/W4A16 quantization tool, Go launcher; step-by-step [Windows guide](docs/windows-build-run.md) |
+| [Run](docs/run.md) | Server flags, Windows runtime, dynamic model loading, standalone state tuning |
+| [HTTP API](docs/http-api.md) | curl examples for every endpoint; complete reference in [rwkv_lightning_api_doc.md](rwkv_lightning_api_doc.md) |
+| [MiSS adapters&peft](src/miss/README.md) | Frozen-base adapter training, checkpoint/resume, export, dynamic serving, caches, and validation |
+| [State tuning](src/state_tuning/README.md) | Standalone `time_state` training and checkpoint format |
 | [Router](RWKV_Lightning_CUDA_router/README.md) | Multi-backend load-balancing reverse proxy with session affinity and state fan-out |
 | [Releasing](docs/releasing.md) | CI packaging matrix and how to publish a versioned release |
 

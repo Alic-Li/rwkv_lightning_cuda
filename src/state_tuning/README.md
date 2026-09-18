@@ -3,7 +3,8 @@
 This directory is intentionally not a general training framework. It adds a
 CUDA/HIP reverse path for frozen FP16 runtime weights; BF16 model archives are
 still converted by the existing loader to the same FP16 runtime representation.
-No function in the sidecar has a weight-gradient output.
+No function computes frozen-base weight gradients. Optional MiSS views add
+FP32 gradients for D only; see [MiSS training and serving](../miss/README.md).
 
 ## Short-context execution
 

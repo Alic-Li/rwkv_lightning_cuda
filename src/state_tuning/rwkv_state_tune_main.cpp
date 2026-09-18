@@ -1,4 +1,7 @@
 #include "dataset.hpp"
+#ifdef RWKV_MISS_TUNE
+#include "../miss/trainer.hpp"
+#endif
 #include "rwkv/runtime/rwkv_server_backend.hpp"
 #include "rwkv/runtime/rwkv_state_tuning.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
@@ -27,6 +30,11 @@ using rwkv7_state_tuning::BlockTapeView;
 using rwkv7_state_tuning::FrozenBlockWeights;
 
 struct Options {
+#ifdef RWKV_MISS_TUNE
+  std::string state, resume, targets = "all";
+  int rank = 16;
+  float alpha = -1;
+#endif
   std::string model;
   std::string data;
   std::string output;
@@ -39,8 +47,16 @@ struct Options {
   int epochs = 1;
   int batch_size = 1;
   std::uint64_t max_steps = 0;
+#ifdef RWKV_MISS_TUNE
+  float lr = 1.0e-3f;
+#else
   float lr = 1.0f;
+#endif
+#ifdef RWKV_MISS_TUNE
+  float lr_final = 1.0e-4f;
+#else
   float lr_final = 0.01f;
+#endif
   std::uint64_t warmup_steps = 10;
   std::uint64_t save_every = 0;
   std::uint64_t seed = 1234;
@@ -49,6 +65,12 @@ struct Options {
 [[noreturn]] void usage(const char *program, const std::string &error = {}) {
   if (!error.empty())
     std::cerr << "error: " << error << "\n\n";
+#ifdef RWKV_MISS_TUNE
+  std::cerr << "MiSS: --rank 16 --alpha RANK --targets "
+               "all|comma-separated-weight-names\n"
+            << "      --state initial.pth --resume checkpoint-directory\n"
+            << "      default lr=0.001 lr-final=0.0001; Adam updates only D\n";
+#endif
   std::cerr
       << "Usage: " << program << " --model MODEL.pth --data TRAIN.jsonl "
       << "--output DIR [options]\n"
@@ -117,6 +139,18 @@ Options parse(int argc, char **argv) {
       out.wkv_tape = true;
     else if (arg == "--chunk-load")
       out.chunk_load = true;
+#ifdef RWKV_MISS_TUNE
+    else if (arg == "--state")
+      out.state = value(i, argc, argv);
+    else if (arg == "--resume")
+      out.resume = value(i, argc, argv);
+    else if (arg == "--targets")
+      out.targets = value(i, argc, argv);
+    else if (arg == "--rank")
+      out.rank = integer<int>(value(i, argc, argv), "rank");
+    else if (arg == "--alpha")
+      out.alpha = real(value(i, argc, argv), "alpha");
+#endif
     else if (arg == "--model")
       out.model = value(i, argc, argv);
     else if (arg == "--data")
@@ -159,6 +193,12 @@ Options parse(int argc, char **argv) {
   if (out.ctx <= 0 || out.chunk <= 0 || out.epochs <= 0 ||
       out.batch_size <= 0 || out.lr <= 0 || out.lr_final <= 0)
     usage(argv[0], "ctx/chunk/epochs/lr values must be positive");
+#ifdef RWKV_MISS_TUNE
+  if (out.rank < 1 || out.rank > 1024 || out.optimizer != "adam")
+    usage(argv[0], "MiSS requires rank 1..1024 and Adam");
+  if (out.alpha == -1)
+    out.alpha = out.rank;
+#endif
   return out;
 }
 
@@ -288,14 +328,22 @@ int main(int argc, char **argv) {
     std::uint64_t planned =
         static_cast<std::uint64_t>(options.epochs) *
         ((dataset_rows + options.batch_size - 1) / options.batch_size);
+#ifndef RWKV_MISS_TUNE
     if (options.max_steps)
       planned = std::min(planned, options.max_steps);
+#endif
 
     rwkv7_server::TrieTokenizer tokenizer;
     if (tokenizer.load(options.vocab) != rwkv7_server::kTokenizerSuccess)
       throw std::runtime_error("failed to load tokenizer: " + options.vocab);
-    rwkv7_server::ModelBackend model(options.model, false, options.chunk_load, "off");
-    const auto frozen = model.state_tuning_model_view();
+    rwkv7_server::ModelBackend model(options.model,
+#ifdef RWKV_MISS_TUNE
+                                     true,
+#else
+                                     false,
+#endif
+                                     options.chunk_load, "off");
+    auto frozen = model.state_tuning_model_view();
     const int L = frozen.layers;
     const int C = frozen.channels;
     const int H = frozen.heads;
@@ -312,6 +360,29 @@ int main(int argc, char **argv) {
     const std::size_t state_lane = static_cast<std::size_t>(H) * N * N;
 
     Stream stream;
+#ifdef RWKV_MISS_TUNE
+    Json::Value config;
+    config["base_fingerprint"] = model.base_fingerprint();
+    config["data_fingerprint"] = rwkv7_miss::fingerprint_file(options.data);
+    config["vocab_fingerprint"] = rwkv7_miss::fingerprint_file(options.vocab);
+    config["state_fingerprint"] =
+        options.state.empty() ? "zero"
+                              : rwkv7_miss::fingerprint_file(options.state);
+    config["rank"] = options.rank;
+    config["alpha"] = options.alpha;
+    config["targets"] = options.targets;
+    config["ctx"] = options.ctx;
+    config["chunk"] = options.chunk;
+    config["batch_size"] = options.batch_size;
+    config["epochs"] = options.epochs;
+    config["lr"] = options.lr;
+    config["lr_final"] = options.lr_final;
+    config["warmup_steps"] = Json::UInt64(options.warmup_steps);
+    config["planned_steps"] = Json::UInt64(planned);
+    config["seed"] = Json::UInt64(options.seed);
+    rwkv7_miss::Trainer miss(frozen, options.rank, options.alpha,
+                             options.targets, max_time, config, stream.value);
+#endif
     DeviceBuffer<half> input, activation_ping, activation_pong, final_norm,
         logits, d_logits, grad_ping, grad_pong, shifts, shift_grad, v_first,
         v_first_grad, block_workspace;
@@ -335,18 +406,33 @@ int main(int argc, char **argv) {
     const std::size_t state_count = static_cast<std::size_t>(L) * state_lane;
     time_state.resize(state_count, "tune time_state");
     state_gradient.resize(state_count, "tune dState");
+#ifndef RWKV_MISS_TUNE
     adam_m.resize(state_count, "tune Adam m");
     if (options.optimizer == "adam")
       adam_v.resize(state_count, "tune Adam v");
+#endif
     per_batch_state_gradient.resize(state_count, "tune per-batch dState");
     state_batch.resize(state_lane, "tune expanded state");
     state_final.resize(state_lane, "tune final state");
     loss.resize(1, "tune loss");
     time_state.zero("zero tune time_state");
     state_gradient.zero("zero tune dState");
+#ifndef RWKV_MISS_TUNE
     adam_m.zero("zero tune Adam m");
     if (options.optimizer == "adam")
       adam_v.zero("zero tune Adam v");
+#endif
+#ifdef RWKV_MISS_TUNE
+    if (!options.state.empty()) {
+      auto initial = model.load_state_from_pth(options.state, 1);
+      // Backend created in FP32 state mode for MiSS.
+      check(cudaMemcpyAsync(time_state.p, initial.wkv_state32.p,
+                            state_count * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream.value),
+            "load MiSS initial state");
+      check(cudaStreamSynchronize(stream.value), "initial state ready");
+    }
+#endif
     std::cout << "Optimizer: " << options.optimizer << '\n';
 
     DeviceBuffer<float> shared_wkv_tape, shared_wkv_final;
@@ -382,6 +468,9 @@ int main(int argc, char **argv) {
           shift_grad.p + static_cast<std::size_t>(layer) * 2 * C + C,
           v_first_grad.p};
     }
+#ifdef RWKV_MISS_TUNE
+    miss.bind_tapes(tapes);
+#endif
     block_workspace.resize(workspace_count, "tune block workspace");
     std::filesystem::create_directories(options.output);
 
@@ -419,9 +508,31 @@ int main(int argc, char **argv) {
     bool stop = false;
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t processed_tokens = 0;
+#ifndef RWKV_MISS_TUNE
     std::vector<float> host_gradient(state_count), accumulated(state_count);
-    for (int epoch = 1; epoch <= options.epochs && !stop; ++epoch) {
+#endif
+    int resume_epoch = 1;
+    std::uint64_t resume_row = 0;
+#ifdef RWKV_MISS_TUNE
+    if (!options.resume.empty())
+      miss.resume(options.resume, global_step, resume_epoch, resume_row,
+                  time_state.p, state_count);
+    if (options.max_steps && global_step >= options.max_steps)
+      stop = true;
+#endif
+    for (int epoch = resume_epoch; epoch <= options.epochs && !stop; ++epoch) {
       rwkv7_state_tuning::JsonlTextReader dataset(options.data);
+      std::uint64_t data_row = 0;
+#ifdef RWKV_MISS_TUNE
+      if (epoch == resume_epoch) {
+        std::string skipped_text;
+        while (data_row < resume_row) {
+          if (!dataset.next(skipped_text))
+            throw std::runtime_error("resume data progress exceeds dataset");
+          ++data_row;
+        }
+      }
+#endif
       bool exhausted = false;
       while (!exhausted) {
         std::vector<std::vector<int>> batch;
@@ -432,6 +543,7 @@ int main(int argc, char **argv) {
             exhausted = true;
             break;
           }
+          ++data_row;
           const auto encoded = tokenizer.encode(text);
           if (encoded.size() < 2) {
             ++skipped;
@@ -444,7 +556,9 @@ int main(int argc, char **argv) {
         }
         if (batch.empty())
           break;
+#ifndef RWKV_MISS_TUNE
         std::fill(accumulated.begin(), accumulated.end(), 0.0f);
+#endif
         float batch_loss = 0.0f;
         for (const auto &tokens : batch) {
           const int length = static_cast<int>(tokens.size()) - 1;
@@ -528,6 +642,7 @@ int main(int argc, char **argv) {
                   "nonfinite loss before optimizer; state not updated");
             batch_loss += chunk_loss;
           }
+#ifndef RWKV_MISS_TUNE
           check(cudaMemcpyAsync(host_gradient.data(), state_gradient.p,
                                 state_count * sizeof(float),
                                 cudaMemcpyDeviceToHost, stream.value),
@@ -546,13 +661,19 @@ int main(int argc, char **argv) {
               throw std::runtime_error(
                   "batch gradient overflow before optimizer");
           }
+#endif
         }
+#ifndef RWKV_MISS_TUNE
         check(cudaMemcpyAsync(state_gradient.p, accumulated.data(),
                               state_count * sizeof(float),
                               cudaMemcpyHostToDevice, stream.value),
               "copy batch gradient");
+#endif
         const std::uint64_t next_step = global_step + 1;
         const float lr = learning_rate(options, next_step, planned);
+#ifdef RWKV_MISS_TUNE
+        miss.update(lr, next_step);
+#else
         if (options.optimizer == "muon") {
           rwkv7_state_tuning::MuonConfig muon;
           muon.learning_rate = lr;
@@ -566,6 +687,7 @@ int main(int argc, char **argv) {
               stream.value, time_state.p, state_gradient.p, adam_m.p, adam_v.p,
               state_count, next_step, adam, true);
         }
+#endif
         check(cudaStreamSynchronize(stream.value), "optimizer update");
         global_step = next_step;
         processed_tokens += batch_tokens;
@@ -588,9 +710,17 @@ int main(int argc, char **argv) {
                   << elapsed / global_step * (planned - global_step) << "s   "
                   << std::flush;
         if (options.save_every && global_step % options.save_every == 0) {
+#ifdef RWKV_MISS_TUNE
+          const auto path = (std::filesystem::path(options.output) /
+                             ("checkpoint-" + std::to_string(global_step)))
+                                .string();
+          miss.checkpoint(path, global_step, epoch, data_row, time_state.p,
+                          state_count);
+#else
           const auto path = checkpoint_name(options.output, global_step);
           rwkv7_state_tuning::save_state_checkpoint_pth(path, stream.value, L,
                                                         H, N, time_state.p);
+#endif
           std::cout << "\nsaved: " << path << '\n';
         }
         if (options.max_steps && global_step >= options.max_steps) {
@@ -600,16 +730,28 @@ int main(int argc, char **argv) {
       }
     }
     std::cout << '\n';
+#ifdef RWKV_MISS_TUNE
+    const std::string final_path =
+        (std::filesystem::path(options.output) / "adapter").string();
+    miss.export_adapter(final_path);
+#else
     const std::string final_path =
         (std::filesystem::path(options.output) / "state-final.pth").string();
     rwkv7_state_tuning::save_state_checkpoint_pth(final_path, stream.value, L,
                                                   H, N, time_state.p);
+#endif
     std::cout << "saved: " << final_path << '\n';
     std::cout << "complete: steps=" << global_step
               << " skipped_short_samples=" << skipped
               << " seed=" << options.seed << '\n';
   } catch (const std::exception &error) {
-    std::cerr << "\nrwkv_state_tune: " << error.what() << '\n';
+    std::cerr <<
+#ifdef RWKV_MISS_TUNE
+        "\nrwkv_miss_tune: "
+#else
+        "\nrwkv_state_tune: "
+#endif
+              << error.what() << '\n';
     return 1;
   }
   return 0;

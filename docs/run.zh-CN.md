@@ -95,3 +95,27 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/model/load" \
 梯度传播。`--batch-size N` 在每次优化器更新中累积 N 条变长样本。checkpoint 只包含
 state 张量，可直接上传到现有推理后端使用。实现细节见
 `../src/state_tuning/README.md`。
+
+## MiSS adapter 训练与推理
+
+同一个构建还会生成 `rwkv_miss_tune`。它冻结基模，只训练所选 attention 和 FFN
+Linear 对应的 MiSS `D[out,rank]`，支持分块 state passing、梯度累积、可续训的周期
+checkpoint，以及与训练 checkpoint 分离的推理导出：
+
+```bash
+./build/rwkv_miss_tune \
+  --model /path/to/model.pth \
+  --data /path/to/train.jsonl \
+  --output ./miss_output \
+  --vocab ./assets/rwkv_vocab_v20230424.txt \
+  --rank 16 --alpha 16 --targets all \
+  --ctx 4096 --chunk 1024 --batch-size 8 --epochs 1 \
+  --lr 0.0001 --lr-final 0.00001 --warmup-steps 10 \
+  --save-every 100 --wkv_tape
+```
+
+通过 `POST /v1/adapters` 注册 `miss_output/adapter`，然后在生成请求中传入
+`adapter_id`，并按需指定 `adapter_version` 或 `adapter_scale`。注册阶段只在 CPU
+RAM 中校验和缓存；第一次请求时才把整个 adapter 一次性上传到 GPU。checkpoint
+续训、推理包身份、缓存预算、性能分析和验收说明见
+[MiSS 文档](../src/miss/README.md)。

@@ -226,9 +226,15 @@ void block_forward_state_tuning_f16(hipStream_t stream, int B, int T,
                          xk, xv, xa, xg);
   rwkv7_v3a_linear_f16_orig_launch(stream, rows, C, C, xr, w.receptance,
                                    tape.r);
+  rwkv7_miss::forward(stream, rows, w.miss[0], xr, tape.r,
+                      tape.miss_reduced[0]);
   rwkv7_v3a_linear_f16_orig_launch(stream, rows, C, C, xk, w.key, tape.k);
+  rwkv7_miss::forward(stream, rows, w.miss[1], xk, tape.k,
+                      tape.miss_reduced[1]);
   rwkv7_v3a_linear_f16_orig_launch(stream, rows, C, C, xv, w.value,
                                    tape.v_base);
+  rwkv7_miss::forward(stream, rows, w.miss[2], xv, tape.v_base,
+                      tape.miss_reduced[2]);
 
   rwkv7_v3a_linear_f16_launch(stream, rows, C, w.rank_w, xw, w.w1, w1);
   rwkv7_act_tanh_launch(stream, w1, tape.w1_tanh,
@@ -284,6 +290,8 @@ void block_forward_state_tuning_f16(hipStream_t stream, int B, int T,
       attention_post);
   rwkv7_v3a_linear_f16_orig_launch(stream, rows, C, C, attention_post, w.output,
                                    attention_out);
+  rwkv7_miss::forward(stream, rows, w.miss[3], attention_post, attention_out,
+                      tape.miss_reduced[3]);
   rwkv7_v3a_add_f16_launch(stream, input, attention_out, tape.x_after_att, R);
 
   rwkv7_v3a_layer_norm_f16_launch(stream, rows, C, tape.x_after_att,
@@ -292,9 +300,13 @@ void block_forward_state_tuning_f16(hipStream_t stream, int B, int T,
                         ffn_mixed);
   rwkv7_v3a_linear_f16_orig_launch(stream, rows, C, w.ffn, ffn_mixed, w.ffn_key,
                                    tape.ffn_hid);
+  rwkv7_miss::forward(stream, rows, w.miss[4], ffn_mixed, tape.ffn_hid,
+                      tape.miss_reduced[4]);
   rwkv7_relu_square_launch(stream, tape.ffn_hid, ffn_act, F);
   rwkv7_v3a_linear_f16_launch(stream, rows, w.ffn, C, ffn_act, w.ffn_value,
                               ffn_out);
+  rwkv7_miss::forward(stream, rows, w.miss[5], ffn_act, ffn_out,
+                      tape.miss_reduced[5]);
   rwkv7_v3a_add_f16_launch(stream, tape.x_after_att, ffn_out, output, R);
 }
 

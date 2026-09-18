@@ -6,6 +6,15 @@
 
 using cudaError_t = hipError_t;
 using cudaStream_t = hipStream_t;
+using cudaEvent_t = hipEvent_t;
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocDefault hipHostMallocDefault
+#define cudaFreeHost hipHostFree
+#define cudaEventCreate hipEventCreate
+#define cudaEventDestroy hipEventDestroy
+#define cudaEventRecord hipEventRecord
+#define cudaEventSynchronize hipEventSynchronize
+#define cudaEventElapsedTime hipEventElapsedTime
 using cudaGraph_t = hipGraph_t;
 using cudaGraphExec_t = hipGraphExec_t;
 #define cudaStreamBeginCapture hipStreamBeginCapture
@@ -26,6 +35,7 @@ constexpr auto cudaMemcpyDeviceToDevice = hipMemcpyDeviceToDevice;
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaMalloc hipMalloc
+#define cudaMemGetInfo hipMemGetInfo
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemset hipMemset

@@ -105,3 +105,29 @@ gradient propagation. `--batch-size N` accumulates N variable-length samples
 per optimizer update. Checkpoints contain only state tensors and can be uploaded to the
 existing inference backend. See `../src/state_tuning/README.md` for implementation
 details.
+
+## MiSS adapter tuning and serving
+
+The same build also provides `rwkv_miss_tune`. It freezes the base model and
+trains only MiSS `D[out,rank]` matrices for the selected attention and FFN
+linears. The trainer supports chunked state passing, gradient accumulation,
+periodic resumable checkpoints, and a separate inference export:
+
+```bash
+./build/rwkv_miss_tune \
+  --model /path/to/model.pth \
+  --data /path/to/train.jsonl \
+  --output ./miss_output \
+  --vocab ./assets/rwkv_vocab_v20230424.txt \
+  --rank 16 --alpha 16 --targets all \
+  --ctx 4096 --chunk 1024 --batch-size 8 --epochs 1 \
+  --lr 0.0001 --lr-final 0.00001 --warmup-steps 10 \
+  --save-every 100 --wkv_tape
+```
+
+Register `miss_output/adapter` through `POST /v1/adapters`, then add
+`adapter_id` and optional `adapter_version` or `adapter_scale` to a generation
+request. Registration validates the package in CPU RAM; its complete weights
+are uploaded to GPU once on the first request. See the
+[MiSS guide](../src/miss/README.md) for checkpoint/resume, package identity,
+cache budgets, profiling, and validation.

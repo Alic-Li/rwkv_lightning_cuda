@@ -297,9 +297,13 @@ void block_backward_state_only(cudaStream_t stream, const half *grad_out,
   // ChannelMix/FFN, followed by the residual into x_after_att.
   linear_runtime_backward_input_f16(stream, rows, w.ffn, C, grad_out,
                                     w.ffn_value, d_act);
+  rwkv7_miss::backward(stream, rows, w.miss[5], tape.miss_reduced[5], grad_out,
+                       d_act);
   relu_square_backward_input_f16(stream, tape.ffn_hid, d_act, d_hid, F);
   linear_orig_backward_input_f16(stream, rows, C, w.ffn, d_hid, w.ffn_key,
                                  d_mixed);
+  rwkv7_miss::backward(stream, rows, w.miss[4], tape.miss_reduced[4], d_hid,
+                       d_mixed);
   const half *ffn_grads[] = {d_mixed};
   const half *ffn_mixes[] = {w.ffn_mix};
   time_mix_backward_input_f16(stream, tape.batch, tape.time, C, 1, ffn_grads,
@@ -313,6 +317,8 @@ void block_backward_state_only(cudaStream_t stream, const half *grad_out,
   // Attention output projection and fused post-WKV GroupNorm/rkv/gate.
   linear_orig_backward_input_f16(stream, rows, C, C, grad_x_after, w.output,
                                  d_post);
+  rwkv7_miss::backward(stream, rows, w.miss[3], tape.miss_reduced[3],
+                       grad_x_after, d_post);
   post_backward_kernel<<<rows * w.heads, kN, 0, stream>>>(
       w.heads, tape.att_group_norm, tape.r, tape.wkv_k, tape.v, w.r_k,
       tape.att_gate, d_post, d_gn, post_dr, post_dk, post_dv, d_gate);
@@ -372,8 +378,14 @@ void block_backward_state_only(cudaStream_t stream, const half *grad_out,
   // Base r/k/v projections.
   linear_orig_backward_input_f16(stream, rows, C, C, wkv_dr, w.receptance,
                                  dx_r);
+  rwkv7_miss::backward(stream, rows, w.miss[0], tape.miss_reduced[0], wkv_dr,
+                       dx_r);
   linear_orig_backward_input_f16(stream, rows, C, C, d_k, w.key, dx_k);
+  rwkv7_miss::backward(stream, rows, w.miss[1], tape.miss_reduced[1], d_k,
+                       dx_k);
   linear_orig_backward_input_f16(stream, rows, C, C, d_v_base, w.value, dx_v);
+  rwkv7_miss::backward(stream, rows, w.miss[2], tape.miss_reduced[2], d_v_base,
+                       dx_v);
   if (!layer_zero) {
     half *d_v1 = arena.take(static_cast<std::size_t>(rows) * w.rank_v);
     half *rank_v_padding =

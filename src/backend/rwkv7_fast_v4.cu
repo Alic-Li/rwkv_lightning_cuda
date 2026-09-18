@@ -1,18 +1,19 @@
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <string>
+#include <mutex>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -20,13 +21,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "rwkv/io/fingerprint.hpp"
 #include "rwkv/io/pth_archive.hpp"
 #include "rwkv/io/pth_tensor.hpp"
-#include "rwkv_quantized.hpp"
-#include "rwkv/runtime/rwkv_server_backend.hpp"
-#include "rwkv_w4a16.cuh"
 #include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
+#include "rwkv/runtime/rwkv_server_backend.hpp"
 #include "rwkv7_fast_v4_kernels.cuh"
+#include "rwkv_quantized.hpp"
+#include "rwkv_w4a16.cuh"
 
 namespace {
 
@@ -1784,6 +1786,8 @@ int tune_cmix_sparse_threshold(
     const W8A16TuneShape& value_shape) {
   const int C = value_shape.N;
   const int F = value_shape.K;
+  if (C % 256 || F % 128)
+    return 0; // sparse tuner has stricter shape requirements
   cudaStream_t stream = nullptr;
   check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create cmix tuning stream");
   DeviceBuffer<half> preact;
@@ -1872,6 +1876,19 @@ void run_backend_forward(
     GenerationState& state,
     DeviceLogits& out) {
   const auto& dims = weights.dims;
+  if (state.adapter)
+    for (const auto &t : state.adapter->package->tensors)
+      if (t.layer >= dims.layers ||
+          t.in !=
+              (t.target == rwkv7_miss::FfnValue ? dims.ffn : dims.channels) ||
+          t.out != (t.target == rwkv7_miss::FfnKey ? dims.ffn : dims.channels))
+        throw std::runtime_error(
+            "MiSS target incompatible with base model dimensions");
+  if (state.adapter && !state.adapter_gpu)
+    state.adapter_gpu = rwkv7_miss::adapter_cache().acquire(
+        *state.adapter, &state.adapter_cold);
+  if (state.adapter_gpu && state.adapter_cold)
+    state.adapter_h2d_ms = state.adapter_gpu->h2d_ms;
   const int B = static_cast<int>(token_batches.size());
   if (B <= 0) {
     throw std::runtime_error("token_batches must not be empty");
@@ -1938,6 +1955,12 @@ void run_backend_forward(
     }
   }
 
+  if (state.adapter) {
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess)
+      state.observed_device_vram_peak =
+          std::max(state.observed_device_vram_peak, total_bytes - free_bytes);
+  }
   const std::size_t row_elems = static_cast<std::size_t>(rows) * C;
   half* x0 = arena.take(row_elems, "x0");
   half* x1 = arena.take(row_elems, "x1");
@@ -1991,6 +2014,17 @@ void run_backend_forward(
 
   for (int layer = 0; layer < dims.layers; ++layer) {
     const LayerWeights& w = weights.layers[layer];
+    const auto miss_add = [&](int target, const half *input, half *output) {
+      if (!state.adapter || layer >= int(state.adapter_gpu->blocks.size()))
+        return;
+      auto linear = state.adapter_gpu->blocks[layer][target];
+      linear.scale = state.adapter->scale;
+      rwkv7_miss::forward(stream, rows, linear, input, output);
+    };
+    const bool miss_value =
+        state.adapter && layer < int(state.adapter_gpu->blocks.size()) &&
+        state.adapter_gpu->blocks[layer][rwkv7_miss::FfnValue].d;
+
     const int Rw = static_cast<int>(w.att_w1_t->shape[0]);
     const int Ra = static_cast<int>(w.att_a1_t->shape[0]);
     const int Rg = static_cast<int>(w.att_g1_t->shape[0]);
@@ -2037,12 +2071,15 @@ void run_backend_forward(
 
     const int profile_att_receptance = profiler.begin(stream, "att_receptance");
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xr, w.att_receptance_w, lt_workspace.p, lt_workspace.n, r);
+    miss_add(0, xr, r);
     profiler.end(stream, profile_att_receptance);
     const int profile_att_key = profiler.begin(stream, "att_key");
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xk, w.att_key_w, lt_workspace.p, lt_workspace.n, k);
+    miss_add(1, xk, k);
     profiler.end(stream, profile_att_key);
     const int profile_att_value = profiler.begin(stream, "att_value");
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xv, w.att_value_w, lt_workspace.p, lt_workspace.n, v_base);
+    miss_add(2, xv, v_base);
     profiler.end(stream, profile_att_value);
     half* v_use = v_base;
     bool v_done = false;
@@ -2116,6 +2153,7 @@ void run_backend_forward(
     profiler.end(stream, profile_att_post);
     const int profile_att_output = profiler.begin(stream, "att_output");
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, w.att_output_w, lt_workspace.p, lt_workspace.n, att_out);
+    miss_add(3, y2, att_out);
     profiler.end(stream, profile_att_output);
     const int profile_ffn_mix = profiler.begin(stream, "ffn_mix");
     if (T == 1) {
@@ -2130,6 +2168,7 @@ void run_backend_forward(
 
     const int profile_ffn_key = profiler.begin(stream, "ffn_key");
     linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, F, mixed, w.ffn_key_w, lt_workspace.p, lt_workspace.n, hid);
+    miss_add(4, mixed, hid);
     profiler.end(stream, profile_ffn_key);
     if (weights.cmix_stats.enabled && T == 1) {
       rwkv7_cmix_stats_relu2_launch(
@@ -2145,6 +2184,8 @@ void run_backend_forward(
         w.ffn_value_w->is_int8() && C >= 4096 && rows <= layer_sparse_max_rows) {
       cmix_mode = CmixMode::NoFcRows2;
     }
+    if (miss_value)
+      cmix_mode = CmixMode::Dense;
     const int profile_ffn_value = profiler.begin(stream, "ffn_value");
     if (cmix_mode == CmixMode::NoFcOne) {
       if (w.ffn_value_w->is_int8()) {
@@ -2190,6 +2231,8 @@ void run_backend_forward(
         rwkv7_v3a_linear_f16_launch(stream, rows, F, C, hid, hp(w.ffn_value_w), cmix_out);
       }
     }
+    if (miss_value)
+      miss_add(5, hid, cmix_out);
     profiler.end(stream, profile_ffn_value);
 
     if (layer + 1 < dims.layers) {
@@ -2267,6 +2310,9 @@ struct ModelBackend::Impl {
         retune(retune_),
         tune_cache_directory(std::move(tune_cache_directory_)),
         weights(load_backend_weights(model_path, chunk_load)) {
+    fingerprint = llm_infer::is_quantized_archive(model_path)
+                      ? rwkv7_miss::source_fingerprint(model_path)
+                      : rwkv7_miss::fingerprint_file(model_path);
     configure_w8a16_tuning(weights, model_path, tune_cache, tune_cache_directory, retune);
   }
 
@@ -2318,6 +2364,8 @@ struct ModelBackend::Impl {
     std::cout << "cmix_stats_end\n";
   }
 
+  const std::string runtime_identity = rwkv7_miss::new_runtime_identity();
+  std::string fingerprint;
   std::string model_path;
   std::string model_name;
   bool use_wkv32 = false;
@@ -2375,6 +2423,7 @@ GenerationState ModelBackend::load_state_from_pth(const std::string& path, int b
     throw std::runtime_error("batch_size must be positive");
   }
   auto state = create_state(batch_size);
+  state.initial_state_identity = rwkv7_miss::fingerprint_file(path);
   auto archive = llm_infer::PthArchive::open(path);
   if (!archive.ok()) {
     throw std::runtime_error("failed to open state PTH: " + archive.status().message());
@@ -2534,6 +2583,22 @@ void ModelBackend::forward_prefill(
     const std::vector<std::vector<int64_t>>& token_batches,
     GenerationState& state,
     DeviceLogits& logits) const {
+  if (state.request_started == std::chrono::steady_clock::time_point{})
+    state.request_started = std::chrono::steady_clock::now();
+  const auto key = rwkv7_miss::effective_model_key(
+      impl_->runtime_identity, state.adapter.get(),
+      state.initial_state_identity, state.wkv32);
+  if (state.advanced && state.effective_key != key)
+    throw std::runtime_error(
+        "incompatible model/adapter/initial-state cache identity");
+  if (state.adapter) {
+    if (state.adapter->package->base != impl_->fingerprint)
+      throw std::runtime_error("adapter base fingerprint mismatch");
+  }
+  state.effective_key = key;
+  state.advanced = true;
+  state.adapter_identity =
+      state.adapter ? state.adapter->identity : std::string{};
   run_backend_forward(impl_->weights, token_batches, impl_->use_wkv32, impl_->cmix_sparse, state, logits);
 }
 
@@ -2546,6 +2611,22 @@ void ModelBackend::forward_decode(
   for (int64_t token : token_batch) {
     batch.push_back({token});
   }
+  if (state.request_started == std::chrono::steady_clock::time_point{})
+    state.request_started = std::chrono::steady_clock::now();
+  const auto key = rwkv7_miss::effective_model_key(
+      impl_->runtime_identity, state.adapter.get(),
+      state.initial_state_identity, state.wkv32);
+  if (state.advanced && state.effective_key != key)
+    throw std::runtime_error(
+        "incompatible model/adapter/initial-state cache identity");
+  if (state.adapter) {
+    if (state.adapter->package->base != impl_->fingerprint)
+      throw std::runtime_error("adapter base fingerprint mismatch");
+  }
+  state.effective_key = key;
+  state.advanced = true;
+  state.adapter_identity =
+      state.adapter ? state.adapter->identity : std::string{};
   run_backend_forward(impl_->weights, batch, impl_->use_wkv32, impl_->cmix_sparse, state, logits);
 }
 
@@ -2568,6 +2649,15 @@ void ModelBackend::copy_state_slice(
     throw std::runtime_error("state slice range exceeds batch size");
   }
 
+  if (dst.advanced && (src.effective_key != dst.effective_key ||
+                       src.adapter_identity != dst.adapter_identity))
+    throw std::runtime_error("cannot copy incompatible adapter state");
+  dst.adapter = src.adapter;
+  dst.adapter_gpu = src.adapter_gpu;
+  dst.effective_key = src.effective_key;
+  dst.adapter_identity = src.adapter_identity;
+  dst.initial_state_identity = src.initial_state_identity;
+  dst.advanced = src.advanced;
   const auto& dims = impl_->weights.dims;
   const std::size_t shift_lane_elems = static_cast<std::size_t>(dims.channels);
   const std::size_t wkv_lane_elems =
@@ -2716,6 +2806,14 @@ int ModelBackend::vocab_size() const {
 
 const std::string& ModelBackend::model_path() const {
   return impl_->model_path;
+}
+
+const std::string &ModelBackend::base_fingerprint() const {
+  return impl_->fingerprint;
+}
+
+std::string ModelBackend::runtime_identity() const {
+  return impl_->runtime_identity + (impl_->use_wkv32 ? ":fp32" : ":fp16");
 }
 
 const std::string& ModelBackend::model_name() const {

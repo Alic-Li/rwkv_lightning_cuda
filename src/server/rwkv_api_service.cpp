@@ -487,6 +487,50 @@ Json::Value uploaded_state_json(const UploadedStateInfo& info) {
   return item;
 }
 
+void register_adapter_routes(drogon::HttpAppFramework &app,
+                             const std::optional<std::string> &password) {
+  app.registerHandler(
+      "/v1/adapters",
+      [password](const HttpRequestPtr &req,
+                 std::function<void(const HttpResponsePtr &)> &&cb) {
+        auto body = req->getJsonObject();
+        Json::Value json = body ? *body : Json::Value(Json::objectValue);
+        HttpResponsePtr auth;
+        if (!check_password(req, json, password, auth)) {
+          cb(auth);
+          return;
+        }
+        try {
+          auto &cache = rwkv7_miss::adapter_cache();
+          Json::Value out;
+          if (req->method() == Post) {
+            out["version"] = cache.register_adapter(
+                json["adapter_id"].asString(), json["path"].asString());
+          } else if (req->method() == Delete) {
+            cache.erase(json["adapter_id"].asString(),
+                        json.get("adapter_version", "").asString());
+            cache.trim();
+            out["deleted"] = true;
+          } else {
+            out["data"] = cache.list();
+            auto stats = cache.stats();
+            out["ram_hits"] = Json::UInt64(stats.ram_hits);
+            out["gpu_hits"] = Json::UInt64(stats.gpu_hits);
+            out["gpu_misses"] = Json::UInt64(stats.gpu_misses);
+            out["uploads"] = Json::UInt64(stats.uploads);
+            out["h2d_ms"] = stats.h2d_ms;
+            out["ram_bytes"] = Json::UInt64(stats.ram_bytes);
+            out["gpu_bytes"] = Json::UInt64(stats.gpu_bytes);
+            out["gpu_peak_bytes"] = Json::UInt64(stats.gpu_peak_bytes);
+          }
+          cb(json_response(out));
+        } catch (const std::exception &e) {
+          cb(json_response(make_error(e.what()), k400BadRequest));
+        }
+      },
+      {Get, Post, Delete});
+}
+
 void register_uploaded_state_routes(
     HttpAppFramework& app,
     const std::optional<std::string>& password) {
@@ -627,6 +671,23 @@ bool has_explicit_think_type(const Json::Value& body) {
 }
 
 GenerateOptions parse_options(const Json::Value& body, GenerateOptions options = {}) {
+  if (body.isMember("adapter_scale") && !body["adapter_scale"].isNumeric())
+    throw std::invalid_argument("adapter_scale must be numeric");
+  if (body.isMember("adapter_id")) {
+    const auto id = body["adapter_id"].asString();
+    if (id.empty())
+      options.adapter.reset();
+    else {
+      float scale = body.get("adapter_scale", 0).asFloat();
+      options.adapter = rwkv7_miss::adapter_cache().resolve(
+          id, body.get("adapter_version", "").asString(),
+          body.isMember("adapter_scale") ? &scale : nullptr);
+    }
+  } else if (body.isMember("adapter_version") ||
+             body.isMember("adapter_scale")) {
+    throw std::invalid_argument(
+        "adapter_id is required with adapter_version/adapter_scale");
+  }
   options.max_tokens = body.get("max_tokens", options.max_tokens).asInt();
   options.temperature = body.get("temperature", options.temperature).asDouble();
   options.top_k = body.get("top_k", options.top_k).asInt();
@@ -1066,6 +1127,7 @@ void register_api_routes_legacy(
     app.registerHandler(path, handle_options, {Options});
   }
   register_uploaded_state_routes(app, password);
+  register_adapter_routes(app, password);
 
   app.registerHandler(
       "/v1/server/status",
@@ -1154,7 +1216,17 @@ void register_api_routes_legacy(
         if (!(*json).isMember("max_tokens")) {
           options.max_tokens = std::max(0, paused->options.max_tokens - paused->generated_tokens);
         }
-        options = parse_options(*json, options);
+        try {
+          options = parse_options(*json, options);
+          bind_adapter(*paused->state, options.adapter);
+        } catch (const std::exception &e) {
+          RequestRegistry::instance().put_paused(std::move(*paused));
+          cb(json_response(make_error(e.what()), k400BadRequest));
+          return;
+        }
+        paused->state->request_started = std::chrono::steady_clock::now();
+        paused->state->adapter_cold = false;
+        paused->state->adapter_h2d_ms = 0;
         const int chunk_size = parse_chunk_size(*json, paused->chunk_size);
         const std::string model = (*json).get("model", paused->model).asString();
 
@@ -1211,6 +1283,8 @@ void register_api_routes_legacy(
                   paused_again.chunk_size = chunk_size;
                   paused_again.options = options;
                   paused_again.options.max_tokens += saved_generated_tokens;
+                  state_ptr->adapter_gpu.reset();
+                  rwkv7_miss::adapter_cache().trim();
                   paused_again.state = state_ptr;
                   paused_again.logits = logits_ptr;
                   StateCacheManager::instance().put_state(paused_again.id, *state_ptr);
@@ -1285,7 +1359,13 @@ void register_api_routes_legacy(
           cb(json_response(make_error("Empty prompts list"), k400BadRequest));
           return;
         }
-        const auto options = parse_options(*json);
+        GenerateOptions options;
+        try {
+          options = parse_options(*json);
+        } catch (const std::exception &e) {
+          cb(json_response(make_error(e.what()), k400BadRequest));
+          return;
+        }
         const bool metrics_requested = parse_metrics_requested(*json);
         int prompt_tokens = 0;
         if (metrics_requested) {
@@ -1517,7 +1597,16 @@ void register_api_routes_legacy(
           return;
         }
 
-        const auto options = parse_options(*json);
+        GenerateOptions options;
+        try {
+          options = parse_options(*json);
+        } catch (const std::exception &e) {
+          cb(json_response(make_error(e.what()), k400BadRequest));
+          return;
+        }
+        session_id += ":" + rwkv7_miss::effective_model_key(
+                                engine.model()->runtime_identity(),
+                                options.adapter.get(), "session", false);
         const int prompt_tokens = engine.count_tokens(prompts.front());
         const auto model = (*json).get("model", engine.model_name()).asString();
         auto active = RequestRegistry::instance().start(
@@ -1678,7 +1767,18 @@ void register_api_routes_legacy(
           cb(json_response(make_error("Missing session_id"), k400BadRequest));
           return;
         }
-        const bool ok = StateCacheManager::instance().delete_state_from_any_level(session_id);
+        auto &state_cache = StateCacheManager::instance();
+        bool ok = state_cache.delete_state_from_any_level(session_id);
+        const auto namespaces = state_cache.list_all_states();
+        const auto prefix = session_id + ":";
+        for (const auto *level :
+             {&namespaces.l1_cache, &namespaces.l2_cache, &namespaces.database})
+          for (const auto &key : *level)
+            if (key.size() == prefix.size() + 64 &&
+                key.compare(0, prefix.size(), prefix) == 0 &&
+                std::all_of(key.begin() + prefix.size(), key.end(),
+                            [](unsigned char c) { return std::isxdigit(c); }))
+              ok = state_cache.delete_state_from_any_level(key) || ok;
         Json::Value resp;
         resp["status"] = ok ? "success" : "not_found";
         resp["message"] = ok ? ("Session " + session_id + " deleted successfully")
@@ -1710,7 +1810,13 @@ void register_api_routes_legacy(
         }
         const auto prompt = format_openai_prompt(*json, engine, !state_id.empty());
         // std::cout << prompt << std::endl; // Debug Prompt
-        auto options = parse_options(*json);
+        GenerateOptions options;
+        try {
+          options = parse_options(*json);
+        } catch (const std::exception &e) {
+          cb(json_response(make_error(e.what()), k400BadRequest));
+          return;
+        }
         if ((*json).isMember("think_type") || (*json).isMember("think") || (*json).isMember("enable_think")) {
           options.force_reasoning = force_reasoning_for_think_type(parse_think_type(*json));
         }
@@ -1743,6 +1849,7 @@ void register_api_routes_legacy(
                       create_request_state(engine, state_id));
                   auto logits_ptr = std::make_shared<DeviceLogits>();
                   const auto prefill_begin = std::chrono::steady_clock::now();
+                  bind_adapter(*state_ptr, options.adapter);
                   const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
                   const auto prefill_end = std::chrono::steady_clock::now();
                   record_prefill_metrics(active, prefill_tokens, prefill_begin, prefill_end);
@@ -1772,6 +1879,8 @@ void register_api_routes_legacy(
                     paused.generated_tokens = active->generated_tokens.load();
                     paused.chunk_size = chunk_size;
                     paused.options = options;
+                    state_ptr->adapter_gpu.reset();
+                    rwkv7_miss::adapter_cache().trim();
                     paused.state = state_ptr;
                     paused.logits = logits_ptr;
                     StateCacheManager::instance().put_state(paused.id, *state_ptr);
@@ -1813,7 +1922,9 @@ void register_api_routes_legacy(
         std::string completion;
 
         const auto prefill_begin = std::chrono::steady_clock::now();
-        const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
+        bind_adapter(*state_ptr, options.adapter);
+        const int prefill_tokens =
+            engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
         const auto prefill_end = std::chrono::steady_clock::now();
         record_prefill_metrics(active, prefill_tokens, prefill_begin, prefill_end);
 
@@ -1843,6 +1954,8 @@ void register_api_routes_legacy(
           paused.generated_tokens = active->generated_tokens.load();
           paused.chunk_size = parse_chunk_size(*json, 2);
           paused.options = options;
+          state_ptr->adapter_gpu.reset();
+          rwkv7_miss::adapter_cache().trim();
           paused.state = state_ptr;
           paused.logits = logits_ptr;
           StateCacheManager::instance().put_state(paused.id, *state_ptr);
@@ -1891,6 +2004,7 @@ void register_api_routes(
     app.registerHandler(path, options_handler, {Options});
   }
   register_uploaded_state_routes(app, password);
+  register_adapter_routes(app, password);
 
   app.registerHandler("/v1/models", [&models, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
     Json::Value body = Json::objectValue;

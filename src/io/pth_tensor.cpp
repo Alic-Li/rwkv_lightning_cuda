@@ -86,6 +86,10 @@ bool storage_dtype(const GlobalRef& global, TensorDType* dtype) {
     *dtype = TensorDType::kBFloat16;
     return true;
   }
+  if (global.name == "HalfStorage") {
+    *dtype = TensorDType::kFloat16;
+    return true;
+  }
   if (global.name == "FloatStorage") {
     *dtype = TensorDType::kFloat32;
     return true;
@@ -152,6 +156,8 @@ float read_element_as_float(
   switch (dtype) {
     case TensorDType::kBFloat16:
       return bf16_bits_to_float(load_scalar<std::uint16_t>(ptr));
+    case TensorDType::kFloat16:
+      return f16_bits_to_float(load_scalar<std::uint16_t>(ptr));
     case TensorDType::kFloat32:
       return load_scalar<float>(ptr);
   }
@@ -332,7 +338,7 @@ private:
     if (!storage_dtype(pid.items[1].global, &out.storage.dtype)) {
       return Status::error(
           "unsupported storage dtype; this reader supports torch.BFloat16Storage and "
-          "torch.FloatStorage, got: " +
+          "torch.HalfStorage / torch.FloatStorage, got: " +
           pid.items[1].global.module + "." + pid.items[1].global.name);
     }
     return push(std::move(out));
@@ -657,6 +663,8 @@ const char* dtype_name(TensorDType dtype) {
   switch (dtype) {
     case TensorDType::kBFloat16:
       return "bfloat16";
+    case TensorDType::kFloat16:
+      return "float16";
     case TensorDType::kFloat32:
       return "float32";
   }
@@ -665,10 +673,11 @@ const char* dtype_name(TensorDType dtype) {
 
 std::uint64_t dtype_size_bytes(TensorDType dtype) {
   switch (dtype) {
-    case TensorDType::kBFloat16:
-      return 2;
-    case TensorDType::kFloat32:
-      return 4;
+  case TensorDType::kFloat16:
+  case TensorDType::kBFloat16:
+    return 2;
+  case TensorDType::kFloat32:
+    return 4;
   }
   return 0;
 }

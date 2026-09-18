@@ -54,6 +54,47 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/tokens/count" \
   --data '{"messages":[{"role":"user","content":"hello"}]}'
 ```
 
+## MiSS adapter lifecycle and request fields
+
+Register an exported MiSS inference directory before using it. Registration
+validates and caches the package in CPU RAM; it does not upload weights to GPU.
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/adapters" \
+  -H "Content-Type: application/json" \
+  --data '{"adapter_id":"task-a","path":"/absolute/path/miss_output/adapter"}'
+
+curl -sS "http://127.0.0.1:8000/v1/adapters"
+```
+
+All generation endpoints accept `adapter_id`, optional `adapter_version`, and
+optional `adapter_scale`. The first request uploads the complete adapter to the
+GPU; prefill and decode reuse it without per-layer or per-token transfers.
+
+```json
+{
+  "adapter_id": "task-a",
+  "adapter_version": "sha256-content-version",
+  "adapter_scale": 1.0
+}
+```
+
+Omit `adapter_version` to bind the latest registered version at request
+admission. `adapter_scale` is the absolute effective scale override. Stateful
+sessions are isolated by base-model lifetime, adapter content version, scale,
+initial state, and WKV precision, so an incompatible cached state is rejected.
+Delete a registration after in-flight requests release their immutable handles:
+
+```bash
+curl -sS -X DELETE "http://127.0.0.1:8000/v1/adapters" \
+  -H "Content-Type: application/json" \
+  --data '{"adapter_id":"task-a"}'
+```
+
+The list response includes RAM/GPU hits, misses, uploads, H2D time, resident
+bytes, and adapter GPU peak bytes. Package format and cache-budget details are
+in the [MiSS guide](../src/miss/README.md).
+
 ## Chat completions
 
 OpenAI-style chat endpoint. Use `stream:false` for one JSON response.

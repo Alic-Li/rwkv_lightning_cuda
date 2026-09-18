@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "rwkv/io/fingerprint.hpp"
 #include "rwkv/io/pth_archive.hpp"
 #include "rwkv/io/pth_tensor.hpp"
 #include "rwkv_quantized.hpp"
@@ -262,5 +263,14 @@ int main(int argc, char** argv) {
     std::cerr << "error: --group-size is only valid with --format w4a16\n";
     return 2;
   }
-  return run(positional[0], positional[1], mode, group_size);
+  const int result = run(positional[0], positional[1], mode, group_size);
+  if (!result) {
+    try {
+      rwkv7_miss::write_source_fingerprint(positional[0], positional[1]);
+    } catch (const std::exception &e) {
+      std::cerr << "source identity: " << e.what() << "\n";
+      return 1;
+    }
+  }
+  return result;
 }
