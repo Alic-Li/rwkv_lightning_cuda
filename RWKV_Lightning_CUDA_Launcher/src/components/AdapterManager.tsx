@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { RWKVClient, type AdapterEntry } from "../lib/api/client";
+import {
+  adapterIDFromFilename,
+  RWKVClient,
+  type AdapterEntry,
+} from "../lib/api/client";
 import { useSecret, useSettings } from "../stores/settings";
 import { ErrorPanel, Field } from "./common";
 
@@ -13,7 +17,6 @@ export function AdapterManager() {
   const [entries, setEntries] = useState<AdapterEntry[]>([]);
   const [id, setId] = useState("");
   const [path, setPath] = useState("");
-  const [file, setFile] = useState<File>();
   const [metadata, setMetadata] = useState<File>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -46,14 +49,26 @@ export function AdapterManager() {
       });
     return () => controller.abort();
   }, [client, revision]);
-  const register = async (upload: boolean) => {
+  const upload = async (file: File, adapterID: string) => {
     setBusy(true);
     setError("");
     try {
-      const result = upload
-        ? await client.uploadAdapter(id.trim(), file!, metadata)
-        : await client.registerAdapter(id.trim(), path);
-      select(id.trim(), result.version);
+      const result = await client.uploadAdapter(adapterID, file, metadata);
+      select(adapterID, result.version);
+      setRevision((v) => v + 1);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const registerPath = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const adapterID = id.trim();
+      const result = await client.registerAdapter(adapterID, path);
+      select(adapterID, result.version);
       setRevision((v) => v + 1);
     } catch (e) {
       setError(String(e));
@@ -122,7 +137,10 @@ export function AdapterManager() {
           }
         />
       </Field>
-      <Field label="Adapter ID to register">
+      <Field
+        label="Adapter ID (optional for upload)"
+        hint="Leave empty to use the PTH filename."
+      >
         <input
           value={id}
           onChange={(e) => setId(e.target.value)}
@@ -134,7 +152,14 @@ export function AdapterManager() {
           type="file"
           accept=".pth"
           disabled={busy}
-          onChange={(e) => setFile(e.target.files?.[0])}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";
+            if (!file) return;
+            const adapterID = id.trim() || adapterIDFromFilename(file.name);
+            setId(adapterID);
+            void upload(file, adapterID);
+          }}
         />
       </Field>
       <Field label="Legacy checkpoint.json (optional)">
@@ -145,13 +170,6 @@ export function AdapterManager() {
           onChange={(e) => setMetadata(e.target.files?.[0])}
         />
       </Field>
-      <button
-        type="button"
-        disabled={busy || !file || !id.trim()}
-        onClick={() => void register(true)}
-      >
-        Upload & select
-      </button>
       <details>
         <summary>Register a file already on the server</summary>
         <Field
@@ -163,7 +181,7 @@ export function AdapterManager() {
         <button
           type="button"
           disabled={busy || !path.trim() || !id.trim()}
-          onClick={() => void register(false)}
+          onClick={() => void registerPath()}
         >
           Register & select
         </button>
@@ -186,7 +204,7 @@ export function AdapterManager() {
       </button>
       <p className="small muted">{stats}</p>
       <ErrorPanel error={error} />
-      {busy && <p role="status">Registering…</p>}
+      {busy && <p role="status">Uploading adapter…</p>}
       {entries.map((entry) => (
         <div className="panel" key={entry.id + entry.version}>
           <strong>{entry.id}</strong>

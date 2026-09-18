@@ -30,6 +30,10 @@ export interface AdapterEntry {
   version: string;
   manifest: { rank: number; scale: number; targets: unknown[] };
 }
+export function adapterIDFromFilename(filename: string) {
+  const name = filename.trim().replace(/\.pth$/i, "").trim();
+  return name || "adapter";
+}
 export function adapterFields(v: {
   adapter_id?: string;
   adapter_version?: string;

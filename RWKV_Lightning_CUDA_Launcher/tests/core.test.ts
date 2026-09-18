@@ -14,7 +14,16 @@ import {
   extractHTMLDocuments,
 } from "../src/lib/chat/html";
 import { suggestedQuantizedPath } from "../src/lib/api/launcher";
-import { adapterFields, generationBody } from "../src/lib/api/client";
+import {
+  adapterFields,
+  adapterIDFromFilename,
+  generationBody,
+} from "../src/lib/api/client";
+it("derives an adapter ID for state-like file upload", () => {
+  expect(adapterIDFromFilename("adapter-final.pth")).toBe("adapter-final");
+  expect(adapterIDFromFilename("HTML.PTH")).toBe("HTML");
+  expect(adapterIDFromFilename(".pth")).toBe("adapter");
+});
 it("omits unset adapter fields and preserves explicit zero scale", () => {
   expect(
     adapterFields({

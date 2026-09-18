@@ -138,7 +138,7 @@ State tuning 使用 `.pth` 基础模型，最终张量结构由原生加载器�
 
 在 Chat 的 **MiSS** 按钮、Parallel Translate 的 MiSS 面板或 Settings 的 **MiSS adapters** 面板中：
 
-- 指定 adapter ID，上传最终 PTH 或新 checkpoint 的 `training.pth`；旧 checkpoint 可附带 `checkpoint.json`。
+- 选择最终 PTH 或新 checkpoint 的 `training.pth` 后立即上传并用于新请求；adapter ID 可选，留空时使用去掉 `.pth` 的文件名。旧 checkpoint 可先附带 `checkpoint.json`。
 - 也可填写服务器已有文件的绝对路径注册。
 - 注册只缓存 D 到服务器 RAM；首次调用才装入 GPU。
 - 选择具体内容版本，并按需覆盖 scale；留空使用默认值，0 保留为显式零。
