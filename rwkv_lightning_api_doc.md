@@ -623,6 +623,9 @@ Authorization: Bearer your-password
 | `GET` | `/v1/models` | 查询已加载和可加载模型 | 否 |
 | `POST` | `/v1/model/load` | 显式加载或切换模型（仅动态模式） | 否 |
 | `POST` | `/v1/tokens/count` | 计算 token 数 | 否 |
+| `POST` | `/v1/state/upload` | 上传初始 state 文件 | 否 |
+| `GET` / `POST` | `/v1/state/list` | 列出已上传 state | 否 |
+| `DELETE` / `POST` | `/v1/state/delete` | 删除已上传 state | 否 |
 | `POST` | `/v1/adapters` | 注册 MiSS 推理 adapter 到 CPU RAM | 否 |
 | `GET` | `/v1/adapters` | 列出 adapter、版本与缓存指标 | 否 |
 | `DELETE` | `/v1/adapters` | 删除 adapter 注册 | 否 |
@@ -638,8 +641,8 @@ Authorization: Bearer your-password
 | `POST` | `/v1/server/resume` | 恢复可续推的聊天流 | 固定为 SSE |
 
 > 动态加载模式当前注册 `/v1/models`、`/v1/model/load`、`/v1/tokens/count`、
-> `/v1/chat/completions`、`/v1/batch/completions` 和 `/v1/server/status`。其余路由保持
-> 单模型启动模式下的现有行为。
+> `/v1/chat/completions`、`/v1/batch/completions`、`/v1/server/status`、`/v1/adapters`，
+> 以及 `/v1/state/upload`、`/v1/state/list`、`/v1/state/delete`。其余路由仅在单模型模式提供。
 
 ### 4. 通用生成参数
 
@@ -668,22 +671,9 @@ Authorization: Bearer your-password
 `chunk_size` 是输出刷新粒度，不是 prefill 分块。prefill 分块由进程启动参数
 `--chunk-size` 全局控制，默认 `128`。
 
-MiSS 推理包必须是 `adapter.json + adapter.pth` 目录，不能使用训练 checkpoint
-目录代替。注册时只校验并缓存 CPU RAM，第一次生成时才把该版本的全部 D 张量一次性
-上传 GPU。注册、查询和删除示例：
-
-```bash
-curl -X POST http://127.0.0.1:8000/v1/adapters \
-  -H 'Content-Type: application/json' \
-  -d '{"adapter_id":"task-a","path":"/absolute/path/miss_output/adapter"}'
-curl http://127.0.0.1:8000/v1/adapters
-curl -X DELETE http://127.0.0.1:8000/v1/adapters \
-  -H 'Content-Type: application/json' -d '{"adapter_id":"task-a"}'
-```
-
-有状态缓存会把基模运行实例、adapter 内容版本、有效 scale、初始 state 和 WKV 精度
-一起纳入身份；切换 adapter 后不会复用不兼容 state。完整格式、版本生命周期与预算环境
-变量见 [`src/miss/README.md`](src/miss/README.md)。
+初始 state 文件的上传、列表和删除，以及 MiSS 适配器的注册、版本选择、列表、删除、
+鉴权和生成示例，统一维护在 [HTTP API 中文文档](docs/http-api.zh-CN.md#状态与适配器端点速查)。
+MiSS 推理包格式与缓存预算见 [MiSS 中文文档](src/miss/README.zh-CN.md)。
 
 ### 5. Thinking 模式
 

@@ -36,13 +36,13 @@ you intentionally want to listen on all IPv4 interfaces.
 
 ## Run on Windows
 
-```bash
-cd build\bundle\rwkv_lighting_cuda;
-set "SCRIPT_DIR=%~dp0\";
-.\build/rwkv_lighting_cuda \
-  --model-path /path/to/model.pth \
-  --vocab-path /path/to/rwkv_vocab_v20230424.txt \
-  --host 127.0.0.1 \
+```powershell
+cd .\build\bundle\rwkv_lighting_cuda
+$env:PATH = "$PWD\lib;$env:PATH"
+.\rwkv_lighting_cuda.exe `
+  --model-path C:\models\model.pth `
+  --vocab-path .\rwkv_vocab_v20230424.txt `
+  --host 127.0.0.1 `
   --port 8000
 ```
 

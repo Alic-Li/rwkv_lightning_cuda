@@ -51,8 +51,17 @@ curl -sS "http://127.0.0.1:8000/v1/server/status"
 | [构建](docs/build.zh-CN.md) | CUDA、ROCm、Windows、量化工具和打包方式 |
 | [运行](docs/run.zh-CN.md) | 服务参数、动态模型加载、state tuning 和运行示例 |
 | [HTTP API](docs/http-api.zh-CN.md) | 生成、流式、批量、state 和管理接口 |
-| [MiSS adapter&peft](src/miss/README.md) | 训练、续训、导出、动态加载、缓存和验收；目前为英文技术文档 |
-| [State tuning](src/state_tuning/README.md) | `time_state` 训练与 checkpoint 说明 |
+| [MiSS 适配器与参数高效微调](src/miss/README.zh-CN.md) | 训练、续训、导出、动态加载、缓存和验收 |
+| [状态微调](src/state_tuning/README.zh-CN.md) | `time_state` 训练与检查点说明 |
+| [MiSS 验证记录](src/miss/VALIDATION.zh-CN.md) / [优化计划](src/miss/OPTIMIZATION_PLAN.zh-CN.md) | 数值验证、实测性能和后续优化目标 |
+| [HIP 后端](hip/README.zh-CN.md) / [移植验证](hip/VALIDATION.zh-CN.md) | AMD 构建、状态微调与验证范围 |
+| [W8A16 / W4A16 量化](quant/README.zh-CN.md) / [W7900 量化验证](hip/QUANTIZATION.zh-CN.md) | 量化格式、精度与吞吐实测 |
+| [多后端路由器](RWKV_Lightning_CUDA_router/README.zh-CN.md) | 负载均衡、会话亲和和状态文件广播 |
+| [Windows 构建与运行](docs/windows-build-run.zh-CN.md) | Windows 环境、编译、打包和启动 |
+| [CI 与版本发布](docs/releasing.zh-CN.md) | CI 检查、安装包和版本发布流程 |
+| [桌面启动器](RWKV_Lightning_CUDA_Launcher/README.md) | Web 界面、模型管理、聊天和训练 |
+| [W4A16 CUDA 算子](quant/gemmv/README_w4a16.md) / [算子审计](docs/kernel-audit-2026-09-12.md) | 量化算子实现、优化与验证 |
+| [W7900 风扇控制](docs/w7900-fan-control.zh-CN.md) | Linux 下的 AMD 风扇配置 |
 
 完整接口字段还可参考 [API 参考](rwkv_lightning_api_doc.md)。英文主文档中的
 [Documentation](README.md#documentation) 只列英文页面，中文入口统一放在本页，

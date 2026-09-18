@@ -1,5 +1,7 @@
 # HIP backend
 
+English | [简体中文](README.zh-CN.md)
+
 This directory contains the ROCm/HIP port of the inference backend and its GPU kernels.
 Configure it with:
 

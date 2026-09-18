@@ -1,5 +1,7 @@
 # MiSS training optimization plan
 
+English | [简体中文](OPTIMIZATION_PLAN.zh-CN.md)
+
 ## Baseline
 
 The first large-model run used:

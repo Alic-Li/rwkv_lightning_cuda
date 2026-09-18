@@ -1,5 +1,7 @@
 # CI and releases
 
+English | [简体中文](releasing.zh-CN.md)
+
 The `CI and Release` GitHub Actions workflow builds CUDA packages for Linux x86-64
 (Ubuntu 22.04) and Windows x64 (Windows Server 2022 / MSVC) against a CUDA
 12.9 / 13.2 matrix. It uses pinned vcpkg dependencies and the Go version in the

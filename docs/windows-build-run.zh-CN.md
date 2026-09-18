@@ -1,45 +1,47 @@
-# Windows build and run guide
+# Windows 构建与运行指南
 
-English | [简体中文](windows-build-run.zh-CN.md)
+[English](windows-build-run.md) | 简体中文
 
-This document records the Windows build that was verified on Windows 10 with an RTX 3080.
+本文记录在 Windows 10、RTX 3080 上验证过的 Windows 构建流程。
 
-## Verified environment
+## 已验证环境
 
-- OS: Windows 10 Pro 22H2, build 19045
-- GPU: NVIDIA GeForce RTX 3080, compute capability 8.6
-- NVIDIA driver: 576.57
-- CUDA Toolkit: 12.9
-- Visual Studio: Visual Studio 2022 with MSVC x64 toolchain
-- CMake: 4.0.3 or newer
-- Go: 1.24.4 or newer, only required for `rwkv_launcher.exe`
-- vcpkg: current enough to install `drogon:x64-windows`
+- 操作系统：Windows 10 Pro 22H2，内部版本 19045
+- GPU：NVIDIA GeForce RTX 3080，计算能力 8.6
+- NVIDIA 驱动：576.57
+- CUDA Toolkit：12.9
+- Visual Studio：Visual Studio 2022，包含 MSVC x64 工具链
+- CMake：4.0.3 或更新版本
+- Go：1.24.4 或更新版本，仅构建 `rwkv_launcher.exe` 时需要
+- vcpkg：版本需足够新，能够安装 `drogon:x64-windows`
 
-The exact GPU architecture used for this build is `86`. For other NVIDIA GPUs, change `CMAKE_CUDA_ARCHITECTURES` to the matching architecture, or use a multi-architecture list for a wider release package.
+本次构建使用 GPU 架构 `86`。其他 NVIDIA GPU 应将 `CMAKE_CUDA_ARCHITECTURES`
+改为对应架构，或使用多架构列表生成适用范围更广的发布包。
 
-## Required build dependencies
+## 构建依赖
 
-Install these tools before building:
+构建前安装以下工具：
 
-- Visual Studio 2022, including `Desktop development with C++`
-- Windows 10 or Windows 11 SDK from the Visual Studio installer
+- Visual Studio 2022，包含“使用 C++ 的桌面开发”（`Desktop development with C++`）工作负载
+- 通过 Visual Studio 安装器安装 Windows 10 或 Windows 11 SDK
 - NVIDIA CUDA Toolkit 12.9
 - CMake
 - Git
 - vcpkg
-- Go, if the web launcher should be built
+- Go（需要构建 Web 启动器时）
 
-Install the C++ dependencies with vcpkg:
+通过 vcpkg 安装 C++ 依赖：
 
 ```powershell
 C:\vcpkg\vcpkg.exe install sqlite3:x64-windows drogon:x64-windows
 ```
 
-`drogon:x64-windows` brings the runtime dependencies used by the server, including Trantor, OpenSSL, zlib, c-ares, Brotli, and JsonCpp.
+`drogon:x64-windows` 会安装服务端使用的运行时依赖，包括 Trantor、OpenSSL、zlib、
+c-ares、Brotli 和 JsonCpp。
 
-## Build the CUDA backend
+## 构建 CUDA 后端
 
-Run from the repository root:
+在仓库根目录执行：
 
 ```powershell
 cd D:\repo\rwkv_lightning_cuda
@@ -59,21 +61,21 @@ cmake -S . -B .\build_win10_sm86 `
 cmake --build .\build_win10_sm86 --config Release -j --target bundle_rwkv_lighting_cuda
 ```
 
-For a wider binary package, replace `86` with a list such as:
+要生成适用范围更广的二进制包，可将 `86` 替换为如下列表：
 
 ```powershell
 -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90"
 ```
 
-The backend executable is generated at:
+后端可执行文件生成在：
 
 ```text
 build_win10_sm86\bundle\rwkv_lighting_cuda\rwkv_lighting_cuda.exe
 ```
 
-## Build the web launcher
+## 构建 Web 启动器
 
-Run from the repository root:
+从仓库根目录开始执行：
 
 ```powershell
 cd D:\repo\rwkv_lightning_cuda\RWKV_Lightning_CUDA_Launcher
@@ -85,17 +87,18 @@ go build -trimpath -ldflags="-s -w" `
   .\main.go
 ```
 
-The launcher starts an HTTP control page on `http://127.0.0.1:8088`. On Windows, it prepends the bundled `lib` directory to the child backend process `PATH`.
+启动器在 `http://127.0.0.1:8088` 提供 HTTP 控制页面。
+在 Windows 上，它将包内的 `lib` 目录加到后端子进程 `PATH` 的开头。
 
-## Complete the runtime bundle
+## 补齐运行时安装包
 
-The CMake bundle target copies the backend executable, vocabulary, and detected runtime DLLs into:
+CMake 的打包目标将后端可执行文件、词表和检测到的运行时 DLL 复制到：
 
 ```text
 build_win10_sm86\bundle\rwkv_lighting_cuda
 ```
 
-If the CUDA runtime DLLs were not discovered automatically on a particular machine, copy them into the bundle manually:
+如果某台机器未能自动找到 CUDA 运行时 DLL，请手动复制到安装包中：
 
 ```powershell
 $bundle = "D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda"
@@ -106,7 +109,7 @@ Copy-Item "$cudaBin\cublas64_12.dll" -Destination "$bundle\lib" -Force
 Copy-Item "$cudaBin\cublasLt64_12.dll" -Destination "$bundle\lib" -Force
 ```
 
-The expected runtime bundle layout is:
+预期的运行时目录结构：
 
 ```text
 rwkv_lighting_cuda
@@ -133,28 +136,29 @@ rwkv_lighting_cuda
 `-- rwkv_vocab_v20230424.txt
 ```
 
-If CMake copied Windows system DLLs into `lib`, they can be removed from the bundle. Keep the vcpkg DLLs, VC runtime DLLs, and CUDA DLLs listed above.
+如果 CMake 将 Windows 系统 DLL 复制进 `lib`，可以将它们从包中移除。
+保留上面列出的 vcpkg DLL、VC 运行时 DLL 和 CUDA DLL。
 
-## Run with the launcher
+## 通过启动器运行
 
-The launcher is the recommended way to run the backend on Windows because it prepares the child process environment:
+Windows 下建议使用启动器运行后端，因为它会准备子进程环境：
 
 ```powershell
 cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda
 .\rwkv_launcher.exe
 ```
 
-Open:
+打开：
 
 ```text
 http://127.0.0.1:8088
 ```
 
-Use the UI to select the model, vocab, port, password, and WKV mode.
+在界面中选择模型、词表、端口、密码和 WKV 模式。
 
-## Run the backend directly
+## 直接运行后端
 
-When starting `rwkv_lighting_cuda.exe` directly, prepend the bundle `lib` directory to `PATH` first:
+直接启动 `rwkv_lighting_cuda.exe` 时，先将包内 `lib` 目录加入 `PATH` 开头：
 
 ```powershell
 cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda
@@ -169,7 +173,7 @@ $env:PATH = "$PWD\lib;$env:PATH"
   --chunk-size 128
 ```
 
-Optional arguments:
+可选参数：
 
 ```powershell
 --host 127.0.0.1
@@ -178,21 +182,20 @@ Optional arguments:
 --wkv32
 ```
 
-The backend binds to `127.0.0.1` by default. Use `--host 0.0.0.0` only when
-you intentionally want to listen on all IPv4 interfaces.
+后端默认绑定 `127.0.0.1`。只有确实需要监听全部 IPv4 网络接口时才使用 `--host 0.0.0.0`。
 
-## Verify the server
+## 验证服务
 
-After the backend prints the endpoint list, verify the OpenAI-compatible models endpoint:
+后端打印端点列表后，检查 OpenAI 兼容的模型列表接口：
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/v1/models
 ```
 
-A successful response looks like:
+成功响应示例：
 
 ```json
 {"data":[{"id":"rwkv7-g1g-2.9b-20260526-ctx8192","object":"model","owned_by":"rwkv_lighting_cuda"}],"object":"list"}
 ```
 
-Runtime files such as `rwkv_sessions.db` and `uploads` are generated in the working directory and are intentionally ignored by git.
+`rwkv_sessions.db` 和 `uploads` 等运行时文件生成在当前工作目录，已明确配置为由 git 忽略。

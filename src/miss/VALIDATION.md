@@ -1,5 +1,7 @@
 # MiSS validation record — 2026-09-18
 
+English | [简体中文](VALIDATION.zh-CN.md)
+
 Environment: RTX PRO 6000 Blackwell Workstation Edition, CUDA architecture
 sm_120, NVIDIA driver 610.57.04. Release CMake build. Python oracle: local
 PyTorch 2.14.0+cu130. ROCm SDK and AMD device were unavailable.

@@ -1,5 +1,7 @@
 # W8A16 and W4A16 quantization
 
+English | [简体中文](README.zh-CN.md)
+
 This directory contains the shared archive format and CUDA W8A16/W4A16 implementations.
 The HIP implementation is in `hip/rwkv_quantized.hip`; see
 [W7900 migration and validation](../hip/QUANTIZATION.md). The

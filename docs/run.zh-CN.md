@@ -1,6 +1,6 @@
 # 运行服务端
 
-[English](run.md) | 简体中文 | [返回 README](../README.md)
+[English](run.md) | 简体中文 | [返回 README](../README_zh.md)
 
 ## 运行服务端
 
@@ -33,13 +33,13 @@ state 数据库存放在同一目录（同样是当前工作目录）。部署�
 
 ## Windows 运行
 
-```bash
-cd build\bundle\rwkv_lighting_cuda;
-set "SCRIPT_DIR=%~dp0\";
-.\build/rwkv_lighting_cuda \
-  --model-path /path/to/model.pth \
-  --vocab-path /path/to/rwkv_vocab_v20230424.txt \
-  --host 127.0.0.1 \
+```powershell
+cd .\build\bundle\rwkv_lighting_cuda
+$env:PATH = "$PWD\lib;$env:PATH"
+.\rwkv_lighting_cuda.exe `
+  --model-path C:\models\model.pth `
+  --vocab-path .\rwkv_vocab_v20230424.txt `
+  --host 127.0.0.1 `
   --port 8000
 ```
 
@@ -94,7 +94,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/model/load" \
 训练。样本会在 `--ctx` 处截断；`--chunk` 控制 checkpoint/recompute 长度并做反向 state
 梯度传播。`--batch-size N` 在每次优化器更新中累积 N 条变长样本。checkpoint 只包含
 state 张量，可直接上传到现有推理后端使用。实现细节见
-`../src/state_tuning/README.md`。
+[状态微调文档](../src/state_tuning/README.zh-CN.md)。
 
 ## MiSS adapter 训练与推理
 
@@ -118,4 +118,4 @@ checkpoint，以及与训练 checkpoint 分离的推理导出：
 `adapter_id`，并按需指定 `adapter_version` 或 `adapter_scale`。注册阶段只在 CPU
 RAM 中校验和缓存；第一次请求时才把整个 adapter 一次性上传到 GPU。checkpoint
 续训、推理包身份、缓存预算、性能分析和验收说明见
-[MiSS 文档](../src/miss/README.md)。
+[MiSS 文档](../src/miss/README.zh-CN.md)。

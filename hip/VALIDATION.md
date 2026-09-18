@@ -1,5 +1,7 @@
 # HIP migration validation
 
+English | [简体中文](VALIDATION.zh-CN.md)
+
 This file records the earlier FP16/state-tuning migration. W4A16/W8A16 were
 subsequently migrated and validated separately: [quantized inference report](QUANTIZATION.md).
 

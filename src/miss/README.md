@@ -1,5 +1,7 @@
 # MiSS adapter training and serving
 
+English | [简体中文](README.zh-CN.md)
+
 The FP16 base remains frozen. Only `D[out, rank]` receives parameter gradients.
 This implements the efficient MiSS form from [the paper](https://arxiv.org/pdf/2409.15371)
 and [reference project](https://github.com/Joluck/MiSS), with no stored or trained A.
@@ -88,7 +90,7 @@ working directory. A production-sized example is:
 | `--batch-size` | Number of independent samples accumulated before one optimizer update |
 | `--epochs`, `--max-steps` | Dataset passes and optional optimizer-update limit |
 | `--save-every`, `--resume` | Periodic resumable checkpoint interval and checkpoint directory |
-| `--wkv_tape` | Share the existing WKV replay tape across layers to reduce recomputation |
+| `--wkv_tape` | Share the WKV replay tape across layers, trading extra WKV recomputation for lower memory |
 
 Defaults are `epochs=1`, `rank=16`, `alpha=rank`, `ctx=128`, `chunk=64`, and
 `batch-size=1`. Steps count optimizer updates, not chunks. The learning-rate
@@ -135,19 +137,11 @@ uses the existing unquantized FP16 runtime representation of BF16 archives.
 
 ## HTTP API and caches
 
-```bash
-curl -X POST localhost:8000/v1/adapters -H 'Content-Type: application/json' \
-  -d '{"adapter_id":"task-a","path":"/absolute/path/miss_output/adapter"}'
-curl localhost:8000/v1/adapters
-curl -X DELETE localhost:8000/v1/adapters -H 'Content-Type: application/json' \
-  -d '{"adapter_id":"task-a"}'
-```
-
-Registration loads and validates CPU RAM only. Generation endpoints accept
-`adapter_id`, optional `adapter_version`, and optional `adapter_scale` (an
-absolute effective scale override). An omitted version selects the latest
-registered version at request admission. One request/batch binds one immutable
-handle. Existing handles survive deletion; new lookup of a deleted version fails.
+Registration, listing, deletion, authentication, and generation request examples
+are maintained in the [HTTP API guide](../../docs/http-api.zh-CN.md#miss-适配器注册列表与删除)
+([English](../../docs/http-api.md)). Registration reads an inference directory on
+the server; there is no multipart adapter-upload endpoint. Existing request
+handles survive deletion, while new lookups of deleted versions fail.
 
 GPU miss uploads the entire contiguous D collection once using pinned staging
 and a nonblocking copy stream. A ready event must complete before publication.

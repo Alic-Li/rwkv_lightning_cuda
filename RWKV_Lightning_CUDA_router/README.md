@@ -1,5 +1,7 @@
 # RWKV Lightning CUDA Router
 
+English | [简体中文](README.zh-CN.md)
+
 An HTTP reverse proxy that balances RWKV inference servers by in-flight batch size
 instead of request count. It passes every method, header, response status, and SSE
 stream through unchanged.

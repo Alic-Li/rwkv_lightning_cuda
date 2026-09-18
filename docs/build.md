@@ -33,12 +33,12 @@ The CUDA inference backend detects the tensor dtype in `.rwkvq` automatically,
 keeps packed INT4 or INT8 weights on device, and dispatches W4A16 or W8A16 for
 attention projections, FFN projections, and the output head. W4 also supports
 `--group-size 32` when higher fidelity is worth the extra scales. Existing
-two-positional-argument commands still export W8A16. HIP builds continue to use
-the BF16/PTH path.
+two-positional-argument commands still export W8A16. HIP builds support both BF16/PTH and W4A16/W8A16 `.rwkvq` inference; see
+the [W7900 quantization report](../hip/QUANTIZATION.md).
 
 ## Windows
 
-```bash
+```powershell
 $env:CudaToolkitDir="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\"
 cmake -S . -B ./build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120" -DCMAKE_TOOLCHAIN_FILE="D:/vcpkg/scripts/buildsystems/vcpkg.cmake"  -DCMAKE_CXX_FLAGS="/Zc:preprocessor" -DCMAKE_CUDA_FLAGS="-Xcompiler=/Zc:preprocessor"
 
@@ -60,6 +60,9 @@ cmake --build build-hip -j
 ```bash
 ## Linux
 CGO_ENABLED=0 go build -ldflags="-s -w" -o rwkv_launcher main.go
+```
+
+```powershell
 ## Windows
 $env:CGO_ENABLED="0"
 go build -trimpath -ldflags="-s -w" -o .\rwkv_launcher.exe .\main.go

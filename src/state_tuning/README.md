@@ -1,5 +1,7 @@
 # RWKV-7 state-tuning sidecar
 
+English | [简体中文](README.zh-CN.md)
+
 This directory is intentionally not a general training framework. It adds a
 CUDA/HIP reverse path for frozen FP16 runtime weights; BF16 model archives are
 still converted by the existing loader to the same FP16 runtime representation.

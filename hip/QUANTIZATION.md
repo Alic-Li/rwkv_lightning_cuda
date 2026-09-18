@@ -1,5 +1,7 @@
 # W7900 W4A16 / W8A16 migration
 
+English | [简体中文](QUANTIZATION.zh-CN.md)
+
 The HIP backend accepts the same `.rwkvq` archives as CUDA. INT4/INT8 projection
 weights remain compressed in VRAM. This migration was validated on a Radeon Pro
 W7900, `gfx1100`, native wave32, ROCm HIP 7.2.53211-9999, AMD Clang 22.0.0,
