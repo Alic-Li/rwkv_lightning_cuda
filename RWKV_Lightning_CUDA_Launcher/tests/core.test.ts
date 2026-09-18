@@ -12,6 +12,7 @@ import { normalizeLanguage } from "../src/lib/translate/languages";
 import {
   buildHTMLPreviewDocument,
   extractHTMLDocuments,
+  formatHTMLForMarkdown,
 } from "../src/lib/chat/html";
 import { suggestedQuantizedPath } from "../src/lib/api/launcher";
 import {
@@ -295,6 +296,30 @@ describe("generated HTML previews", () => {
     expect(extractHTMLDocuments("Use an <html> element.")).toEqual([]);
     expect(extractHTMLDocuments("```html\n<div>unfinished</div>")).toEqual([]);
   });
+  it("wraps standalone HTML for stable Markdown rendering", () => {
+    const raw =
+      '<!DOCTYPE html>\n<html lang="zh-CN"><body><script>const value = `ok`</script></body></html>';
+    const formatted = formatHTMLForMarkdown(raw);
+    expect(formatted).toStartWith("```html\n<!DOCTYPE html>");
+    expect(formatted).toEndWith("\n```");
+    expect(formatHTMLForMarkdown("Here is `<html>`.")).toBe(
+      "Here is `<html>`.",
+    );
+  });
+  it("repairs quoted HTML with an orphan closing fence and keeps the explanation", () => {
+    const malformed =
+      "><!DOCTYPE html>\n" +
+      '<html lang="zh-CN"><body>SVG animation</body></html>\n' +
+      "```\n" +
+      "这是一个完全用 SVG 手绘的鹈鹕骑自行车动画。";
+    expect(extractHTMLDocuments(malformed)).toEqual([
+      '<!DOCTYPE html>\n<html lang="zh-CN"><body>SVG animation</body></html>',
+    ]);
+    const formatted = formatHTMLForMarkdown(malformed);
+    expect(formatted).toStartWith("```html\n<!DOCTYPE html>");
+    expect(formatted).toContain("</html>\n```\n\n这是一个完全用 SVG");
+    expect(formatted.match(/```/g)).toHaveLength(2);
+  });
   it("renders generated markup in an isolated sandboxed iframe", () => {
     const preview = buildHTMLPreviewDocument(
       '<script>document.body.textContent="ok"</script>',
@@ -318,6 +343,45 @@ describe("generated HTML previews", () => {
         },
       }),
     );
+    expect(html).toContain("Preview HTML");
+  });
+  it("displays unfenced assistant HTML as one highlighted code block", async () => {
+    const { createElement } = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { Message } = await import("../src/pages/ChatPage");
+    const html = renderToStaticMarkup(
+      createElement(Message, {
+        message: {
+          id: "raw-answer",
+          role: "assistant",
+          content:
+            '<!DOCTYPE html>\n<html lang="zh-CN"><head></head><body>ok</body></html>',
+        },
+      }),
+    );
+    expect(html).toContain('<code class="hljs language-html">');
+    expect(html).toContain("&lt;!DOCTYPE");
+    expect(html).toContain('hljs-keyword">html</span>&gt;');
+    expect(html).not.toContain("<blockquote>");
+    expect(html).toContain("Preview HTML");
+  });
+  it("renders the malformed model response as HTML code followed by prose", async () => {
+    const { createElement } = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { Message } = await import("../src/pages/ChatPage");
+    const html = renderToStaticMarkup(
+      createElement(Message, {
+        message: {
+          id: "quoted-html-answer",
+          role: "assistant",
+          content:
+            "><!DOCTYPE html>\n<html><body>ok</body></html>\n```\n这是后续说明。",
+        },
+      }),
+    );
+    expect(html).toContain('<code class="hljs language-html">');
+    expect(html).toContain("<p>这是后续说明。</p>");
+    expect(html).not.toContain("<blockquote>");
     expect(html).toContain("Preview HTML");
   });
 });

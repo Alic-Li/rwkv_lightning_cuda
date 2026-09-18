@@ -20,7 +20,11 @@ import { GenerationSettings } from "../components/GenerationSettings";
 import { StateManager } from "../components/StateManager";
 import { AdapterManager } from "../components/AdapterManager";
 import { CopyButton, Dialog } from "../components/common";
-import { extractHTMLDocuments, openHTMLPreview } from "../lib/chat/html";
+import {
+  extractHTMLDocuments,
+  formatHTMLForMarkdown,
+  openHTMLPreview,
+} from "../lib/chat/html";
 export const Message = memo(function Message({
   message,
 }: {
@@ -29,6 +33,13 @@ export const Message = memo(function Message({
   const htmlDocuments = useMemo(
     () =>
       message.role === "assistant" ? extractHTMLDocuments(message.content) : [],
+    [message.content, message.role],
+  );
+  const renderedContent = useMemo(
+    () =>
+      message.role === "assistant"
+        ? formatHTMLForMarkdown(message.content)
+        : message.content,
     [message.content, message.role],
   );
   return (
@@ -44,7 +55,7 @@ export const Message = memo(function Message({
       </div>
       <div className="markdown">
         <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-          {message.content || "…"}
+          {renderedContent || "…"}
         </Markdown>
       </div>
       {message.error && (
