@@ -11,6 +11,7 @@
 # RWKV Lightning CUDA
 
 [中文说明](README_zh.md)
+[知乎文章](https://zhuanlan.zhihu.com/p/2084593015339991309)
 
 High-performance RWKV-7 inference server for NVIDIA CUDA GPUs, with an AMD HIP
 fallback path. It ships OpenAI-style and native batch APIs with streaming SSE,
