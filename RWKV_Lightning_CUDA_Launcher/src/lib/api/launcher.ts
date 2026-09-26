@@ -1,73 +1,17 @@
-import { request } from "./client";
-export interface RuntimeConfig {
-  model_path: string;
-  vocab_path: string;
-  port: string;
-  password: string;
-  use_wkv32: boolean;
-  chunk_load: boolean;
-  enable_dynamic_loading: boolean;
-  chunk_size: number;
-  state_db_path: string;
-  tune_cache: string;
-}
-export type RuntimeStatus =
-  | "offline"
-  | "starting"
-  | "ready"
-  | "stopping"
-  | "error";
-export interface ProcessStatus {
-  status: RuntimeStatus | "running" | "completed";
-  running: boolean;
-  error: string;
-  logs: string[];
-  elapsed: number;
-  checkpoint?: string;
-  progress?: {
-    step: number;
-    total: number;
-    epoch: number;
-    epochs: number;
-    loss: number;
-    lr: number;
-    tokens_per_second: number;
-    eta: number;
-  };
-  losses?: { step: number; loss: number }[];
-  available?: boolean;
-  miss_available?: boolean;
-}
-export interface QuantizationStatus extends ProcessStatus {
-  output_path?: string;
-}
-export interface QuantizationConfig {
-  input_path: string;
-  output_path: string;
-  format: "w8a16" | "w4a16";
-  group_size: 32 | 128;
-}
-export const defaultQuantization: QuantizationConfig = {
-  input_path: "",
-  output_path: "",
-  format: "w4a16",
-  group_size: 128,
-};
-export function suggestedQuantizedPath(
-  input: string,
-  format: QuantizationConfig["format"],
-) {
-  const base = input.replace(/\.pth$/i, "");
-  return base ? `${base}.${format}.rwkvq` : "";
-}
-export interface RuntimeState extends ProcessStatus {
-  config?: RuntimeConfig;
-  base_url?: string;
-  backend?: {
-    model?: { id?: string; name?: string; path?: string; loaded?: boolean };
-    prefill_queue?: Record<string, number>;
-  };
-}
+import type {
+  DeviceSelection,
+  QuantizationConfig,
+  RuntimeConfig,
+  TuningConfig,
+} from "./types";
+
+export type * from "./types";
+
+/**
+ * First-run defaults. Note that a runtime `start` decodes onto the previously
+ * saved config, so omitting a field preserves the stored value — always submit
+ * the complete form.
+ */
 export const defaultRuntime: RuntimeConfig = {
   model_path: "",
   vocab_path: "./rwkv_vocab_v20230424.txt",
@@ -80,37 +24,16 @@ export const defaultRuntime: RuntimeConfig = {
   state_db_path: "rwkv_sessions.db",
   tune_cache: "",
 };
-export interface TuningConfig {
-  method: "state" | "miss";
-  rank: number;
-  alpha: number;
-  targets: string;
-  state: string;
-  resume: string;
-  model: string;
-  data: string;
-  output: string;
-  vocab: string;
-  ctx: number;
-  chunk: number;
-  epochs: number;
-  batch_size: number;
-  max_steps: number;
-  lr: number;
-  lr_final: number;
-  warmup_steps: number;
-  save_every: number;
-  seed: number;
-  optimizer: "adam" | "muon";
-  wkv_tape: boolean;
+
+/** MiSS is adam-only; `state` keeps whatever the user picked. */
+export function effectiveOptimizer(
+  config: TuningConfig,
+): TuningConfig["optimizer"] {
+  return config.method === "miss" ? "adam" : config.optimizer;
 }
+
 export const defaultTuning: TuningConfig = {
   method: "state",
-  rank: 16,
-  alpha: 16,
-  targets: "all",
-  state: "",
-  resume: "",
   model: "",
   data: "",
   output: "./state_output",
@@ -127,59 +50,61 @@ export const defaultTuning: TuningConfig = {
   seed: 1234,
   optimizer: "adam",
   wkv_tape: false,
+  rank: 16,
+  alpha: 16,
+  targets: "all",
+  state: "",
+  resume: "",
 };
-export class LauncherClient {
-  getStatus(signal?: AbortSignal) {
-    return request<RuntimeState>("/api/status", undefined, signal);
-  }
-  start(config: RuntimeConfig) {
-    return request("/api/start", config);
-  }
-  stop() {
-    return request("/api/stop", {});
-  }
-  restart() {
-    return request("/api/restart", {});
-  }
-  pickFile() {
-    return request<{ path: string }>("/api/pick-file", {});
-  }
-  pickDirectory() {
-    return request<{ path: string }>("/api/pick-directory", {});
+
+export const defaultQuantization: QuantizationConfig = {
+  input_path: "",
+  output_path: "",
+  format: "w4a16",
+  group_size: 128,
+};
+
+export function suggestedQuantizedPath(
+  input: string,
+  format: QuantizationConfig["format"],
+) {
+  const base = input.replace(/\.pth$/i, "");
+  return base ? `${base}.${format}.rwkvq` : "";
+}
+
+/**
+ * `visible_devices` is a three-state string on the wire. `inherit` omits the
+ * field so the Agent keeps its `--card` / inherited env; `none` sends `""` to
+ * explicitly inject nothing.
+ */
+export function deviceValue(selection: DeviceSelection) {
+  switch (selection.mode) {
+    case "inherit":
+      return undefined;
+    case "none":
+      return "";
+    case "explicit":
+      return selection.value.trim();
   }
 }
-export class StateTuningClient {
-  getStatus(signal?: AbortSignal) {
-    return request<ProcessStatus>("/api/tuning/status", undefined, signal);
+
+export function applyDevice<T extends { visible_devices?: string }>(
+  body: T,
+  selection: DeviceSelection,
+): T {
+  const value = deviceValue(selection);
+  if (value === undefined) {
+    // `visible_devices` must be absent (not empty) to inherit the Agent config.
+    const rest = { ...body };
+    delete rest.visible_devices;
+    return rest;
   }
-  start(config: TuningConfig) {
-    return request("/api/tuning/start", config);
-  }
-  stop() {
-    return request("/api/tuning/stop", {});
-  }
-  validate(path: string) {
-    return request<{ samples: number }>("/api/tuning/validate", { path });
-  }
-  openFolder() {
-    return request("/api/tuning/open-folder", {});
-  }
+  return { ...body, visible_devices: value };
 }
-export class QuantizationClient {
-  getStatus(signal?: AbortSignal) {
-    return request<QuantizationStatus>(
-      "/api/quantization/status",
-      undefined,
-      signal,
-    );
-  }
-  start(config: QuantizationConfig) {
-    return request("/api/quantization/start", config);
-  }
-  stop() {
-    return request("/api/quantization/stop", {});
-  }
+
+/** Rebuild the tri-state selector from a value echoed by the Agent. */
+export function deviceSelection(value: string | undefined): DeviceSelection {
+  if (value === undefined) return { mode: "inherit" };
+  if (value === "") return { mode: "none" };
+  return { mode: "explicit", value };
 }
-export const launcher = new LauncherClient();
-export const tuning = new StateTuningClient();
-export const quantization = new QuantizationClient();

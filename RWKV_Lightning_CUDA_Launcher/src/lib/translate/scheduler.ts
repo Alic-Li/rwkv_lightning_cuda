@@ -1,3 +1,5 @@
+import { tNow } from "@/lib/i18n";
+
 export interface TranslateChunk {
   id: number;
   source: string;
@@ -19,7 +21,7 @@ export function createTranslationScheduler(options: {
     options.concurrency < 1 ||
     options.concurrency > 128
   )
-    throw new Error("Batch size must be an integer from 1 to 128");
+    throw new Error(tNow("error.batchSize"));
   const controller = new AbortController();
   let cursor = 0;
   const run = async () => {

@@ -1,12 +1,18 @@
 import { create } from "zustand";
-import { persist, createJSONStorage } from "zustand/middleware";
-import { chunkText, translationPrompt } from "../lib/translate/chunk";
-import { normalizeLanguage } from "../lib/translate/languages";
-import type { TranslateChunk } from "../lib/translate/scheduler";
-import { RWKVClient, adapterFields } from "../lib/api/client";
-import { useSettings, useSecret, storage } from "./settings";
-export const translationBody = (prompt: string | string[]) => ({
-  contents: Array.isArray(prompt) ? prompt : [prompt],
+import { createJSONStorage, persist } from "zustand/middleware";
+import { adapterFields } from "@/lib/api/client";
+import { inferenceApi } from "@/lib/api/inference";
+import { chunkText, translationPrompt } from "@/lib/translate/chunk";
+import { normalizeLanguage } from "@/lib/translate/languages";
+import type { TranslateChunk } from "@/lib/translate/scheduler";
+import { storage, useSettings } from "./settings";
+
+/**
+ * Raw continuation body for `/v1/batch/completions`. `stop_tokens: [0]` and the
+ * sampling values are part of the translation contract — do not "tidy" them.
+ */
+export const translationBody = (contents: string | string[]) => ({
+  contents: Array.isArray(contents) ? contents : [contents],
   stream: false,
   max_tokens: 2048,
   temperature: 1,
@@ -17,26 +23,38 @@ export const translationBody = (prompt: string | string[]) => ({
   alpha_decay: 0.996,
   stop_tokens: [0],
 });
-interface Job {
+
+interface TranslateState {
+  /** Node the current results belong to; results never leak across nodes. */
+  owner: string;
   source: string;
   chunks: TranslateChunk[];
   busy: boolean;
   error: string;
   elapsed: number;
+  /** Empty string means "follow the saved default". */
   from: string;
   to: string;
+  /** 0 means "follow the saved default". */
   concurrency: number;
   set: (
-    v: Partial<Pick<Job, "source" | "from" | "to" | "concurrency">>,
+    patch: Partial<
+      Pick<TranslateState, "source" | "from" | "to" | "concurrency" | "error">
+    >,
   ) => void;
-  run: (ids?: number[]) => Promise<void>;
+  run: (backendId: string, ids?: number[]) => Promise<void>;
   stop: () => void;
   clear: () => void;
 }
-let activeController: AbortController | undefined;
+
+let controller: AbortController | null = null;
+
+const MAX_BATCH = 128;
+
 export const useTranslate = create(
-  persist<Job>(
+  persist<TranslateState>(
     (set, get) => ({
+      owner: "",
       source: "",
       chunks: [],
       busy: false,
@@ -45,135 +63,174 @@ export const useTranslate = create(
       from: "",
       to: "",
       concurrency: 0,
-      set: (v) => set(v),
-      stop: () => activeController?.abort(),
+
+      set: (patch) => set(patch),
+
+      stop: () => controller?.abort(),
+
       clear: () => {
-        if (!get().busy) set({ source: "", chunks: [], error: "", elapsed: 0 });
-      },
-      run: async (ids) => {
         if (get().busy) return;
-        const v = useSettings.getState().values;
+        set({ source: "", chunks: [], error: "", elapsed: 0 });
+      },
+
+      run: async (backendId, ids) => {
         const state = get();
-        // This adapter is a Launcher feature, never silently assume a remote CUDA chat endpoint is raw.
-        if (v.baseURL && v.baseURL.replace(/\/$/, "") !== location.origin) {
-          set({
-            error:
-              "Raw translation requires this Go Launcher. Leave API Base URL empty (automatic).",
-          });
-          return;
-        }
+        if (state.busy || !backendId) return;
+        const settings = useSettings.getState();
         const from = normalizeLanguage(
-            state.from || v.sourceLanguage,
-            "English",
-          ),
-          to = normalizeLanguage(state.to || v.targetLanguage, "Chinese");
-        const limit = state.concurrency || v.concurrency;
-        if (!from.trim() || !to.trim()) {
-          set({ error: "Both language names are required." });
+          state.from || settings.sourceLanguage,
+          "English",
+        );
+        const to = normalizeLanguage(
+          state.to || settings.targetLanguage,
+          "Chinese",
+        );
+        const limit = state.concurrency || settings.concurrency;
+        if (!from || !to || from === to) {
+          set({ error: "invalid-languages" });
           return;
         }
-        if (from === to) {
-          set({ error: "Source and target languages must be different." });
+        if (!Number.isInteger(limit) || limit < 1 || limit > MAX_BATCH) {
+          set({ error: "invalid-batch" });
           return;
         }
+
+        // Results are scoped to a node: switching nodes starts a fresh job.
+        const sameOwner = state.owner === backendId;
         let chunks: TranslateChunk[];
+        if (ids) {
+          if (!sameOwner) return;
+          chunks = state.chunks.map((c) => ({ ...c }));
+        } else {
+          chunks = chunkText(state.source).map((source, id) => ({
+            id,
+            source,
+            prompt: translationPrompt(source, from, to),
+            status: "pending" as const,
+            translated: "",
+          }));
+          if (chunks.length === 0) {
+            set({ error: "empty-source" });
+            return;
+          }
+        }
+
+        const selected = ids ? chunks.filter((c) => ids.includes(c.id)) : chunks;
+        const started = performance.now();
+        controller = new AbortController();
+        const signal = controller.signal;
+
+        const publish = () =>
+          set({
+            chunks,
+            owner: backendId,
+            elapsed: (performance.now() - started) / 1000,
+          });
+
+        set({ busy: true, error: "", chunks, owner: backendId });
+        publish();
+
         try {
-          chunks = ids
-            ? state.chunks.map((c) => ({ ...c }))
-            : chunkText(state.source).map((source, id) => ({
-                id,
-                source,
-                prompt: translationPrompt(source, from, to),
-                status: "pending",
-                translated: "",
-              }));
-          if (!chunks.length) throw new Error("Paste a document first.");
-          const selected = ids
-            ? chunks.filter((c) => ids.includes(c.id))
-            : chunks;
-          const started = performance.now();
-          const publish = () => {
-            set({
-              chunks: chunks.map((c) => ({ ...c })),
-              elapsed: (performance.now() - started) / 1000,
-            });
-          };
-          const client = new RWKVClient("", useSecret.getState().key);
-          if (!Number.isInteger(limit) || limit < 1 || limit > 128)
-            throw new Error("Batch size must be an integer from 1 to 128");
-          const controller = new AbortController();
-          activeController = controller;
-          set({ chunks: chunks.map((c) => ({ ...c })), busy: true, error: "" });
           for (let offset = 0; offset < selected.length; offset += limit) {
+            if (signal.aborted) break;
             const batch = selected.slice(offset, offset + limit);
+            const batchStarted = performance.now();
             for (const chunk of batch) {
               chunk.status = "running";
               chunk.error = undefined;
               chunk.translated = "";
             }
             publish();
-            const batchStarted = performance.now();
+
             try {
-              const result = await client.completeChat(
+              const response = await inferenceApi.batchCompletions(
+                backendId,
                 {
-                  ...translationBody(batch.map((chunk) => chunk.prompt)),
-                  ...adapterFields(v.generation),
+                  ...translationBody(batch.map((c) => c.prompt)),
+                  ...adapterFields(settings.generation),
                 },
-                controller.signal,
+                signal,
               );
-              const choices = new Map(
-                (result.choices || []).map((choice) => [choice.index, choice]),
+              const byIndex = new Map(
+                (response.choices ?? []).map((choice) => [choice.index, choice]),
               );
               for (const [index, chunk] of batch.entries()) {
-                const choice = choices.get(index);
-                if (!choice?.message?.content)
+                const choice = byIndex.get(index);
+                const text = choice?.message?.content;
+                if (typeof text !== "string")
                   throw new Error(
                     `Backend returned no result for line ${chunk.id + 1}`,
                   );
-                chunk.translated = choice.message.content;
-                chunk.finishReason = choice.finish_reason;
+                chunk.translated = text;
+                chunk.finishReason = choice?.finish_reason;
                 chunk.status = "done";
               }
-            } catch (e) {
+            } catch (error) {
+              const aborted = signal.aborted;
               for (const chunk of batch) {
                 if (chunk.status === "done") continue;
-                chunk.status = controller.signal.aborted ? "pending" : "error";
-                chunk.error = controller.signal.aborted
+                chunk.status = aborted ? "pending" : "error";
+                chunk.error = aborted
                   ? "Stopped. Retry to continue."
-                  : String(e);
+                  : error instanceof Error
+                    ? error.message
+                    : String(error);
               }
-              if (controller.signal.aborted) break;
+              if (aborted) {
+                publish();
+                break;
+              }
             } finally {
-              const elapsed = (performance.now() - batchStarted) / 1000;
-              for (const chunk of batch) chunk.elapsed = elapsed;
+              const seconds = (performance.now() - batchStarted) / 1000;
+              for (const chunk of batch) chunk.elapsed = seconds;
               publish();
             }
           }
-          publish();
-        } catch (e) {
-          set({ error: String(e) });
+        } catch (error) {
+          if (!signal.aborted)
+            set({
+              error: error instanceof Error ? error.message : String(error),
+            });
         } finally {
-          activeController = undefined;
+          publish();
+          controller = null;
           set({ busy: false });
         }
       },
     }),
     {
-      name: "rwkv-translation-v1",
+      name: "rwkv-translation-v2",
+      version: 2,
       storage: createJSONStorage(() => storage),
-      partialize: (s) => ({ ...s, busy: false }),
+      partialize: (s) =>
+        ({
+          owner: s.owner,
+          source: s.source,
+          chunks: s.chunks,
+          elapsed: s.elapsed,
+          from: s.from,
+          to: s.to,
+          concurrency: s.concurrency,
+        }) as TranslateState,
       onRehydrateStorage: () => (state) => {
-        if (state)
-          state.chunks = state.chunks.map((c) =>
-            c.status === "running"
-              ? {
-                  ...c,
-                  status: "pending",
-                  error: "Interrupted by reload. Retry to continue.",
-                }
-              : c,
-          );
+        if (!state) return;
+        // A reload cannot resume in-flight requests: put them back in the queue.
+        state.chunks = state.chunks.map((chunk) =>
+          chunk.status === "running"
+            ? {
+                ...chunk,
+                status: "pending",
+                error: "Interrupted by reload. Retry to continue.",
+              }
+            : chunk,
+        );
       },
     },
   ),
 );
+
+export const translatedOutput = (chunks: TranslateChunk[]) =>
+  chunks
+    .filter((c) => c.status === "done" && c.translated)
+    .map((c) => c.translated)
+    .join("\n\n");

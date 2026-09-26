@@ -1,1 +1,55 @@
-<!doctype html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><meta name="theme-color" content="#171d23"/><meta name="description" content="RWKV Lightning local runtime, chat, parallel translation and state tuning."/><title>RWKV Lightning</title><script>try{const s=JSON.parse(localStorage.getItem("rwkv-settings-v1")||"{}");const t=s?.state?.values?.theme||"dark";const r=t==="system"?(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"):t;document.documentElement.dataset.theme=r;document.documentElement.style.colorScheme=r;document.querySelector('meta[name="theme-color"]').content=r==="light"?"#d5dfe5":"#171d23"}catch{document.documentElement.dataset.theme="dark"}</script></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <meta name="theme-color" content="#09090b" />
+    <meta
+      name="description"
+      content="RWKV Lightning 多后端控制台：节点总览、Runtime 运维、Chat、并行翻译、State / MiSS 训练与量化。"
+    />
+    <title>RWKV Lightning Console</title>
+    <script>
+      // Paint the persisted theme before React mounts so there is no flash.
+      // The default is "system": a hard-coded dark default would ignore the
+      // desktop's appearance setting.
+      (function () {
+        var prefersLight = function () {
+          try {
+            return matchMedia("(prefers-color-scheme: light)").matches;
+          } catch (error) {
+            return false;
+          }
+        };
+        var theme = "system";
+        try {
+          var raw = localStorage.getItem("rwkv-settings-v2");
+          if (raw) theme = JSON.parse(raw)?.state?.theme || "system";
+        } catch (error) {
+          /* unreadable storage: fall back to the system preference */
+        }
+        var resolved =
+          theme === "light" || theme === "dark"
+            ? theme
+            : prefersLight()
+              ? "light"
+              : "dark";
+        var root = document.documentElement;
+        root.dataset.theme = resolved;
+        root.style.colorScheme = resolved;
+        root.lang = "zh-CN";
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta)
+          meta.setAttribute(
+            "content",
+            resolved === "light" ? "#ffffff" : "#09090b",
+          );
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

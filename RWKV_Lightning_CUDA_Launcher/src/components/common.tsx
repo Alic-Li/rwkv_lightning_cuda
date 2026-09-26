@@ -1,258 +1,211 @@
+import { Check, Copy, FolderOpen, HardDrive } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { X, Copy, Search, FolderOpen, Check } from "lucide-react";
-import { launcher } from "../lib/api/launcher";
-export function ErrorPanel({
-  error,
-  children,
-}: {
-  error?: string;
-  children?: ReactNode;
-}) {
-  return error ? (
-    <div className="error-panel" role="alert">
-      <strong>Something needs attention</strong>
-      <div>{error}</div>
-      {children}
-    </div>
-  ) : null;
-}
-export function Panel({
-  title,
-  children,
-  hint,
-}: {
-  title: string;
-  children: ReactNode;
-  hint?: string;
-}) {
-  return (
-    <section className="panel">
-      <div className="section-heading">
-        <h2>{title}</h2>
-        {hint && <span>{hint}</span>}
-      </div>
-      {children}
-    </section>
-  );
-}
-export function Field({
+import { Button } from "@/components/ui/button";
+import { Field } from "@/components/ui/field";
+import { copyText } from "@/lib/api/http";
+import { nodeApi } from "@/lib/api/node";
+import { useI18n } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+import { toast, usePageTitle, useUI } from "@/stores/ui";
+
+export function CopyButton({
+  text,
   label,
-  hint,
-  children,
+  className,
+  size = "xs",
+  disabled,
 }: {
-  label: string;
-  hint?: string;
-  children: ReactNode;
+  text: string;
+  label?: string;
+  className?: string;
+  size?: "xs" | "sm" | "default";
+  disabled?: boolean;
 }) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
   return (
-    <label className="field">
-      <span title={hint}>
-        {label}
-        {hint && (
-          <span className="help" title={hint}>
-            ⓘ
-          </span>
-        )}
-      </span>
-      {children}
-    </label>
+    <Button
+      size={size}
+      className={className}
+      disabled={disabled || !text}
+      onClick={async () => {
+        try {
+          await copyText(text);
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1800);
+        } catch (error) {
+          toast.error(
+            t("toast.failed", {
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        }
+      }}
+    >
+      {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+      {copied ? t("common.copied") : (label ?? t("common.copy"))}
+    </Button>
   );
 }
+
+/**
+ * Reports whether the page heading is still on screen, so the toolbar can
+ * carry the view name only while this one is scrolled out of sight. Set
+ * eagerly on mount — a page always opens scrolled to the top, and waiting for
+ * the observer's first callback would flash the duplicate title for a frame.
+ */
+function useHeadingVisibility() {
+  const ref = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    const setVisible = usePageTitle.getState().setInlineVisible;
+    setVisible(true);
+    const node = ref.current;
+    if (!node) return () => setVisible(false);
+    const observer = new IntersectionObserver(
+      ([entry]) => setVisible(entry.isIntersecting),
+      // The scroll container clips the heading, so the viewport root is
+      // enough; the threshold trips once the heading is more than half gone.
+      { threshold: 0.5 },
+    );
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+      setVisible(false);
+    };
+  }, []);
+  return ref;
+}
+
+export function PageHeader({
+  eyebrow,
+  title,
+  description,
+  actions,
+  className,
+}: {
+  eyebrow?: ReactNode;
+  title: ReactNode;
+  description?: ReactNode;
+  actions?: ReactNode;
+  className?: string;
+}) {
+  const headingRef = useHeadingVisibility();
+  return (
+    <div
+      className={cn(
+        "flex flex-wrap items-end justify-between gap-4",
+        className,
+      )}
+    >
+      <div className="min-w-0">
+        {eyebrow && (
+          <div className="font-mono text-[11px] font-semibold tracking-[0.08em] text-muted-foreground">
+            {eyebrow}
+          </div>
+        )}
+        <h1
+          ref={headingRef}
+          className="mt-0.5 text-[22px] font-semibold tracking-[-0.02em]"
+        >
+          {title}
+        </h1>
+        {description && (
+          <p className="mt-1.5 max-w-3xl text-[13px] leading-relaxed text-muted-foreground">
+            {description}
+          </p>
+        )}
+      </div>
+      {actions && (
+        <div className="flex flex-wrap items-center gap-2">{actions}</div>
+      )}
+    </div>
+  );
+}
+
+const pickerButton =
+  "mr-0.5 inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors last:mr-[3px] hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50";
+
+/**
+ * Remote path input. Browsing goes through the Agent whitelist
+ * (`POST /api/v1/node/fs`); the native host picker is only offered for nodes
+ * that advertise `host_dialog`, because it opens on the *node's* desktop.
+ */
 export function PathField({
   label,
   value,
   onChange,
   placeholder,
-  directory = false,
+  backendId,
+  hostDialog = false,
+  className,
 }: {
-  label: string;
+  label: ReactNode;
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
-  directory?: boolean;
+  backendId: string;
+  hostDialog?: boolean;
+  className?: string;
 }) {
-  const [error, setError] = useState("");
+  const { t } = useI18n();
+  const openFsBrowser = useUI((s) => s.openFsBrowser);
   const [busy, setBusy] = useState(false);
   return (
-    <div>
-      <Field label={label}>
-        <span className="path-input">
-          <input
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-            placeholder={placeholder || "/path/to/file"}
-          />
+    <Field label={label} hint={t("fs.description")} className={className}>
+      {/* One control, not an input with a button beside it: in a two-column
+          form the old "浏览远端" button took half the row and left the path
+          itself fifty pixels to show in. The pickers are icons at its end. */}
+      <div
+        className={cn(
+          "flex h-[34px] min-w-0 items-center rounded-lg border border-border bg-background transition-colors",
+          "focus-within:border-border-strong focus-within:ring-2 focus-within:ring-ring/40",
+        )}
+      >
+        <input
+          value={value}
+          placeholder={placeholder}
+          spellCheck={false}
+          onChange={(event) => onChange(event.target.value)}
+          className="h-full min-w-0 flex-1 bg-transparent px-2.5 font-mono text-xs outline-none placeholder:text-muted-foreground/70"
+        />
+        {hostDialog && (
           <button
             type="button"
-            title={`Browse ${label}`}
+            title={t("fs.hostDialog")}
+            aria-label={t("fs.hostDialog")}
             disabled={busy}
+            className={pickerButton}
             onClick={async () => {
               setBusy(true);
-              setError("");
               try {
-                const { path } = directory
-                  ? await launcher.pickDirectory()
-                  : await launcher.pickFile();
-                if (path) onChange(path);
-              } catch (e) {
-                setError(String(e));
+                const result = await nodeApi.pickFile(backendId);
+                if (result.path) onChange(result.path);
+              } catch (error) {
+                toast.error(
+                  t("toast.failed", {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  }),
+                );
               } finally {
                 setBusy(false);
               }
             }}
           >
-            <FolderOpen size={16} />
-            <span>Browse</span>
+            <FolderOpen className="size-3.5" />
           </button>
-        </span>
-      </Field>
-      {error && <p className="inline-error">{error}</p>}
-    </div>
-  );
-}
-export function CopyButton({
-  text,
-  label = "Copy",
-}: {
-  text: string;
-  label?: string;
-}) {
-  const [state, setState] = useState("");
-  return (
-    <>
-      <button
-        type="button"
-        title={label}
-        onClick={async () => {
-          try {
-            await navigator.clipboard.writeText(text);
-            setState("Copied");
-            setTimeout(() => setState(""), 1800);
-          } catch {
-            setState("Clipboard unavailable");
-          }
-        }}
-      >
-        {state === "Copied" ? <Check size={14} /> : <Copy size={14} />}{" "}
-        {state || label}
-      </button>
-    </>
-  );
-}
-export function Dialog({
-  title,
-  children,
-  onClose,
-}: {
-  title: string;
-  children: ReactNode;
-  onClose: () => void;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const el = ref.current;
-    const previous = document.activeElement as HTMLElement | null;
-    el?.showModal();
-    return () => {
-      el?.close();
-      previous?.focus();
-    };
-  }, []);
-  return (
-    <dialog
-      ref={ref}
-      onCancel={(e) => {
-        e.preventDefault();
-        onClose();
-      }}
-      onClick={(e) => {
-        if (e.target === ref.current) onClose();
-      }}
-    >
-      <div className="dialog-heading">
-        <h2>{title}</h2>
-        <button title="Close dialog" onClick={onClose}>
-          <X size={18} />
+        )}
+        <button
+          type="button"
+          title={t("common.browse")}
+          aria-label={t("common.browse")}
+          disabled={!backendId}
+          className={pickerButton}
+          onClick={() => openFsBrowser(onChange, value)}
+        >
+          <HardDrive className="size-3.5" />
         </button>
       </div>
-      {children}
-    </dialog>
+    </Field>
   );
-}
-export function Console({
-  lines,
-  title = "Console",
-}: {
-  lines: string[];
-  title?: string;
-}) {
-  const [query, setQuery] = useState("");
-  const [cleared, setCleared] = useState<string | undefined>();
-  const box = useRef<HTMLDivElement>(null);
-  const following = useRef(true);
-  const start = cleared ? lines.lastIndexOf(cleared) + 1 : 0;
-  const visible = lines
-    .slice(start)
-    .filter((l) => l.toLowerCase().includes(query.toLowerCase()));
-  useEffect(() => {
-    if (following.current && box.current)
-      box.current.scrollTop = box.current.scrollHeight;
-  }, [lines, query]);
-  return (
-    <details className="console-wrap" open>
-      <summary>
-        {title}
-        <span>stdout / stderr · {lines.length} lines</span>
-      </summary>
-      <div className="console-tools">
-        <span className="search-input">
-          <Search size={14} />
-          <input
-            aria-label="Search logs"
-            placeholder="Filter output…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-        </span>
-        <CopyButton text={visible.join("\n")} />
-        <button onClick={() => setCleared(lines.at(-1))}>Clear view</button>
-      </div>
-      <div
-        className="console"
-        ref={box}
-        onScroll={() => {
-          const el = box.current!;
-          following.current =
-            el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-        }}
-      >
-        {visible.length ? (
-          visible.map((line, i) => (
-            <div
-              key={i}
-              className={
-                /error|failed|exception|out of memory/i.test(line)
-                  ? "log-error"
-                  : ""
-              }
-            >
-              {line}
-            </div>
-          ))
-        ) : (
-          <span className="muted">Process output will appear here.</span>
-        )}
-      </div>
-    </details>
-  );
-}
-export function download(text: string, extension: string) {
-  const url = URL.createObjectURL(
-    new Blob([text], { type: "text/plain;charset=utf-8" }),
-  );
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `rwkv-translation.${extension}`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
