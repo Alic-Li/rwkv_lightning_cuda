@@ -57,13 +57,22 @@ cmake --build build-hip -j
 
 ## Go Web Frontend (launcher)
 
+Run from `RWKV_Lightning_CUDA_Launcher/`. Install Bun first; see the [frontend guide](../RWKV_Lightning_CUDA_Launcher/docs/frontend-development.md). Build the frontend before compiling Go:
+
+```bash
+bun install --frozen-lockfile
+bun run build
+```
+
+Linux GPU metrics require `CGO_ENABLED=1` and gcc/libdl; the portable build below disables NVML.
+
 ```bash
 ## Linux
-CGO_ENABLED=0 go build -ldflags="-s -w" -o rwkv_launcher main.go
+CGO_ENABLED=0 go build -ldflags="-s -w" -o rwkv_launcher .
 ```
 
 ```powershell
 ## Windows
 $env:CGO_ENABLED="0"
-go build -trimpath -ldflags="-s -w" -o .\rwkv_launcher.exe .\main.go
+go build -trimpath -ldflags="-s -w" -o .\rwkv_launcher.exe .
 ```

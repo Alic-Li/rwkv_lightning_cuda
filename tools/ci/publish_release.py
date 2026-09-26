@@ -66,8 +66,12 @@ class Publisher:
         release = self.lookup(f"releases/tags/{quote(self.tag, safe='')}")
         if release is not None:
             return release
-        # Tag lookup can omit drafts. Authenticated listing includes accessible drafts.
-        return next((r for r in self.pages("releases") if r["tag_name"] == self.tag), None)
+        # Tag lookup can omit drafts. Authenticated listing includes accessible
+        # drafts; match interrupted ones by name too, because a draft can sit on
+        # an "untagged-<hex>" placeholder tag_name that never equals the target.
+        return next((r for r in self.pages("releases")
+                     if r["tag_name"] == self.tag
+                     or (r["draft"] and r["name"] == self.tag)), None)
 
     def pages(self, path):
         page = 1
@@ -122,6 +126,27 @@ class Publisher:
             return release
         return retry(ensure)
 
+    def pin_tag(self, release_id):
+        """Re-assert the real tag on a release and confirm it stuck.
+
+        GitHub rewrites a release's tag_name to an "untagged-<hex>" placeholder
+        when a PATCH touches a draft whose target tag ref already exists —
+        observed on body updates right after ensure_tag created the ref, and
+        that placeholder is what published the old duplicate releases. The
+        rewrite can strike any PATCH, so pin right before the publish flip and
+        verify again after it; the release must never land on a placeholder.
+        """
+        def pin():
+            current = self.api(f"releases/{release_id}")
+            if current.get("tag_name") != self.tag:
+                self.api(f"releases/{release_id}", {"tag_name": self.tag}, "PATCH")
+        retry(pin)
+        final = retry(lambda: self.api(f"releases/{release_id}"))
+        if final.get("tag_name") != self.tag:
+            raise RuntimeError(
+                f"Release {release_id} stayed on tag {final.get('tag_name')!r} instead of {self.tag}"
+            )
+
     def publish(self, directory):
         assets = sorted(p for p in directory.iterdir()
                         if p.name.endswith((".zip", ".tar.gz", ".sha256")))
@@ -142,8 +167,10 @@ class Publisher:
         for asset in assets:
             print(f"Uploading {asset.name}", flush=True)
             self.upload_asset(release, asset)
+        self.pin_tag(release["id"])
         # PATCH is idempotent, including when publishing succeeded but its response was lost.
         retry(lambda: self.api(release_path, {"draft": False, "make_latest": "true"}, "PATCH"))
+        self.pin_tag(release["id"])
         print(f"Published {self.tag}")
 
 

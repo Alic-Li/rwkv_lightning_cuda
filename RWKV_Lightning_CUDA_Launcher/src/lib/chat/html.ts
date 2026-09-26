@@ -100,10 +100,10 @@ export function openHTMLPreview(html: string) {
       type: "text/html;charset=utf-8",
     }),
   );
-  const link = document.createElement("a");
-  link.href = url;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  link.click();
+  // Not rel=noopener: WebKit refuses to load a blob: URL in a tab that has
+  // no opener, which left the tab blank. The opener link is cut by hand
+  // instead; the generated page itself runs in a sandboxed iframe anyway.
+  const opened = window.open(url, "_blank");
+  if (opened) opened.opener = null;
   window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }

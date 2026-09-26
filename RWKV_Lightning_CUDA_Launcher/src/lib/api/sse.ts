@@ -1,3 +1,5 @@
+import { tNow } from "@/lib/i18n";
+
 /** Incremental SSE framing; UTF-8 decoding belongs to the stream reader. */
 export class SSEParser {
   private pending = "";
@@ -56,7 +58,7 @@ export async function readSSE(
       throw new Error(`Malformed SSE event: ${data.slice(0, 160)}`);
     }
     if (!event || typeof event !== "object")
-      throw new Error("Invalid SSE event");
+      throw new Error(tNow("error.invalidSSE"));
     if (event.error)
       throw new Error(
         typeof event.error === "string"

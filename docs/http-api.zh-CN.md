@@ -2,6 +2,8 @@
 
 [English](http-api.md) | 简体中文 | [返回 README](../README_zh.md)
 
+本页介绍原生推理服务；Launcher 的 Client/Agent 控制、鉴权和后端转发请看[联调指南](../RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md)。
+
 完整的接口参考（中文）见 [rwkv_lightning_api_doc.md](../rwkv_lightning_api_doc.md)。
 以下示例假设服务端运行在 `8000` 端口。
 如果服务端以 `--password` 启动，请通过 Bearer token 请求头或 JSON 里的 `password`

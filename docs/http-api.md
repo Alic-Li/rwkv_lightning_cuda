@@ -2,6 +2,8 @@
 
 [English](http-api.md) | [简体中文](http-api.zh-CN.md) | [Back to README](../README.md)
 
+This page covers the native inference service. For Launcher Client/Agent control, authentication and backend forwarding, see the [integration guide (Chinese)](../RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md).
+
 The complete endpoint reference (in Chinese) lives in
 [rwkv_lightning_api_doc.md](../rwkv_lightning_api_doc.md). The examples below
 assume the server is running on port `8000`.

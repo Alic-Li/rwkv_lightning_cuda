@@ -28,7 +28,7 @@
 - CMake
 - Git
 - vcpkg
-- Go（需要构建 Web 启动器时）
+- Go、Bun（需要构建 Web 启动器时）
 
 通过 vcpkg 安装 C++ 依赖：
 
@@ -80,14 +80,17 @@ build_win10_sm86\bundle\rwkv_lighting_cuda\rwkv_lighting_cuda.exe
 ```powershell
 cd D:\repo\rwkv_lightning_cuda\RWKV_Lightning_CUDA_Launcher
 
+bun install --frozen-lockfile
+bun run build
+
 $env:CGO_ENABLED = "0"
 
 go build -trimpath -ldflags="-s -w" `
   -o ..\build_win10_sm86\bundle\rwkv_lighting_cuda\rwkv_launcher.exe `
-  .\main.go
+  .
 ```
 
-启动器在 `http://127.0.0.1:8088` 提供 HTTP 控制页面。
+启动器在 `http://127.0.0.1:10721` 提供 HTTP 控制页面。
 在 Windows 上，它将包内的 `lib` 目录加到后端子进程 `PATH` 的开头。
 
 ## 补齐运行时安装包
@@ -151,7 +154,7 @@ cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda
 打开：
 
 ```text
-http://127.0.0.1:8088
+http://127.0.0.1:10721
 ```
 
 在界面中选择模型、词表、端口、密码和 WKV 模式。
