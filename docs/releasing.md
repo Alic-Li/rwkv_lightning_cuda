@@ -111,7 +111,15 @@ Assets are uploaded through the REST `upload_url` returned by the release API,
 using its numeric release ID rather than resolving the tag again through
 `gh release upload`. Same-name assets (including incomplete uploads) are removed
 before retrying. Tag lookup also falls back to paginated release listing to find
-existing drafts. Uploads are checked for completed state and file size.
+existing drafts, matching interrupted drafts by release name when they sit on an
+`untagged-<hex>` placeholder tag. GitHub also rewrites a draft's `tag_name` to a
+placeholder whenever a PATCH touches the draft while the target tag ref already
+exists (observed on release-notes updates right after the tag was created). The
+publisher therefore re-reads and re-pins the real tag right before publishing
+and verifies the binding again afterwards, failing the job rather than letting
+the release land on a placeholder tag and the next push publish the same
+version again.
+Uploads are checked for completed state and file size.
 The release remains a draft if
 any upload fails. Already published releases are never overwritten.
 
