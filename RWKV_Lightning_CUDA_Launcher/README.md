@@ -1,25 +1,37 @@
 # RWKV Lightning Launcher
 
-本地 Go Launcher + Bun / TypeScript / React 静态 WebUI。包含 Chat、Parallel Translate、State Tuning、Runtime、Settings，默认深色 Aero 风格，支持 Light / System。
+Go Launcher + React / TypeScript 静态 WebUI，使用 Vite 构建、Tailwind CSS 4 设计令牌、Bun 管理依赖与测试。多后端控制台包含节点总览、Runtime 运维、Chat、并行翻译、State / MiSS 训练、量化与设置，默认跟随系统外观，可显式选择深色 / 浅色，并支持中英界面切换。
+
+## 文档入口
+
+- [前端与第三方联调指南](docs/integration-guide.md)：接入方式、鉴权、curl / SDK 示例、错误与 SSE。
+- [控制面 API 参考](docs/control-plane-api.md)：完整路由、请求体、返回值与兼容约定。
+- [前端开发指南](docs/frontend-development.md)：工程结构、Tailwind 接入、多后端架构、Bun 与测试。
+- [未决事项](docs/open-items.md)：已知但未修的问题、需要先做决定的兼容性取舍、尚未实机验收的范围。
+- [原生推理 API](../rwkv_lightning_api_doc.md)：C++ server 的生成、模型、state、adapter 接口。
+
+前端框架是 React，样式为 Tailwind CSS 4（CSS-first `@theme` 令牌 + shadcn 风格自建组件 + Radix primitives），不使用 HeroUI；Bun 用于依赖管理、脚本执行和测试。
 
 ## 构建与运行
 
-在本目录执行：
+安装 Bun（CI 使用 1.3.9），然后在本目录执行：
 
 ```bash
-bun install
+bun install --frozen-lockfile
 bun run build
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o rwkv_launcher main.go
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o rwkv_launcher .
 ```
 
 Windows PowerShell：
 
 ```powershell
-bun install
+bun install --frozen-lockfile
 bun run build
 $env:CGO_ENABLED="0"
-go build -trimpath -ldflags="-s -w" -o rwkv_launcher.exe main.go
+go build -trimpath -ldflags="-s -w" -o rwkv_launcher.exe .
 ```
+
+Linux 上要启用 GPU 指标（NVML 绑定）需以 `CGO_ENABLED=1 go build .` 构建（只需 gcc 与 libdl，不需要 CUDA toolkit）；`CGO_ENABLED=0` 构建仍然可用，metrics 端点会返回 `available:false` 加原因。macOS/Windows 构建不受影响。
 
 将 Launcher 放进原生后端的运行目录，保留原生 bundle 的依赖库：
 
@@ -35,9 +47,33 @@ runtime-directory/
 
 Windows release 中位于可执行文件旁的 DLL 也应保留；旧 Launcher 对 `lib/` 的 PATH 补充逻辑继续生效。Linux 使用原生 bundle 自带的库解析规则。CUDA/HIP 在原生程序编译时选择，前端没有虚构 CPU 或设备切换参数。
 
-运行 `./rwkv_launcher`（Windows 为 `./rwkv_launcher.exe`），访问 **http://127.0.0.1:8088**。程序默认打开系统浏览器；设置 `RWKV_LAUNCHER_NO_BROWSER=1` 可禁用自动打开。
+运行 `./rwkv_launcher`（Windows 为 `./rwkv_launcher.exe`），访问 **http://127.0.0.1:10721**。程序默认打开系统浏览器；设置 `RWKV_LAUNCHER_NO_BROWSER=1` 可禁用自动打开。
 
-`dist/` 是纯静态输出，使用 `//go:embed dist/*` 编入 Go 二进制。生产环境不需要 Bun 或 Node.js。仓库中保留生成的 `dist/`，CI 会使用锁文件重新安装依赖、测试并构建前端，再编译 Go 并将 `dist/` 放入发布目录；修改前端后必须重新执行 `bun run build`，将源码、锁文件和更新后的 `dist/` 一起提交。
+### 形态与启动参数（多后端）
+
+同一个二进制靠 flag 决定跑成什么角色，详见 [docs/control-plane-api.md](docs/control-plane-api.md)：
+
+```bash
+rwkv_launcher                                  # 本机全套：Client + Agent 同机（现有行为）
+rwkv_launcher --listen 0.0.0.0:18766 --token t # 服务器节点：仅 Agent；非 loopback 必须带 token，否则拒绝启动
+rwkv_launcher --client                         # 控制台：仅 Client（本机无 runtime 二进制时自动进入，合法状态）
+```
+
+| Flag | 默认 | 说明 |
+| --- | --- | --- |
+| `--listen` | `127.0.0.1:10721` | 监听地址；非 loopback 必须配 `--token` |
+| `--token` | 空 | 控制/推理全部路径的 Bearer token（含 `/v1` 反代） |
+| `--client` | false | 纯 Client：WebUI + 后端注册表，不管理本地进程 |
+| `--config` | `~/.rwkv_launcher/launcher.json` | 后端注册表落盘位置（JSON，0600） |
+| `--card` | 空 | 本 Agent 默认选卡，注入 `CUDA_VISIBLE_DEVICES`（AMD 为 `HIP/ROCR_VISIBLE_DEVICES`） |
+
+`visible_devices`（字符串，如 `0`、`0,1`、空串=显式不注入）可出现在 Runtime / Tuning / Quantization 三个请求体里，优先级：请求体 > `--card` > 继承的 `CUDA_VISIBLE_DEVICES` > 不注入。训练与推理的互斥相应从全局改为按卡：显式选卡且设备集无交集时可并行，不可判定时保守拦截。
+
+`dist/` 是纯静态输出，使用 `//go:embed dist/*` 编入 Go 二进制。生产环境不需要 Bun 或 Node.js。
+
+`dist/` **不入库**，它是构建产物：CI 会使用锁文件重新安装依赖、跑 lint/test、执行 `bun run build`，然后才编译 Go，所以仓库里放一份只会在每次前端改动时产生无意义的二进制冲突。代价是 `go build` 之前必须先 `bun run build`——忘了的话 `//go:embed dist/*` 会直接编译失败（`pattern dist/*: no matching files found`），不会静默产出一个空壳二进制。
+
+字体同理：Geist 与 JetBrains Mono 以 `@fontsource-variable/*` 依赖形式安装，构建时产出 latin subset 的 variable woff2 到 `dist/assets/`，源码树与仓库里都不存放字体文件。二者自托管而非引 CDN，内网与离线机器上的观感才和设计稿一致。
 
 路由使用 `/#/chat`、`/#/translate`、`/#/state-tuning`、`/#/runtime`、`/#/settings`，无需服务端 SPA fallback。不要用 `file://` 打开 `dist/index.html`。
 
@@ -49,22 +85,24 @@ Windows release 中位于可执行文件旁的 DLL 也应保留；旧 Launcher �
 bun run dev
 ```
 
-Vite 将 `/api`、`/v1` 和 `/logs` 转发到 `127.0.0.1:8088`。生产流量直接走 Go，没有 Node 中间层。`go run main.go` 的临时可执行目录不包含原生二进制，不适合验证本地进程启动。
+Vite 将 `/api` 和 `/v1` 转发到 `127.0.0.1:10721`。生产流量直接走 Go，没有 Node 中间层。`go run .` 的临时可执行目录不包含原生二进制，不适合验证本地进程启动。
 
 ## 使用
 
-- **Runtime**：输入真实模型和词表路径，可调用宿主机原生文件选择器。最近模型保存于浏览器。Start 使用当前表单；Restart 使用实际运行配置。配置修改在下次 Stop → Start 后生效。
-- 动态加载时，模型路径必须为目录。启动服务后，在 Available models 中选择并 Load 模型，再开始 Chat / Translate。Ready 表示 HTTP 服务已就绪，模型是否加载另行判断。
-- **Chat**：真实 SSE 增量输出，支持 Markdown、代码高亮、表格、Stop、Regenerate / Retry、历史搜索、重命名和删除。停止或网络中断保留部分输出。
-- **Parallel Translate**：按段落/句末标点切片，极长无标点文本回退到空白边界和 Unicode 字符边界；默认目标 800 字符、8 个 worker。块结果始终按 ID 合并，支持停止、恢复 pending、单块重试和失败重试。Inspector 每页 50 块，已完成预览使用独立 memo 组件与 content-visibility；流式 UI 更新合并到最多约 10 次/秒。
-- 语言名允许自定义。Auto 是 prompt 中的字面名称，不运行语言检测器。Copy / TXT / Markdown 可导出结果；未完成块导出为 `···` 占位。Check request 查看下一次任务首块的真实 body，Inspector 查看已有任务的原始 prompt。
+- **节点总览**：注册表里的每个后端的可达性、runtime 状态、已加载模型与运行中任务；可逐个或全部重新探测、切换当前节点、移除节点（`local` 保留）。切换节点后所有页面跟随该节点。
+- **Runtime**：输入真实模型和词表路径，可浏览远端白名单目录，宿主机对话框仅在节点宣告 `host_dialog` 时出现。Start 使用当前表单；Restart 使用实际运行配置。配置修改在下次 Stop → Start 后生效。
+- 选卡是三态字符串：缺省沿用 Agent `--card` / 继承环境、空串显式不注入、显式值如 `0,1`；Runtime / 训练 / 量化共用同一控件。
+- 动态加载时，模型路径必须为目录。启动服务后，在模型列表中选择并 Load，再开始 Chat / Translate。Ready 表示 HTTP 服务已就绪，模型是否加载另行判断。
+- **Chat**：真实 SSE 增量输出，支持 Markdown、代码高亮、表格、Stop、重新生成、HTML 预览。会话按 backend ID 隔离；停止或网络中断保留部分输出。
+- **Parallel Translate**：按非空行生成原始续写任务，直接调用 `/v1/batch/completions`，每批 1–128 行非流式执行并按 `choices[].index` 合并。支持停止、重试失败行与待执行行。结果记录所属节点，切换节点不会串结果。
+- 语言名允许自定义，未知值回退默认。Copy / TXT / Markdown 可导出结果；未完成块以 `···` 占位。
 - **State Tuning**：通过真实 CLI 训练，JSONL 每行必须恰好为一个字符串 `text` 字段。验证在 Go 宿主机执行，拒绝额外/重复字段。显示 stdout / stderr、真实 step / epoch / loss / LR / tokens/s / ETA、loss 曲线和实际保存的 checkpoint 路径。
-- **Appearance**：顶部栏可随时切换 Dark / Light / System；Settings 中也提供三态选择。System 会跟随操作系统并在系统外观变化时即时更新，选择会保存在本地，页面加载前即应用以避免主题闪烁。
-- **Settings**：API Base URL / Key、默认语言/并发/切片、采样参数、清除本地数据。默认 Base URL 留空，Go 自动使用实际 runtime 端口和密码。自定义地址不带 `/v1`，用于直接连接原生 Chat；平行翻译需要同源 Launcher 适配器。
+- **Appearance**：默认跟随系统外观（System），Settings 中可显式选择 Dark / Light / System，以及中文 / English 切换。System 会跟随操作系统并在系统外观变化时即时更新，选择会保存在本地，页面加载前即应用以避免主题闪烁。
+- **Settings**：外观与语言、当前节点与 Agent token、翻译默认语言与 batch size，以及清除本机数据。远端 token 由本机 Client 注入，浏览器不持久化。
 
-快捷键：`Ctrl/Cmd+K` 命令面板，`Ctrl/Cmd+N` 新会话，`Ctrl/Cmd+Enter` 开始翻译/提交训练，`Esc` 关闭弹窗。Chat 使用 Enter 发送、Shift+Enter 换行，并兼容输入法组合输入。
+快捷键：`Ctrl/Cmd+Enter` 开始翻译，`Esc` 关闭弹窗。Chat 使用 Enter 发送、Shift+Enter 换行，并兼容输入法组合输入。
 
-会话、当前翻译任务和设置保存在本浏览器 localStorage；翻译中的页面切换不会停止调度，刷新则恢复已保存结果并将中断块标为 pending。API Key 和 runtime password 只保留在内存中，不写入浏览器持久化数据，密码也不会出现在启动日志或 status 中。存储容量不足时显示错误，请导出重要结果。
+会话、当前翻译任务、各表单与设置保存在本浏览器 localStorage（`rwkv-*` 键，含版本与 migrate）；翻译中的页面切换不会停止调度，刷新则恢复已保存结果并将中断块标为 pending。Agent token 与 runtime password 只保留在内存中，不写入浏览器持久化数据，密码也不会出现在启动日志或 status 中。存储容量不足时显示错误，请导出重要结果。
 
 ## 与当前原生代码的兼容说明
 
@@ -91,11 +129,11 @@ Chat 仍调用 `/v1/chat/completions`，服务端内部执行 batch 生成。默
 Chat:      browser /v1/chat/completions + messages
         → native  /v1/chat/completions
 
-Translate: browser /v1/chat/completions + contents (每次一个 prompt)
+Translate: browser /v1/batch/completions + contents (每批最多 128 个 prompt)
         → native  /v1/batch/completions
 ```
 
-仅当 body 有 `contents` 且没有 `messages` 时适配，body 不变。翻译以每个非空输入行为一个 chunk，前端按 1–128 的 batch size 分组，每组作为一个原生 batch 请求执行，**不调用任何专用 Translation API**。检查请求窗口明确显示这个映射。直接连接未经适配的远程 CUDA Chat 地址时，翻译页面会拒绝发送，避免默默改变 prompt 语义。
+前端直接调用 `/v1/batch/completions`。Go 侧曾有一段 `contents → batch` 适配（POST `/v1/chat/completions` 且 body 有 `contents`、没有 `messages` 时改写路径），那是给旧 WebUI 的；旧 WebUI 已随本次重做移除，适配也一并删除，`/v1` 现在是完全透明的反向代理。翻译以每个非空输入行为一个 chunk，前端按 1–128 的 batch size 分组，每组作为一个原生 batch 请求执行，**不调用任何专用 Translation API**。
 
 翻译 sampler 采用当前兼容翻译实现中的参数：`max_tokens=2048`、`temperature=1`、`top_k=1`、`top_p=0`、presence/frequency penalty=0、`stop_tokens=[0]`。翻译请求使用 `stream=false`，每行完成后一次显示完整结果；普通 Chat 仍使用流式输出。
 
@@ -147,45 +185,43 @@ State tuning 使用 `.pth` 基础模型，最终张量结构由原生加载器�
 
 管理本地 runtime 时，Go 自动透传其鉴权信息；连接远程服务器时使用 Settings 中的 API key。
 
-两个原生程序各自申请 GPU，没有跨进程资源协调；仓库没有规定必须互斥。本 Launcher 为避免默认启动两份模型而选择**串行资源策略**：训练与本 Launcher 管理的推理互斥，训练前可确认 Stop & Start；Go 侧也强制检查。不会停止 Launcher 之外的 GPU 进程。Stop 会终止训练，保留此前实际写出的 checkpoint，不声称已保存尚未落盘的更新。
+两个原生程序各自申请 GPU，没有跨进程资源协调；仓库没有规定必须互斥。本 Launcher 按显卡判断训练与推理互斥：设备集有交集或不可判定时拒绝同时启动，显式选择无交集设备时允许并行。WebUI 已在 Runtime / 训练 / 量化三处接入 `visible_devices`；Go 侧仍执行最终检查。不会停止 Launcher 之外的 GPU 进程。Stop 会终止训练，保留此前实际写出的 checkpoint，不声称已保存尚未落盘的更新。
 
-## Launcher HTTP 接口
+## WebUI 使用的接口
 
-新增的控制接口在 `main.go` 实现，不是对原生 API 的假设。所有 POST 都发送 JSON，失败返回实际 `{"error":"..."}` 与 HTTP 错误码。
+WebUI 使用 [新控制面 API](docs/control-plane-api.md)：浏览器只与本机 Client 同源通信，节点级请求都带 `/api/v1/backends/{id}` 前缀；`src/lib/api/http.ts` 是唯一出口。接入步骤见 [联调指南](docs/integration-guide.md)。
 
-| Method | Path                       | 行为                                                            |
-| ------ | -------------------------- | --------------------------------------------------------------- |
-| GET    | `/api/status`              | 进程状态、真实 backend status、脱敏配置、最近 2000 行日志       |
-| POST   | `/api/start`               | RuntimeConfig；验证路径/端口并启动                              |
-| POST   | `/api/stop`                | 等待运行进程退出                                                |
-| POST   | `/api/restart`             | 使用上次实际启动配置停止并重启                                  |
-| POST   | `/api/pick-file`           | 原生宿主机文件选择；无图形环境时明确报错，可手动输入路径        |
-| POST   | `/api/pick-directory`      | 原生宿主机目录选择，用于训练输出目录                            |
-| GET    | `/logs`                    | 保留旧 Runtime SSE 日志入口                                     |
-| GET    | `/api/tuning/status`       | 训练状态、可执行文件是否存在、日志、进度、loss 数据、checkpoint |
-| POST   | `/api/tuning/validate`     | `{"path":"..."}`，返回有效样本数或准确行号错误                  |
-| POST   | `/api/tuning/start`        | TuningConfig，按 method=state/miss 启动对应训练程序             |
-| POST   | `/api/tuning/stop`         | 停止训练进程                                                    |
-| POST   | `/api/tuning/open-folder`  | 打开最近实际保存 checkpoint 所在文件夹                          |
-| GET    | `/api/quantization/status` | 量化进程状态、工具可用性、输出路径与日志                        |
-| POST   | `/api/quantization/start`  | 启动 W8A16 或 W4A16 `.pth` → `.rwkvq` 转换                      |
-| POST   | `/api/quantization/stop`   | 停止量化进程                                                    |
-| \*     | `/v1/*`                    | 转发到本 Launcher 管理的原生 backend，SSE 即时 flush            |
+控制面接口的完整路径表、schema 与安全模型见 [docs/control-plane-api.md](docs/control-plane-api.md)。所有 POST 都发送 JSON，失败返回实际 `{"error":"..."}` 与 HTTP 错误码。
 
-完整 TypeScript payload 见 `src/lib/api/launcher.ts`。推理接口沿用项目文档，没有新增原生 CLI flag。静态和控制服务仅绑定 loopback，并验证 Host / Origin；不允许从外站操作本地进程。Markdown 不直接解析原始 HTML；助手输出完整 HTML 或闭合的 `html` fence 时会出现新标签页预览按钮，生成内容运行在不带同源权限的 sandbox iframe 中。
+新控制面（`/api/v1`）：`/api/v1/node`、`/api/v1/node/metrics`、`/api/v1/node/fs`、`/api/v1/node/dialog/{file,directory,reveal}`、`/api/v1/runtime`（+ `start/stop/restart/load/state/import/logs`）、`/api/v1/jobs`（+ `/{id}`、`/tuning`、`/tuning/validate`、`/quantization`、`/{id}/stop`、`/{id}/logs`）、`/api/v1/backends`（Client：增删查 + `/{id}/probe` + `/{id}/api/v1/*`、`/{id}/v1/*` 转发）。
+
+**没有旧路径 alias。** `/api/v1` 是唯一的控制面。pre-v1 的 `/api/status`、
+`/api/start`、`/api/stop`、`/api/restart`、`/api/tuning/*`、
+`/api/quantization/*`、`/api/pick-file`、`/api/pick-directory`、
+`/api/tuning/open-folder` 和 `/logs` 全部移除，未知 `/api` 路径一律返回
+JSON 404。连带移除的还有"连接旧版 Agent"的转发适配（原 `legacy.go`）：
+探测阶梯现在只有 `/api/v1/node` → `/v1/server/status` 两级，只会说 pre-v1
+协议的主机不再被识别成 agent。
+
+这意味着 **Client 与 Agent 必须同版本部署**。这是有意的取舍——本次重做从干净
+版本起步，不承担混版本兼容的负担。跨版本策略见
+[未决事项](docs/open-items.md)。
+
+请求体 TypeScript 类型与默认值见 `src/lib/api/types.ts` 与 `src/lib/api/launcher.ts`；完整字段以 [API 参考](docs/control-plane-api.md) 为准。推理接口沿用项目文档，没有新增原生 CLI flag（选卡走环境变量注入）。loopback 形态验证 Host / Origin；非 loopback 的 Agent 以 `--token` 鉴权并保留 same-origin 浏览器检查。Markdown 不直接解析原始 HTML；助手输出完整 HTML 或闭合的 `html` fence 时会出现新标签页预览按钮，生成内容运行在不带同源权限的 sandbox iframe 中。
 
 ## 验证
 
 ```bash
 bun run test
 bun run lint
+bun run typecheck
 bun run build
 go test -race .
 go vet .
 ```
 
-测试覆盖 SSE 任意拆包、UTF-8、CRLF、畸形事件/错误/断流/Abort；切片内容保持、Unicode；worker 并发硬上限、取消、乱序、失败重试；会话与翻译持久化、敏感字段不落盘；Go 参数验证、真实子进程启停、互斥、训练回车日志、脱敏、Ready 探测、原始续写路由、静态托管和跨源拒绝。
+测试覆盖 SSE 任意拆包、UTF-8、CRLF、畸形事件/错误/断流/Abort；切片内容保持、Unicode；worker 并发硬上限、取消、乱序、失败重试；注册表与按节点隔离的 snapshot 轮询、三态选卡、空响应体停止、会话与翻译持久化、敏感字段不落盘；Go 参数验证、真实子进程启停、互斥、训练回车日志、脱敏、Ready 探测、原始续写路由、静态托管和跨源拒绝。
 
-本次环境中通过了 Linux 构建和 Windows amd64 交叉构建，并使用实际 `rwkv_lighting_cuda` 验证动态模式服务的 Start → Ready → Restart → Ready → Stop、模型枚举、错误日志和 JSONL 校验。该服务验证没有加载有效基础模型，不代表真实模型 Chat / 翻译质量或训练数值已验证。
+历史验证记录：此前通过了 Linux 构建和 Windows amd64 交叉构建，并使用实际 `rwkv_lighting_cuda` 验证动态模式服务的 Start → Ready → Restart → Ready → Stop、模型枚举、错误日志和 JSONL 校验。该服务验证没有加载有效基础模型，不代表真实模型 Chat / 翻译质量或训练数值已验证。
 
-当前环境无可连接的浏览器会话，尚未完成交互式视觉验收。后续验收建议用有效基础模型在 1280 / 1024 像素宽度检查五个页面、流式输出、文件选择、训练及 checkpoint，并验证宿主机对应的 CUDA/HIP 和 Windows DLL 环境。
+新控制台已完成无头浏览器渲染验证（七个路由均能挂载并请求控制面），但未完成交互式视觉验收，不能据此认为已通过浏览器验收。后续验收建议用有效基础模型在 1280 / 1024 像素宽度检查全部页面、流式输出、远端目录浏览、训练及 checkpoint，并验证宿主机对应的 CUDA/HIP 和 Windows DLL 环境。

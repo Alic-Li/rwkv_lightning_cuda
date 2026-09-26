@@ -6,9 +6,10 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -29,53 +30,15 @@ import (
 
 const defaultPort = "8000"
 const defaultVocabPath = "./rwkv_vocab_v20230424.txt"
-const listenAddr = "127.0.0.1:10721"
+const defaultListen = "127.0.0.1:10721"
+
+// launcherVersion is stamped by release builds via
+// -ldflags "-X main.launcherVersion=v<VERSION>".
+var launcherVersion = "dev"
 
 //go:embed dist/*
 var webFiles embed.FS
 
-type startRequest struct {
-	ModelPath            string `json:"model_path"`
-	VocabPath            string `json:"vocab_path"`
-	Port                 string `json:"port"`
-	Password             string `json:"password"`
-	UseWKV32             bool   `json:"use_wkv32"`
-	ChunkLoad            bool   `json:"chunk_load"`
-	EnableDynamicLoading bool   `json:"enable_dynamic_loading"`
-	ChunkSize            int    `json:"chunk_size"`
-	StateDBPath          string `json:"state_db_path"`
-	TuneCache            string `json:"tune_cache"`
-}
-type tuneRequest struct {
-	Method      string  `json:"method"`
-	Rank        int     `json:"rank"`
-	Alpha       float64 `json:"alpha"`
-	Targets     string  `json:"targets"`
-	State       string  `json:"state"`
-	Resume      string  `json:"resume"`
-	Model       string  `json:"model"`
-	Data        string  `json:"data"`
-	Output      string  `json:"output"`
-	Vocab       string  `json:"vocab"`
-	Ctx         int     `json:"ctx"`
-	Chunk       int     `json:"chunk"`
-	Epochs      int     `json:"epochs"`
-	BatchSize   int     `json:"batch_size"`
-	MaxSteps    int     `json:"max_steps"`
-	LR          float64 `json:"lr"`
-	LRFinal     float64 `json:"lr_final"`
-	WarmupSteps int     `json:"warmup_steps"`
-	SaveEvery   int     `json:"save_every"`
-	Seed        int     `json:"seed"`
-	Optimizer   string  `json:"optimizer"`
-	WKVTape     bool    `json:"wkv_tape"`
-}
-type quantizeRequest struct {
-	InputPath  string `json:"input_path"`
-	OutputPath string `json:"output_path"`
-	Format     string `json:"format"`
-	GroupSize  int    `json:"group_size"`
-}
 type process struct {
 	mu         sync.Mutex
 	cmd        *exec.Cmd
@@ -143,7 +106,7 @@ func splitProgress(data []byte, atEOF bool) (int, []byte, error) {
 	}
 	return 0, nil, nil
 }
-func (p *process) launch(exe string, args []string, secret string) error {
+func (p *process) launch(exe string, args []string, secret string, deviceSpec string) error {
 	p.mu.Lock()
 	if p.cmd != nil {
 		p.mu.Unlock()
@@ -153,6 +116,11 @@ func (p *process) launch(exe string, args []string, secret string) error {
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = appDir()
 	cmd.Env = backendProcessEnv(cmd.Dir)
+	// §5.8: GPU selection is environment injection, never a child flag.
+	if deviceSpec != "" {
+		vendor, _ := gpuVendor()
+		cmd.Env = applyVisibleDevices(cmd.Env, deviceSpec, vendor)
+	}
 	// Drain both pipes before Wait to avoid losing the final checkpoint/log lines.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -232,6 +200,17 @@ func (p *process) launch(exe string, args []string, secret string) error {
 	return nil
 }
 func (p *process) active() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.cmd != nil }
+
+// pid is the running child's PID, or 0 when nothing is running. The metrics
+// sampler uses it to tell the runtime's memory from everyone else's.
+func (p *process) pid() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cmd == nil || p.cmd.Process == nil {
+		return 0
+	}
+	return p.cmd.Process.Pid
+}
 func (p *process) stop() error {
 	p.mu.Lock()
 	if p.cmd == nil {
@@ -263,7 +242,7 @@ func (p *process) snapshot() map[string]any {
 	return map[string]any{"status": p.state, "running": p.cmd != nil, "error": p.errorText, "logs": append([]string{}, p.logs...), "progress": p.progress, "losses": append([]map[string]any{}, p.losses...), "checkpoint": p.checkpoint, "elapsed": elapsed}
 }
 
-// Keep the legacy runtime log stream available to existing local clients.
+// SSE log stream shared by the runtime and both job processes.
 func (p *process) sse(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -310,11 +289,197 @@ type launcher struct {
 	quantization       *process
 	config             startRequest
 	quantizationOutput string
+
+	// Last accepted job configs (fs whitelist + dashboard display only).
+	tuningConfig       tuneRequest
+	quantizationConfig quantizeRequest
+
+	// §5.8 device state of the managed GPU processes (guarded by mu).
+	// Quantization is absent on purpose — it never touches a GPU, see
+	// handleQuantizationStart.
+	runtimeDevices resolvedDevices
+	tuningDevices  resolvedDevices
+
+	// Startup form (§1): one binary, roles chosen at startup time.
+	listen     string
+	token      string
+	clientOnly bool
+	card       string
+	configPath string
+
+	backends *registry
+	fs       *fsWhitelist
 }
 
 func newLauncher() *launcher {
-	return &launcher{runtime: newProcess(), tuning: newProcess(), quantization: newProcess(), config: startRequest{Port: defaultPort, VocabPath: defaultVocabPath, ChunkSize: 128, StateDBPath: "rwkv_sessions.db"}}
+	l := &launcher{
+		runtime:      newProcess(),
+		tuning:       newProcess(),
+		quantization: newProcess(),
+		config:       startRequest{Port: defaultPort, VocabPath: defaultVocabPath, ChunkSize: 128, StateDBPath: "rwkv_sessions.db"},
+		listen:       defaultListen,
+	}
+	l.backends = openRegistry(defaultConfigPath())
+	l.fs = openFSWhitelist(filepath.Join(appDir(), fsRootsFile))
+	return l
 }
+
+// loopbackListen reports whether the HTTP listener is loopback-only (§2:
+// the Client must only ever bind loopback; the Agent may bind wider with a
+// mandatory token).
+func (l *launcher) loopbackListen() bool {
+	host, _, err := net.SplitHostPort(l.listen)
+	if err != nil {
+		return false
+	}
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	return false
+}
+
+// role reports the startup form: "full" (Client+Agent on this machine),
+// "agent" (server node), or "client" (no local runtime — a legal state, not
+// an error). Detection is lazy: dropping a runtime binary next to the
+// launcher upgrades the form without a restart.
+func (l *launcher) role() string {
+	if l.clientOnly || !l.agentCapable() {
+		return "client"
+	}
+	if l.loopbackListen() {
+		return "full"
+	}
+	return "agent"
+}
+
+func (l *launcher) agentCapable() bool {
+	if l.clientOnly {
+		return false
+	}
+	return binaryPresent(backendExecutable())
+}
+
+func binaryPresent(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
+func toolBinary(name string) string {
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	return filepath.Join(appDir(), name)
+}
+
+// capabilities is an open set (§5.4): clients must ignore unknown bits.
+// T2 decision: quantization stays a single bit — one tool binary serves
+// both w8a16 and w4a16; the format is a per-job config, not a deployment
+// property.
+func (l *launcher) capabilities() []string {
+	if l.role() == "client" {
+		return []string{}
+	}
+	caps := []string{}
+	if binaryPresent(backendExecutable()) {
+		caps = append(caps, "runtime")
+	}
+	if binaryPresent(toolBinary("rwkv_state_tune")) {
+		caps = append(caps, "tuning_state")
+	}
+	if binaryPresent(toolBinary("rwkv_miss_tune")) {
+		caps = append(caps, "tuning_miss")
+	}
+	if binaryPresent(toolBinary("rwkv_quantize")) {
+		caps = append(caps, "quantization")
+	}
+	// state_import: this Agent can hand a node-local .pth to the runtime's
+	// multipart upload, which the native API offers no path form of. The
+	// console hides the "import from this node" control on agents without it.
+	caps = append(caps, "metrics", "fs", "state_import")
+	if l.role() == "full" {
+		caps = append(caps, "host_dialog")
+	}
+	return caps
+}
+
+// status is the RuntimeState payload shared by /api/v1/runtime and
+// /api/v1/node (§6.1): process state plus available (can this host start a
+// runtime at all), visible_devices (the raw spec the current runtime was
+// pinned to, §5.8(b)), card and managed.
+func (l *launcher) status() map[string]any {
+	l.mu.Lock()
+	config := l.config
+	devices := l.runtimeDevices
+	l.mu.Unlock()
+	out := l.runtime.snapshot()
+	safe := config
+	safe.Password = ""
+	out["config"] = safe
+	out["base_url"] = "http://127.0.0.1:" + config.Port
+	out["translation_adapter"] = true
+	out["available"] = l.agentCapable()
+	out["visible_devices"] = devices.spec
+	// The --card pin, so clients can lock their device pickers to it; empty
+	// when the launcher was started without --card (§5.8).
+	out["card"] = l.card
+	// A runtime the Agent did not spawn itself (started by hand or by another
+	// launcher) used to read as "offline" forever: the /v1/server/status probe
+	// only ran for managed processes. Probe the configured port regardless, so
+	// an external server shows up as ready — with managed=false, since
+	// stop/restart cannot act on a process we do not own.
+	managed, _ := out["running"].(bool)
+	out["managed"] = managed
+	// A Client cannot start a runtime, so it has no port worth probing: keep
+	// its status payload a pure reflection of process state (§6.1 contract).
+	// Gate on the explicit --client-only flag, not role(): a host missing the
+	// native binary is still exactly where someone starts the server by hand.
+	if !l.clientOnly && out["status"] != "stopping" {
+		client := http.Client{Timeout: 1500 * time.Millisecond}
+		resp, err := client.Get("http://127.0.0.1:" + config.Port + "/v1/server/status")
+		if err == nil {
+			defer resp.Body.Close()
+			var data map[string]any
+			if resp.StatusCode == 200 && json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data) == nil && data["status"] == "running" {
+				out["status"] = "ready"
+				out["backend"] = data
+			}
+		}
+	}
+	out["running"] = out["status"] == "ready" || out["status"] == "running"
+	if out["status"] == "completed" {
+		out["status"] = "offline"
+	}
+	return out
+}
+
+// nodePayload is GET /api/v1/node (§6.1): everything status() reports plus
+// the node identity fields the Client's capability probe reads. This is the
+// only shape a node is ever identified by.
+func (l *launcher) nodePayload() map[string]any {
+	out := l.status()
+	out["role"] = "agent"
+	out["version"] = launcherVersion
+	out["capabilities"] = l.capabilities()
+	return out
+}
+
+func (l *launcher) tuningStatus() map[string]any {
+	out := l.tuning.snapshot()
+	out["available"] = binaryPresent(toolBinary("rwkv_state_tune"))
+	out["miss_available"] = binaryPresent(toolBinary("rwkv_miss_tune"))
+	return out
+}
+
+func (l *launcher) quantizationStatus() map[string]any {
+	out := l.quantization.snapshot()
+	out["available"] = binaryPresent(toolBinary("rwkv_quantize"))
+	l.mu.Lock()
+	out["output_path"] = l.quantizationOutput
+	l.mu.Unlock()
+	return out
+}
+
 func existingPath(path string, dir bool) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("path is required")
@@ -331,7 +496,7 @@ func existingPath(path string, dir bool) error {
 	}
 	return nil
 }
-func runtimeArgs(req startRequest) ([]string, error) {
+func (l *launcher) runtimeArgs(req startRequest, devices resolvedDevices) ([]string, error) {
 	if err := existingPath(req.ModelPath, req.EnableDynamicLoading); err != nil {
 		return nil, fmt.Errorf("model: %w", err)
 	}
@@ -345,8 +510,15 @@ func runtimeArgs(req startRequest) ([]string, error) {
 		req.Port = defaultPort
 	}
 	port, e := strconv.Atoi(req.Port)
-	if e != nil || port < 1 || port > 65535 || port == 8088 {
-		return nil, fmt.Errorf("port must be 1–65535 and different from launcher port 8088")
+	if e != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("port must be 1–65535")
+	}
+	// The launcher's own HTTP port is the only reserved one; the historical
+	// hardcoded 8088 check is gone (the launcher no longer listens there).
+	if _, own, err := net.SplitHostPort(l.listen); err == nil {
+		if ownPort, err2 := strconv.Atoi(own); err2 == nil && ownPort == port {
+			return nil, fmt.Errorf("port %d is used by the launcher HTTP server", port)
+		}
 	}
 	if req.ChunkSize == 0 {
 		req.ChunkSize = 128
@@ -355,7 +527,16 @@ func runtimeArgs(req startRequest) ([]string, error) {
 		return nil, fmt.Errorf("prefill chunk size must be positive")
 	}
 	args := []string{"--model-path", req.ModelPath, "--vocab-path", req.VocabPath, "--host", "127.0.0.1", "--port", req.Port, "--chunk-size", strconv.Itoa(req.ChunkSize)}
-	for _, pair := range [][2]string{{"--password", req.Password}, {"--state-db-path", req.StateDBPath}, {"--tune-cache", req.TuneCache}} {
+	tuneCache := req.TuneCache
+	if tuneCache == "" {
+		// §5.8(c): with a pinned card the default tune cache is card-bound
+		// so a card switch cannot silently reuse another card's tuning.
+		// `devices` was resolved once by the caller: re-resolving here would
+		// let auto placement sample free VRAM twice and pin the process and
+		// its tune cache to different cards.
+		tuneCache = deviceTuneCache(req, devices)
+	}
+	for _, pair := range [][2]string{{"--password", req.Password}, {"--state-db-path", req.StateDBPath}, {"--tune-cache", tuneCache}} {
 		if pair[1] != "" {
 			args = append(args, pair[0], pair[1])
 		}
@@ -371,13 +552,19 @@ func runtimeArgs(req startRequest) ([]string, error) {
 	return args, nil
 }
 func (l *launcher) start(req startRequest) error {
-	if l.tuning.active() {
+	if err := l.validateDeviceRequest(req.VisibleDevices); err != nil {
+		return err
+	}
+	devices := l.resolveVisibleDevices(req.VisibleDevices)
+	// §5.8(a): the global runtime/tuning exclusion is per-card now — only
+	// processes whose resolved devices overlap are blocked.
+	if l.tuning.active() && devicesOverlap(devices, l.tuningDevices) {
 		return fmt.Errorf("state tuning is using the GPU; stop tuning first")
 	}
 	if l.runtime.active() {
 		return fmt.Errorf("backend is already running")
 	}
-	args, err := runtimeArgs(req)
+	args, err := l.runtimeArgs(req, devices)
 	if err != nil {
 		return err
 	}
@@ -389,39 +576,125 @@ func (l *launcher) start(req startRequest) error {
 		conn.Close()
 		return fmt.Errorf("port %s is already in use", req.Port)
 	}
-	if err = l.runtime.launch(backendExecutable(), args, req.Password); err != nil {
+	if err = l.runtime.launch(backendExecutable(), args, req.Password, devices.spec); err != nil {
 		return err
 	}
+	if devices.auto {
+		l.runtime.appendLog("auto device placement: GPU " + devices.spec + " (most free VRAM)")
+	}
+	if note := tuneCacheNote(req, devices); note != "" {
+		l.runtime.appendLog(note)
+	}
 	l.config = req
+	l.runtimeDevices = devices
+	l.recordFSConfigs(req, l.tuningConfig, l.quantizationConfig)
 	return nil
 }
-func (l *launcher) status() map[string]any {
+
+// runtimeLoadRequest is POST /api/v1/runtime/load: put the runtime (and, in
+// dynamic-loading mode, a model) onto a chosen card. Restart-based by design
+// — CUDA binds devices to the process at init — so a card switch inherently
+// interrupts active inference; the request contract says so.
+type runtimeLoadRequest struct {
+	Model          string `json:"model"`
+	VisibleDevices string `json:"visible_devices"`
+}
+
+const runtimeLoadReadyTimeout = 10 * time.Minute
+
+// runtimeLoad switches the managed runtime onto a card using the saved
+// config: stop → start with the card injected as CUDA_VISIBLE_DEVICES →
+// wait for readiness → (dynamic mode) POST /v1/model/load. It runs with the
+// saved config because that carries the real runtime password, which the
+// WebUI never sees (status() blanks it on the wire).
+func (l *launcher) runtimeLoad(req runtimeLoadRequest) (map[string]any, error) {
 	l.mu.Lock()
-	config := l.config
+	cfg := l.config
 	l.mu.Unlock()
-	out := l.runtime.snapshot()
-	safe := config
-	safe.Password = ""
-	out["config"] = safe
-	out["base_url"] = "http://127.0.0.1:" + config.Port
-	out["translation_adapter"] = true
-	if out["running"] == true && out["status"] != "stopping" {
-		client := http.Client{Timeout: 1500 * time.Millisecond}
-		resp, err := client.Get("http://127.0.0.1:" + config.Port + "/v1/server/status")
-		if err == nil {
-			defer resp.Body.Close()
-			var data map[string]any
-			if resp.StatusCode == 200 && json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data) == nil && data["status"] == "running" {
-				out["status"] = "ready"
-				out["backend"] = data
-			}
+	if cfg.ModelPath == "" {
+		return nil, errors.New("no saved runtime config: start the runtime once from the Runtime page first")
+	}
+	if spec := strings.TrimSpace(req.VisibleDevices); spec != "" {
+		cfg.VisibleDevices = &spec
+	} else {
+		cfg.VisibleDevices = nil // no card chosen: §5.8 chain, auto placement included
+	}
+	// Refuse a pin violation before stopping the current runtime: a failed
+	// start after the stop would leave the node with nothing serving.
+	if err := l.validateDeviceRequest(cfg.VisibleDevices); err != nil {
+		return nil, err
+	}
+
+	l.mu.Lock()
+	if l.runtime.active() {
+		if e := l.runtime.stop(); e != nil {
+			l.mu.Unlock()
+			return nil, fmt.Errorf("stopping the current runtime failed: %w", e)
 		}
 	}
-	if out["status"] == "completed" {
-		out["status"] = "offline"
+	e := l.start(cfg)
+	l.mu.Unlock()
+	if e != nil {
+		l.runtime.appendLog("card switch failed: " + e.Error())
+		return nil, e
 	}
-	return out
+	l.mu.Lock()
+	spec := l.runtimeDevices.spec
+	l.mu.Unlock()
+
+	// Readiness is what status() reports: the native server answering
+	// /v1/server/status. Non-dynamic cold loads of multi-GB models live
+	// inside this window, hence the generous cap.
+	deadline := time.Now().Add(runtimeLoadReadyTimeout)
+	for {
+		state, _ := l.status()["status"].(string)
+		if state == "ready" {
+			break
+		}
+		if state == "error" {
+			return nil, errors.New("runtime failed to start on the requested card; see the runtime log")
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("runtime did not become ready within %s", runtimeLoadReadyTimeout)
+		}
+		time.Sleep(800 * time.Millisecond)
+	}
+
+	loaded := ""
+	target := strings.TrimSpace(req.Model)
+	if cfg.EnableDynamicLoading && target != "" {
+		client := http.Client{Timeout: 15 * time.Minute}
+		body, err := json.Marshal(map[string]string{"model": target})
+		if err != nil {
+			return nil, err
+		}
+		httpReq, err := http.NewRequest("POST",
+			"http://127.0.0.1:"+cfg.Port+"/v1/model/load", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if cfg.Password != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+cfg.Password)
+		}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("model load request failed: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			return nil, fmt.Errorf("model load failed: HTTP %d: %s",
+				resp.StatusCode, strings.TrimSpace(string(snippet)))
+		}
+		loaded = target
+		l.runtime.appendLog("model " + target + " loaded on GPU " + spec)
+	} else if spec != "" {
+		l.runtime.appendLog("runtime restarted on GPU " + spec)
+	}
+	return map[string]any{"ok": true, "visible_devices": spec, "model": loaded}, nil
 }
+
 func validateDataset(path string) (int, error) {
 	if err := existingPath(path, false); err != nil {
 		return 0, err
@@ -608,31 +881,25 @@ func (l *launcher) proxy(w http.ResponseWriter, r *http.Request) {
 	config := l.config
 	l.mu.Unlock()
 	target, _ := url.Parse("http://127.0.0.1:" + config.Port)
-	if r.URL.Path == "/v1/chat/completions" && r.Method == "POST" {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<20))
-		if err != nil {
-			writeJSON(w, 400, map[string]any{"error": err.Error()})
-			return
-		}
-		var payload map[string]json.RawMessage
-		if err = json.Unmarshal(body, &payload); err != nil {
-			writeJSON(w, 400, map[string]any{"error": err.Error()})
-			return
-		}
-		// CUDA chat adds a User/Assistant envelope. Raw contents must use the existing generic continuation handler.
-		if _, raw := payload["contents"]; raw {
-			if _, chat := payload["messages"]; !chat {
-				r.URL.Path = "/v1/batch/completions"
-			}
-		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
-	}
+	// /v1 is a transparent pass-through. It used to sniff POSTs to
+	// /v1/chat/completions and rewrite a `contents` body to
+	// /v1/batch/completions, because the old WebUI sent raw continuations to
+	// the chat path. That WebUI is gone — the current console posts raw
+	// continuations to /v1/batch/completions itself (see
+	// src/lib/api/inference.ts) — so the launcher no longer buffers and
+	// re-parses up to 16 MiB of every chat request to guess what the caller
+	// meant.
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.FlushInterval = -1
 	original := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		original(req)
+		// The Agent token authenticates this hop only and means nothing to
+		// the runtime, so drop it. Without an Agent token the caller may be
+		// supplying the runtime's own password — keep that one.
+		if l.token != "" {
+			req.Header.Del("Authorization")
+		}
 		if req.Header.Get("Authorization") == "" && config.Password != "" {
 			req.Header.Set("Authorization", "Bearer "+config.Password)
 		}
@@ -654,254 +921,81 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 	}
 	return nil
 }
-func (l *launcher) handler() http.Handler {
-	mux := http.NewServeMux()
-	web, _ := fs.Sub(webFiles, "dist")
-	mux.Handle("/", http.FileServer(http.FS(web)))
-	api := func(path, method string, f func(http.ResponseWriter, *http.Request) error) {
-		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != method {
-				writeJSON(w, 405, map[string]any{"error": "method not allowed"})
-				return
-			}
-			if err := f(w, r); err != nil {
-				writeJSON(w, 400, map[string]any{"error": err.Error()})
-			}
-		})
+
+// defaultConfigPath is the T4 decision: the Client registry lives under
+// the user's home so it survives launcher binary upgrades (and per-card
+// deployment folders being swapped wholesale). macOS/Linux:
+// ~/.rwkv_launcher/launcher.json, Windows: %USERPROFILE%\.rwkv_launcher\launcher.json.
+func defaultConfigPath() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".rwkv_launcher", "launcher.json")
 	}
-	api("/api/status", "GET", func(w http.ResponseWriter, r *http.Request) error { writeJSON(w, 200, l.status()); return nil })
-	for _, action := range []string{"start", "stop", "restart"} {
-		action := action
-		api("/api/"+action, "POST", func(w http.ResponseWriter, r *http.Request) error {
-			l.mu.Lock()
-			defer l.mu.Unlock()
-			req := l.config
-			if action == "start" {
-				if e := decode(w, r, &req); e != nil {
-					return e
-				}
-			}
-			if action != "start" {
-				if e := l.runtime.stop(); e != nil {
-					return e
-				}
-			}
-			if action != "stop" {
-				if e := l.start(req); e != nil {
-					l.runtime.appendLog("start failed: " + e.Error())
-					l.runtime.mu.Lock()
-					if l.runtime.cmd == nil {
-						l.runtime.state = "error"
-						l.runtime.errorText = e.Error()
-					}
-					l.runtime.mu.Unlock()
-					return e
-				}
-			}
-			writeJSON(w, 200, map[string]any{"ok": true})
-			return nil
-		})
-	}
-	api("/api/pick-file", "POST", func(w http.ResponseWriter, r *http.Request) error {
-		path, e := pickFile()
-		if e != nil {
-			return e
-		}
-		writeJSON(w, 200, map[string]any{"path": path})
-		return nil
-	})
-	api("/api/pick-directory", "POST", func(w http.ResponseWriter, r *http.Request) error {
-		path, e := pickDirectory()
-		if e != nil {
-			return e
-		}
-		writeJSON(w, 200, map[string]any{"path": path})
-		return nil
-	})
-	api("/api/tuning/validate", "POST", func(w http.ResponseWriter, r *http.Request) error {
-		var req struct {
-			Path string `json:"path"`
-		}
-		if e := decode(w, r, &req); e != nil {
-			return e
-		}
-		n, e := validateDataset(req.Path)
-		if e != nil {
-			return e
-		}
-		writeJSON(w, 200, map[string]any{"samples": n})
-		return nil
-	})
-	api("/api/tuning/status", "GET", func(w http.ResponseWriter, r *http.Request) error {
-		out := l.tuning.snapshot()
-		name := "rwkv_state_tune"
-		if runtime.GOOS == "windows" {
-			name += ".exe"
-		}
-		_, err := os.Stat(filepath.Join(appDir(), name))
-		out["available"] = err == nil
-		missName := "rwkv_miss_tune"
-		if runtime.GOOS == "windows" {
-			missName += ".exe"
-		}
-		_, missErr := os.Stat(filepath.Join(appDir(), missName))
-		out["miss_available"] = missErr == nil
-		writeJSON(w, 200, out)
-		return nil
-	})
-	api("/api/tuning/start", "POST", func(w http.ResponseWriter, r *http.Request) error {
-		var req tuneRequest
-		if e := decode(w, r, &req); e != nil {
-			return e
-		}
-		args, e := tuningArgs(req)
-		if e != nil {
-			return e
-		}
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		if l.runtime.active() {
-			return fmt.Errorf("inference is using the GPU; stop inference before starting tuning")
-		}
-		name := "rwkv_state_tune"
-		if req.Method == "miss" {
-			name = "rwkv_miss_tune"
-		}
-		if runtime.GOOS == "windows" {
-			name += ".exe"
-		}
-		if e = l.tuning.launch(filepath.Join(appDir(), name), args, ""); e != nil {
-			return e
-		}
-		l.tuning.mu.Lock()
-		if l.tuning.cmd != nil {
-			l.tuning.state = "running"
-		}
-		l.tuning.mu.Unlock()
-		writeJSON(w, 200, map[string]any{"ok": true})
-		return nil
-	})
-	api("/api/tuning/stop", "POST", func(w http.ResponseWriter, r *http.Request) error {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		if e := l.tuning.stop(); e != nil {
-			return e
-		}
-		writeJSON(w, 200, map[string]any{"ok": true})
-		return nil
-	})
-	api("/api/tuning/open-folder", "POST", func(w http.ResponseWriter, r *http.Request) error {
-		l.tuning.mu.Lock()
-		path := l.tuning.checkpoint
-		l.tuning.mu.Unlock()
-		if path == "" {
-			return fmt.Errorf("no saved checkpoint")
-		}
-		folder := filepath.Dir(path)
-		var cmd *exec.Cmd
-		switch runtime.GOOS {
-		case "windows":
-			cmd = exec.Command("explorer", folder)
-		case "darwin":
-			cmd = exec.Command("open", folder)
-		default:
-			cmd = exec.Command("xdg-open", folder)
-		}
-		if e := cmd.Start(); e != nil {
-			return e
-		}
-		go cmd.Wait()
-		writeJSON(w, 200, map[string]any{"ok": true})
-		return nil
-	})
-	api("/api/quantization/status", "GET", func(w http.ResponseWriter, r *http.Request) error {
-		out := l.quantization.snapshot()
-		name := "rwkv_quantize"
-		if runtime.GOOS == "windows" {
-			name += ".exe"
-		}
-		_, err := os.Stat(filepath.Join(appDir(), name))
-		out["available"] = err == nil
-		l.mu.Lock()
-		out["output_path"] = l.quantizationOutput
-		l.mu.Unlock()
-		writeJSON(w, 200, out)
-		return nil
-	})
-	api("/api/quantization/start", "POST", func(w http.ResponseWriter, r *http.Request) error {
-		var req quantizeRequest
-		if e := decode(w, r, &req); e != nil {
-			return e
-		}
-		args, e := quantizationArgs(req)
-		if e != nil {
-			return e
-		}
-		name := "rwkv_quantize"
-		if runtime.GOOS == "windows" {
-			name += ".exe"
-		}
-		exe := filepath.Join(appDir(), name)
-		if e = existingPath(exe, false); e != nil {
-			return fmt.Errorf("quantizer is unavailable: %w", e)
-		}
-		if e = l.quantization.launch(exe, args, ""); e != nil {
-			return e
-		}
-		l.quantization.mu.Lock()
-		if l.quantization.cmd != nil {
-			l.quantization.state = "running"
-		}
-		l.quantization.mu.Unlock()
-		l.mu.Lock()
-		l.quantizationOutput = req.OutputPath
-		l.mu.Unlock()
-		writeJSON(w, 200, map[string]any{"ok": true})
-		return nil
-	})
-	api("/api/quantization/stop", "POST", func(w http.ResponseWriter, r *http.Request) error {
-		if e := l.quantization.stop(); e != nil {
-			return e
-		}
-		writeJSON(w, 200, map[string]any{"ok": true})
-		return nil
-	})
-	mux.HandleFunc("/logs", l.runtime.sse)
-	mux.HandleFunc("/v1/", l.proxy)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Loopback binding plus Host/Origin checks prevent cross-site launcher control and DNS rebinding.
-		host, _, err := net.SplitHostPort(r.Host)
-		if err != nil {
-			host = r.Host
-		}
-		if host != "localhost" && host != "127.0.0.1" && host != "[::1]" && host != "::1" {
-			writeJSON(w, 403, map[string]any{"error": "local host required"})
-			return
-		}
-		if origin := r.Header.Get("Origin"); origin != "" {
-			u, e := url.Parse(origin)
-			if e != nil || u.Host != r.Host {
-				writeJSON(w, 403, map[string]any{"error": "same-origin request required"})
-				return
-			}
-		}
-		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
-			writeJSON(w, 403, map[string]any{"error": "cross-site request rejected"})
-			return
-		}
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		mux.ServeHTTP(w, r)
-	})
+	return filepath.Join(appDir(), "launcher.json")
 }
+
+// validateStartup enforces the §5.1 hard constraints before anything binds:
+// a non-loopback listen without a token refuses to start (the /api surface
+// can spawn arbitrary processes — loopback makes that a feature, otherwise
+// it is unauthenticated RCE), and a client-only form must stay loopback.
+func validateStartup(listen, token string, clientOnly, agentCapable bool) error {
+	host, portText, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("--listen must be host:port, got %q", listen)
+	}
+	if port, err := strconv.Atoi(portText); err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("--listen port must be 1–65535")
+	}
+	loopback := false
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		loopback = true
+	case "":
+		// ":port" binds every interface — treat as non-loopback.
+	}
+	if !loopback && token == "" {
+		return fmt.Errorf("refusing to listen on %s without --token: the control API can start local processes; a non-loopback listener without a token is unauthenticated remote code execution", listen)
+	}
+	if (clientOnly || !agentCapable) && !loopback {
+		return fmt.Errorf("a client-only launcher must bind loopback (Client serves the WebUI on 127.0.0.1; it never manages processes)")
+	}
+	return nil
+}
+
 func main() {
+	listen := flag.String("listen", defaultListen, "HTTP listen address; non-loopback requires --token")
+	token := flag.String("token", "", "bearer token protecting every control and inference path")
+	client := flag.Bool("client", false, "run as a pure Client: WebUI + backend registry, no local runtime")
+	configPath := flag.String("config", defaultConfigPath(), "backend registry file (JSON, 0600)")
+	card := flag.String("card", "", "default GPU selection for managed processes (CUDA_VISIBLE_DEVICES style, e.g. 0 or 0,1)")
+	flag.Parse()
+
 	l := newLauncher()
-	url := "http://" + listenAddr
-	if os.Getenv("RWKV_LAUNCHER_NO_BROWSER") != "1" {
+	l.listen, l.token, l.clientOnly, l.card = *listen, *token, *client, *card
+	if *configPath != "" {
+		l.configPath = *configPath
+		l.backends = openRegistry(l.configPath)
+	}
+	if err := validateStartup(l.listen, l.token, l.clientOnly, l.agentCapable()); err != nil {
+		log.Fatalf("rwkv_launcher: %v", err)
+	}
+	url := "http://" + l.listen
+	if l.loopbackListen() && os.Getenv("RWKV_LAUNCHER_NO_BROWSER") != "1" {
 		go func() { time.Sleep(350 * time.Millisecond); openBrowser(url) }()
 	}
-	log.Printf("RWKV Lightning Launcher: %s", url)
-	server := http.Server{Addr: listenAddr, Handler: l.handler(), ReadHeaderTimeout: 5 * time.Second}
+	log.Printf("RWKV Lightning Launcher %s: %s (role: %s)", launcherVersion, url, l.role())
+	server := http.Server{Addr: l.listen, Handler: l.handler(), ReadHeaderTimeout: 5 * time.Second}
+	// Bind before probing. The "local" backend probe dials this very port, so
+	// a probe that wins the race against the listener caches Reachable=false
+	// for a full probeInterval — which greys out the runtime controls and the
+	// composer on a freshly started launcher.
+	ln, err := net.Listen("tcp", l.listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Display-only probes at startup and every probeInterval; results never
+	// gate any logic (I3).
+	go l.backends.probeAll(l.localBackend)
+	go l.backends.probeLoop(l.localBackend)
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -915,7 +1009,7 @@ func main() {
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	}()
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }

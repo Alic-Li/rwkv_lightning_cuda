@@ -27,7 +27,7 @@ Install these tools before building:
 - CMake
 - Git
 - vcpkg
-- Go, if the web launcher should be built
+- Go and Bun (CI uses 1.3.9), if the web launcher should be built
 
 Install the C++ dependencies with vcpkg:
 
@@ -78,14 +78,17 @@ Run from the repository root:
 ```powershell
 cd D:\repo\rwkv_lightning_cuda\RWKV_Lightning_CUDA_Launcher
 
+bun install --frozen-lockfile
+bun run build
+
 $env:CGO_ENABLED = "0"
 
 go build -trimpath -ldflags="-s -w" `
   -o ..\build_win10_sm86\bundle\rwkv_lighting_cuda\rwkv_launcher.exe `
-  .\main.go
+  .
 ```
 
-The launcher starts an HTTP control page on `http://127.0.0.1:8088`. On Windows, it prepends the bundled `lib` directory to the child backend process `PATH`.
+The launcher starts an HTTP control page on `http://127.0.0.1:10721`. On Windows, it prepends the bundled `lib` directory to the child backend process `PATH`.
 
 ## Complete the runtime bundle
 
@@ -147,7 +150,7 @@ cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda
 Open:
 
 ```text
-http://127.0.0.1:8088
+http://127.0.0.1:10721
 ```
 
 Use the UI to select the model, vocab, port, password, and WKV mode.

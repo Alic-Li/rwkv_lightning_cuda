@@ -56,6 +56,7 @@ are described in the [build guide](docs/build.md).
 | [Build](docs/build.md) | CMake build for CUDA and ROCm, W8A16/W4A16 quantization tool, Go launcher; step-by-step [Windows guide](docs/windows-build-run.md) |
 | [Run](docs/run.md) | Server flags, Windows runtime, dynamic model loading, standalone state tuning |
 | [HTTP API](docs/http-api.md) | curl examples for every endpoint; complete reference in [rwkv_lightning_api_doc.md](rwkv_lightning_api_doc.md) |
+| [Launcher integration (Chinese)](RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md) | Client / Agent, control APIs, authentication and multi-backend integration |
 | [MiSS adapters&peft](src/miss/README.md) | Frozen-base adapter training, checkpoint/resume, export, dynamic serving, caches, and validation |
 | [State tuning](src/state_tuning/README.md) | Standalone `time_state` training and checkpoint format |
 | [Router](RWKV_Lightning_CUDA_router/README.md) | Multi-backend load-balancing reverse proxy with session affinity and state fan-out |

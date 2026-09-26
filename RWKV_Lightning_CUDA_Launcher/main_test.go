@@ -42,8 +42,9 @@ func testFile(t *testing.T, name, contents string) string {
 	return p
 }
 func TestRuntimeArgs(t *testing.T) {
+	l := newLauncher()
 	req := startRequest{ModelPath: testFile(t, "with spaces.pth", "model"), VocabPath: testFile(t, "vocab.txt", "vocab"), Port: "8000", Password: "secret value", UseWKV32: true, ChunkLoad: true, ChunkSize: 64, StateDBPath: "cache path.db", TuneCache: "cache.tune"}
-	args, e := runtimeArgs(req)
+	args, e := l.runtimeArgs(req, resolvedDevices{})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -51,19 +52,25 @@ func TestRuntimeArgs(t *testing.T) {
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("%v", args)
 	}
-	for _, port := range []string{"0", "65536", "8088", "08088", "oops", "-1"} {
+	// Port 8088 is a legal runtime port now that the launcher listens on
+	// 10721; the launcher's own HTTP port stays reserved.
+	req.Port = "8088"
+	if _, e = l.runtimeArgs(req, resolvedDevices{}); e != nil {
+		t.Fatal("rejected runtime port 8088", e)
+	}
+	for _, port := range []string{"0", "65536", "10721", "oops", "-1"} {
 		req.Port = port
-		if _, e = runtimeArgs(req); e == nil {
+		if _, e = l.runtimeArgs(req, resolvedDevices{}); e == nil {
 			t.Fatalf("accepted port %s", port)
 		}
 	}
 	req.Port = "8000"
 	req.EnableDynamicLoading = true
-	if _, e = runtimeArgs(req); e == nil {
+	if _, e = l.runtimeArgs(req, resolvedDevices{}); e == nil {
 		t.Fatal("dynamic loading accepted a file")
 	}
 	req.ModelPath = t.TempDir()
-	if _, e = runtimeArgs(req); e != nil {
+	if _, e = l.runtimeArgs(req, resolvedDevices{}); e != nil {
 		t.Fatal(e)
 	}
 }
@@ -298,7 +305,7 @@ func TestProcessLogsAndProgress(t *testing.T) {
 	t.Setenv("RWKV_TEST_CHILD", "logs")
 	p := newProcess()
 	exe, _ := os.Executable()
-	if e := p.launch(exe, nil, "secret-value"); e != nil {
+	if e := p.launch(exe, nil, "secret-value", ""); e != nil {
 		t.Fatal(e)
 	}
 	p.mu.Lock()
@@ -327,7 +334,7 @@ func TestProcessStopAndMutualExclusion(t *testing.T) {
 	t.Setenv("RWKV_TEST_CHILD", "wait")
 	l := newLauncher()
 	exe, _ := os.Executable()
-	if e := l.tuning.launch(exe, nil, ""); e != nil {
+	if e := l.tuning.launch(exe, nil, "", ""); e != nil {
 		t.Fatal(e)
 	}
 	defer l.tuning.stop()
@@ -353,7 +360,7 @@ func TestReadinessIsReal(t *testing.T) {
 		t.Fatal(err)
 	}
 	exe, _ := os.Executable()
-	if e := l.runtime.launch(exe, nil, ""); e != nil {
+	if e := l.runtime.launch(exe, nil, "", ""); e != nil {
 		t.Fatal(e)
 	}
 	defer l.runtime.stop()
@@ -373,19 +380,18 @@ func TestReadinessIsReal(t *testing.T) {
 		t.Fatal("backend status was not used")
 	}
 }
-func TestProxyRawContinuationAndErrors(t *testing.T) {
+func TestProxyIsTransparentAndReportsErrors(t *testing.T) {
+	// /v1 passes through untouched. The launcher used to sniff POSTs to
+	// /v1/chat/completions and reroute a `contents` body to
+	// /v1/batch/completions for the old WebUI; the current console addresses
+	// /v1/batch/completions itself, so a body is no longer inspected and a
+	// path is no longer rewritten.
+	var seen []string
 	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
 		if r.Header.Get("Authorization") != "Bearer managed-secret" {
 			t.Error("missing managed auth")
 		}
-		if bytes.Contains(body, []byte(`"contents"`)) {
-			if r.URL.Path != "/v1/batch/completions" {
-				t.Error(r.URL.Path)
-			}
-		} else if r.URL.Path != "/v1/chat/completions" {
-			t.Error(r.URL.Path)
-		}
+		seen = append(seen, r.URL.Path)
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\ndata: [DONE]\n\n")
 	}))
@@ -394,14 +400,25 @@ func TestProxyRawContinuationAndErrors(t *testing.T) {
 	l := newLauncher()
 	l.config.Port = u.Port()
 	l.config.Password = "managed-secret"
-	for _, body := range []string{`{"contents":["English: Hello\n\nChinese:"],"stream":true}`, `{"messages":[{"role":"user","content":"hi"}],"stream":true}`} {
-		r := httptest.NewRequest("POST", "http://127.0.0.1:8088/v1/chat/completions", strings.NewReader(body))
+
+	for _, c := range []struct{ path, body string }{
+		{"/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"}],"stream":true}`},
+		// A raw continuation posted to the chat path stays on the chat path.
+		{"/v1/chat/completions", `{"contents":["English: Hello\n\nChinese:"],"stream":true}`},
+		{"/v1/batch/completions", `{"contents":["English: Hello\n\nChinese:"],"stream":true}`},
+	} {
+		r := httptest.NewRequest("POST", "http://127.0.0.1:8088"+c.path, strings.NewReader(c.body))
 		w := httptest.NewRecorder()
 		l.handler().ServeHTTP(w, r)
 		if w.Code != 200 || !strings.Contains(w.Body.String(), "[DONE]") {
-			t.Fatal(w.Code, w.Body.String())
+			t.Fatal(c.path, w.Code, w.Body.String())
 		}
 	}
+	want := []string{"/v1/chat/completions", "/v1/chat/completions", "/v1/batch/completions"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("proxy rewrote a path: got %v, want %v", seen, want)
+	}
+
 	native.Close()
 	r := httptest.NewRequest("POST", "http://127.0.0.1:8088/v1/chat/completions", strings.NewReader(`{}`))
 	w := httptest.NewRecorder()
@@ -415,7 +432,7 @@ func TestStaticHostAndSecurity(t *testing.T) {
 	for _, c := range []struct {
 		method, path, origin string
 		want                 int
-	}{{"GET", "/", "", 200}, {"GET", "/api/status", "", 200}, {"GET", "/api/start", "", 405}, {"POST", "/api/stop", "https://evil.example", 403}} {
+	}{{"GET", "/", "", 200}, {"GET", "/api/v1/backends", "", 200}, {"GET", "/api/v1/nope", "", 404}, {"POST", "/api/v1/runtime/stop", "https://evil.example", 403}} {
 		r := httptest.NewRequest(c.method, "http://127.0.0.1:8088"+c.path, nil)
 		r.Header.Set("Origin", c.origin)
 		w := httptest.NewRecorder()
@@ -427,7 +444,7 @@ func TestStaticHostAndSecurity(t *testing.T) {
 			t.Fatal("static app missing")
 		}
 	}
-	r := httptest.NewRequest("GET", "http://evil.example/api/status", nil)
+	r := httptest.NewRequest("GET", "http://evil.example/api/v1/backends", nil)
 	w := httptest.NewRecorder()
 	l.handler().ServeHTTP(w, r)
 	if w.Code != 403 {

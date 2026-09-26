@@ -28,6 +28,7 @@ third_party/
 # Launcher binaries
 RWKV_Lightning_CUDA_Launcher/rwkv_launcher
 RWKV_Lightning_CUDA_Launcher/rwkv_launcher.exe
+RWKV_Lightning_CUDA_Launcher/rwkv_launcher_linux_amd64
 
 RWKV_Lightning_CUDA_router/rwkv_router
 RWKV_Lightning_CUDA_router/rwkv_router.exe
@@ -45,3 +46,5 @@ dist/
 # Keep the launcher web assets versioned, including new hashed filenames.
 !RWKV_Lightning_CUDA_Launcher/dist/
 !RWKV_Lightning_CUDA_Launcher/dist/**
+
+.DS_Store

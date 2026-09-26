@@ -53,6 +53,7 @@ curl -sS "http://127.0.0.1:8000/v1/server/status"
 | [构建](docs/build.zh-CN.md) | CUDA、ROCm、Windows、量化工具和打包方式 |
 | [运行](docs/run.zh-CN.md) | 服务参数、动态模型加载、state tuning 和运行示例 |
 | [HTTP API](docs/http-api.zh-CN.md) | 生成、流式、批量、state 和管理接口 |
+| [Launcher 前端与第三方联调](RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md) | Client / Agent、控制面、鉴权与多后端接入 |
 | [MiSS 适配器与参数高效微调](src/miss/README.zh-CN.md) | 训练、续训、导出、动态加载、缓存和验收 |
 | [状态微调](src/state_tuning/README.zh-CN.md) | `time_state` 训练与检查点说明 |
 | [MiSS 验证记录](src/miss/VALIDATION.zh-CN.md) / [优化计划](src/miss/OPTIMIZATION_PLAN.zh-CN.md) | 数值验证、实测性能和后续优化目标 |

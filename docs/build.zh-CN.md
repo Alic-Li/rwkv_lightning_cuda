@@ -60,13 +60,22 @@ cmake --build build-hip -j
 
 ## Go Web 前端（launcher）
 
+在 `RWKV_Lightning_CUDA_Launcher/` 内执行，先安装 Bun，详见[前端开发指南](../RWKV_Lightning_CUDA_Launcher/docs/frontend-development.md)。先构建前端，再编译 Go：
+
+```bash
+bun install --frozen-lockfile
+bun run build
+```
+
+Linux GPU 指标需要 `CGO_ENABLED=1` 与 gcc/libdl；下方通用构建禁用 NVML。
+
 ```bash
 ## Linux
-CGO_ENABLED=0 go build -ldflags="-s -w" -o rwkv_launcher main.go
+CGO_ENABLED=0 go build -ldflags="-s -w" -o rwkv_launcher .
 ```
 
 ```powershell
 ## Windows
 $env:CGO_ENABLED="0"
-go build -trimpath -ldflags="-s -w" -o .\rwkv_launcher.exe .\main.go
+go build -trimpath -ldflags="-s -w" -o .\rwkv_launcher.exe .
 ```
