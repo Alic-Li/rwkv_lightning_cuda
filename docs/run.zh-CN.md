@@ -72,7 +72,9 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/model/load" \
 ## 独立 state 调优（CUDA）
 
 在 `RWKV7_STATE_TUNING=ON`（CUDA 构建默认开启）时，独立的 `rwkv_state_tune` 二进制
-只训练 `blocks.N.att.time_state`，输入是形如 `{"text":"..."}` 的 JSONL 行：
+只训练 `blocks.N.att.time_state`，输入是形如 `{"text":"..."}` 的 JSONL 行；
+也可写成 `{"segments":[{"text":"...","train":false}, ...]}`，只对选定片段（例如 AI
+回复）计算 loss：
 
 ```bash
 ./build/rwkv_state_tune \
@@ -93,8 +95,8 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/model/load" \
 这个以正确性为先的版本使用现有 BF16 PTH 加载器及其 FP16 运行时权重，不支持 INT8
 训练。样本会在 `--ctx` 处截断；`--chunk` 控制 checkpoint/recompute 长度并做反向 state
 梯度传播。`--batch-size N` 在每次优化器更新中累积 N 条变长样本。checkpoint 只包含
-state 张量，可直接上传到现有推理后端使用。实现细节见
-[状态微调文档](../src/state_tuning/README.zh-CN.md)。
+state 张量，可直接上传到现有推理后端使用。掩码 `segments`
+格式和实现细节见 [状态微调文档](../src/state_tuning/README.zh-CN.md)。
 
 ## MiSS adapter 训练与推理
 

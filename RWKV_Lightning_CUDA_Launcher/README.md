@@ -97,7 +97,7 @@ Vite 将 `/api` 和 `/v1` 转发到 `127.0.0.1:10721`，并把请求的 `Origin`
 - **Chat**：真实 SSE 增量输出，支持 Markdown、代码高亮、表格、Stop、重新生成、HTML 预览。思考开关为「自动 / 关 / 开」三档。右侧生成参数面板调整 temperature / top_p / top_k / max_tokens 与重复惩罚，并选择 State 与 MiSS adapter。会话按 backend ID 隔离；停止或网络中断保留部分输出。
 - **并行翻译**：按非空行生成原始续写任务，直接调用 `/v1/batch/completions`，每批 1–128 行非流式执行并按 `choices[].index` 合并。任务栏放语言、batch 与开始 / 停止，不能开始时直接写明原因；译文逐行显示状态（等待 / 进行中 / 完成 / 失败），失败行显示错误原因，可重试失败行、继续被停止的剩余行。结果记录所属节点，切换节点不会串结果。
 - 语言名允许自定义，未知值回退默认。复制 / TXT / Markdown 导出已完成的行。
-- **State / MiSS 训练**：通过真实 CLI 训练，JSONL 每行必须恰好为一个字符串 `text` 字段；「校验数据集」在 Go 宿主机执行，拒绝额外/重复字段。参数分组并提供「推荐 / 低显存 / 试跑」预设。进度卡显示真实 step / epoch / loss / LR / tokens/s / ETA、可切换并平滑的 loss / lr / tok/s 曲线和实际保存的 checkpoint 路径；进程输出在日志抽屉里查看。
+- **State / MiSS 训练**：通过真实 CLI 训练，JSONL 每行必须恰好为一个字符串 `text` 字段，或一个 `segments` 数组（每项恰好为字符串 `text` 和布尔 `train`，只对 `train:true` 片段计算 loss）；「校验数据集」在 Go 宿主机执行，拒绝额外/重复字段。参数分组并提供「推荐 / 低显存 / 试跑」预设。进度卡显示真实 step / epoch / loss / LR / tokens/s / ETA、可切换并平滑的 loss / lr / tok/s 曲线和实际保存的 checkpoint 路径；进程输出在日志抽屉里查看。
 - **量化**：把 BF16 `.pth` 转成 `.rwkvq`（w4a16，group 128 / 32；或 w8a16），输出路径按输入自动推导。在节点 CPU 上运行，不占显卡；显示进度与输出文件。
 - **Appearance**：默认跟随系统外观（System），Settings 中可显式选择 Dark / Light / System，以及中文 / English 切换。System 会跟随操作系统并在系统外观变化时即时更新，选择会保存在本地，页面加载前即应用以避免主题闪烁。
 - **Settings**：外观与语言、当前节点与 Agent token、翻译默认语言与 batch size，以及清除本机数据。远端 token 由本机 Client 注入，浏览器不持久化。

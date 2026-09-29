@@ -366,7 +366,7 @@ Start / stop / restart 成功均为 `200 {"ok":true}`。start 成功不等于模
 | --- | --- | --- |
 | `method` | string | `state` 或 `miss`；空值按 state |
 | `model` | string | 已存在的 BF16 `.pth` 基模，不接受 `.rwkvq` |
-| `data` | string | 已存在的 JSONL 文件；非空行恰好一个字符串 `text` 字段 |
+| `data` | string | 已存在的 JSONL 文件；非空行恰好一个字符串 `text` 字段，或一个 `segments` 数组（每项为字符串 `text` + 布尔 `train`） |
 | `output` | string | 非空输出目录路径 |
 | `vocab` | string | 可选词表文件；非空时须存在 |
 | `ctx` / `chunk` | integer | 均 > 0，`chunk <= ctx` |

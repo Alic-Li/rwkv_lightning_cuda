@@ -67,7 +67,7 @@ accumulates later-layer value-residual gradients and consumes them in layer 0.
 ## Standalone CLI
 
 Both GPU backends produce `rwkv_state_tune`. It streams JSONL records containing
-exactly one `text` field, tokenizes each record, applies causal next-token loss,
+exactly one `text` field (or masked `segments`, below), tokenizes each record, applies causal next-token loss,
 and performs one state-only optimizer update per batch:
 
 ```bash
@@ -84,6 +84,27 @@ and performs one state-only optimizer update per batch:
   --warmup-steps 10 \
   --save-every 500
 ```
+
+### Masked loss (train only the assistant reply)
+
+A row may instead list `segments`. Every segment is fed through the model, but only
+tokens from segments with `"train": true` are loss targets:
+
+```json
+{"segments":[{"text":"User: Hi\n\nAssistant:","train":false},{"text":" Hello! How can I help?\n\n","train":true}]}
+```
+
+- Each segment needs exactly one string `text` and one boolean `train`; `{"text":"..."}`
+  rows still train every token.
+- Segments are tokenized independently and concatenated, so split them where a token
+  boundary is natural (for example right after `Assistant:`).
+- Loss and gradient are averaged over trained tokens in the batch. Untrained prefixes
+  still run forward and backward, because the initial state gets its gradient through
+  them; tokens after the last trained token are dropped. Rows with no trained token
+  inside `--ctx` are skipped.
+- The progress line reports `tokens=` (positions run through the model, used for
+  tok/s) and `trained=` (loss targets).
+- `rwkv_miss_tune` reads the same format.
 
 Checkpoints contain only FP32 `blocks.N.att.time_state` tensors in PyTorch
 `[H,V,K]` layout. The writer validates each archive with the same PTH parser

@@ -195,11 +195,12 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
                                bf16 *workspace, std::size_t workspace_elements,
                                bool layer_zero);
 
-// Cross entropy over every row. loss must point to one FP32 device scalar and
-// is overwritten with the row mean times gradient_scale. gradient_scale
-// weights valid tokens across chunks/samples; it is not loss scaling.
-// The dense path requires
-// ignore_index < 0 (dense, equal-length batches). d_logits is BF16.
+// Cross entropy over rows. loss must point to one FP32 device scalar and is
+// overwritten with the sum over kept rows of (row loss * gradient_scale /
+// rows). Rows whose target equals ignore_index add no loss and get zero
+// d_logits; the divisor stays rows, so callers normalising by a count of kept
+// tokens across chunks/samples pass rows / kept. gradient_scale is not loss
+// scaling. d_logits is BF16.
 void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
                                          int vocab, const bf16 *logits,
                                          const int *targets, int ignore_index,

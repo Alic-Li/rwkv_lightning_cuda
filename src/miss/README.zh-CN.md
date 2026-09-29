@@ -57,7 +57,9 @@ cmake --build build -j 6
   --epochs 1 --lr 0.001 --lr-final 0.0001 --warmup-steps 10 --save-every 100
 ```
 
-每条 JSONL 记录必须为 `{"text":"..."}`。路径相对于 shell 当前工作目录解析。
+每条 JSONL 记录必须为 `{"text":"..."}`，或掩码形式
+`{"segments":[{"text":"...","train":bool}, ...]}`（见
+[状态微调](../state_tuning/README.zh-CN.md#掩码训练只训练-ai-回复)）。路径相对于 shell 当前工作目录解析。
 以下是接近生产规模的示例：
 
 ```bash

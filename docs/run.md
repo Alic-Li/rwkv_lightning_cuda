@@ -80,7 +80,8 @@ from VRAM, and then loads the selected model.
 
 With `RWKV7_STATE_TUNING=ON` (the default for CUDA builds), the standalone
 `rwkv_state_tune` binary trains only `blocks.N.att.time_state` from JSONL rows
-of the form `{"text":"..."}`:
+of the form `{"text":"..."}`, or `{"segments":[{"text":"...","train":false}, ...]}`
+to compute loss only on selected segments such as assistant replies:
 
 ```bash
 ./build/rwkv_state_tune \
@@ -103,8 +104,8 @@ its FP16 runtime weights and rejects INT8 training. Samples are truncated at
 `--ctx`; `--chunk` controls checkpoint/recompute length with reverse state
 gradient propagation. `--batch-size N` accumulates N variable-length samples
 per optimizer update. Checkpoints contain only state tensors and can be uploaded to the
-existing inference backend. See `../src/state_tuning/README.md` for implementation
-details.
+existing inference backend. See `../src/state_tuning/README.md` for the masked
+`segments` format and implementation details.
 
 ## MiSS adapter tuning and serving
 

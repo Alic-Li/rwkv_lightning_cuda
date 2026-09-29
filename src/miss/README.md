@@ -62,7 +62,9 @@ cmake --build build -j 6
   --epochs 1 --lr 0.001 --lr-final 0.0001 --warmup-steps 10 --save-every 100
 ```
 
-Each JSONL record must be `{"text":"..."}`. Paths are resolved from the shell's
+Each JSONL record must be `{"text":"..."}` or a masked
+`{"segments":[{"text":"...","train":bool}, ...]}` row (see
+[state tuning](../state_tuning/README.md#masked-loss-train-only-the-assistant-reply)). Paths are resolved from the shell's
 working directory. A production-sized example is:
 
 ```bash
