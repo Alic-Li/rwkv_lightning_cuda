@@ -695,6 +695,81 @@ func (l *launcher) runtimeLoad(req runtimeLoadRequest) (map[string]any, error) {
 	return map[string]any{"ok": true, "visible_devices": spec, "model": loaded}, nil
 }
 
+// validateDatasetRow mirrors the trainer's JSONL reader: a row is exactly
+// {"text": string} or {"segments": [{"text": string, "train": bool}, ...]}.
+func validateDatasetRow(row string) error {
+	dec := json.NewDecoder(strings.NewReader(row))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return fmt.Errorf("expected JSON object")
+	}
+	key, err := dec.Token()
+	switch {
+	case err == nil && key == "text":
+		value, valueErr := dec.Token()
+		if _, isString := value.(string); valueErr != nil || !isString {
+			return fmt.Errorf("text must be a string")
+		}
+	case err == nil && key == "segments":
+		if err := validateSegments(dec); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("only a text or segments field is supported")
+	}
+	if dec.More() {
+		return fmt.Errorf("exactly one text or segments field is required")
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return fmt.Errorf("invalid object")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("trailing data")
+	}
+	return nil
+}
+
+func validateSegments(dec *json.Decoder) error {
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+		return fmt.Errorf("segments must be an array")
+	}
+	if !dec.More() {
+		return fmt.Errorf("segments must not be empty")
+	}
+	for dec.More() {
+		if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+			return fmt.Errorf("segment must be an object")
+		}
+		hasText, hasTrain := false, false
+		for dec.More() {
+			key, keyErr := dec.Token()
+			value, valueErr := dec.Token()
+			if keyErr != nil || valueErr != nil {
+				return fmt.Errorf("invalid segment")
+			}
+			_, isString := value.(string)
+			_, isBool := value.(bool)
+			switch {
+			case key == "text" && !hasText && isString:
+				hasText = true
+			case key == "train" && !hasTrain && isBool:
+				hasTrain = true
+			default:
+				return fmt.Errorf("segment needs exactly one string text and one boolean train field")
+			}
+		}
+		if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+			return fmt.Errorf("invalid segment")
+		}
+		if !hasText || !hasTrain {
+			return fmt.Errorf("segment needs exactly one string text and one boolean train field")
+		}
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim(']') {
+		return fmt.Errorf("invalid segments array")
+	}
+	return nil
+}
+
 func validateDataset(path string) (int, error) {
 	if err := existingPath(path, false); err != nil {
 		return 0, err
@@ -715,28 +790,8 @@ func validateDataset(path string) (int, error) {
 		if len(s.Bytes()) == 0 {
 			continue
 		}
-		dec := json.NewDecoder(strings.NewReader(s.Text()))
-		tok, err := dec.Token()
-		if err != nil || tok != json.Delim('{') {
-			return 0, fmt.Errorf("line %d: expected JSON object", line)
-		}
-		key, err := dec.Token()
-		if err != nil || key != "text" {
-			return 0, fmt.Errorf("line %d: only text field is supported", line)
-		}
-		value, valueErr := dec.Token()
-		_, isString := value.(string)
-		if valueErr != nil || !isString {
-			return 0, fmt.Errorf("line %d: text must be a string", line)
-		}
-		if dec.More() {
-			return 0, fmt.Errorf("line %d: exactly one text field is required", line)
-		}
-		if tok, err = dec.Token(); err != nil || tok != json.Delim('}') {
-			return 0, fmt.Errorf("line %d: invalid object", line)
-		}
-		if _, err = dec.Token(); err != io.EOF {
-			return 0, fmt.Errorf("line %d: trailing data", line)
+		if err := validateDatasetRow(s.Text()); err != nil {
+			return 0, fmt.Errorf("line %d: %w", line, err)
 		}
 		count++
 	}

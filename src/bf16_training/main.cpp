@@ -29,6 +29,16 @@ using rwkv_bf16_training::BlockTapeView;
 using rwkv_bf16_training::DeviceBuffer;
 using rwkv_bf16_training::FrozenBlockWeights;
 
+// Target i of a sample predicts tokens[i + 1]; train[i + 1] says whether it
+// contributes to the loss. Untrained prefixes still run forward and backward
+// because the tuned initial state receives its gradient through them.
+struct Sample {
+  std::vector<int> tokens;
+  std::vector<unsigned char> train;
+};
+
+constexpr int kIgnoredTarget = -1;
+
 struct Options {
 #ifdef RWKV_MISS_TUNE
   std::string state, resume, targets = "all";
@@ -92,7 +102,10 @@ struct Options {
       << "  --lr-final FLOAT      final learning rate (default 0.01)\n"
       << "  --warmup-steps N      linear warmup updates (default 10)\n"
       << "  --save-every N        periodic checkpoint interval (default 0)\n"
-      << "  --seed N              deterministic run seed (default 1234)\n";
+      << "  --seed N              deterministic run seed (default 1234)\n"
+      << "JSONL rows: {\"text\": ...} trains every token; "
+         "{\"segments\": [{\"text\": ..., \"train\": bool}, ...]}\n"
+      << "computes loss only on tokens from train=true segments\n";
   std::exit(error.empty() ? 0 : 2);
 }
 
@@ -524,9 +537,9 @@ int main(int argc, char **argv) {
       std::uint64_t data_row = 0;
 #ifdef RWKV_MISS_TUNE
       if (epoch == resume_epoch) {
-        std::string skipped_text;
+        std::vector<rwkv7_state_tuning::TextSegment> skipped_row;
         while (data_row < resume_row) {
-          if (!dataset.next(skipped_text))
+          if (!dataset.next(skipped_row))
             throw std::runtime_error("resume data progress exceeds dataset");
           ++data_row;
         }
@@ -534,24 +547,43 @@ int main(int argc, char **argv) {
 #endif
       bool exhausted = false;
       while (!exhausted) {
-        std::vector<std::vector<int>> batch;
+        std::vector<Sample> batch;
+        // batch_tokens counts loss targets and normalises the gradient;
+        // batch_positions counts every position run through the model.
         std::size_t batch_tokens = 0;
+        std::size_t batch_positions = 0;
         while (batch.size() < static_cast<std::size_t>(options.batch_size)) {
-          std::string text;
-          if (!dataset.next(text)) {
+          std::vector<rwkv7_state_tuning::TextSegment> segments;
+          if (!dataset.next(segments)) {
             exhausted = true;
             break;
           }
           ++data_row;
-          const auto encoded = tokenizer.encode(text);
-          if (encoded.size() < 2) {
+          // Segments are tokenized independently so the mask follows their
+          // boundaries exactly.
+          Sample sample;
+          for (const auto &segment : segments) {
+            const auto encoded = tokenizer.encode(segment.text);
+            sample.tokens.insert(sample.tokens.end(), encoded.begin(),
+                                 encoded.end());
+            sample.train.insert(sample.train.end(), encoded.size(),
+                                segment.train ? 1 : 0);
+          }
+          std::size_t count = std::min(
+              sample.tokens.size(), static_cast<std::size_t>(options.ctx) + 1);
+          // Positions after the last trained target carry no gradient.
+          while (count >= 2 && !sample.train[count - 1])
+            --count;
+          if (count < 2) {
             ++skipped;
             continue;
           }
-          const std::size_t count = std::min(
-              encoded.size(), static_cast<std::size_t>(options.ctx) + 1);
-          batch.emplace_back(encoded.begin(), encoded.begin() + count);
-          batch_tokens += count - 1;
+          sample.tokens.resize(count);
+          sample.train.resize(count);
+          batch_tokens += static_cast<std::size_t>(
+              std::count(sample.train.begin() + 1, sample.train.end(), 1));
+          batch_positions += count - 1;
+          batch.push_back(std::move(sample));
         }
         if (batch.empty())
           break;
@@ -559,7 +591,8 @@ int main(int argc, char **argv) {
         std::fill(accumulated.begin(), accumulated.end(), 0.0f);
 #endif
         float batch_loss = 0.0f;
-        for (const auto &tokens : batch) {
+        for (const auto &sample : batch) {
+          const auto &tokens = sample.tokens;
           const int length = static_cast<int>(tokens.size()) - 1;
           const int chunks = 1 + (length - 1) / max_time;
           copy_device(carried.p, time_state.p, state_count * sizeof(float));
@@ -580,7 +613,8 @@ int main(int argc, char **argv) {
                   frozen.cpu_emb_ln0_bf16 + static_cast<std::size_t>(token) * C;
               std::copy(source, source + C,
                         host_input.data() + static_cast<std::size_t>(t) * C);
-              host_targets[t] = target;
+              host_targets[t] =
+                  sample.train[offset + t + 1] ? target : kIgnoredTarget;
             }
             check(cudaMemcpyAsync(input.p, host_input.data(),
                                   host_input.size() * sizeof(std::uint16_t),
@@ -620,8 +654,8 @@ int main(int argc, char **argv) {
             const bf16 *final_block = forward_chunk(j);
             const int T = std::min(max_time, length - j * max_time);
             rwkv_bf16_training::cross_entropy_forward_backward_bf16(
-                stream.value, T, V, logits.p, targets.p, -1, loss.p, d_logits.p,
-                static_cast<float>(T) / batch_tokens);
+                stream.value, T, V, logits.p, targets.p, kIgnoredTarget, loss.p,
+                d_logits.p, static_cast<float>(T) / batch_tokens);
             rwkv_bf16_training::model_output_backward_state_only(
                 stream.value, L, 1, T, frozen.blocks.data(), tapes.data(),
                 backward.data(), final_block, frozen.ln_out_weight,
@@ -688,7 +722,7 @@ int main(int argc, char **argv) {
 #endif
         check(cudaStreamSynchronize(stream.value), "optimizer update");
         global_step = next_step;
-        processed_tokens += batch_tokens;
+        processed_tokens += batch_positions;
         const double elapsed = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - started)
                                    .count();
@@ -700,7 +734,8 @@ int main(int argc, char **argv) {
                   << planned << " epoch=" << epoch << '/' << options.epochs
                   << " loss=" << std::fixed << std::setprecision(4)
                   << batch_loss << " batch=" << batch.size()
-                  << " tokens=" << batch_tokens
+                  << " tokens=" << batch_positions
+                  << " trained=" << batch_tokens
                   << " lr=" << std::setprecision(6) << lr
                   << " tok/s=" << std::setprecision(1)
                   << processed_tokens / elapsed

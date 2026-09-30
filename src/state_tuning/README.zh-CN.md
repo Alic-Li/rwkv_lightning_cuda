@@ -41,8 +41,8 @@ BF16 模型文件仍由现有加载器转换为相同的 FP16 运行时表示。
 
 ## 独立命令行工具
 
-两种 GPU 后端都会生成 `rwkv_state_tune`。它以流式方式读取仅包含一个 `text` 字段的
-JSONL 记录，分词后计算因果下一 token 损失，并在每个批次后执行一次仅更新状态的优化：
+两种 GPU 后端都会生成 `rwkv_state_tune`。它以流式方式读取仅包含一个 `text` 字段（或下文的
+掩码 `segments`）的 JSONL 记录，分词后计算因果下一 token 损失，并在每个批次后执行一次仅更新状态的优化：
 
 ```bash
 ./build/rwkv_state_tune \
@@ -58,6 +58,24 @@ JSONL 记录，分词后计算因果下一 token 损失，并在每个批次后�
   --warmup-steps 10 \
   --save-every 500
 ```
+
+### 掩码训练（只训练 AI 回复）
+
+数据行也可以写成 `segments`。所有片段都会送入模型，但只有 `"train": true` 片段中的
+token 作为 loss 目标：
+
+```json
+{"segments":[{"text":"User: 你好\n\nAssistant:","train":false},{"text":" 你好！有什么可以帮你？\n\n","train":true}]}
+```
+
+- 每个片段必须恰好包含一个字符串 `text` 和一个布尔 `train`；`{"text":"..."}` 行仍然
+  训练全部 token。
+- 各片段分别分词后拼接，因此应在自然的 token 边界切分，例如紧跟在 `Assistant:` 之后。
+- loss 和梯度按批次内参与训练的 token 数取平均。不训练的前缀仍会做前向和反向，因为
+  初始 state 的梯度要经过它们回传；最后一个训练 token 之后的部分会被丢弃。`--ctx`
+  范围内没有训练 token 的行会被跳过。
+- 进度行中 `tokens=` 是送入模型的位置数（用于计算 tok/s），`trained=` 是 loss 目标数。
+- `rwkv_miss_tune` 读取相同格式。
 
 检查点只包含 FP32 `blocks.N.att.time_state` 张量，采用 PyTorch `[H,V,K]` 布局。
 写入器使用与推理相同的 PTH 解析器校验文件，然后将其发布为

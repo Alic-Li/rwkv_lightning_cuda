@@ -204,19 +204,11 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
       !std::isfinite(gradient_scale) || gradient_scale <= 0) {
     throw std::invalid_argument("invalid cross entropy arguments");
   }
-  int valid = rows;
-  if (ignore_index >= 0) {
-    // The normal state-tuning path uses dense labels. Keeping ignore support
-    // exact would require a tiny count reduction, so use a count supplied by
-    // the caller only when no ignore index is active.
-    throw std::invalid_argument(
-        "ignore_index is not supported by the first exact short-context path");
-  }
   const cudaError_t error = cudaMemsetAsync(loss, 0, sizeof(float), stream);
   if (error != cudaSuccess)
     throw std::runtime_error(cudaGetErrorString(error));
   xent_kernel<<<rows, kThreads, 0, stream>>>(
-      vocab, logits, targets, ignore_index, gradient_scale / valid, loss,
+      vocab, logits, targets, ignore_index, gradient_scale / rows, loss,
       d_logits);
 }
 

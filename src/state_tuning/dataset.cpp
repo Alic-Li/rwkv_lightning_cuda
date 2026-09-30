@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 
 namespace rwkv7_state_tuning {
 namespace {
@@ -114,29 +115,92 @@ void whitespace(const std::string &line, std::size_t &at) {
     ++at;
 }
 
-std::string parse_text(const std::string &line) {
+void expect(const std::string &line, std::size_t &at, char c,
+            const char *error) {
+  whitespace(line, at);
+  if (at >= line.size() || line[at] != c)
+    throw std::runtime_error(error);
+  ++at;
+  whitespace(line, at);
+}
+
+bool json_bool(const std::string &line, std::size_t &at) {
+  if (line.compare(at, 4, "true") == 0) {
+    at += 4;
+    return true;
+  }
+  if (line.compare(at, 5, "false") == 0) {
+    at += 5;
+    return false;
+  }
+  throw std::runtime_error("segment train must be true or false");
+}
+
+TextSegment parse_segment(const std::string &line, std::size_t &at) {
+  expect(line, at, '{', "segment must be an object");
+  bool has_text = false;
+  bool has_train = false;
+  TextSegment segment;
+  while (true) {
+    const std::string key = json_string(line, at);
+    expect(line, at, ':', "missing ':' after segment field");
+    if (key == "text" && !has_text) {
+      segment.text = json_string(line, at);
+      has_text = true;
+    } else if (key == "train" && !has_train) {
+      segment.train = json_bool(line, at);
+      has_train = true;
+    } else {
+      throw std::runtime_error(
+          "segment must contain exactly one text and one train field");
+    }
+    whitespace(line, at);
+    if (at < line.size() && line[at] == ',') {
+      expect(line, at, ',', "missing ','");
+      continue;
+    }
+    expect(line, at, '}', "missing closing segment brace");
+    break;
+  }
+  if (!has_text || !has_train)
+    throw std::runtime_error("segment requires both text and train");
+  return segment;
+}
+
+// A row is either {"text": "..."} (every token trained) or
+// {"segments": [{"text": "...", "train": bool}, ...]}.
+std::vector<TextSegment> parse_row(const std::string &line) {
   std::size_t at = 0;
-  whitespace(line, at);
-  if (at >= line.size() || line[at++] != '{')
-    throw std::runtime_error("JSONL row must be an object");
-  whitespace(line, at);
+  expect(line, at, '{', "JSONL row must be an object");
   const std::string key = json_string(line, at);
+  expect(line, at, ':', "missing ':' after row field");
+  std::vector<TextSegment> segments;
+  if (key == "text") {
+    segments.push_back({json_string(line, at), true});
+  } else if (key == "segments") {
+    expect(line, at, '[', "segments must be an array");
+    if (at < line.size() && line[at] == ']')
+      throw std::runtime_error("segments must not be empty");
+    while (true) {
+      segments.push_back(parse_segment(line, at));
+      whitespace(line, at);
+      if (at < line.size() && line[at] == ',') {
+        expect(line, at, ',', "missing ','");
+        continue;
+      }
+      expect(line, at, ']', "missing closing segments bracket");
+      break;
+    }
+  } else {
+    throw std::runtime_error("JSONL row must contain a text or segments field");
+  }
   whitespace(line, at);
-  if (at >= line.size() || line[at++] != ':')
-    throw std::runtime_error("missing ':' after text");
-  whitespace(line, at);
-  const std::string value = json_string(line, at);
-  whitespace(line, at);
-  if (key != "text")
-    throw std::runtime_error("JSONL row must contain only the text field");
   if (at < line.size() && line[at] == ',')
-    throw std::runtime_error("only the text field is supported");
-  if (at >= line.size() || line[at++] != '}')
-    throw std::runtime_error("missing closing object brace");
-  whitespace(line, at);
+    throw std::runtime_error("JSONL row must contain exactly one field");
+  expect(line, at, '}', "missing closing object brace");
   if (at != line.size())
     throw std::runtime_error("trailing JSON data");
-  return value;
+  return segments;
 }
 
 } // namespace
@@ -147,14 +211,14 @@ JsonlTextReader::JsonlTextReader(const std::string &path)
     throw std::runtime_error("failed to open dataset: " + path);
 }
 
-bool JsonlTextReader::next(std::string &text) {
+bool JsonlTextReader::next(std::vector<TextSegment> &segments) {
   std::string line;
   while (std::getline(input_, line)) {
     ++line_number_;
     if (line.empty())
       continue;
     try {
-      text = parse_text(line);
+      segments = parse_row(line);
       return true;
     } catch (const std::exception &error) {
       throw std::runtime_error(path_ + ":" + std::to_string(line_number_) +
@@ -164,11 +228,22 @@ bool JsonlTextReader::next(std::string &text) {
   return false;
 }
 
+bool JsonlTextReader::next(std::string &text) {
+  std::vector<TextSegment> segments;
+  if (!next(segments))
+    return false;
+  if (segments.size() != 1 || !segments[0].train)
+    throw std::runtime_error(path_ + ":" + std::to_string(line_number_) +
+                             ": expected a plain text row");
+  text = std::move(segments[0].text);
+  return true;
+}
+
 std::size_t count_jsonl_rows(const std::string &path) {
   JsonlTextReader reader(path);
-  std::string text;
+  std::vector<TextSegment> segments;
   std::size_t rows = 0;
-  while (reader.next(text))
+  while (reader.next(segments))
     ++rows;
   return rows;
 }

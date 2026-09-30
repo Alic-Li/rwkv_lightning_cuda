@@ -63,6 +63,68 @@ int main() {
         throw std::runtime_error("JSONL row count mismatch");
     }  // Close file handles before deleting the fixture on Windows.
     std::filesystem::remove(dataset);
+
+    const auto masked = std::filesystem::temp_directory_path() /
+                        "rwkv_state_tuning_masked_dataset_test.jsonl";
+    {
+      std::ofstream file(masked);
+      file << "{\"text\":\"plain\"}\n";
+      file << " { \"segments\" : [ {\"text\":\"User: hi\\n\\nAssistant:\","
+              "\"train\":false}, {\"train\":true,\"text\":\" \\u4f60\"} ] } \n";
+    }
+    {
+      rwkv7_state_tuning::JsonlTextReader reader(masked.string());
+      std::vector<TextSegment> segments;
+      if (!reader.next(segments) || segments.size() != 1 ||
+          segments[0].text != "plain" || !segments[0].train)
+        throw std::runtime_error("plain row is not one trained segment");
+      if (!reader.next(segments) || segments.size() != 2 ||
+          segments[0].text != "User: hi\n\nAssistant:" || segments[0].train ||
+          segments[1].text != " 你" || !segments[1].train ||
+          reader.next(segments))
+        throw std::runtime_error("JSONL segments mismatch");
+    }
+    {
+      rwkv7_state_tuning::JsonlTextReader reader(masked.string());
+      std::string text;
+      bool rejected = false;
+      try {
+        (void)reader.next(text);
+        (void)reader.next(text);
+      } catch (const std::runtime_error &) {
+        rejected = true;
+      }
+      if (!rejected)
+        throw std::runtime_error("plain reader accepted a masked row");
+    }
+    std::filesystem::remove(masked);
+
+    for (const char *row :
+         {"{\"segments\":[]}", "{\"segments\":[{\"text\":\"a\"}]}",
+          "{\"segments\":[{\"train\":true}]}",
+          "{\"segments\":[{\"text\":\"a\",\"train\":1}]}",
+          "{\"segments\":[{\"text\":\"a\",\"train\":true,\"x\":1}]}",
+          "{\"segments\":[{\"text\":\"a\",\"text\":\"b\",\"train\":true}]}",
+          "{\"segments\":{\"text\":\"a\",\"train\":true}}",
+          "{\"text\":\"a\",\"segments\":[]}"}) {
+      const auto bad = std::filesystem::temp_directory_path() /
+                       "rwkv_state_tuning_bad_dataset_test.jsonl";
+      {
+        std::ofstream file(bad);
+        file << row << '\n';
+      }
+      bool rejected_row = false;
+      try {
+        rwkv7_state_tuning::JsonlTextReader reader(bad.string());
+        std::vector<TextSegment> segments;
+        (void)reader.next(segments);
+      } catch (const std::runtime_error &) {
+        rejected_row = true;
+      }
+      std::filesystem::remove(bad);
+      if (!rejected_row)
+        throw std::runtime_error(std::string("accepted bad row: ") + row);
+    }
   } catch (const std::exception &error) {
     std::cerr << "state_tuning_api_test failed: " << error.what() << '\n';
     return 1;

@@ -75,11 +75,14 @@ func TestRuntimeArgs(t *testing.T) {
 	}
 }
 func TestDatasetValidation(t *testing.T) {
-	good := testFile(t, "data.jsonl", "{\"text\":\"你好\\nworld\"}\n\n{\"text\":\"\"}\n")
-	if n, e := validateDataset(good); e != nil || n != 2 {
+	good := testFile(t, "data.jsonl", "{\"text\":\"你好\\nworld\"}\n\n{\"text\":\"\"}\n{\"segments\":[{\"text\":\"User: hi\\n\\nAssistant:\",\"train\":false},{\"train\":true,\"text\":\" hello\"}]}\n")
+	if n, e := validateDataset(good); e != nil || n != 3 {
 		t.Fatalf("%d %v", n, e)
 	}
-	for _, s := range []string{"", "{\"other\":\"a\"}", "{\"text\":3}", "{\"text\":null}", "{\"text\":\"a\",\"extra\":1}", "{\"text\":\"a\",\"text\":\"b\"}", "{\"text\":\"a\"}{}", "  ", "[]"} {
+	for _, s := range []string{"", "{\"other\":\"a\"}", "{\"text\":3}", "{\"text\":null}", "{\"text\":\"a\",\"extra\":1}", "{\"text\":\"a\",\"text\":\"b\"}", "{\"text\":\"a\"}{}", "  ", "[]",
+		"{\"segments\":[]}", "{\"segments\":{}}", "{\"segments\":[{\"text\":\"a\"}]}", "{\"segments\":[{\"train\":true}]}", "{\"segments\":[{\"text\":\"a\",\"train\":1}]}",
+		"{\"segments\":[{\"text\":\"a\",\"train\":true,\"x\":1}]}", "{\"segments\":[{\"text\":\"a\",\"text\":\"b\",\"train\":true}]}", "{\"segments\":[{\"text\":[],\"train\":true}]}",
+		"{\"text\":\"a\",\"segments\":[]}", "{\"segments\":[{\"text\":\"a\",\"train\":true}],\"text\":\"a\"}"} {
 		if _, e := validateDataset(testFile(t, "bad.jsonl", s)); e == nil {
 			t.Fatalf("accepted %q", s)
 		}

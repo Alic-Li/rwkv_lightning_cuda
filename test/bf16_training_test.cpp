@@ -234,8 +234,23 @@ int main() {
     near(to_float(g[0]), expected, expected * .004, "BF16 non-target gradient");
     near(download(loss)[0], std::log(65536.0) / 262144, 1e-10,
          "BF16 mean loss");
-    std::cout << "Native BF16 WKV finite differences, chunk adjoint, LN and "
-                 "long-batch CE passed\n";
+    // Ignored rows are masked out of both loss and gradient; the per-row
+    // weight is still gradient_scale / rows.
+    DeviceBuffer<bf16> masked_logits, masked_dlogits;
+    DeviceBuffer<int> masked_labels;
+    upload(masked_logits, std::vector<bf16>(2 * 64, to_bf16(0)));
+    upload(masked_labels, std::vector<int>{3, -1});
+    masked_dlogits.resize(2 * 64, "masked dlogits");
+    cross_entropy_forward_backward_bf16(nullptr, 2, 64, masked_logits.p,
+                                        masked_labels.p, -1, loss.p,
+                                        masked_dlogits.p, 2.0f);
+    auto masked = download(masked_dlogits);
+    near(to_float(masked[3]), 1.0 / 64 - 1, 4e-3, "masked kept target");
+    for (int i = 64; i < 128; ++i)
+      near(to_float(masked[i]), 0.0, 0.0, "masked row gradient");
+    near(download(loss)[0], std::log(64.0), 1e-5, "masked mean loss");
+    std::cout << "Native BF16 WKV finite differences, chunk adjoint, LN, "
+                 "long-batch and masked CE passed\n";
     return 0;
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

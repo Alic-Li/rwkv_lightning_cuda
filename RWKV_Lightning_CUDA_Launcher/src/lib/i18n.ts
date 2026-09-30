@@ -443,7 +443,7 @@ const zh = {
   "training.unsupported": "该节点没有训练能力。",
   "training.missUnsupported": "该节点没有 MiSS 工具。",
   "training.running": "训练进行中",
-  "training.datasetHint": "非空行恰好一个字符串 text 字段",
+  "training.datasetHint": "非空行为 {text} 或 {segments:[{text,train}]}",
 
   "training.stop": "停止训练",
   "training.method.label": "训练方法",
@@ -1006,7 +1006,7 @@ const en: Record<MessageKey, string> = {
   "training.unsupported": "This node has no tuning capability.",
   "training.missUnsupported": "This node has no MiSS tool.",
   "training.running": "Training in progress",
-  "training.datasetHint": "Each non-empty line holds exactly one `text` string",
+  "training.datasetHint": "Each non-empty line is {text} or {segments:[{text,train}]}",
 
   "training.stop": "Stop training",
   "training.method.label": "Method",
