@@ -57,7 +57,7 @@ func TestStateImportStreamsNodeFileToRuntime(t *testing.T) {
 		data, _ := io.ReadAll(part)
 		gotBody = string(data)
 		w.WriteHeader(201)
-		fmt.Fprint(w, `{"object":"rwkv.state","state_id":"agentic.pth"}`)
+		fmt.Fprint(w, `{"object":"rwkv.state","state_id":"agentic-017f22e2-79b0-7cc3-98c4-dc0c0c07398f","original_filename":"agentic.pth","size_bytes":14,"created_ms":1645557742000,"uploaded_at":"2022-02-22T19:22:22.000Z"}`)
 	}))
 	defer native.Close()
 	u, _ := url.Parse(native.URL)
@@ -66,7 +66,7 @@ func TestStateImportStreamsNodeFileToRuntime(t *testing.T) {
 
 	code, out, raw := stateImportCall(t, l, `{"path":`+fmt.Sprintf("%q", path)+`}`)
 	// The runtime's own status and body pass through untouched.
-	if code != 201 || out["state_id"] != "agentic.pth" {
+	if code != 201 || out["state_id"] != "agentic-017f22e2-79b0-7cc3-98c4-dc0c0c07398f" || out["original_filename"] != "agentic.pth" || out["created_ms"] != float64(1645557742000) {
 		t.Fatalf("import: %d %s", code, raw)
 	}
 	if gotName != "agentic.pth" || gotBody != "PK-state-bytes" {

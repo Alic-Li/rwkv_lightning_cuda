@@ -483,6 +483,12 @@ Json::Value uploaded_state_json(const UploadedStateInfo& info) {
   Json::Value item;
   item["state_id"] = info.state_id;
   item["filename"] = info.filename;
+  item["original_filename"] = info.original_filename;
+  item["created_ms"] = static_cast<Json::Int64>(info.created_ms);
+  item["uploaded_at"] = info.uploaded_at;
+  item["layers"] = info.layers;
+  item["heads"] = info.heads;
+  item["head_size"] = info.head_size;
   item["size_bytes"] = static_cast<Json::UInt64>(info.size_bytes);
   item["tensor_count"] = info.tensor_count;
   item["created"] = static_cast<Json::Int64>(info.created);
@@ -602,7 +608,8 @@ void register_uploaded_state_routes(
         try {
           const auto& file = files.front();
           const auto info = UploadedStateStore::instance().upload(
-              file.getFileName(), file.fileData(), file.fileLength());
+              file.getFileName(), file.fileData(), file.fileLength(),
+              req->getHeader("x-rwkv-state-upload-uuid"));
           Json::Value resp = uploaded_state_json(info);
           resp["object"] = "rwkv.state";
           cb(json_response(std::move(resp)));
@@ -808,14 +815,15 @@ std::string create_translation_prompt(
   return source_lang + ": " + text + "\n\n" + target_lang + ":";
 }
 
-Json::Value build_choices(const std::vector<std::string>& texts) {
+Json::Value build_choices(const std::vector<std::string>& texts,
+                          const InferenceEngine::GenerationStats& stats) {
   Json::Value choices = Json::arrayValue;
   for (size_t i = 0; i < texts.size(); ++i) {
     Json::Value choice;
     choice["index"] = static_cast<int>(i);
     choice["message"]["role"] = "assistant";
     choice["message"]["content"] = texts[i];
-    choice["finish_reason"] = "stop";
+    choice["finish_reason"] = stats.finish_reasons.at(i);
     choices.append(choice);
   }
   return choices;
@@ -835,8 +843,7 @@ bool send_finish_chunk(
     const ResponseStreamPtr& stream,
     const std::string& id,
     const std::string& model,
-    int choice_count,
-    const std::string& finish_reason = "stop") {
+    const InferenceEngine::GenerationStats& stats) {
   Json::Value payload;
   if (!id.empty()) {
     payload["id"] = id;
@@ -848,11 +855,11 @@ bool send_finish_chunk(
     payload["model"] = model;
   }
   payload["choices"] = Json::arrayValue;
-  for (int i = 0; i < choice_count; ++i) {
+  for (size_t i = 0; i < stats.finish_reasons.size(); ++i) {
     Json::Value choice;
-    choice["index"] = i;
+    choice["index"] = static_cast<int>(i);
     choice["delta"] = Json::objectValue;
-    choice["finish_reason"] = finish_reason;
+    choice["finish_reason"] = stats.finish_reasons[i];
     payload["choices"].append(choice);
   }
   Json::StreamWriterBuilder builder;
@@ -861,12 +868,19 @@ bool send_finish_chunk(
   return stream->send("data: " + Json::writeString(builder, payload) + "\n\n");
 }
 
+InferenceEngine::GenerationStats cancelled_generation(int choices) {
+  InferenceEngine::GenerationStats stats;
+  stats.stopped = true;
+  stats.finish_reasons.assign(static_cast<size_t>(choices), "stop");
+  return stats;
+}
+
 void start_streaming_task(
     ResponseStreamPtr stream,
     std::string id,
     std::string model,
     int choice_count,
-    const std::function<void(const InferenceEngine::StreamCallback&)>& task,
+    const std::function<InferenceEngine::GenerationStats(const InferenceEngine::StreamCallback&)>& task,
     const std::function<void()>& on_done = {}) {
   std::thread([stream = std::move(stream),
                id = std::move(id),
@@ -889,6 +903,7 @@ void start_streaming_task(
       Json::Value choice;
       choice["index"] = index;
       choice["delta"]["content"] = chunk;
+      choice["finish_reason"] = Json::nullValue;
       payload["choices"].append(choice);
       Json::StreamWriterBuilder builder;
       builder["emitUTF8"] = true;
@@ -896,8 +911,11 @@ void start_streaming_task(
       return stream->send("data: " + Json::writeString(builder, payload) + "\n\n");
     };
     try {
-      task(emit);
-      send_finish_chunk(stream, id, model, std::max(1, choice_count));
+      const auto stats = task(emit);
+      if (stats.finish_reasons.size() != static_cast<size_t>(choice_count)) {
+        throw std::runtime_error("generation returned incomplete finish reasons");
+      }
+      send_finish_chunk(stream, id, model, stats);
     } catch (const PrefillBatchLimitExceeded& e) {
       Json::StreamWriterBuilder builder;
       builder["indentation"] = "";
@@ -980,7 +998,8 @@ Json::Value build_openai_response(
     const InferenceEngine& engine,
     const Json::Value& body,
     const std::string& prompt,
-    const std::string& completion) {
+    const std::string& completion,
+    const InferenceEngine::GenerationStats& stats) {
   Json::Value resp;
   resp["id"] = "chatcmpl-rwkv-fast";
   resp["object"] = "chat.completion";
@@ -992,7 +1011,7 @@ Json::Value build_openai_response(
   choice["index"] = 0;
   choice["message"]["role"] = "assistant";
   choice["message"]["content"] = completion;
-  choice["finish_reason"] = "stop";
+  choice["finish_reason"] = stats.finish_reasons.at(0);
   resp["choices"].append(choice);
   resp["usage"]["prompt_tokens"] = engine.count_tokens(prompt);
   resp["usage"]["completion_tokens"] = engine.count_tokens(completion);
@@ -1292,7 +1311,7 @@ void register_api_routes_legacy(
                   return active->stop_requested.load() || active->pause_requested.load();
                 });
                 if (!permit.has_value()) {
-                  return;
+                  return cancelled_generation(1);
                 }
                 const auto stats = engine.generate_from_logits_stream(
                     *state_ptr,
@@ -1327,6 +1346,7 @@ void register_api_routes_legacy(
                   StateCacheManager::instance().put_state(paused_again.id, *state_ptr);
                   RequestRegistry::instance().put_paused(std::move(paused_again));
                 }
+                return stats;
               },
               [active]() {
                 RequestRegistry::instance().finish(active);
@@ -1433,7 +1453,7 @@ void register_api_routes_legacy(
                         return active->stop_requested.load() || active->pause_requested.load();
                       });
                   if (!permit.has_value()) {
-                    return;
+                    return cancelled_generation(static_cast<int>(prompts.size()));
                   }
                   InferenceEngine::StatsCallback on_prefill_complete;
                   if (metrics_requested) {
@@ -1461,6 +1481,7 @@ void register_api_routes_legacy(
                   if (metrics_requested) {
                     record_generation_stats(active, stats);
                   }
+                  return stats;
                 },
                 [active]() {
                   RequestRegistry::instance().finish(active);
@@ -1518,7 +1539,7 @@ void register_api_routes_legacy(
         if (metrics_requested) {
           record_generation_stats(active, stats);
         }
-        resp["choices"] = build_choices(results);
+        resp["choices"] = build_choices(results, stats);
         RequestRegistry::instance().finish(active);
         cb(json_response(std::move(resp)));
       },
@@ -1667,7 +1688,7 @@ void register_api_routes_legacy(
                     return active->stop_requested.load() || active->pause_requested.load();
                   });
                   if (!permit.has_value()) {
-                    return;
+                    return cancelled_generation(1);
                   }
                   auto cached_state = state_id.empty()
                       ? StateCacheManager::instance().get_state(session_id)
@@ -1677,7 +1698,7 @@ void register_api_routes_legacy(
                       : (cached_state.has_value() ? std::move(*cached_state)
                                                   : engine.model()->create_state(1));
                   auto state_ptr = std::make_shared<GenerationState>(std::move(state));
-                  engine.batch_generate_state_stream(
+                  const auto stats = engine.batch_generate_state_stream(
                       prompts,
                       *state_ptr,
                       options,
@@ -1690,6 +1711,7 @@ void register_api_routes_legacy(
                         return active->stop_requested.load() || active->pause_requested.load();
                       });
                   StateCacheManager::instance().put_state(session_id, *state_ptr);
+                  return stats;
                 },
                 [active]() {
                   RequestRegistry::instance().finish(active);
@@ -1725,13 +1747,14 @@ void register_api_routes_legacy(
           cb(json_response(make_error(error.what()), k400BadRequest));
           return;
         }
-        auto texts = engine.batch_generate_state(prompts, state, options);
+        InferenceEngine::GenerationStats stats;
+        auto texts = engine.batch_generate_state(prompts, state, options, &stats);
         manager.put_state(session_id, state);
         Json::Value resp;
         resp["id"] = "rwkv7-fast-state";
         resp["object"] = "chat.completion";
         resp["model"] = model;
-        resp["choices"] = build_choices(texts);
+        resp["choices"] = build_choices(texts, stats);
         RequestRegistry::instance().finish(active);
         cb(json_response(std::move(resp)));
       },
@@ -1880,7 +1903,7 @@ void register_api_routes_legacy(
                     return active->stop_requested.load() || active->pause_requested.load();
                   });
                   if (!permit.has_value()) {
-                    return;
+                    return cancelled_generation(1);
                   }
                   auto state_ptr = std::make_shared<GenerationState>(
                       create_request_state(engine, state_id));
@@ -1923,6 +1946,7 @@ void register_api_routes_legacy(
                     StateCacheManager::instance().put_state(paused.id, *state_ptr);
                     RequestRegistry::instance().put_paused(std::move(paused));
                   }
+                  return stats;
                 },
                 [active]() {
                   RequestRegistry::instance().finish(active);
@@ -2000,7 +2024,7 @@ void register_api_routes_legacy(
         }
         RequestRegistry::instance().finish(active);
 
-        cb(json_response(build_openai_response(engine, *json, prompt, completion)));
+        cb(json_response(build_openai_response(engine, *json, prompt, completion, stats)));
       },
       {Post});
 
@@ -2120,33 +2144,34 @@ void register_api_routes(
                 auto state = create_request_state(
                     engine, state_id, static_cast<int>(prompts.size()));
                 if (prompts.size() == 1) {
-                  engine.batch_generate_state_stream(prompts, state, options, chunk_size, emit);
+                  return engine.batch_generate_state_stream(prompts, state, options, chunk_size, emit);
                 } else {
-                  engine.batch_generate_stream_with_state(
+                  return engine.batch_generate_stream_with_state(
                       prompts, state, options, chunk_size, emit);
                 }
               } else {
-                engine.batch_generate_stream(prompts, options, chunk_size, emit);
+                return engine.batch_generate_stream(prompts, options, chunk_size, emit);
               }
             }, [] {});
         }));
         return;
       }
       std::vector<std::string> results;
+      InferenceEngine::GenerationStats stats;
       if (!state_id.empty()) {
         auto state = create_request_state(
             engine, state_id, static_cast<int>(prompts.size()));
         results = prompts.size() == 1
-            ? engine.batch_generate_state(prompts, state, options)
-            : engine.batch_generate_with_state(prompts, state, options);
+            ? engine.batch_generate_state(prompts, state, options, &stats)
+            : engine.batch_generate_with_state(prompts, state, options, &stats);
       } else {
-        results = engine.batch_generate(prompts, options);
+        results = engine.batch_generate(prompts, options, &stats);
       }
       if (batch) {
-        Json::Value resp; resp["id"] = "rwkv7-fast-batch"; resp["object"] = "chat.completion"; resp["model"] = model; resp["choices"] = build_choices(results);
+        Json::Value resp; resp["id"] = "rwkv7-fast-batch"; resp["object"] = "chat.completion"; resp["model"] = model; resp["choices"] = build_choices(results, stats);
         cb(json_response(std::move(resp)));
       } else {
-        auto resp = build_openai_response(engine, *json, prompts.front(), results.front());
+        auto resp = build_openai_response(engine, *json, prompts.front(), results.front(), stats);
         resp["model"] = model;
         cb(json_response(std::move(resp)));
       }

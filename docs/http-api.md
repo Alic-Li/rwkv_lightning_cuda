@@ -71,13 +71,16 @@ loading.
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/state/upload" \
-  -F "file=@./rwkv-state-agentic.pth"
+  -F "file=@./state01.pth"
 ```
 
-The response uses the uploaded file's basename as its ID, for example
-`{"object":"rwkv.state","state_id":"rwkv-state-agentic.pth"}`. Uploading a
-file with a name that is already present returns an `already exists` error. Use
-that value in a generation request:
+The response's `state_id` and `filename` are the original basename without its
+extension plus a UUID-v7: `state01.pth` becomes
+`state01-01a1086e-6d3a-744f-b79d-7e67754de680`. `original_filename` preserves the
+original basename (POSIX and Windows paths are stripped). Repeated uploads of
+the same filename get distinct IDs and never overwrite an existing file.
+Empty/invalid archives, missing/duplicate layers, invalid shapes/dtypes or
+storage ranges return HTTP 400. Use the **returned** ID in generation requests:
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions" \
@@ -85,7 +88,7 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions"
   --data '{
     "model":"api-test",
     "messages":[{"role":"user","content":"Continue from the supplied state."}],
-    "state_id":"rwkv-state-agentic.pth",
+    "state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680",
     "stream":false,
     "max_tokens":8
   }'
@@ -114,7 +117,11 @@ Listing also accepts `POST`; deletion also accepts `POST`. A successful deletion
 returns HTTP 200 with `state_id` and `deleted:true`; a missing state returns
 HTTP 404 with `deleted:false`. Missing or conflicting IDs return HTTP 400.
 Listing returns `object:"list"` and a `data` array containing `state_id`,
-`filename`, `size_bytes`, `tensor_count`, and `created` (Unix seconds).
+`filename`, `original_filename`, `size_bytes` (file bytes), `tensor_count`,
+`layers`, `heads`, `head_size`, `created` (Unix seconds), `created_ms` (Unix
+milliseconds), and `uploaded_at` (RFC 3339 UTC, e.g. `2026-10-05T08:30:00.123Z`).
+The upload response contains the same fields. Lists are newest first by
+`created_ms`, with ID ordering for ties.
 These files are separate from the session cache managed by `/state/status`
 and `/state/delete`.
 
@@ -123,7 +130,7 @@ curl -sS "${AUTH_HEADER[@]}" "http://127.0.0.1:8000/v1/state/list"
 
 curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/state/delete" \
   -H "Content-Type: application/json" \
-  --data '{"state_id":"rwkv-state-agentic.pth"}'
+  --data '{"state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680"}'
 ```
 
 When `--password` is enabled, use an `Authorization: Bearer ...` header for the
@@ -194,6 +201,15 @@ in the [MiSS guide](../src/miss/README.md).
 
 OpenAI-style chat endpoint. Use `stream:false` for one JSON response.
 
+`choices[].finish_reason` is `stop` when a configured stop token is sampled,
+and `length` when `max_tokens` is exhausted. Sampling a stop token on the final
+allowed step still returns `stop`. Each batch choice has its own reason. SSE
+content chunks use `finish_reason:null`; the final chunk has an empty `delta`
+and the actual reason, followed by `[DONE]`. Explicit server stop/pause also
+uses `stop`. The gateway forwards these values unchanged. This applies to
+chat, batch, State chat, and resumed generation; `stop_tokens` remains the
+numeric-token stopping mechanism.
+
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
@@ -253,7 +269,7 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/batch/completions
   -H "Content-Type: application/json" \
   --data '{
     "contents":["English: Hello\n\nChinese:","English: Good morning\n\nChinese:"],
-    "state_id":"rwkv-state-agentic.pth",
+    "state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680",
     "stream":false,
     "max_tokens":8,
     "temperature":1.0,
@@ -272,7 +288,7 @@ curl -sS "${AUTH_HEADER[@]}" -N -X POST "http://127.0.0.1:8000/v1/batch/completi
   -H "Content-Type: application/json" \
   --data '{
     "contents":["English: Hello\n\nChinese:","English: Good morning\n\nChinese:"],
-    "state_id":"rwkv-state-agentic.pth",
+    "state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680",
     "stream":true,
     "max_tokens":8,
     "temperature":1.0,
@@ -297,7 +313,7 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/translate/v1/batch-t
     "source_lang":"English",
     "target_lang":"Chinese",
     "text_list":["Hello","Good morning"],
-    "state_id":"rwkv-state-agentic.pth"
+    "state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680"
   }'
 ```
 

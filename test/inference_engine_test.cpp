@@ -203,6 +203,68 @@ int main() {
     TEST_EQ(batch_stream_backend->prefill_batches()[0].size(), static_cast<std::size_t>(2));
     TEST_EQ(batch_stream_backend->prefill_batches()[1].size(), static_cast<std::size_t>(1));
 
+    // Exercise every generation entry point at the budget boundary. The final
+    // sampled EOS still means stop, even when it uses the last allowed step.
+    for (int budget : {0, 1, static_cast<int>(answer_ids.size()),
+                       static_cast<int>(answer_ids.size()) + 1}) {
+      auto bounded = options;
+      bounded.max_tokens = budget;
+      const std::string expected = budget > static_cast<int>(answer_ids.size())
+          ? "stop" : "length";
+      rwkv7_server::InferenceEngine::GenerationStats stats;
+      engine.batch_generate({prompt}, bounded, &stats);
+      TEST_EQ(stats.finish_reasons, std::vector<std::string>{expected});
+      const auto accept = [](int, const std::string&) { return true; };
+      stats = engine.batch_generate_stream({prompt}, bounded, 100, accept);
+      TEST_EQ(stats.finish_reasons, std::vector<std::string>{expected});
+      auto state = fake_backend->create_state(1);
+      engine.batch_generate_state({prompt}, state, bounded, &stats);
+      TEST_EQ(stats.finish_reasons, std::vector<std::string>{expected});
+      state = fake_backend->create_state(1);
+      stats = engine.batch_generate_state_stream({prompt}, state, bounded, 100, accept);
+      TEST_EQ(stats.finish_reasons, std::vector<std::string>{expected});
+      rwkv7_server::DeviceLogits logits;
+      state = fake_backend->create_state(1);
+      engine.prefill_prompt(prompt, state, logits);
+      stats = engine.generate_from_logits_stream(state, logits, bounded, 100, accept);
+      TEST_EQ(stats.finish_reasons, std::vector<std::string>{expected});
+    }
+
+    auto bounded = options;
+    bounded.max_tokens = 1;
+    bounded.stop_tokens.clear();
+    rwkv7_server::InferenceEngine::GenerationStats stats;
+    engine.batch_generate({prompt}, bounded, &stats);
+    TEST_EQ(stats.finish_reasons[0], std::string("length"));
+    bounded.stop_tokens = {answer_ids.front()};
+    engine.batch_generate({prompt}, bounded, &stats);
+    TEST_EQ(stats.finish_reasons[0], std::string("stop"));
+    TEST_EQ(stats.generated_tokens, 0);
+
+    // Sorted row 1 is the shorter original prompt at index 0. Only that row
+    // emits EOS; the longer prompt must keep its independent length reason.
+    auto mixed_backend = std::make_shared<rwkv_test::FakeModelBackend>(
+        build_logits_steps(answer_ids, vocab_size), "mixed-finish", 1);
+    rwkv7_server::InferenceEngine mixed_engine(mixed_backend, tokenizer, "mixed-finish");
+    bounded = options;
+    bounded.max_tokens = 1;
+    mixed_engine.batch_generate({prompt, longer_prompt}, bounded, &stats);
+    TEST_EQ(stats.finish_reasons, (std::vector<std::string>{"stop", "length"}));
+    stats = mixed_engine.batch_generate_stream(
+        {prompt, longer_prompt}, bounded, 100,
+        [](int, const std::string&) { return true; });
+    TEST_EQ(stats.finish_reasons, (std::vector<std::string>{"stop", "length"}));
+    stats = engine.batch_generate_stream(
+        {prompt}, options, 1, [](int, const std::string&) { return true; },
+        [] { return true; });
+    TEST_EQ(stats.finish_reasons[0], std::string("stop"));
+    TEST_CHECK(stats.stopped);
+    TEST_EQ(stats.generated_tokens, 0);
+    stats = engine.batch_generate_stream(
+        {prompt}, options, 1, [](int, const std::string&) { return false; });
+    TEST_EQ(stats.finish_reasons[0], std::string("stop"));
+    TEST_CHECK(stats.stopped);
+
     std::cout << "rwkv_inference_engine_test passed\n";
     return 0;
   } catch (const std::exception& e) {

@@ -261,6 +261,12 @@ export interface UploadedState {
   size_bytes: number;
   tensor_count: number;
   created: number;
+  original_filename?: string;
+  created_ms?: number;
+  uploaded_at?: string;
+  layers?: number;
+  heads?: number;
+  head_size?: number;
 }
 
 export interface AdapterEntry {

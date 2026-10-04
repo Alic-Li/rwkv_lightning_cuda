@@ -90,13 +90,14 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/tokens/count" \
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/state/upload" \
-  -F "file=@./rwkv-state-agentic.pth"
+  -F "file=@./state01.pth"
 ```
 
-响应以上传文件名的 basename 作为 ID，例如
-`{"object":"rwkv.state","state_id":"rwkv-state-agentic.pth"}`。上传同名文件会返回
-HTTP 400 和 `already exists` 错误。每次请求只允许一个文件；空文件、无效 PTH 或
-不含 `blocks.N.att.time_state` 张量的文件也会返回 HTTP 400。在生成请求中使用该值：
+响应的 `state_id` 和 `filename` 为「原文件名去扩展名 + UUID-v7」，例如上传
+`state01.pth` 得到 `state01-01a1086e-6d3a-744f-b79d-7e67754de680`。
+`original_filename` 保留原文件的 basename（支持 POSIX / Windows 路径）。同名重复上传
+会得到不同 ID，不会覆盖已有文件。每次请求只允许一个文件；空文件、无效 PTH、缺层、
+重复层、非法张量形状/dtype/存储范围会返回 HTTP 400。在生成请求中使用**实际返回的** ID：
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions" \
@@ -104,7 +105,7 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions"
   --data '{
     "model":"api-test",
     "messages":[{"role":"user","content":"Continue from the supplied state."}],
-    "state_id":"rwkv-state-agentic.pth",
+    "state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680",
     "stream":false,
     "max_tokens":8
   }'
@@ -121,6 +122,8 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions"
 `User`/`Assistant` prompt，以匹配典型的 state 调优数据；显式 `think_type` 会覆盖该
 行为，`think_type:"none"` 也会显式关闭前缀。
 
+兼容性与上传路径详见 [State 上传与权重兼容性](state-upload-compatibility.zh-CN.md)。
+
 ### 列表：`GET /v1/state/list`（也支持 `POST`）
 
 ```bash
@@ -128,7 +131,10 @@ curl -sS "${AUTH_HEADER[@]}" "http://127.0.0.1:8000/v1/state/list"
 ```
 
 返回 `{"object":"list","data":[...]}`。每个条目包含 `state_id`、`filename`、
-`size_bytes`、`tensor_count` 和 `created`（Unix 时间戳，秒）；上传响应也包含这些字段。
+`original_filename`、`size_bytes`（文件字节数）、`tensor_count`、`layers`、`heads`、
+`head_size`、`created`（Unix 秒）、`created_ms`（Unix 毫秒）和 `uploaded_at`
+（RFC 3339 UTC 字符串，例如 `2026-10-05T08:30:00.123Z`）；上传响应包含相同字段。
+列表按 `created_ms` 从新到旧排列；同毫秒按 ID 排序。
 没有已上传文件时，`data` 是空数组。
 
 ### 删除：`DELETE /v1/state/delete`（也支持 `POST`）
@@ -136,19 +142,19 @@ curl -sS "${AUTH_HEADER[@]}" "http://127.0.0.1:8000/v1/state/list"
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/state/delete" \
   -H "Content-Type: application/json" \
-  --data '{"state_id":"rwkv-state-agentic.pth"}'
+  --data '{"state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680"}'
 ```
 
-成功返回 HTTP 200 和 `{"state_id":"rwkv-state-agentic.pth","deleted":true}`；
+成功返回 HTTP 200 和 `{"state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680","deleted":true}`；
 不存在时返回 HTTP 404，`deleted` 为 `false`。缺少 ID 或各通道 ID 冲突时返回 HTTP 400。
 也可以用 `X-RWKV-State-Id` 请求头或 URL 查询参数传入 ID：
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/state/delete" \
-  -H "X-RWKV-State-Id: rwkv-state-agentic.pth"
+  -H "X-RWKV-State-Id: state01-01a1086e-6d3a-744f-b79d-7e67754de680"
 
 curl -sS "${AUTH_HEADER[@]}" -X DELETE \
-  "http://127.0.0.1:8000/v1/state/delete?state_id=rwkv-state-agentic.pth"
+  "http://127.0.0.1:8000/v1/state/delete?state_id=state01-01a1086e-6d3a-744f-b79d-7e67754de680"
 ```
 
 此接口管理上传的初始状态文件；生成期间缓存的 `session_id` 会话由
@@ -256,6 +262,13 @@ curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/adapters" \
 
 OpenAI 风格的聊天接口。`stream:false` 时返回单个 JSON 响应。
 
+`choices[].finish_reason` 表示实际结束原因：采样命中配置的停止 token 时为
+`stop`，耗尽 `max_tokens` 时为 `length`。最后一次允许的采样恰好命中停止
+token，仍返回 `stop`。批量请求逐条记录原因。SSE 内容包为
+`finish_reason:null`，最终包以空 `delta` 返回实际原因，随后发送 `[DONE]`。
+显式调用服务端停止或暂停也使用 `stop`。网关原样透传这些值。
+该规则覆盖聊天、批量、State 聊天和恢复续推；停止配置仍使用数字 `stop_tokens`。
+
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
@@ -313,7 +326,7 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/batch/completions
   -H "Content-Type: application/json" \
   --data '{
     "contents":["English: Hello\n\nChinese:","English: Good morning\n\nChinese:"],
-    "state_id":"rwkv-state-agentic.pth",
+    "state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680",
     "stream":false,
     "max_tokens":8,
     "temperature":1.0,
@@ -332,7 +345,7 @@ curl -sS "${AUTH_HEADER[@]}" -N -X POST "http://127.0.0.1:8000/v1/batch/completi
   -H "Content-Type: application/json" \
   --data '{
     "contents":["English: Hello\n\nChinese:","English: Good morning\n\nChinese:"],
-    "state_id":"rwkv-state-agentic.pth",
+    "state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680",
     "stream":true,
     "max_tokens":8,
     "temperature":1.0,
@@ -357,7 +370,7 @@ curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/translate/v1/batch-t
     "source_lang":"English",
     "target_lang":"Chinese",
     "text_list":["Hello","Good morning"],
-    "state_id":"rwkv-state-agentic.pth"
+    "state_id":"state01-01a1086e-6d3a-744f-b79d-7e67754de680"
   }'
 ```
 

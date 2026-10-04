@@ -18,9 +18,15 @@ constexpr std::size_t kMaxUploadedStateBytes = 512ull * 1024ull * 1024ull;
 struct UploadedStateInfo {
   std::string state_id;
   std::string filename;
+  std::string original_filename;
   std::uint64_t size_bytes = 0;
   int tensor_count = 0;
   std::int64_t created = 0;
+  std::int64_t created_ms = 0;
+  std::string uploaded_at;
+  int layers = 0;
+  int heads = 0;
+  int head_size = 0;
 };
 
 struct UploadedStateHandle {
@@ -36,7 +42,8 @@ class UploadedStateStore {
   UploadedStateInfo upload(
       const std::string& filename,
       const char* data,
-      std::size_t size);
+      std::size_t size,
+      const std::string& upload_uuid = {});
   std::optional<UploadedStateHandle> acquire(const std::string& state_id) const;
   bool erase(const std::string& state_id);
   std::vector<UploadedStateInfo> list() const;

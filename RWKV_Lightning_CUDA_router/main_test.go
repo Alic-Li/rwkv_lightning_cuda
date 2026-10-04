@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -167,7 +173,7 @@ func TestProxySynchronizesUploadedState(t *testing.T) {
 		requestsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/v1/state/upload" {
-			_, _ = io.WriteString(w, `{"state_id":"state-uploaded"}`)
+			fmt.Fprintf(w, `{"state_id":"state-%s"}`, r.Header.Get("X-RWKV-State-Upload-UUID"))
 			return
 		}
 		_, _ = io.WriteString(w, `{}`)
@@ -179,7 +185,7 @@ func TestProxySynchronizesUploadedState(t *testing.T) {
 		requestsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/v1/state/upload" {
-			_, _ = io.WriteString(w, `{"state_id":"state-uploaded"}`)
+			fmt.Fprintf(w, `{"state_id":"state-%s"}`, r.Header.Get("X-RWKV-State-Upload-UUID"))
 			return
 		}
 		_, _ = io.WriteString(w, `{}`)
@@ -196,17 +202,16 @@ func TestProxySynchronizesUploadedState(t *testing.T) {
 	}
 	p := &proxy{scheduler: s, client: serverA.Client()}
 
-	uploadReq := httptest.NewRequest(http.MethodPost, "/v1/state/upload", strings.NewReader("upload"))
+	uploadReq := stateUploadRequest(t, "state.pth", "upload")
 	uploadResp := httptest.NewRecorder()
 	p.ServeHTTP(uploadResp, uploadReq)
 	if uploadResp.Code != http.StatusOK || requestsA != 1 || requestsB != 1 {
 		t.Fatalf("upload code=%d requestsA=%d requestsB=%d", uploadResp.Code, requestsA, requestsB)
 	}
 
-	inferReq := httptest.NewRequest(
-		http.MethodPost,
-		"/v1/batch/completions",
-		strings.NewReader(`{"contents":["test"],"state_id":"state-uploaded"}`))
+	var uploaded listedState
+	json.Unmarshal(uploadResp.Body.Bytes(), &uploaded)
+	inferReq := httptest.NewRequest(http.MethodPost, "/v1/batch/completions", strings.NewReader(fmt.Sprintf(`{"contents":["test"],"state_id":%q}`, uploaded.ID)))
 	inferResp := httptest.NewRecorder()
 	p.ServeHTTP(inferResp, inferReq)
 	if inferResp.Code != http.StatusOK || requestsA != 2 || requestsB != 1 {
@@ -251,5 +256,125 @@ func TestProxySynchronizesStateListAndDelete(t *testing.T) {
 		if requests["a:"+path] != 1 || requests["b:"+path] != 1 {
 			t.Fatalf("%s was not sent to every backend: %+v", path, requests)
 		}
+	}
+}
+
+func TestStateUploadUUIDSharedAcrossWorkers(t *testing.T) {
+	original := stateUploadRequest(t, "state01.pth", "original-file-bytes")
+	originalBody, _ := io.ReadAll(original.Body)
+	contentType := original.Header.Get("Content-Type")
+	var mu sync.Mutex
+	var ids []string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-RWKV-State-Upload-UUID")
+		mu.Lock()
+		ids = append(ids, id)
+		mu.Unlock()
+		data, _ := io.ReadAll(r.Body)
+		if !bytes.Equal(data, originalBody) {
+			t.Error("upload body changed")
+		}
+		if r.Header.Get("Content-Type") != contentType {
+			t.Error("content type changed")
+		}
+		fmt.Fprintf(w, `{"state_id":"state01-%s","size_bytes":123,"created_ms":1}`, id)
+	}
+	a := httptest.NewServer(http.HandlerFunc(handler))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(handler))
+	defer b.Close()
+	ua, _ := url.Parse(a.URL)
+	ub, _ := url.Parse(b.URL)
+	p := &proxy{scheduler: &scheduler{backends: []*backend{{name: "a", baseURL: ua, weight: 1}, {name: "b", baseURL: ub, weight: 1}}, sessions: map[string]*backend{}}, client: a.Client()}
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/state/upload", bytes.NewReader(originalBody))
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("X-RWKV-State-Upload-UUID", "caller-value-must-be-replaced")
+		resp := httptest.NewRecorder()
+		p.ServeHTTP(resp, req)
+		if resp.Code != 200 {
+			t.Fatalf("upload returned %d: %s", resp.Code, resp.Body.String())
+		}
+		if !strings.Contains(resp.Body.String(), `"size_bytes":123`) {
+			t.Error("metadata lost")
+		}
+	}
+	if len(ids) != 4 || ids[0] != ids[1] || ids[2] != ids[3] || ids[0] == ids[2] {
+		t.Fatalf("UUIDs not shared per upload: %v", ids)
+	}
+	pattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !pattern.MatchString(ids[0]) {
+		t.Fatalf("invalid UUID-v7: %s", ids[0])
+	}
+	stamp, err := strconv.ParseInt(strings.ReplaceAll(ids[0][:13], "-", ""), 16, 64)
+	if err != nil || time.Now().UnixMilli()-stamp > 5000 {
+		t.Fatalf("invalid UUID timestamp: %d %v", stamp, err)
+	}
+}
+
+func TestStateListConsistency(t *testing.T) {
+	tests := []struct {
+		name, a, b string
+		want       int
+	}{
+		{"order and timestamps", `{"object":"list","data":[{"state_id":"a","size_bytes":1,"created_ms":1},{"state_id":"b","size_bytes":2}]}`, `{"object":"list","data":[{"state_id":"b","size_bytes":2},{"state_id":"a","size_bytes":1,"created_ms":2}]}`, 200},
+		{"missing state", `{"object":"list","data":[{"state_id":"a"}]}`, `{"object":"list","data":[]}`, 502},
+		{"size mismatch", `{"object":"list","data":[{"state_id":"a","size_bytes":1}]}`, `{"object":"list","data":[{"state_id":"a","size_bytes":2}]}`, 502},
+		{"shape mismatch", `{"object":"list","data":[{"state_id":"a","heads":1}]}`, `{"object":"list","data":[{"state_id":"a","heads":2}]}`, 502},
+		{"invalid list", `{"object":"list","data":[]}`, `{}`, 502},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, tc.a) }))
+			defer a.Close()
+			b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, tc.b) }))
+			defer b.Close()
+			ua, _ := url.Parse(a.URL)
+			ub, _ := url.Parse(b.URL)
+			p := &proxy{scheduler: &scheduler{backends: []*backend{{name: "a", baseURL: ua, weight: 1}, {name: "b", baseURL: ub, weight: 1}}}, client: a.Client()}
+			resp := httptest.NewRecorder()
+			p.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/v1/state/list", nil))
+			if resp.Code != tc.want {
+				t.Fatalf("status %d, want %d: %s", resp.Code, tc.want, resp.Body.String())
+			}
+		})
+	}
+}
+
+func stateUploadRequest(t *testing.T, filename, content string) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, err := form.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part.Write([]byte(content))
+	form.Close()
+	req := httptest.NewRequest(http.MethodPost, "/v1/state/upload", bytes.NewReader(body.Bytes()))
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	return req
+}
+
+func TestProxyPreservesFinishReasons(t *testing.T) {
+	for _, tc := range []struct{ contentType, body string }{
+		{"application/json", `{"choices":[{"index":0,"finish_reason":"stop"},{"index":1,"finish_reason":"length"}]}`},
+		{"text/event-stream", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"},
+	} {
+		t.Run(tc.contentType, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			baseURL, _ := url.Parse(server.URL)
+			p := &proxy{scheduler: &scheduler{backends: []*backend{{name: "test", baseURL: baseURL, weight: 1}}, sessions: map[string]*backend{}}, client: server.Client()}
+			req := httptest.NewRequest(http.MethodPost, "/v1/batch/completions", strings.NewReader(`{"contents":["hi"]}`))
+			resp := httptest.NewRecorder()
+			p.ServeHTTP(resp, req)
+			if resp.Code != http.StatusOK || resp.Body.String() != tc.body {
+				t.Fatalf("finish reasons changed: status=%d body=%q", resp.Code, resp.Body.String())
+			}
+		})
 	}
 }

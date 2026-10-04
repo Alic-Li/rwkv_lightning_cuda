@@ -24,6 +24,8 @@ class InferenceEngine {
     double decode_seconds = 0.0;
     bool stopped = false;
     bool stop_token = false;
+    // In original prompt order; each choice may terminate independently.
+    std::vector<std::string> finish_reasons;
   };
 
   using StatsCallback = std::function<void(const GenerationStats&)>;
@@ -36,17 +38,20 @@ class InferenceEngine {
 
   std::vector<std::string> batch_generate(
       const std::vector<std::string>& prompts,
-      const GenerateOptions& options) const;
+      const GenerateOptions& options,
+      GenerationStats* stats = nullptr) const;
 
   std::vector<std::string> batch_generate_with_state(
       const std::vector<std::string>& prompts,
       GenerationState& state,
-      const GenerateOptions& options) const;
+      const GenerateOptions& options,
+      GenerationStats* stats = nullptr) const;
 
   std::vector<std::string> batch_generate_state(
       const std::vector<std::string>& prompts,
       GenerationState& state,
-      const GenerateOptions& options) const;
+      const GenerateOptions& options,
+      GenerationStats* stats = nullptr) const;
 
   GenerationStats batch_generate_stream(
       const std::vector<std::string>& prompts,
@@ -65,7 +70,7 @@ class InferenceEngine {
       const ControlCallback& should_stop = {},
       const StatsCallback& on_prefill_complete = {}) const;
 
-  void batch_generate_state_stream(
+  GenerationStats batch_generate_state_stream(
       const std::vector<std::string>& prompts,
       GenerationState& state,
       const GenerateOptions& options,
@@ -119,7 +124,8 @@ class InferenceEngine {
       const StreamCallback* emit,
       int stream_index,
       int chunk_size,
-      const ControlCallback& should_stop) const;
+      const ControlCallback& should_stop,
+      GenerationStats* stats = nullptr) const;
 
   std::shared_ptr<IModelBackend> model_;
   std::shared_ptr<TrieTokenizer> tokenizer_;

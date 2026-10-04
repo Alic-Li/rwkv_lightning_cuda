@@ -205,7 +205,7 @@ export function StateManager({
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
                         <div className="truncate text-[12.5px] font-medium">
-                          {state.filename}
+                          {state.original_filename ?? state.filename}
                         </div>
                         <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
                           {state.state_id}
@@ -242,7 +242,7 @@ export function StateManager({
                       </span>
                       <span>·</span>
                       <span>
-                        {new Date(state.created * 1000).toLocaleString()}
+                        {new Date(state.created_ms ?? state.created * 1000).toLocaleString()}
                       </span>
                     </div>
                   </div>

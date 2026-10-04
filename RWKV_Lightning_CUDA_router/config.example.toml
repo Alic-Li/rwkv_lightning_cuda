@@ -11,6 +11,13 @@ request_timeout_seconds = 0
 # After an upstream connection/transport failure, temporarily avoid that endpoint.
 failure_cooldown_seconds = 5
 
+# Retry only failed State uploads; keep the same UUID/body for every attempt.
+# 1 disables retries. Defaults apply when omitted or 0.
+state_upload_max_attempts = 3
+state_upload_attempt_timeout_seconds = 120
+state_upload_retry_base_ms = 250
+state_upload_retry_max_ms = 2000
+
 [[backends]]
 name = "gpu-a"
 url = "http://192.168.1.21:8000"
