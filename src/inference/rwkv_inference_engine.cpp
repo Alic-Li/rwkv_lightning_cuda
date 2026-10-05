@@ -57,6 +57,13 @@ struct AdapterMetrics {
   }
 };
 
+void mark_interrupted(InferenceEngine::GenerationStats& stats) {
+  stats.stopped = true;
+  for (auto& reason : stats.finish_reasons) {
+    if (reason == "length") reason = "stop";
+  }
+}
+
 constexpr int kForceReasoningMaskStartStep = 1;
 constexpr int kForceReasoningMaskEndStep = 2;
 constexpr int kForceReasoningDenyTokenA = 111;
@@ -381,15 +388,18 @@ void InferenceEngine::prefill_batch_chunked(
 std::string InferenceEngine::generate_one(
     const std::string& prompt,
     GenerationState& state,
-      const GenerateOptions& options,
-      const StreamCallback* emit,
-      int stream_index,
-      int chunk_size,
-      const ControlCallback& should_stop) const {
+    const GenerateOptions& options,
+    const StreamCallback* emit,
+    int stream_index,
+    int chunk_size,
+    const ControlCallback& should_stop,
+    GenerationStats* out_stats) const {
   bind_adapter(state, options.adapter);
   AdapterMetrics adapter_metrics(state);
+  GenerationStats stats;
+  stats.finish_reasons = {"length"};
   DeviceLogits logits;
-  prefill_prompt(prompt, state, logits);
+  stats.prompt_tokens = prefill_prompt(prompt, state, logits);
 
   std::vector<int> token_buffer;
   std::string utf8_pending;
@@ -398,14 +408,18 @@ std::string InferenceEngine::generate_one(
   auto penalties = make_sampler_penalties(model_->vocab_size());
   for (int step = 0; step < options.max_tokens; ++step) {
     if (should_stop && should_stop()) {
+      mark_interrupted(stats);
       break;
     }
     const int token = sample_with_options_mask(logits, penalties, options, step);
     adapter_metrics.token();
     if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
+      stats.stop_token = true;
+      stats.finish_reasons[0] = "stop";
       break;
     }
 
+    ++stats.generated_tokens;
     token_buffer.push_back(token);
     result += tokenizer_->decode(token);
 
@@ -414,6 +428,8 @@ std::string InferenceEngine::generate_one(
       token_buffer.clear();
       const std::string chunk = take_complete_utf8(utf8_pending, false);
       if (!chunk.empty() && !(*emit)(stream_index, chunk)) {
+        mark_interrupted(stats);
+        if (out_stats) *out_stats = stats;
         return result;
       }
     }
@@ -428,32 +444,39 @@ std::string InferenceEngine::generate_one(
     }
     const std::string tail = take_complete_utf8(utf8_pending, true);
     if (!tail.empty()) {
-      (*emit)(stream_index, tail);
+      if (!(*emit)(stream_index, tail)) mark_interrupted(stats);
     }
   }
+  if (out_stats) *out_stats = std::move(stats);
   return result;
 }
 
 std::vector<std::string> InferenceEngine::batch_generate(
     const std::vector<std::string>& prompts,
-    const GenerateOptions& options) const {
+    const GenerateOptions& options,
+    GenerationStats* out_stats) const {
   if (prompts.empty()) {
+    if (out_stats) *out_stats = {};
     return {};
   }
 
   auto state = model_->create_state(static_cast<int>(prompts.size()));
-  return batch_generate_with_state(prompts, state, options);
+  return batch_generate_with_state(prompts, state, options, out_stats);
 }
 
 std::vector<std::string> InferenceEngine::batch_generate_with_state(
     const std::vector<std::string>& prompts,
     GenerationState& state,
-    const GenerateOptions& options) const {
+    const GenerateOptions& options,
+    GenerationStats* out_stats) const {
   bind_adapter(state, options.adapter);
   AdapterMetrics adapter_metrics(state);
   if (prompts.empty()) {
+    if (out_stats) *out_stats = {};
     return {};
   }
+  GenerationStats stats;
+  stats.finish_reasons.assign(prompts.size(), "length");
   const int batch_size = static_cast<int>(prompts.size());
   if (state.batch_size != batch_size) {
     throw std::runtime_error("generation state batch size mismatch");
@@ -462,6 +485,7 @@ std::vector<std::string> InferenceEngine::batch_generate_with_state(
   std::vector<size_t> sorted_to_original;
   const auto sorted_prompt_ids = encode_prompts_sorted(prompts, sorted_to_original);
 
+  for (const auto& ids : sorted_prompt_ids) stats.prompt_tokens += static_cast<int>(ids.size());
   DeviceLogits logits;
   prefill_batch_chunked(sorted_prompt_ids, state, logits);
 
@@ -484,11 +508,14 @@ std::vector<std::string> InferenceEngine::batch_generate_with_state(
       const int token = sampled_tokens[i];
       if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
         finished[i] = true;
+        stats.stop_token = true;
+        stats.finish_reasons[sorted_to_original[i]] = "stop";
         decode_batch[i] = fallback_token;
         --active;
         continue;
       }
 
+      ++stats.generated_tokens;
       decode_batch[i] = token;
       sorted_outputs[i] += tokenizer_->decode(token);
     }
@@ -503,17 +530,19 @@ std::vector<std::string> InferenceEngine::batch_generate_with_state(
   for (size_t i = 0; i < sorted_outputs.size(); ++i) {
     outputs[sorted_to_original[i]] = std::move(sorted_outputs[i]);
   }
+  if (out_stats) *out_stats = std::move(stats);
   return outputs;
 }
 
 std::vector<std::string> InferenceEngine::batch_generate_state(
     const std::vector<std::string>& prompts,
     GenerationState& state,
-    const GenerateOptions& options) const {
+    const GenerateOptions& options,
+    GenerationStats* out_stats) const {
   if (prompts.size() != 1 || state.batch_size != 1) {
     throw std::runtime_error("stateful generation only supports single prompt batch");
   }
-  return {generate_one(prompts.front(), state, options, nullptr, 0, 0, {})};
+  return {generate_one(prompts.front(), state, options, nullptr, 0, 0, {}, out_stats)};
 }
 
 InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream(
@@ -547,6 +576,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
   if (prompts.empty()) {
     return stats;
   }
+  stats.finish_reasons.assign(prompts.size(), "length");
   const int batch_size = static_cast<int>(prompts.size());
   if (state.batch_size != batch_size) {
     throw std::runtime_error("streaming generation state batch size mismatch");
@@ -578,7 +608,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
 
   for (int step = 0; step < options.max_tokens && active > 0; ++step) {
     if (should_stop && should_stop()) {
-      stats.stopped = true;
+      mark_interrupted(stats);
       break;
     }
     const auto sampled_tokens = sample_batch_with_options_mask(logits, penalties, options, step);
@@ -593,6 +623,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
       if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
         finished[i] = true;
         stats.stop_token = true;
+        stats.finish_reasons[sorted_to_original[i]] = "stop";
         decode_batch[i] = fallback_token;
         --active;
         if (!token_buffers[i].empty()) {
@@ -601,7 +632,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
         }
         const std::string tail = take_complete_utf8(utf8_pending[i], true);
         if (!tail.empty() && !emit(static_cast<int>(sorted_to_original[i]), tail)) {
-          stats.stopped = true;
+          mark_interrupted(stats);
           stats.decode_seconds =
               std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_begin).count();
           return stats;
@@ -618,7 +649,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
         token_buffers[i].clear();
         const std::string chunk = take_complete_utf8(utf8_pending[i], false);
         if (!chunk.empty() && !emit(static_cast<int>(sorted_to_original[i]), chunk)) {
-          stats.stopped = true;
+          mark_interrupted(stats);
           stats.decode_seconds =
               std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_begin).count();
           return stats;
@@ -639,7 +670,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
     }
     const std::string tail = take_complete_utf8(utf8_pending[i], true);
     if (!tail.empty() && !emit(static_cast<int>(sorted_to_original[i]), tail)) {
-      stats.stopped = true;
+      mark_interrupted(stats);
       stats.decode_seconds =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_begin).count();
       return stats;
@@ -649,7 +680,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
   return stats;
 }
 
-void InferenceEngine::batch_generate_state_stream(
+InferenceEngine::GenerationStats InferenceEngine::batch_generate_state_stream(
     const std::vector<std::string>& prompts,
     GenerationState& state,
     const GenerateOptions& options,
@@ -659,7 +690,9 @@ void InferenceEngine::batch_generate_state_stream(
   if (prompts.size() != 1 || state.batch_size != 1) {
     throw std::runtime_error("stateful generation only supports single prompt batch");
   }
-  generate_one(prompts.front(), state, options, &emit, 0, chunk_size, should_stop);
+  GenerationStats stats;
+  generate_one(prompts.front(), state, options, &emit, 0, chunk_size, should_stop, &stats);
+  return stats;
 }
 
 int InferenceEngine::prefill_prompt(
@@ -686,6 +719,7 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
   }
 
   GenerationStats stats;
+  stats.finish_reasons = {"length"};
   std::vector<int> token_buffer;
   std::string utf8_pending;
   auto penalties = make_sampler_penalties(model_->vocab_size());
@@ -693,7 +727,7 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
 
   for (int step = 0; step < options.max_tokens; ++step) {
     if (should_stop && should_stop()) {
-      stats.stopped = true;
+      mark_interrupted(stats);
       break;
     }
 
@@ -701,6 +735,7 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
     adapter_metrics.token();
     if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
       stats.stop_token = true;
+      stats.finish_reasons[0] = "stop";
       break;
     }
 
@@ -712,7 +747,7 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
       token_buffer.clear();
       const std::string chunk = take_complete_utf8(utf8_pending, false);
       if (!chunk.empty() && !emit(0, chunk)) {
-        stats.stopped = true;
+        mark_interrupted(stats);
         break;
       }
     }
@@ -726,7 +761,7 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
   }
   const std::string tail = take_complete_utf8(utf8_pending, true);
   if (!tail.empty() && !emit(0, tail)) {
-    stats.stopped = true;
+    mark_interrupted(stats);
   }
 
   const auto decode_end = std::chrono::steady_clock::now();

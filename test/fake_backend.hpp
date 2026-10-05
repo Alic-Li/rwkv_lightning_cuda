@@ -13,10 +13,10 @@ namespace rwkv_test {
 
 class FakeModelBackend final : public rwkv7_server::IModelBackend {
  public:
-  explicit FakeModelBackend(std::vector<std::vector<float>> logits_steps, std::string name = "fake-model")
+  explicit FakeModelBackend(std::vector<std::vector<float>> logits_steps, std::string name = "fake-model", int stop_row = -1)
       : logits_steps_(std::move(logits_steps)),
         vocab_size_(logits_steps_.empty() ? 0 : static_cast<int>(logits_steps_.front().size())),
-        model_name_(std::move(name)) {
+        model_name_(std::move(name)), stop_row_(stop_row) {
     for (const auto& step : logits_steps_) {
       if (static_cast<int>(step.size()) != vocab_size_) {
         throw std::runtime_error("inconsistent fake backend vocab size");
@@ -129,6 +129,11 @@ class FakeModelBackend final : public rwkv7_server::IModelBackend {
           step.end(),
           repeated.begin() + static_cast<std::size_t>(row) * vocab_size_);
     }
+    if (stop_row_ >= 0 && stop_row_ < rows) {
+      auto begin = repeated.begin() + static_cast<std::size_t>(stop_row_) * vocab_size_;
+      std::fill(begin, begin + vocab_size_, -100.0f);
+      *begin = 100.0f;
+    }
     logits.rows = rows;
     logits.vocab_size = vocab_size_;
     copy_host_to_device(repeated, logits.values, "alloc fake logits", "copy fake logits");
@@ -138,6 +143,7 @@ class FakeModelBackend final : public rwkv7_server::IModelBackend {
   int vocab_size_ = 0;
   std::string model_path_ = "fake://backend";
   std::string model_name_;
+  int stop_row_ = -1;
   mutable std::size_t step_index_ = 0;
   mutable std::vector<std::vector<std::vector<int64_t>>> prefill_batches_;
   mutable std::vector<std::vector<int64_t>> decode_tokens_;

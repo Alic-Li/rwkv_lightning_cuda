@@ -45,14 +45,43 @@ store is shared by all backends.
 
 `/v1/state/upload`, `/v1/state/list`, and `/v1/state/delete` are sent concurrently
 to every configured backend, and the router waits for every response. An upload
-therefore creates the same filename-based `state_id` on every worker, so subsequent
+generates one UUID-v7 at the router and forwards it to all workers via
+`X-RWKV-State-Upload-UUID`. Each worker creates the same `<filename-stem>-<uuid>`
+ID, so subsequent
 inference requests carrying that ID remain safely load-balanced. If a worker fails
 or workers return inconsistent status/IDs, the router returns an error instead of
-claiming the state is synchronized. The example body limit is 513 MiB so it can
+claiming the state is synchronized. Lists compare IDs, byte sizes and tensor
+structure across workers (timestamps/order may differ). Upload failures can leave
+files on successful workers: fan-out is not a distributed transaction. Upgrade
+the router and all runtimes together; direct runtime uploads generate their own
+UUID, so upload through the router for load-balanced inference. The example body limit is 513 MiB so it can
 proxy the backend's 512 MiB state upload limit plus multipart framing.
 
-The router does not retry POST requests: retrying after an uncertain upstream write
-can execute a generation twice. Clients may safely retry connection failures.
+Inference POSTs are never automatically retried. State uploads are an idempotent
+exception: failed workers retry transport/read errors, timeouts and HTTP
+408/429/500/502/503/504 using the same UUID and body. Deterministic 4xx errors are
+not retried. Defaults: 3 attempts, 120 seconds per attempt, exponential backoff
+with jitter, 250 ms base and 2000 ms cap. `Retry-After`, cancellation and the total
+operation deadline are respected. See the `state_upload_*` configuration keys.
+The runtime checks SHA-256, filename and size before returning an existing record;
+conflicting bytes never overwrite it, and retries preserve the first upload time.
+
+State inference is eligible only on healthy, confirmed replicas, including when
+session affinity points elsewhere. Cooldown expiry alone does not confirm a State.
+No ready replica means HTTP 503, with no fallback to a zero State. Partial upload
+failure after retry exhaustion returns HTTP 502 JSON containing `state_id`,
+`ready_backends` and `failed_backends` (name/final status, 0 when no status arrived).
+When every worker deterministically rejects the upload, the runtime rejection is
+preserved. Full success retains the original response shape.
+
+Retries are bounded to the upload request; there is no indefinite background
+repair after it returns. A failed replica rejoins State routing only after an
+upload acknowledgment or later list confirmation. Unknown IDs, including after a
+router restart, trigger list discovery with a five-second deadline before routing.
+Lists still require cross-worker consistency for a successful client response.
+Deletion blocks new uses of that State, uncertain deletion stays blocked, and
+uniform validation/auth rejection restores previous readiness. Stale lists cannot
+undo upload/delete mutations.
 
 ## Batch load test
 

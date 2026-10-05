@@ -17,7 +17,7 @@ TRIPLET = "x64-windows" if WINDOWS else "x64-linux"
 ARCHS = os.environ.get("CUDA_ARCHITECTURES", "75;80;86;87;89;90;100;120")
 CPU_TESTS = (
     "tokenizer", "pth_archive", "quantized_archive", "prefill_admission",
-    "state_tuning_api",
+    "state_tuning_api", "uploaded_state_store",
 )
 BINARIES = ("rwkv_lighting_cuda", "rwkv_quantize", "rwkv_state_tune")
 

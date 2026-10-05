@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -21,11 +23,15 @@ import (
 )
 
 type config struct {
-	Listen                 string          `toml:"listen"`
-	MaxRequestBodyBytes    int64           `toml:"max_request_body_bytes"`
-	RequestTimeoutSeconds  int             `toml:"request_timeout_seconds"`
-	FailureCooldownSeconds int             `toml:"failure_cooldown_seconds"`
-	Backends               []backendConfig `toml:"backends"`
+	Listen                           string          `toml:"listen"`
+	MaxRequestBodyBytes              int64           `toml:"max_request_body_bytes"`
+	RequestTimeoutSeconds            int             `toml:"request_timeout_seconds"`
+	FailureCooldownSeconds           int             `toml:"failure_cooldown_seconds"`
+	StateUploadMaxAttempts           int             `toml:"state_upload_max_attempts"`
+	StateUploadAttemptTimeoutSeconds int             `toml:"state_upload_attempt_timeout_seconds"`
+	StateUploadRetryBaseMS           int             `toml:"state_upload_retry_base_ms"`
+	StateUploadRetryMaxMS            int             `toml:"state_upload_retry_max_ms"`
+	Backends                         []backendConfig `toml:"backends"`
 }
 
 type backendConfig struct {
@@ -43,11 +49,13 @@ type backend struct {
 }
 
 type scheduler struct {
-	mu       sync.Mutex
-	backends []*backend
-	next     uint64
-	sessions map[string]*backend
-	cooldown time.Duration
+	mu         sync.Mutex
+	backends   []*backend
+	next       uint64
+	sessions   map[string]*backend
+	cooldown   time.Duration
+	states     map[string]*statePlacement
+	stateEpoch uint64
 }
 
 func newScheduler(c config) (*scheduler, error) {
@@ -56,6 +64,9 @@ func newScheduler(c config) (*scheduler, error) {
 	}
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return nil, fmt.Errorf("listen must be host:port: %w", err)
+	}
+	if _, err := configuredUploadPolicy(c); err != nil {
+		return nil, err
 	}
 	if c.MaxRequestBodyBytes < 0 || c.RequestTimeoutSeconds < 0 || c.FailureCooldownSeconds < 0 {
 		return nil, errors.New("timeout, cooldown, and body limit cannot be negative")
@@ -95,7 +106,7 @@ func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(
 	defer s.mu.Unlock()
 	now := time.Now()
 	if session != "" {
-		if b := s.sessions[session]; b != nil && !now.Before(b.unhealthy) {
+		if b := s.sessions[session]; b != nil && !now.Before(b.unhealthy) && s.stateReadyLocked(stateID, b) {
 			b.inflight += bsz
 			return b, s.releaseFunc(b, bsz), nil
 		}
@@ -104,7 +115,7 @@ func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(
 	best := math.Inf(1)
 	for offset := 0; offset < len(s.backends); offset++ {
 		b := s.backends[(int(s.next)+offset)%len(s.backends)]
-		if now.Before(b.unhealthy) {
+		if now.Before(b.unhealthy) || !s.stateReadyLocked(stateID, b) {
 			continue
 		}
 		load := float64(b.inflight) / b.weight
@@ -113,7 +124,10 @@ func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(
 		}
 	}
 	if chosen == nil {
-		return nil, nil, errors.New("all upstream backends are temporarily unavailable")
+		if stateID == "" {
+			return nil, nil, errors.New("all upstream backends are temporarily unavailable")
+		}
+		return nil, nil, errors.New("no healthy upstream backend has the requested State ready")
 	}
 	s.next = (s.next + 1) % uint64(len(s.backends))
 	chosen.inflight += bsz
@@ -159,10 +173,11 @@ func (s *scheduler) acquireAll() ([]*backend, func()) {
 }
 
 type proxy struct {
-	scheduler *scheduler
-	client    *http.Client
-	maxBody   int64
-	timeout   time.Duration
+	scheduler    *scheduler
+	client       *http.Client
+	maxBody      int64
+	timeout      time.Duration
+	uploadPolicy uploadRetryPolicy
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +191,14 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bsz, session := batchSize(r, body)
-	stateID := requestStateID(r, body)
+	stateID, err := resolvedRequestStateID(r, body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if stateID != "" && p.scheduler.needsStateRefresh(stateID) {
+		p.refreshState(r, stateID)
+	}
 	b, release, err := p.scheduler.acquire(bsz, session, stateID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -202,10 +224,22 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := p.client.Do(upstream)
 	if err != nil {
 		p.scheduler.failed(b)
+		p.scheduler.stateUnavailable(stateID, b)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	if stateID != "" && (resp.StatusCode == 400 || resp.StatusCode == 404) {
+		// A restarted runtime can lose its temporary State store.
+		errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		if readErr != nil || bytes.Contains(errorBody, []byte("uploaded state not found")) {
+			p.scheduler.stateUnavailable(stateID, b)
+		}
+		copyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		w.Write(errorBody)
+		return
+	}
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	destination := io.Writer(w)
@@ -213,6 +247,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		destination = flushingWriter{ResponseWriter: w}
 	}
 	if _, err := io.Copy(destination, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
+		if r.Context().Err() == nil {
+			p.scheduler.failed(b)
+			p.scheduler.stateUnavailable(stateID, b)
+		}
 		log.Printf("proxy %s: response copy: %v", b.name, err)
 	}
 }
@@ -231,8 +269,24 @@ type stateResponse struct {
 
 // serveSynchronizedState fans state-file mutations and checks out to every
 // backend and waits for every result. A single successful worker is never
-// enough: otherwise a later load-balanced inference could miss the state.
+// enough for full synchronization; inference separately checks replica readiness.
 func (p *proxy) serveSynchronizedState(w http.ResponseWriter, r *http.Request, body []byte) {
+	if r.URL.Path == "/v1/state/upload" {
+		p.serveStateUpload(w, r, body)
+		return
+	}
+	epoch := p.scheduler.stateSnapshot()
+	var mutation stateMutation
+	rollbackDeletion := false
+	if r.URL.Path == "/v1/state/delete" {
+		id, err := resolvedRequestStateID(r, body)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		mutation = p.scheduler.beginStateMutation(id, true)
+		defer func() { p.scheduler.finishStateMutation(mutation, rollbackDeletion) }()
+	}
 	backends, release := p.scheduler.acquireAll()
 	defer release()
 	ctx := r.Context()
@@ -248,31 +302,16 @@ func (p *proxy) serveSynchronizedState(w http.ResponseWriter, r *http.Request, b
 		wg.Add(1)
 		go func(i int, b *backend) {
 			defer wg.Done()
-			target := *b.baseURL
-			target.Path = joinPath(b.baseURL.Path, r.URL.Path)
-			target.RawQuery = r.URL.RawQuery
-			upstream, err := http.NewRequestWithContext(ctx, r.Method, target.String(), bytes.NewReader(body))
-			if err != nil {
-				responses[i] = stateResponse{backend: b, err: err}
-				return
+			responses[i] = p.stateRequest(ctx, r, body, b, "")
+			if r.URL.Path == "/v1/state/list" {
+				p.scheduler.observeStateList(b, responses[i], epoch)
 			}
-			copyHeaders(upstream.Header, r.Header)
-			upstream.Host = b.baseURL.Host
-			resp, err := p.client.Do(upstream)
-			if err != nil {
-				p.scheduler.failed(b)
-				responses[i] = stateResponse{backend: b, err: err}
-				return
-			}
-			defer resp.Body.Close()
-			responseBody, err := io.ReadAll(resp.Body)
-			if err != nil {
-				p.scheduler.failed(b)
-			}
-			responses[i] = stateResponse{backend: b, status: resp.StatusCode, header: resp.Header.Clone(), body: responseBody, err: err}
 		}(i, b)
 	}
 	wg.Wait()
+	if r.URL.Path == "/v1/state/delete" {
+		rollbackDeletion = rejectedStateDeletion(responses)
+	}
 
 	for _, response := range responses {
 		if response.err != nil {
@@ -280,34 +319,28 @@ func (p *proxy) serveSynchronizedState(w http.ResponseWriter, r *http.Request, b
 			return
 		}
 	}
-	if r.URL.Path == "/v1/state/upload" {
-		var stateID string
-		for _, response := range responses {
-			if response.status < 200 || response.status >= 300 {
-				copyHeaders(w.Header(), response.header)
-				w.WriteHeader(response.status)
-				_, _ = w.Write(response.body)
-				return
-			}
-			var uploaded struct {
-				StateID string `json:"state_id"`
-			}
-			if json.Unmarshal(response.body, &uploaded) != nil || uploaded.StateID == "" {
-				http.Error(w, "backend returned an invalid uploaded state response", http.StatusBadGateway)
-				return
-			}
-			if stateID == "" {
-				stateID = uploaded.StateID
-			} else if stateID != uploaded.StateID {
-				http.Error(w, "backends returned different state_id values", http.StatusBadGateway)
-				return
-			}
+	status := responses[0].status
+	for _, response := range responses[1:] {
+		if response.status != status {
+			http.Error(w, "state synchronization returned inconsistent backend responses", http.StatusBadGateway)
+			return
 		}
-	} else {
-		status := responses[0].status
-		for _, response := range responses[1:] {
-			if response.status != status {
-				http.Error(w, "state synchronization returned inconsistent backend responses", http.StatusBadGateway)
+	}
+
+	if r.URL.Path == "/v1/state/list" && responses[0].status >= 200 && responses[0].status < 300 {
+		var baseline map[string]listedState
+		for i, response := range responses {
+			states, err := decodeStateList(response.body)
+			if err != nil {
+				http.Error(w, "backend returned an invalid state list", http.StatusBadGateway)
+				return
+			}
+			if i == 0 {
+				baseline = states
+				continue
+			}
+			if !reflect.DeepEqual(baseline, states) {
+				http.Error(w, "state lists differ across backends", http.StatusBadGateway)
 				return
 			}
 		}
@@ -444,10 +477,61 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid config: %v", err)
 	}
-	p := &proxy{scheduler: s, maxBody: c.MaxRequestBodyBytes, timeout: time.Duration(c.RequestTimeoutSeconds) * time.Second, client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, MaxIdleConns: 1024, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second, ResponseHeaderTimeout: 0, ExpectContinueTimeout: time.Second}}}
+	policy, _ := configuredUploadPolicy(c)
+	p := &proxy{uploadPolicy: policy, scheduler: s, maxBody: c.MaxRequestBodyBytes, timeout: time.Duration(c.RequestTimeoutSeconds) * time.Second, client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, MaxIdleConns: 1024, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second, ResponseHeaderTimeout: 0, ExpectContinueTimeout: time.Second}}}
 	server := &http.Server{Addr: c.Listen, Handler: p, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
 	log.Printf("RWKV router listening on %s with %d backends", c.Listen, len(s.backends))
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+// UUID-v7 per RFC 9562, with cryptographic randomness for its 74 random bits.
+func newUploadUUID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	timestamp := uint64(time.Now().UnixMilli())
+	for i := 5; i >= 0; i-- {
+		id[i] = byte(timestamp)
+		timestamp >>= 8
+	}
+	id[6] = (id[6] & 0x0f) | 0x70
+	id[8] = (id[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:]), nil
+}
+
+// Compare file identity/structure, allowing per-worker upload timestamps/order.
+type listedState struct {
+	ID       string `json:"state_id"`
+	Size     uint64 `json:"size_bytes"`
+	Tensors  int    `json:"tensor_count"`
+	Layers   int    `json:"layers"`
+	Heads    int    `json:"heads"`
+	HeadSize int    `json:"head_size"`
+}
+
+func decodeStateList(body []byte) (map[string]listedState, error) {
+	var payload struct {
+		Object string         `json:"object"`
+		Data   *[]listedState `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Object != "list" || payload.Data == nil {
+		return nil, errors.New("invalid state list")
+	}
+	states := make(map[string]listedState)
+	for _, state := range *payload.Data {
+		if state.ID == "" {
+			return nil, errors.New("empty state ID")
+		}
+		if _, ok := states[state.ID]; ok {
+			return nil, errors.New("duplicate state ID")
+		}
+		states[state.ID] = state
+	}
+	return states, nil
 }
