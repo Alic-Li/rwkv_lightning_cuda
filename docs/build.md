@@ -2,6 +2,21 @@
 
 [English](build.md) | [简体中文](build.zh-CN.md) | [Back to README](../README.md)
 
+## Prerequisites
+
+- CMake 3.24 or newer and a C++20-capable compiler.
+- One GPU toolchain: NVIDIA CUDA Toolkit (the project CI covers CUDA 12.9 and 13.2), or ROCm 7.2.5 with HIP, hipBLAS, hipBLASLt, and hipRAND for the AMD backend.
+- SQLite3, OpenSSL, and JsonCpp development files. CMake discovers JsonCpp through its config package or, as a fallback, `pkg-config` (`pkg-config` is only needed for that fallback).
+- Drogon is needed to build the `rwkv_lighting_cuda` HTTP server target. Without it, CMake still builds the other available targets but skips the server.
+
+On Debian or Ubuntu, the host-side dependencies for the complete CUDA build can be installed with:
+
+```bash
+sudo apt install build-essential cmake pkg-config libsqlite3-dev libssl-dev libjsoncpp-dev libdrogon-dev
+```
+
+Install the NVIDIA driver and CUDA Toolkit separately, following NVIDIA's instructions for your system. For HIP builds, install the matching ROCm development packages instead of CUDA; see the [AMD ROCm section](#amd-rocm-hip).
+
 ```bash
 cmake -S . -B ./build \
   -DCMAKE_BUILD_TYPE=Release \

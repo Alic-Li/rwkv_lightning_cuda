@@ -2,6 +2,21 @@
 
 [English](build.md) | 简体中文 | [返回 README](../README_zh.md)
 
+## 前置依赖
+
+- CMake 3.24 或更新版本，以及支持 C++20 的 C++ 编译器。
+- GPU 工具链二选一：NVIDIA CUDA Toolkit（项目 CI 覆盖 CUDA 12.9 和 13.2）；或 ROCm 7.2.5，以及 AMD 后端所需的 HIP、hipBLAS、hipBLASLt 和 hipRAND。
+- SQLite3、OpenSSL 和 JsonCpp 的开发文件。CMake 会优先通过 JsonCpp 的 config 包查找；回退时使用 `pkg-config`（只有回退路径需要安装 `pkg-config`）。
+- 构建 `rwkv_lighting_cuda` HTTP 服务端目标需要 Drogon。未安装 Drogon 时，CMake 仍会构建其他可用目标，但会跳过服务端。
+
+Debian 或 Ubuntu 上，完整 CUDA 构建所需的主机端依赖可通过以下命令安装：
+
+```bash
+sudo apt install build-essential cmake pkg-config libsqlite3-dev libssl-dev libjsoncpp-dev libdrogon-dev
+```
+
+NVIDIA 驱动和 CUDA Toolkit 请根据系统按照 NVIDIA 官方说明单独安装。构建 HIP 后端时，安装对应版本的 ROCm 开发包并使用 HIP 工具链；详见 [AMD ROCm 部分](#amd-rocm-hip)。
+
 ## CMake 构建
 
 ```bash
