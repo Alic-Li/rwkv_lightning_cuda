@@ -12,6 +12,16 @@ else()
   message(FATAL_ERROR "RWKV_GPU_BACKEND must be CUDA or HIP")
 endif()
 
+# Clang >= 15 (including the ROCm toolchain used for the HIP backend) enables
+# PIE by default on Linux. The host C++ objects are compiled without -fPIC and
+# several dependencies come from prebuilt non-PIC static archives
+# (e.g. libdrogon.a / libtrantor.a), so a PIE link makes ld.lld fail with
+# "relocation R_X86_64_32S cannot be used against local symbol; recompile with
+# -fPIC". Link the HIP executables as traditional position-dependent programs.
+if(RWKV_GPU_BACKEND STREQUAL "HIP" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_link_options(-no-pie)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 include(RwkvOptions)

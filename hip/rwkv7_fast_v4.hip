@@ -736,25 +736,39 @@ void build_cpu_emb_ln0_f16_quantized(
     std::cerr << "error: quantized emb/ln0 shape mismatch\n";
     std::exit(1);
   }
-  DeviceBuffer<std::uint16_t> gpu_emb, gpu_w, gpu_b, gpu_out;
-  gpu_emb.resize(elems, "alloc quantized emb");
-  gpu_w.resize(dims.channels, "alloc quantized ln0 weight");
-  gpu_b.resize(dims.channels, "alloc quantized ln0 bias");
-  gpu_out.resize(elems, "alloc quantized emb output");
-  check_hip(hipMemcpy(gpu_emb.p, emb_data.data(), emb_data.size(), hipMemcpyHostToDevice), "copy quantized emb");
-  check_hip(hipMemcpy(gpu_w.p, w_data.data(), w_data.size(), hipMemcpyHostToDevice), "copy quantized ln0 weight");
-  check_hip(hipMemcpy(gpu_b.p, b_data.data(), b_data.size(), hipMemcpyHostToDevice), "copy quantized ln0 bias");
-  if (emb->dtype == llm_infer::QuantizedDType::kBFloat16) {
-    rwkv7_v4_emb_ln0_bf16_to_f16_launch(nullptr, dims.vocab, dims.channels,
-                                         gpu_emb.p, gpu_w.p, gpu_b.p, gpu_out.p, kLnEps);
-  } else {
+  if (emb->dtype != llm_infer::QuantizedDType::kBFloat16) {
     std::cerr << "error: float16 emb preprocessing is not supported\n";
     std::exit(1);
   }
-  check_hip(hipGetLastError(), "launch quantized emb+ln0 preprocess");
+  // Preprocess the embedding table in row chunks so the peak device footprint is
+  // two chunk buffers instead of two full vocab x channels tables. The quantized
+  // weights are already resident at this point, so allocating both full-size
+  // tables at once can exhaust VRAM on large models.
+  const std::size_t row_bytes = static_cast<std::size_t>(dims.channels) * sizeof(std::uint16_t);
+  const int rows_per_chunk = static_cast<int>(
+      std::max<std::size_t>(1, kWeightLoadChunkBytes / row_bytes));
+  const int chunk_rows = std::min(rows_per_chunk, dims.vocab);
+  const std::size_t chunk_elems = static_cast<std::size_t>(chunk_rows) * dims.channels;
+  DeviceBuffer<std::uint16_t> gpu_emb, gpu_w, gpu_b, gpu_out;
+  gpu_emb.resize(chunk_elems, "alloc quantized emb chunk");
+  gpu_w.resize(dims.channels, "alloc quantized ln0 weight");
+  gpu_b.resize(dims.channels, "alloc quantized ln0 bias");
+  gpu_out.resize(chunk_elems, "alloc quantized emb output chunk");
+  check_hip(hipMemcpy(gpu_w.p, w_data.data(), w_data.size(), hipMemcpyHostToDevice), "copy quantized ln0 weight");
+  check_hip(hipMemcpy(gpu_b.p, b_data.data(), b_data.size(), hipMemcpyHostToDevice), "copy quantized ln0 bias");
   weights.cpu_emb_ln0_f16.resize(elems);
-  check_hip(hipMemcpy(weights.cpu_emb_ln0_f16.data(), gpu_out.p, elems * sizeof(std::uint16_t),
-                        hipMemcpyDeviceToHost), "copy quantized emb+ln0");
+  for (int row_offset = 0; row_offset < dims.vocab; row_offset += rows_per_chunk) {
+    const int rows_this_chunk = std::min(rows_per_chunk, dims.vocab - row_offset);
+    const std::size_t bytes_this_chunk = static_cast<std::size_t>(rows_this_chunk) * row_bytes;
+    check_hip(hipMemcpy(gpu_emb.p, emb_data.data() + static_cast<std::size_t>(row_offset) * row_bytes,
+                          bytes_this_chunk, hipMemcpyHostToDevice), "copy quantized emb chunk");
+    rwkv7_v4_emb_ln0_bf16_to_f16_launch(nullptr, rows_this_chunk, dims.channels,
+                                         gpu_emb.p, gpu_w.p, gpu_b.p, gpu_out.p, kLnEps);
+    check_hip(hipGetLastError(), "launch quantized emb+ln0 preprocess");
+    check_hip(hipMemcpy(weights.cpu_emb_ln0_f16.data() + static_cast<std::size_t>(row_offset) * dims.channels,
+                          gpu_out.p, bytes_this_chunk, hipMemcpyDeviceToHost),
+               "copy quantized emb+ln0 chunk");
+  }
   check_hip(hipDeviceSynchronize(), "sync quantized emb+ln0 preprocess");
   weights.cpu_emb_bytes = weights.cpu_emb_ln0_f16.size() * sizeof(std::uint16_t);
 }
