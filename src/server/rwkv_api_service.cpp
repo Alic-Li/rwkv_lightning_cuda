@@ -1764,8 +1764,19 @@ void register_api_routes_legacy(
           cb(json_response(make_error(error.what()), k400BadRequest));
           return;
         }
-        InferenceEngine::GenerationStats stats;
-        auto texts = engine.batch_generate_state(prompts, state, options, &stats);
+        std::vector<std::string> texts(1);
+        const auto stats = engine.batch_generate_state_stream(
+            prompts,
+            state,
+            options,
+            0,
+            [&](int index, const std::string& chunk) {
+              texts.at(static_cast<size_t>(index)) += chunk;
+              return true;
+            },
+            [active]() {
+              return active->stop_requested.load() || active->pause_requested.load();
+            });
         manager.put_state(session_id, state);
         Json::Value resp;
         resp["id"] = "rwkv7-fast-state";
