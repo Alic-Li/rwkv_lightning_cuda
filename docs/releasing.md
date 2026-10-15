@@ -51,6 +51,7 @@ rwkv_lighting_cuda/
 ├── lib/                  # Linux runtime dependencies
 ├── rwkv_launcher
 ├── rwkv_lighting_cuda
+├── rwkv_miss_tune
 ├── rwkv_quantize
 ├── rwkv_state_tune
 └── rwkv_vocab_v20230424.txt
@@ -65,7 +66,7 @@ and runtime DLLs sit beside them. Models and the optional router are not include
 Extract the whole directory, change into it, and run `rwkv_launcher` (Windows:
 `rwkv_launcher.exe`). The launcher uses the included vocabulary by default.
 Linux libraries are resolved using the executables' origin-relative RPATH.
-Pass `--vocab ./rwkv_vocab_v20230424.txt` when using the state-tuning CLI
+Pass `--vocab ./rwkv_vocab_v20230424.txt` when using the state-tuning or MiSS-tuning CLI
 (its compiled default points to the build machine's source tree).
 
 The target machine needs an NVIDIA driver compatible with the CUDA version of the

@@ -44,6 +44,7 @@ rwkv_lighting_cuda/
 ├── lib/                  # Linux 运行时依赖
 ├── rwkv_launcher
 ├── rwkv_lighting_cuda
+├── rwkv_miss_tune
 ├── rwkv_quantize
 ├── rwkv_state_tune
 └── rwkv_vocab_v20230424.txt
@@ -56,7 +57,7 @@ CI 根据 `bun.lock` 安装前端依赖，执行 lint/测试，并在编译启�
 
 解压整个目录，进入后运行 `rwkv_launcher`（Windows 为 `rwkv_launcher.exe`）。
 启动器默认使用附带词表。Linux 库通过相对于可执行文件位置的 RPATH 解析。
-使用状态微调 CLI 时传入 `--vocab ./rwkv_vocab_v20230424.txt`，因为编译时的默认值
+使用状态微调或 MiSS 微调 CLI 时传入 `--vocab ./rwkv_vocab_v20230424.txt`，因为编译时的默认值
 指向构建机器的源码目录。
 
 目标机器需要与安装包 CUDA 版本（12.9 或 13.2）及 GPU 兼容的 NVIDIA 驱动。
