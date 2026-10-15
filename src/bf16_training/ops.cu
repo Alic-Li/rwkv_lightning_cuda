@@ -1,5 +1,5 @@
 // Training-only BF16 copies of the inference linear/norm/mix semantics.
-#include "ops.hpp"
+#include "rwkv/bf16_training/ops.hpp"
 #ifdef RWKV_USE_HIP
 #include <hipblas/hipblas.h>
 #else

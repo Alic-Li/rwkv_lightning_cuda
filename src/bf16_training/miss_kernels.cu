@@ -1,5 +1,5 @@
 // Copied from src/miss/kernels.cu; BF16 tensors, FP32 reduction/accumulation.
-#include "miss.hpp"
+#include "rwkv/bf16_training/miss.hpp"
 #include <cmath>
 #include <stdexcept>
 namespace rwkv_bf16_miss {

@@ -1,5 +1,5 @@
-#include "model.hpp"
-#include "ops.hpp"
+#include "rwkv/bf16_training/model.hpp"
+#include "rwkv/bf16_training/ops.hpp"
 #include "rwkv/io/fingerprint.hpp"
 #include "rwkv/io/pth_tensor.hpp"
 #include "rwkv/io/pth_writer.hpp"

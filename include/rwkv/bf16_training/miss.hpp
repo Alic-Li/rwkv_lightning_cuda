@@ -1,5 +1,5 @@
 #pragma once
-#include "runtime.hpp"
+#include "rwkv/bf16_training/runtime.hpp"
 #include <array>
 #include <cstddef>
 

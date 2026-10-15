@@ -1,5 +1,5 @@
 #pragma once
-#include "runtime.hpp"
+#include "rwkv/bf16_training/runtime.hpp"
 namespace rwkv_bf16_training {
 void rwkv7_tmix_mix6_launch(cudaStream_t stream, int B, int T, int C,
                             const bf16 *x, bf16 *shift_state, const bf16 *x_r,

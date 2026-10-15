@@ -1,12 +1,12 @@
 // Copied from src/state_tuning; independent BF16 training implementation.
-#include "training.hpp"
+#include "rwkv/bf16_training/training.hpp"
 
-#include "runtime.hpp"
+#include "rwkv/bf16_training/runtime.hpp"
 
 #include <algorithm>
 #include <stdexcept>
 
-#include "ops.hpp"
+#include "rwkv/bf16_training/ops.hpp"
 
 namespace rwkv_bf16_training {
 namespace {

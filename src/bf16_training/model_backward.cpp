@@ -1,5 +1,5 @@
 // Copied from src/state_tuning; independent BF16 training implementation.
-#include "training.hpp"
+#include "rwkv/bf16_training/training.hpp"
 
 #include <algorithm>
 #include <stdexcept>

@@ -1,4 +1,4 @@
-#include "training.hpp"
+#include "rwkv/bf16_training/training.hpp"
 #include <array>
 #include <cmath>
 #include <iostream>

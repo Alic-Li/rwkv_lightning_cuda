@@ -1,12 +1,12 @@
 #pragma once
 
-#include "miss.hpp"
+#include "rwkv/bf16_training/miss.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-#include "runtime.hpp"
+#include "rwkv/bf16_training/runtime.hpp"
 #include "rwkv/runtime/rwkv_training_wkv.hpp"
 
 namespace rwkv_bf16_training {

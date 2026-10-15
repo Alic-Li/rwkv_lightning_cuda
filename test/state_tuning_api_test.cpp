@@ -1,5 +1,5 @@
 #include "dataset.hpp"
-#include "training.hpp"
+#include "rwkv/bf16_training/training.hpp"
 
 #include "rwkv/io/pth_archive.hpp"
 #include "rwkv/io/pth_tensor.hpp"

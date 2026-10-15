@@ -1,4 +1,4 @@
-#include "format.hpp"
+#include "rwkv/bf16_training/format.hpp"
 #include "rwkv/io/pth_writer.hpp"
 #include <cstring>
 #include <filesystem>

@@ -1,6 +1,6 @@
 #pragma once
-#include "format.hpp"
-#include "training.hpp"
+#include "rwkv/bf16_training/format.hpp"
+#include "rwkv/bf16_training/training.hpp"
 namespace rwkv_bf16_miss {
 class Trainer {
 public:

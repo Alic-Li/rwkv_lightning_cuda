@@ -1,12 +1,12 @@
 #include "../state_tuning/dataset.hpp"
 #ifdef RWKV_MISS_TUNE
-#include "trainer.hpp"
+#include "rwkv/bf16_training/trainer.hpp"
 #endif
-#include "model.hpp"
+#include "rwkv/bf16_training/model.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
-#include "training.hpp"
+#include "rwkv/bf16_training/training.hpp"
 
-#include "runtime.hpp"
+#include "rwkv/bf16_training/runtime.hpp"
 
 #include <algorithm>
 #include <chrono>

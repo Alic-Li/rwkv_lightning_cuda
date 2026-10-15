@@ -92,8 +92,10 @@ if(RWKV7_STATE_TUNING)
     ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cpp bf16_training/format.cpp
     io/pth_archive.cpp io/pth_tensor.cpp io/pth_writer.cpp io/fingerprint.cpp
     inference/rwkv_tokenizer.cpp utils/tokenizer.cpp)
-  target_include_directories(rwkv_bf16_training PUBLIC ${PROJECT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/bf16_training PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  target_include_directories(rwkv_bf16_training
+    PUBLIC ${PROJECT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils
+  )
   target_link_libraries(rwkv_bf16_training PUBLIC ${RWKV_JSON_TARGET} OpenSSL::Crypto)
   if(RWKV_GPU_BACKEND STREQUAL "HIP")
     target_compile_definitions(rwkv_bf16_training PUBLIC RWKV_USE_HIP)
@@ -134,6 +136,19 @@ if(Drogon_FOUND)
   add_executable(rwkv_lighting_cuda
     app/rwkv_fast_server.cpp
     server/rwkv_api_service.cpp
+    server/router/adapter_routes.cpp
+    server/router/batch_routes.cpp
+    server/router/chat_routes.cpp
+    server/router/dynamic_routes.cpp
+    server/router/generation_helpers.cpp
+    server/router/http_helpers.cpp
+    server/router/legacy_routes.cpp
+    server/router/model_routes.cpp
+    server/router/server_routes.cpp
+    server/router/session_routes.cpp
+    server/router/token_routes.cpp
+    server/router/translation_routes.cpp
+    server/router/uploaded_state_routes.cpp
     server/rwkv_model_router.cpp
   )
   target_link_libraries(rwkv_lighting_cuda PRIVATE rwkv::backend Drogon::Drogon)

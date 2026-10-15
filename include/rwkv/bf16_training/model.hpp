@@ -1,5 +1,5 @@
 #pragma once
-#include "training.hpp"
+#include "rwkv/bf16_training/training.hpp"
 #include <map>
 namespace rwkv_bf16_training {
 class Model {

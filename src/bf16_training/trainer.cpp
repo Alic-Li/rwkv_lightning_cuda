@@ -1,4 +1,4 @@
-#include "trainer.hpp"
+#include "rwkv/bf16_training/trainer.hpp"
 #include "rwkv/io/pth_tensor.hpp"
 #include "rwkv/io/pth_writer.hpp"
 #include <cmath>
