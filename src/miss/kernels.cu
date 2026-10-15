@@ -62,93 +62,6 @@ __global__ void project(int in, int out, int rank, float scale, const half *x,
   const size_t i = row * (size_t)out + o;
   y[i] = __float2half_rn(fmaf(scale, delta, __half2float(y[i])));
 }
-// Short chunks need only one thread per parameter, avoiding thousands of
-// mostly idle CTAs when rows is smaller than a warp.
-__global__ void grad_d_short(int rows, int out, int rank, float scale,
-                             const float *s, const half *g, float *dd) {
-  const size_t q = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-  if (q >= size_t(out) * rank)
-    return;
-  float sum = 0;
-  for (int t = 0; t < rows; ++t)
-    sum = fmaf(__half2float(g[t * (size_t)out + q / rank]),
-               s[t * (size_t)rank + q % rank], sum);
-  dd[q] += scale * sum;
-}
-
-// One CTA owns a D element; deterministic reduction, no cross-CTA atomics.
-__global__ void grad_d(int rows, int out, int rank, float scale, const float *s,
-                       const half *g, float *dd) {
-  const int q = blockIdx.x;
-  float sum = 0;
-  for (int t = threadIdx.x; t < rows; t += blockDim.x)
-    sum = fmaf(__half2float(g[t * (size_t)out + q / rank]),
-               s[t * (size_t)rank + q % rank], sum);
-  __shared__ float partial[threads];
-  partial[threadIdx.x] = sum;
-  __syncthreads();
-  for (int n = threads / 2; n; n /= 2) {
-    if (threadIdx.x < n)
-      partial[threadIdx.x] += partial[threadIdx.x + n];
-    __syncthreads();
-  }
-  if (!threadIdx.x)
-    dd[q] += scale * partial[0];
-}
-// Shared tiles reuse G across 16 rank slots and S across 16 outputs.
-// This avoids one strided CTA reduction per D element for longer chunks.
-__global__ void grad_d_tiled(int rows, int out, int rank, float scale,
-                             const float *s, const half *g, float *dd) {
-  constexpr int tile = 16;
-  const int lane = threadIdx.x;
-  const int o = blockIdx.x * tile + lane / tile;
-  const int j = blockIdx.y * tile + lane % tile;
-  __shared__ float sg[tile][tile], ss[tile][tile];
-  float sum = 0;
-  for (int t0 = 0; t0 < rows; t0 += tile) {
-    const int t = t0 + lane / tile;
-    const int go = blockIdx.x * tile + lane % tile;
-    const int sj = blockIdx.y * tile + lane % tile;
-    sg[lane / tile][lane % tile] =
-        (t < rows && go < out) ? __half2float(g[t * (size_t)out + go]) : 0;
-    ss[lane / tile][lane % tile] =
-        (t < rows && sj < rank) ? s[t * (size_t)rank + sj] : 0;
-    __syncthreads();
-#pragma unroll
-    for (int k = 0; k < tile; ++k)
-      sum = fmaf(sg[k][lane / tile], ss[k][lane % tile], sum);
-    __syncthreads();
-  }
-  if (o < out && j < rank)
-    dd[o * (size_t)rank + j] += scale * sum;
-}
-
-// Computes dS once per rank slot and broadcasts it directly to dX.
-__global__ void grad_x(int in, int out, int rank, float scale, const half *d,
-                       const half *g, half *dx) {
-  const int row = blockIdx.x, j = blockIdx.y;
-  float sum = 0;
-  for (int o = threadIdx.x; o < out; o += blockDim.x)
-    sum = fmaf(__half2float(g[row * (size_t)out + o]),
-               __half2float(d[o * (size_t)rank + j]), sum);
-  __shared__ float partial[threads];
-  partial[threadIdx.x] = sum;
-  __syncthreads();
-  for (int n = threads / 2; n; n /= 2) {
-    if (threadIdx.x < n)
-      partial[threadIdx.x] += partial[threadIdx.x + n];
-    __syncthreads();
-  }
-  for (int k = j + threadIdx.x * rank; k < in; k += threads * rank) {
-    const size_t i = row * (size_t)in + k;
-    dx[i] = __float2half_rn(fmaf(scale, partial[0], __half2float(dx[i])));
-  }
-}
-__global__ void cast(const float *x, half *y, size_t n) {
-  const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-  if (i < n)
-    y[i] = __float2half_rn(x[i]);
-}
 void validate(int rows, const Linear &w) {
   if (rows <= 0 || rows > 65535 || w.in <= 0 || w.out <= 0 || w.rank <= 0 ||
       w.rank > 1024 || !std::isfinite(w.scale))
@@ -174,32 +87,6 @@ void forward(cudaStream_t stream, int rows, const Linear &w, const half *x,
   project<<<dim3((w.out + threads - 1) / threads, rows), threads,
             w.rank * sizeof(float), stream>>>(w.in, w.out, w.rank, w.scale, x,
                                               s, separate, w.d, y);
-  checked();
-}
-void backward(cudaStream_t stream, int rows, const Linear &w, const float *s,
-              const half *g, half *dx) {
-  if (!w.d)
-    return;
-  validate(rows, w);
-  if (!g || !dx || (w.gradient && !s))
-    throw std::invalid_argument("null MiSS backward input");
-  if (w.gradient) {
-    if (rows < 32)
-      grad_d_short<<<(w.out * w.rank + threads - 1) / threads, threads, 0,
-                     stream>>>(rows, w.out, w.rank, w.scale, s, g, w.gradient);
-    else if (w.out >= 256)
-      grad_d_tiled<<<dim3((w.out + 15) / 16, (w.rank + 15) / 16), threads, 0,
-                     stream>>>(rows, w.out, w.rank, w.scale, s, g, w.gradient);
-    else
-      grad_d<<<w.out * w.rank, threads, 0, stream>>>(rows, w.out, w.rank,
-                                                     w.scale, s, g, w.gradient);
-  }
-  grad_x<<<dim3(rows, w.rank), threads, 0, stream>>>(w.in, w.out, w.rank,
-                                                     w.scale, w.d, g, dx);
-  checked();
-}
-void cast_master(cudaStream_t stream, const float *x, half *y, size_t n) {
-  cast<<<(n + threads - 1) / threads, threads, 0, stream>>>(x, y, n);
   checked();
 }
 } // namespace rwkv7_miss

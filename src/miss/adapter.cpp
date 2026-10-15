@@ -206,6 +206,10 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
       throw std::runtime_error("invalid legacy MiSS checkpoint");
     const auto &config = checkpoint["config"];
     Json::Value m;
+    // Pre-BF16 checkpoints did not declare a training dtype.
+    m["dtype"] = config.get("training_dtype", "float16");
+    if (m["dtype"] != "float16" && m["dtype"] != "bfloat16")
+      throw std::runtime_error("unsupported legacy MiSS training dtype");
     m["rank"] = config["rank"];
     m["alpha"] = config["alpha"];
     if (m["rank"].asInt() <= 0) throw std::runtime_error("invalid rank");
@@ -466,7 +470,7 @@ std::shared_ptr<const GpuLease> AdapterCache::acquire(const AdapterHandle &h,
       if (lease->blocks.size() <= size_t(t.layer))
         lease->blocks.resize(t.layer + 1);
       lease->blocks[t.layer][t.target] = {
-          t.in, t.out, t.rank, 1, lease->data.p + t.offset, nullptr};
+          t.in, t.out, t.rank, 1, lease->data.p + t.offset};
     }
   } catch (...) {
     if (stream)

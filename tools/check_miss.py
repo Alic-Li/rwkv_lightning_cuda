@@ -13,18 +13,16 @@ p.add_argument('--work', type=pathlib.Path, required=True)
 a = p.parse_args()
 a.work.mkdir(parents=True, exist_ok=True)
 torch.manual_seed(1234)
-# Independent explicit fixed A autograd reference, including ragged blocks.
-X = (torch.randn(17, 67) * .1).half().float().requires_grad_()
-D = (torch.randn(35, 16) * .1).half().float().requires_grad_()
+# Independent explicit fixed A reference for FP16 inference, including ragged blocks.
+X = (torch.randn(17, 67) * .1).half().float()
+D = (torch.randn(35, 16) * .1).half().float()
 W = (torch.randn(35, 67) * .1).half().float()
-G = (torch.randn(17, 35) * .1).half().float()
+# Keep the seeded draw order stable for the full-model fixtures below.
+_ = torch.randn(17, 35)
 A = torch.eye(16).repeat(1, 5)[:, :67]
-base = X @ W.T
-Y = base + X @ A.T @ D.T
-(Y * G).sum().backward()
-torch.save(dict(X=X.detach(), D=D.detach(), G=G, base_Y=base.detach().half(),
-                base_dX=(G @ W).half(), Y=(base.detach().half().float() + X.detach() @ A.T @ D.detach().T),
-                dD=D.grad, dX=(G @ W).half().float() + G @ D.detach() @ A), a.work/'reference.pth')
+base = (X @ W.T).half()
+torch.save(dict(X=X, D=D, base_Y=base, Y=base.float() + X @ A.T @ D.T),
+           a.work/'reference.pth')
 subprocess.run([a.build/'test/rwkv_miss_test', a.work/'reference.pth'], check=True)
 # Two layers exercise v_first cross-layer gradients; nonzero mixes exercise shifts.
 C, F, V, R, L = 64, 128, 256, 16, 2

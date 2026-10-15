@@ -29,35 +29,24 @@ void near(double a, double b, double tol) {
                              " / " + std::to_string(b));
 }
 void numerical(int rows, int in, int out, int rank) {
-  std::vector<half> x(rows * in), d(out * rank), g(rows * out), y(rows * out),
-      dx(rows * in);
+  std::vector<half> x(rows * in), d(out * rank), y(rows * out);
   for (size_t i = 0; i < x.size(); ++i)
     x[i] = __float2half(.15f * std::sin(i * .11f));
   for (size_t i = 0; i < d.size(); ++i)
     d[i] = __float2half(.07f * std::cos(i * .21f));
-  for (size_t i = 0; i < g.size(); ++i) {
-    g[i] = __float2half(.2f * std::sin(i * .07f));
-    y[i] = __float2half(.01f);
-  }
-  for (auto &v : dx)
-    v = __float2half(.02f);
-  DeviceBuffer<half> X, D, G, Y, Yf, DX;
-  DeviceBuffer<float> S, DD;
+  for (auto &v : y)
+    v = __float2half(.01f);
+  DeviceBuffer<half> X, D, Y, Yf;
+  DeviceBuffer<float> S;
   upload(X, x);
   upload(D, d);
-  upload(G, g);
   upload(Y, y);
   upload(Yf, y);
-  upload(DX, dx);
   S.resize(rows * rank, "S");
-  DD.resize(out * rank, "dD");
-  DD.zero("zero");
-  Linear w{in, out, rank, .7f, D.p, DD.p};
+  Linear w{in, out, rank, .7f, D.p};
   forward(nullptr, rows, w, X.p, Y.p, S.p);
   forward(nullptr, rows, w, X.p, Yf.p);
-  backward(nullptr, rows, w, S.p, G.p, DX.p);
-  auto a = read(Y), f = read(Yf), b = read(DX);
-  auto c = read(DD);
+  auto a = read(Y), f = read(Yf);
   std::vector<double> s(rows * rank);
   for (int t = 0; t < rows; ++t)
     for (int k = 0; k < in; ++k)
@@ -70,34 +59,6 @@ void numerical(int rows, int in, int out, int rank) {
       near(__half2float(a[t * out + o]), v, 2e-4);
       near(__half2float(f[t * out + o]), __half2float(a[t * out + o]), 0);
     }
-  for (int o = 0; o < out; ++o)
-    for (int j = 0; j < rank; ++j) {
-      double v = 0;
-      for (int t = 0; t < rows; ++t)
-        v += .7f * __half2float(g[t * out + o]) * s[t * rank + j];
-      near(c[o * rank + j], v, 2e-5);
-    }
-  for (int t = 0; t < rows; ++t)
-    for (int k = 0; k < in; ++k) {
-      double v = __half2float(dx[t * in + k]);
-      for (int o = 0; o < out; ++o)
-        v += .7f * __half2float(g[t * out + o]) *
-             __half2float(d[o * rank + k % rank]);
-      near(__half2float(b[t * in + k]), v, 2e-4);
-    }
-  backward(nullptr, rows, w, S.p, G.p, DX.p);
-  auto twice = read(DD);
-  for (size_t i = 0; i < c.size(); ++i)
-    near(twice[i], 2 * c[i], 1e-6);
-  // Finite differences of the continuous explicit shard expansion objective.
-  auto objective = [&](double delta) {
-    double v = 0;
-    for (int t = 0; t < rows; ++t)
-      v += .7f * __half2float(g[t * out]) * s[t * rank] *
-           (double(__half2float(d[0])) + delta);
-    return v;
-  };
-  near((objective(1e-5) - objective(-1e-5)) / 2e-5, c[0], 2e-5);
   Linear none;
   auto before = read(Y);
   forward(nullptr, rows, none, nullptr, Y.p);
@@ -122,27 +83,15 @@ void reference(const std::string &path) {
     std::memcpy(v.data(), h.at(n).values_f16.data(), v.size() * 2);
     return v;
   };
-  DeviceBuffer<half> X, D, G, Y, DX;
-  DeviceBuffer<float> S, DD;
+  DeviceBuffer<half> X, D, Y;
   upload(X, halfdata("X"));
   upload(D, halfdata("D"));
-  upload(G, halfdata("G"));
   upload(Y, halfdata("base_Y"));
-  upload(DX, halfdata("base_dX"));
-  S.resize(rows * rank, "S");
-  DD.resize(out * rank, "DD");
-  DD.zero("zero");
-  Linear w{in, out, rank, 1, D.p, DD.p};
-  forward(nullptr, rows, w, X.p, Y.p, S.p);
-  backward(nullptr, rows, w, S.p, G.p, DX.p);
-  auto y = read(Y), dx = read(DX);
-  auto dd = read(DD);
+  Linear w{in, out, rank, 1, D.p};
+  forward(nullptr, rows, w, X.p, Y.p);
+  auto y = read(Y);
   for (size_t i = 0; i < y.size(); ++i)
     near(__half2float(y[i]), h.at("Y").values[i], .002);
-  for (size_t i = 0; i < dx.size(); ++i)
-    near(__half2float(dx[i]), h.at("dX").values[i], .002);
-  for (size_t i = 0; i < dd.size(); ++i)
-    near(dd[i], h.at("dD").values[i], .0001);
 }
 void cache() {
   auto dir = rwkv_test::unique_temp_path("miss_cache");

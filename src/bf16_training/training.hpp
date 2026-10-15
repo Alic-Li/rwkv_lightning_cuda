@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "runtime.hpp"
-#include "rwkv/runtime/rwkv_state_tuning.hpp"
+#include "rwkv/runtime/rwkv_training_wkv.hpp"
 
 namespace rwkv_bf16_training {
 

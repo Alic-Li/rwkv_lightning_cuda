@@ -1,5 +1,5 @@
 #include "dataset.hpp"
-#include "rwkv/runtime/rwkv_state_tuning.hpp"
+#include "training.hpp"
 
 #include "rwkv/io/pth_archive.hpp"
 #include "rwkv/io/pth_tensor.hpp"
@@ -28,20 +28,28 @@ int main() {
 
     const auto checkpoint = std::filesystem::temp_directory_path() /
                             "rwkv_state_tuning_writer_test.pth";
-    std::vector<float> runtime(2 * 2 * 2);
-    for (std::size_t i = 0; i < runtime.size(); ++i)
-      runtime[i] = static_cast<float>(i);
-    save_state_checkpoint_pth_host(checkpoint.string(), 1, 2, 2, runtime);
+    constexpr int heads = 2, n = 64;
+    std::vector<float> runtime(heads * n * n), expected_state(runtime.size());
+    for (int h = 0; h < heads; ++h)
+      for (int k = 0; k < n; ++k)
+        for (int v = 0; v < n; ++v) {
+          // Exactly representable BF16 values, asymmetric in K/V.
+          const float value = static_cast<float>(h * 64 + k - v);
+          runtime[(h * n + k) * n + v] = value;
+          expected_state[(h * n + v) * n + k] = value;
+        }
+    rwkv_bf16_training::save_state_checkpoint_pth_host(
+        checkpoint.string(), 1, heads, n, runtime);
     auto archive = llm_infer::PthArchive::open(checkpoint.string());
     if (!archive.ok())
       throw std::runtime_error(archive.status().message());
     auto records = llm_infer::parse_pth_tensor_records(archive.value());
-    if (!records.ok() || records.value().size() != 1)
-      throw std::runtime_error("checkpoint record parse failed");
+    if (!records.ok() || records.value().size() != 1 ||
+        records.value()[0].dtype != llm_infer::TensorDType::kBFloat16)
+      throw std::runtime_error("BF16 checkpoint record parse failed");
     auto tensor =
         llm_infer::load_tensor_as_float(archive.value(), records.value()[0]);
-    if (!tensor.ok() ||
-        tensor.value().values != std::vector<float>({0, 2, 1, 3, 4, 6, 5, 7}))
+    if (!tensor.ok() || tensor.value().values != expected_state)
       throw std::runtime_error("checkpoint state transpose mismatch");
     std::filesystem::remove(checkpoint);
 

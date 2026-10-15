@@ -62,7 +62,7 @@ try:
     stats=request('/v1/adapters')
     assert stats['uploads']==0
     assert stats['gpu_bytes']==0
-    # All formats/IDs deduplicate to the same FP16 D payload; no Adam RAM cache.
+    # All formats/IDs deduplicate to the same BF16 D payload; no Adam RAM cache.
     with zipfile.ZipFile(a.work/'learn/adapter-final.pth') as z:
         manifest=json.loads(z.read('archive/miss.json'))
     assert stats['ram_bytes']==sum(t['shape'][0]*t['shape'][1]*2 for t in manifest['targets'])
@@ -99,6 +99,22 @@ try:
     request('/v1/adapters',{'adapter_id':'test'},'DELETE')
     for adapter_id in ['checkpoint','final','legacy','legacy-upload']:
         request('/v1/adapters',{'adapter_id':adapter_id},'DELETE')
+    assert request('/v1/adapters')['data']==[]
+    # Checkpoints predating training_dtype still load as FP16. Explicitly
+    # unsupported dtypes must fail rather than silently quantizing as FP16.
+    meta['config'].pop('training_dtype')
+    (legacy/'checkpoint.json').write_text(json.dumps(meta))
+    upload('legacy-fp16',legacy/'training.pth',legacy/'checkpoint.json')
+    entries=request('/v1/adapters')['data']
+    assert len(entries)==1 and entries[0]['manifest']['dtype']=='float16'
+    request('/v1/adapters',{'adapter_id':'legacy-fp16'},'DELETE')
+    meta['config']['training_dtype']='unsupported'
+    (legacy/'checkpoint.json').write_text(json.dumps(meta))
+    try:
+        upload('invalid-dtype',legacy/'training.pth',legacy/'checkpoint.json')
+        raise AssertionError('unsupported training dtype accepted')
+    except urllib.error.HTTPError as error:
+        assert error.code==400
     assert request('/v1/adapters')['data']==[]
     print('HTTP registration/list/cold+hot generation/deletion passed')
 finally:

@@ -92,8 +92,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/model/load" \
   --batch-size 8
 ```
 
-这个以正确性为先的版本使用现有 BF16 PTH 加载器及其 FP16 运行时权重，不支持 INT8
-训练。样本会在 `--ctx` 处截断；`--chunk` 控制 checkpoint/recompute 长度并做反向 state
+训练使用独立的原生 BF16 backbone，不支持量化基模。样本会在 `--ctx` 处截断；`--chunk` 控制 checkpoint/recompute 长度并做反向 state
 梯度传播。`--batch-size N` 在每次优化器更新中累积 N 条变长样本。checkpoint 只包含
 state 张量，可直接上传到现有推理后端使用。掩码 `segments`
 格式和实现细节见 [状态微调文档](../src/state_tuning/README.zh-CN.md)。

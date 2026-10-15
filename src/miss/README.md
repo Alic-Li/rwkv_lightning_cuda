@@ -152,7 +152,7 @@ when loading the model, before requests can bind adapters; this adds a
 sequential model-file hash read at startup. `rwkv_quantize` writes
 `output.rwkvq.source.json`, binding the quantized archive hash to its source PTH;
 keep this file beside the quantized model to reuse an adapter trained on its
-FP16 runtime source. Older quantized models need to be requantized to obtain
+unquantized source PTH. Older quantized models need to be requantized to obtain
 this provenance file. Quantized base **inference** is supported; training still
 uses a separate native BF16 backbone with streamed BF16/FP32/FP16 input conversion.
 

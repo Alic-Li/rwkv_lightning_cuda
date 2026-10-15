@@ -31,15 +31,13 @@ HIP 实现包括 `rwkv7_statepassing_clampw.hip`、`backward_kernels.hip`、
   --chunk-load --ctx 64 --chunk 32 --max-steps 2 --save-every 1
 ```
 
-`--chunk-load` 限制加载权重时的临时缓冲区，运行时权重仍全部驻留 GPU。
-`--chunk` 则控制激活重算，并跨分块边界传递循环梯度。
-检查点包含 FP32 状态张量，使用与推理兼容的 PyTorch 布局。
+两个训练 CLI 均使用独立的 [BF16 backbone](../src/bf16_training/README.md)。
+权重加载始终通过有界暂存缓冲区流式进行；`--chunk` 控制激活重算并跨边界传递循环梯度。
+状态导出为 BF16，主参数与优化器状态为 FP32。
 
-验证包括 WKV 导数的 CPU 有限差分、分块边界伴随梯度、LayerNorm 和交叉熵梯度、
-批次梯度归约，以及 Adam 动量/更新。测试沿用历史名称 `rwkv_state_tuning_cuda_test`，
-但在 HIP 构建中执行 HIP 算子。
-短训练成功不代表完整模型的 PyTorch 梯度对齐或长期收敛已得到验证。
-BF16 WKV 输入/输出已编译，数值回归使用 FP16 输入/输出，这也是模型运行时训练格式。
+`rwkv_bf16_training_test` 覆盖 WKV 有限差分、分块伴随梯度、归一化反向与交叉熵梯度。
+HIP 构建会使用 HIP 算子；CUDA 验证结果不能代替 HIP 验证。
+旧 FP16 训练 sidecar 和 `rwkv_state_tuning_cuda_test` 已移除。
 
 HIP 推理目前支持 W4A16/W8A16 `.rwkvq` 文件和 BF16 PTH 权重。
 量化投影权重在设备上保持压缩；gfx1100 使用向量化 GEMV 和原生 RDNA3 WMMA，

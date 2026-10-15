@@ -1,23 +1,12 @@
-# RWKV-7 原 FP16 状态微调模块
+# RWKV-7 状态微调
 
 [English](README.md) | 简体中文
 
-> 当前 `rwkv_state_tune` 和 `rwkv_miss_tune` 已切换到独立的
-> [BF16 训练 backbone](../bf16_training/README.md)。下文描述本目录保留的旧 FP16
-> 实现，不代表当前训练二进制的数值路径。当前训练与导出使用 BF16，主参数和优化器使用 FP32。
-
-本目录不是通用训练框架，而是为冻结的 FP16 运行时权重提供 CUDA/HIP 反向计算路径。
-BF16 模型文件仍由现有加载器转换为相同的 FP16 运行时表示。所有函数均不计算冻结基模
-权重的梯度。可选的 MiSS 视图只为 D 增加 FP32 参数梯度，详见 [MiSS 训练与服务](../miss/README.zh-CN.md)。
-
-## 短上下文执行流程
-
-1. `ModelBackend::state_tuning_model_view` 暴露已加载推理权重的只读视图，并拒绝 INT8 张量。
-2. `model_forward_state_tuning_f16` 复用推理用的 LayerNorm、time-mix、线性层、激活、ChannelMix 和 WKV 后处理算子。WKV 使用不依赖 PyTorch 的精确状态传递算子，记录 FP32 `[B,H,T,K,V]` 状态检查点。
-3. `cross_entropy_forward_backward_f16` 生成按行平均的标量损失和 FP16 `dLogits`。
-4. `model_output_backward_state_only` 计算冻结输出头及最终 LayerNorm 的输入梯度，然后按 `L-1 ... 0` 的顺序遍历各层。
-5. `model_backward_state_only` 只使用两个持久化的 `[B,T,C]` 梯度缓冲区。每个块返回 `dx` 和各批次的 FP32 `dState`。
-6. `reduce_state_gradient_f32` 归约批次维度，`adam_update_state_f32` 只更新 `time_state`、`dState`、`m` 和 `v`。
+`rwkv_state_tune` 和 `rwkv_miss_tune` 使用独立的
+[BF16 训练 backbone](../bf16_training/README.md)，不链接推理核心。
+本目录只保留共享 JSONL 数据读取器和状态微调使用说明。
+旧 FP16 训练 sidecar 及其推理 backend 桥接接口已移除。
+MiSS 的 FP16 表示仍用于在线推理，训练使用 BF16；主参数与优化器张量使用 FP32。
 
 运行时状态 ABI 为 `[H,K,V]`；PyTorch 状态文件使用 `[H,V,K]`，因此加载和检查点序列化时
 需要转置最后两个维度。推理加载器已在加载时完成此转换。
@@ -32,7 +21,7 @@ BF16 模型文件仍由现有加载器转换为相同的 FP16 运行时表示。
 ## 执行条件与限制
 
 - 支持 CUDA 或 ROCm/HIP，注意力头大小为 64。
-- 使用 FP16 计算，WKV 状态和优化器张量为 FP32。
+- 使用 BF16 计算，WKV 状态、主参数和优化器张量为 FP32。
 - 不支持 W8A16/INT8 训练路径。
 - 样本只按 `--ctx` 截断；`--chunk` 控制激活内存。前向计算在分块边界保存 WKV、注意力移位和 FFN 移位状态；反向按逆序重算各分块，并跨边界传递这三类状态梯度，不截断循环计算图。
 - 复用一份分块激活记录。边界检查点目前保留在 GPU 上，显存占用随分块数量增长。
@@ -77,7 +66,7 @@ token 作为 loss 目标：
 - 进度行中 `tokens=` 是送入模型的位置数（用于计算 tok/s），`trained=` 是 loss 目标数。
 - `rwkv_miss_tune` 读取相同格式。
 
-检查点只包含 FP32 `blocks.N.att.time_state` 张量，采用 PyTorch `[H,V,K]` 布局。
+状态导出只包含 BF16 `blocks.N.att.time_state` 张量，采用 PyTorch `[H,V,K]` 布局。
 写入器使用与推理相同的 PTH 解析器校验文件，然后将其发布为
 `state-step-XXXXXXXX.pth` 或 `state-final.pth`。
 

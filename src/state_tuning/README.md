@@ -1,4 +1,4 @@
-# RWKV-7 state tuning (legacy FP16 implementation)
+# RWKV-7 state tuning
 
 English | [简体中文](README.zh-CN.md)
 
@@ -7,31 +7,10 @@ The active `rwkv_state_tune` and `rwkv_miss_tune` binaries now use the independe
 passing and microbatch accumulation, streams base tensors into BF16, and exports
 BF16 state/adapter files. WKV directly reuses the standard operator in `cuda/`.
 
-The implementation details below describe the retained FP16 sidecar,
-not the current CLI's numerical path. The dataset
-reader remains shared; FP16 sidecar tests continue to cover existing consumers.
-
-This directory is intentionally not a general training framework. It adds a
-CUDA/HIP reverse path for frozen FP16 runtime weights; BF16 model archives are
-still converted by the existing loader to the same FP16 runtime representation.
-No function computes frozen-base weight gradients. Optional MiSS views add
-FP32 gradients for D only; see [MiSS training and serving](../miss/README.md).
-
-## Short-context execution
-
-1. ModelBackend::state_tuning_model_view exposes read-only views of the
-   already-loaded inference weights and rejects INT8 tensors.
-2. model_forward_state_tuning_f16 reuses the inference LayerNorm, time-mix,
-   linear, activation, ChannelMix and post-WKV kernels. WKV uses the torch-free
-   exact state-passing kernel and records FP32 [B,H,T,K,V] state checkpoints.
-3. cross_entropy_forward_backward_f16 produces the scalar row-mean loss and
-   FP16 dLogits.
-4. model_output_backward_state_only applies the frozen head and final
-   LayerNorm input gradients, then visits blocks in L-1 ... 0 order.
-5. model_backward_state_only uses only two persistent [B,T,C] gradient buffers.
-   Each block returns dx and a per-batch FP32 dState.
-6. reduce_state_gradient_f32 reduces the batch dimension and
-   adam_update_state_f32 updates only time_state, dState, m, and v.
+This directory retains the shared JSONL dataset reader and state-tuning usage
+notes. The legacy FP16 training sidecar and its inference-backend bridge have
+been removed. Neither training CLI links the inference core. MiSS training is
+implemented in `src/bf16_training/`; FP16 MiSS remains an inference format.
 
 The runtime state ABI is [H,K,V]. PyTorch state files use [H,V,K], so loading
 and checkpoint serialization transpose the last two dimensions. The inference
@@ -49,7 +28,7 @@ accumulates later-layer value-residual gradients and consumes them in layer 0.
 ## Execution and limits
 
 - CUDA or ROCm/HIP, head size 64.
-- FP16 compute with FP32 WKV state and optimizer tensors.
+- BF16 compute with FP32 WKV state, master parameters and optimizer tensors.
 - No W8A16/INT8 training path.
 - Samples are truncated only at `--ctx`. `--chunk` controls activation memory.
   Forward saves WKV and attention/FFN shift states at chunk boundaries.
@@ -106,7 +85,7 @@ tokens from segments with `"train": true` are loss targets:
   tok/s) and `trained=` (loss targets).
 - `rwkv_miss_tune` reads the same format.
 
-Checkpoints contain only FP32 `blocks.N.att.time_state` tensors in PyTorch
+State exports contain only BF16 `blocks.N.att.time_state` tensors in PyTorch
 `[H,V,K]` layout. The writer validates each archive with the same PTH parser
 used by inference before publishing it as `state-step-XXXXXXXX.pth` or
 `state-final.pth`.

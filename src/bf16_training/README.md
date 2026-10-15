@@ -3,8 +3,8 @@
 `rwkv_state_tune` and `rwkv_miss_tune` now build from this directory and link
 `rwkv_bf16_training`, independently of `rwkv7_fast_backend_core`. The existing
 FP16 inference backend remains unchanged apart from accepting BF16 adapter
-files. The layer forward/reverse implementations were copied from the existing
-state-tuning path; the linear, normalization, mixing and activation primitives
+files. The legacy FP16 training sidecar has been removed. The layer forward/reverse
+implementations preserve its execution order; the linear, normalization, mixing and activation primitives
 implement the same RWKV ordering with BF16 inputs and outputs.
 
 ## Precision
@@ -23,8 +23,9 @@ WKV is **not forked here**. CUDA directly compiles and calls
 [`cuda/rwkv7_statepassing_clampw.cu`](../../cuda/rwkv7_statepassing_clampw.cu) and
 [its shape helper](../../cuda/rwkv7_statepassing_clampw.cpp), selecting
 `IoType::BF16`. HIP uses the existing corresponding HIP operator. The shared
-operator also supports old callers; the new training execution never selects
-its FP16 specialization.
+operator retains its FP16 specialization, but training execution only selects
+BF16. Its standalone interface is `include/rwkv/runtime/rwkv_training_wkv.hpp`;
+the inference backend does not include it.
 
 ## Loading and memory
 

@@ -35,18 +35,15 @@ inference kernels still require architecture-specific validation beyond gfx1100.
   --chunk-load --ctx 64 --chunk 32 --max-steps 2 --save-every 1
 ```
 
-`--chunk-load` bounds temporary weight-loading buffers; all runtime weights
-still reside on the GPU. `--chunk` instead controls activation recomputation
-and carries recurrent gradients across chunk boundaries. Checkpoints contain
-FP32 state tensors in the inference-compatible PyTorch layout.
+Both training CLIs use the independent [BF16 backbone](../src/bf16_training/README.md).
+Weight loading always streams through bounded staging buffers. `--chunk` controls
+activation recomputation and carries recurrent gradients across boundaries.
+State exports contain BF16 tensors; master parameters and optimizer state are FP32.
 
-Validation includes CPU finite differences for WKV derivatives, chunk boundary
-adjoints, LayerNorm and cross-entropy gradients, batch gradient reduction and
-Adam moments/updates. The test retains its historical name
-`rwkv_state_tuning_cuda_test` but runs HIP kernels in a HIP build.
-Successful short training runs do not establish full-model PyTorch gradient
-alignment or long-run convergence. BF16 WKV I/O is compiled; the numerical
-regression uses FP16 I/O, which is also the model runtime training format.
+`rwkv_bf16_training_test` covers WKV finite differences and chunk adjoints,
+normalization backward and cross-entropy gradients. It uses HIP in a HIP build;
+CUDA results do not establish HIP correctness. The legacy FP16 training sidecar
+and `rwkv_state_tuning_cuda_test` have been removed.
 
 HIP inference now accepts W4A16/W8A16 `.rwkvq` archives as well as BF16 PTH
 weights. Quantized projection weights remain compressed on device; gfx1100

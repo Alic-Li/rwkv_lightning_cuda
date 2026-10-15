@@ -99,8 +99,8 @@ to compute loss only on selected segments such as assistant replies:
   --batch-size 8
 ```
 
-This first correctness-oriented version uses the existing BF16 PTH loader and
-its FP16 runtime weights and rejects INT8 training. Samples are truncated at
+Training uses the independent native BF16 backbone and rejects quantized base
+weights. Samples are truncated at
 `--ctx`; `--chunk` controls checkpoint/recompute length with reverse state
 gradient propagation. `--batch-size N` accumulates N variable-length samples
 per optimizer update. Checkpoints contain only state tensors and can be uploaded to the

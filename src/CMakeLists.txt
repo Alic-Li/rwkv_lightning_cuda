@@ -27,19 +27,6 @@ if(RWKV_GPU_BACKEND STREQUAL "HIP")
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_wkv_fp16_v2.hip
     ${PROJECT_SOURCE_DIR}/hip/rwkv7_wkv_fp32_v2.hip
   )
-  if(RWKV7_STATE_TUNING)
-    list(APPEND RWKV_CORE_GPU_SOURCES
-      ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cpp
-      ${PROJECT_SOURCE_DIR}/hip/rwkv7_statepassing_clampw.hip
-      ${PROJECT_SOURCE_DIR}/hip/backward_kernels.hip
-      ${PROJECT_SOURCE_DIR}/hip/block_backward.hip
-      ${PROJECT_SOURCE_DIR}/hip/block_forward.hip
-      ${PROJECT_SOURCE_DIR}/hip/training_kernels.hip
-      ${PROJECT_SOURCE_DIR}/hip/model_forward.hip
-      state_tuning/model_backward.cpp
-      state_tuning/state_checkpoint.cpp
-    )
-  endif()
 else()
   set(RWKV_CORE_GPU_SOURCES
     backend/rwkv7_fast_v4.cu
@@ -52,19 +39,6 @@ else()
     ${PROJECT_SOURCE_DIR}/quant/gemmv/rwkv_w8a16.cu
     ${PROJECT_SOURCE_DIR}/quant/gemmv/rwkv_w4a16.cu
   )
-  if(RWKV7_STATE_TUNING)
-    list(APPEND RWKV_CORE_GPU_SOURCES
-      ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cpp
-      ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cu
-      state_tuning/backward_kernels.cu
-      state_tuning/block_backward.cu
-      state_tuning/block_forward.cu
-      state_tuning/training_kernels.cu
-      state_tuning/model_backward.cpp
-      state_tuning/model_forward.cu
-      state_tuning/state_checkpoint.cpp
-    )
-  endif()
 endif()
 
 add_library(rwkv7_fast_backend_core STATIC
