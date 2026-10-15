@@ -35,6 +35,7 @@ enum class ThinkType {
 };
 
 struct GenerateOptions {
+  std::string adapter_id;
   std::shared_ptr<const rwkv7_miss::AdapterHandle> adapter;
   int max_tokens = 8192;
   std::vector<int64_t> stop_tokens{0, 261, 24281};

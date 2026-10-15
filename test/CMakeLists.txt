@@ -29,6 +29,8 @@ rwkv_add_unit_test(rwkv_quantized_archive_test ${CMAKE_CURRENT_SOURCE_DIR}/quant
 rwkv_add_unit_test(rwkv_sampler_test ${CMAKE_CURRENT_SOURCE_DIR}/sampler_test.cpp)
 rwkv_add_unit_test(rwkv_state_cache_test ${CMAKE_CURRENT_SOURCE_DIR}/state_cache_test.cpp)
 rwkv_add_unit_test(rwkv_inference_engine_test ${CMAKE_CURRENT_SOURCE_DIR}/inference_engine_test.cpp)
+rwkv_add_unit_test(rwkv_prompt_cache_test ${CMAKE_CURRENT_SOURCE_DIR}/prompt_cache_test.cpp)
+set_tests_properties(rwkv_prompt_cache_test PROPERTIES SKIP_RETURN_CODE 77)
 rwkv_add_unit_test(rwkv_prefill_admission_test ${CMAKE_CURRENT_SOURCE_DIR}/prefill_admission_test.cpp)
 rwkv_add_unit_test(rwkv_cuda_non4096_kernels_test ${CMAKE_CURRENT_SOURCE_DIR}/cuda_non4096_kernels_test.cpp)
 if(RWKV_GPU_BACKEND STREQUAL "CUDA")

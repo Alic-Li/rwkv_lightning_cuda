@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +21,7 @@ class InferenceEngine {
   struct GenerationStats {
     int prompt_tokens = 0;
     int generated_tokens = 0;
+    int cached_prompt_tokens = 0;
     double prefill_seconds = 0.0;
     double decode_seconds = 0.0;
     bool stopped = false;
@@ -30,11 +32,13 @@ class InferenceEngine {
 
   using StatsCallback = std::function<void(const GenerationStats&)>;
 
+  // Prompt cache capacity is measured in CPU-resident rows; zero disables caching.
   InferenceEngine(
       std::shared_ptr<IModelBackend> model,
       std::shared_ptr<TrieTokenizer> tokenizer,
       std::string model_name,
-      int prefill_chunk_size = 128);
+      int prefill_chunk_size = 128,
+      size_t prompt_cache_capacity = 256);
 
   std::vector<std::string> batch_generate(
       const std::vector<std::string>& prompts,
@@ -61,6 +65,7 @@ class InferenceEngine {
       const ControlCallback& should_stop = {},
       const StatsCallback& on_prefill_complete = {}) const;
 
+  // A supplied cache state ID (including empty for zero state) enables prefix reuse.
   GenerationStats batch_generate_stream_with_state(
       const std::vector<std::string>& prompts,
       GenerationState& state,
@@ -68,7 +73,8 @@ class InferenceEngine {
       int chunk_size,
       const StreamCallback& emit,
       const ControlCallback& should_stop = {},
-      const StatsCallback& on_prefill_complete = {}) const;
+      const StatsCallback& on_prefill_complete = {},
+      const std::optional<std::string>& prompt_cache_state_id = std::nullopt) const;
 
   GenerationStats batch_generate_state_stream(
       const std::vector<std::string>& prompts,
@@ -126,6 +132,15 @@ class InferenceEngine {
       int chunk_size,
       const ControlCallback& should_stop,
       GenerationStats* stats = nullptr) const;
+
+  struct PromptCache;
+  std::shared_ptr<PromptCache> prompt_cache_;
+  void prefill_cached(
+      std::vector<std::vector<int64_t>>& prompt_ids,
+      std::vector<size_t>& sorted_to_original,
+      GenerationState& state, DeviceLogits& logits,
+      const std::string& state_id, const std::string& adapter_id,
+      GenerationStats& stats) const;
 
   std::shared_ptr<IModelBackend> model_;
   std::shared_ptr<TrieTokenizer> tokenizer_;

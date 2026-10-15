@@ -719,6 +719,7 @@ GenerateOptions parse_options(const Json::Value& body, GenerateOptions options =
     throw std::invalid_argument("adapter_scale must be numeric");
   if (body.isMember("adapter_id")) {
     const auto id = body["adapter_id"].asString();
+    options.adapter_id = id;
     if (id.empty())
       options.adapter.reset();
     else {
@@ -843,7 +844,8 @@ bool send_finish_chunk(
     const ResponseStreamPtr& stream,
     const std::string& id,
     const std::string& model,
-    const InferenceEngine::GenerationStats& stats) {
+    const InferenceEngine::GenerationStats& stats,
+    const std::vector<bool>& finished) {
   Json::Value payload;
   if (!id.empty()) {
     payload["id"] = id;
@@ -856,12 +858,14 @@ bool send_finish_chunk(
   }
   payload["choices"] = Json::arrayValue;
   for (size_t i = 0; i < stats.finish_reasons.size(); ++i) {
+    if (finished[i]) continue;
     Json::Value choice;
     choice["index"] = static_cast<int>(i);
     choice["delta"] = Json::objectValue;
     choice["finish_reason"] = stats.finish_reasons[i];
     payload["choices"].append(choice);
   }
+  if (payload["choices"].empty()) return true;
   Json::StreamWriterBuilder builder;
   builder["emitUTF8"] = true;
   builder["indentation"] = "";
@@ -888,7 +892,12 @@ void start_streaming_task(
                choice_count,
                task,
                on_done]() mutable {
-    auto emit = [&stream, &id, &model](int index, const std::string& chunk) -> bool {
+    std::vector<bool> finished(static_cast<size_t>(choice_count), false);
+    auto emit = [&stream, &id, &model, &finished](int index, const std::string& chunk) -> bool {
+      if (index < 0 || static_cast<size_t>(index) >= finished.size()) {
+        throw std::runtime_error("generation returned invalid choice index");
+      }
+      if (finished[index]) return true;
       Json::Value payload;
       if (!id.empty()) {
         payload["id"] = id;
@@ -902,20 +911,28 @@ void start_streaming_task(
       payload["choices"] = Json::arrayValue;
       Json::Value choice;
       choice["index"] = index;
-      choice["delta"]["content"] = chunk;
-      choice["finish_reason"] = Json::nullValue;
+      // The engine reserves empty chunks for per-row stop events.
+      choice["delta"] = Json::objectValue;
+      if (chunk.empty()) {
+        choice["finish_reason"] = "stop";
+      } else {
+        choice["delta"]["content"] = chunk;
+        choice["finish_reason"] = Json::nullValue;
+      }
       payload["choices"].append(choice);
       Json::StreamWriterBuilder builder;
       builder["emitUTF8"] = true;
       builder["indentation"] = "";
-      return stream->send("data: " + Json::writeString(builder, payload) + "\n\n");
+      const bool sent = stream->send("data: " + Json::writeString(builder, payload) + "\n\n");
+      if (sent && chunk.empty()) finished[index] = true;
+      return sent;
     };
     try {
       const auto stats = task(emit);
       if (stats.finish_reasons.size() != static_cast<size_t>(choice_count)) {
         throw std::runtime_error("generation returned incomplete finish reasons");
       }
-      send_finish_chunk(stream, id, model, stats);
+      send_finish_chunk(stream, id, model, stats, finished);
     } catch (const PrefillBatchLimitExceeded& e) {
       Json::StreamWriterBuilder builder;
       builder["indentation"] = "";
@@ -1477,7 +1494,7 @@ void register_api_routes_legacy(
                       [active]() {
                         return active->stop_requested.load() || active->pause_requested.load();
                       },
-                      on_prefill_complete);
+                      on_prefill_complete, state_id);
                   if (metrics_requested) {
                     record_generation_stats(active, stats);
                   }
@@ -1530,7 +1547,7 @@ void register_api_routes_legacy(
               },
               [active]() {
                 return active->stop_requested.load() || active->pause_requested.load();
-              });
+              }, {}, state_id);
         } catch (const std::exception& error) {
           RequestRegistry::instance().finish(active);
           cb(json_response(make_error(error.what()), k400BadRequest));
@@ -2136,10 +2153,15 @@ void register_api_routes(
       }
       const int chunk_size = parse_chunk_size(*json, batch ? 8 : 2);
       if ((*json).get("stream", false).asBool()) {
-        cb(make_sse_response([lease, prompts, state_id, options, model, chunk_size](ResponseStreamPtr stream) {
+        cb(make_sse_response([lease, prompts, state_id, options, model, chunk_size, batch](ResponseStreamPtr stream) {
           start_streaming_task(std::move(stream), "chatcmpl-rwkv-fast", model, static_cast<int>(prompts.size()),
-            [lease, prompts, state_id, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
+            [lease, prompts, state_id, options, chunk_size, batch](const InferenceEngine::StreamCallback& emit) {
               auto& engine = lease->engine();
+              if (batch) {
+                auto state = create_request_state(engine, state_id, static_cast<int>(prompts.size()));
+                return engine.batch_generate_stream_with_state(
+                    prompts, state, options, chunk_size, emit, {}, {}, state_id);
+              }
               if (!state_id.empty()) {
                 auto state = create_request_state(
                     engine, state_id, static_cast<int>(prompts.size()));
@@ -2158,7 +2180,16 @@ void register_api_routes(
       }
       std::vector<std::string> results;
       InferenceEngine::GenerationStats stats;
-      if (!state_id.empty()) {
+      if (batch) {
+        auto state = create_request_state(engine, state_id, static_cast<int>(prompts.size()));
+        results.resize(prompts.size());
+        stats = engine.batch_generate_stream_with_state(
+            prompts, state, options, 0,
+            [&](int index, const std::string& chunk) {
+              results.at(static_cast<size_t>(index)) += chunk;
+              return true;
+            }, {}, {}, state_id);
+      } else if (!state_id.empty()) {
         auto state = create_request_state(
             engine, state_id, static_cast<int>(prompts.size()));
         results = prompts.size() == 1
