@@ -176,8 +176,8 @@ void register_dynamic_routes(
       }
     } catch (const std::exception& e) { cb(json_response(make_error(e.what()), k400BadRequest)); }
   };
-  app.registerHandler("/v1/chat/completions", [generate](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) { generate(req, std::move(cb), false); }, {Post});
-  app.registerHandler("/v1/batch/completions", [generate](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) { generate(req, std::move(cb), true); }, {Post});
+  app.registerHandler("/v1/chat/completions", asynchronous_generation([generate](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) { generate(req, std::move(cb), false); }), {Post});
+  app.registerHandler("/v1/batch/completions", asynchronous_generation([generate](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) { generate(req, std::move(cb), true); }), {Post});
 }
 
 }  // namespace rwkv7_server::router

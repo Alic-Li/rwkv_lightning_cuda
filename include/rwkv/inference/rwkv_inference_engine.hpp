@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -39,7 +40,8 @@ class InferenceEngine {
       std::shared_ptr<TrieTokenizer> tokenizer,
       std::string model_name,
       int prefill_chunk_size = 128,
-      size_t prompt_cache_capacity = 256);
+      size_t prompt_cache_capacity = 256,
+      int max_decode_batch_size = 64);
 
   std::vector<std::string> batch_generate(
       const std::vector<std::string>& prompts,
@@ -117,6 +119,11 @@ class InferenceEngine {
  int prefill_chunk_size() const { return prefill_chunk_size_; }
 
  private:
+  struct Scheduler;
+  Scheduler& scheduler() const;
+  mutable std::mutex scheduler_mutex_;
+  mutable std::shared_ptr<Scheduler> scheduler_;
+  int max_decode_batch_size_ = 64;
   std::vector<int64_t> encode_prompt(const std::string& prompt) const;
   std::vector<std::vector<int64_t>> encode_prompts_sorted(
       const std::vector<std::string>& prompts,

@@ -3,13 +3,52 @@
 #include <cctype>
 #include <cstdio>
 #include <stdexcept>
-#include <thread>
+#include <future>
+#include <trantor/utils/ConcurrentTaskQueue.h>
 
 #include "rwkv/server/rwkv_uploaded_state_store.hpp"
 
 namespace rwkv7_server::router {
 
 using namespace drogon;
+
+namespace {
+std::shared_ptr<trantor::ConcurrentTaskQueue> generation_workers;
+int generation_device = 0;
+}
+
+void configure_generation_workers(size_t count) {
+  rwkv7_fast_v4::check_cuda(cudaGetDevice(&generation_device), "get HTTP worker device");
+  generation_workers = std::make_shared<trantor::ConcurrentTaskQueue>(count, "generation");
+}
+
+void shutdown_generation_workers() {
+  RequestRegistry::instance().stop_active();
+  if (generation_workers) generation_workers->stop();
+}
+
+GenerationHttpHandler asynchronous_generation(GenerationHttpHandler handler) {
+  // Capture the pool lifetime with each registered route. Startup configuration
+  // happens before registration and shutdown joins workers before model release.
+  if (!generation_workers) configure_generation_workers(64);
+  const auto workers = generation_workers;
+  const int device = generation_device;
+  return [handler = std::move(handler), workers, device](
+      const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+    workers->runTaskInQueue([handler, req, cb = std::move(cb), device]() mutable {
+      auto replied = std::make_shared<std::atomic<bool>>(false);
+      auto reply = [cb = std::move(cb), replied](const HttpResponsePtr& response) {
+        if (!replied->exchange(true)) cb(response);
+      };
+      try {
+        rwkv7_fast_v4::check_cuda(cudaSetDevice(device), "select HTTP worker device");
+        handler(req, std::function<void(const HttpResponsePtr&)>(reply));
+      } catch (const std::exception& error) {
+        reply(json_response(make_error(error.what()), k400BadRequest));
+      }
+    });
+  };
+}
 
 void record_prefill_metrics(
     const std::shared_ptr<RequestRegistry::ActiveRequest>& active,
@@ -289,7 +328,7 @@ void start_streaming_task(
     const std::function<InferenceEngine::GenerationStats(const InferenceEngine::StreamCallback&)>& task,
     const std::function<void()>& on_done,
     std::shared_ptr<std::vector<std::string>> matched_stops) {
-  std::thread([stream = std::move(stream),
+  auto job = std::make_shared<std::packaged_task<void()>>([stream = std::move(stream),
                id = std::move(id),
                model = std::move(model),
                choice_count,
@@ -333,6 +372,7 @@ void start_streaming_task(
       return sent;
     };
     try {
+      rwkv7_fast_v4::check_cuda(cudaSetDevice(generation_device), "select stream worker device");
       const auto stats = task(emit);
       if (stats.finish_reasons.size() != static_cast<size_t>(choice_count)) {
         throw std::runtime_error("generation returned incomplete finish reasons");
@@ -354,7 +394,8 @@ void start_streaming_task(
     if (on_done) {
       on_done();
     }
-  }).detach();
+  });
+  generation_workers->runTaskInQueue([job] { (*job)(); });
 }
 
 std::string format_openai_prompt(

@@ -110,6 +110,52 @@ std::vector<int> sample_batch_repetition_temperature_topk_topp(
   return tokens;
 }
 
+std::vector<int> sample_rows(
+    const DeviceLogits& logits, SamplerPenaltyState& penalties,
+    const std::vector<GenerateOptions>& options, const std::vector<int>& steps) {
+  if (logits.rows != penalties.batch_size || logits.vocab_size != penalties.vocab_size ||
+      options.size() != static_cast<size_t>(logits.rows) || steps.size() != options.size())
+    throw std::invalid_argument("row sampler shape mismatch");
+  std::vector<rwkv_sampling::RowSamplingOptions> rows;
+  for (size_t i = 0; i < options.size(); ++i) {
+    const auto& o = options[i];
+    if (!(o.temperature >= 0.001 && o.temperature <= 1000))
+      throw std::invalid_argument("temperature must be in [0.001, 1000]");
+    int k = o.top_k <= 0 || o.top_k > logits.vocab_size ? logits.vocab_size : o.top_k;
+    double p = o.top_p < 0 || o.top_p > 1 ? 1 : o.top_p;
+    if (p == 0) { k = 1; p = 1; }
+    const int step = o.force_reasoning_token_offset + steps[i];
+    rows.push_back({float(o.alpha_presence), float(o.alpha_frequency), float(o.alpha_decay),
+                    float(1.44269504088896340736 / o.temperature), k, float(p),
+                    o.force_reasoning && step >= 1 && step <= 2});
+  }
+  penalties.row_options.resize(rows.size() * sizeof(rows[0]), "allocate row sampling options");
+  rwkv7_fast_v4::check_cuda(cudaMemcpy(penalties.row_options.p, rows.data(),
+      rows.size() * sizeof(rows[0]), cudaMemcpyHostToDevice), "upload row sampling options");
+  rwkv7_fast_v4::check_cuda(rwkv_sampling::sample_rows_raw(logits.values.p,
+      penalties.penalties.p, penalties.outputs.p, penalties.rand_states.p, penalties.probs.p,
+      logits.rows, logits.vocab_size,
+      reinterpret_cast<const rwkv_sampling::RowSamplingOptions*>(penalties.row_options.p), 0),
+      "sample independent rows");
+  std::vector<int> tokens(logits.rows);
+  rwkv7_fast_v4::check_cuda(cudaMemcpy(tokens.data(), penalties.outputs.p,
+      tokens.size() * sizeof(int), cudaMemcpyDeviceToHost), "download row samples");
+  return tokens;
+}
+
+void copy_sampler_row(const SamplerPenaltyState& src, int src_row,
+                      SamplerPenaltyState& dst, int dst_row) {
+  if (src.vocab_size != dst.vocab_size || src_row < 0 || src_row >= src.batch_size ||
+      dst_row < 0 || dst_row >= dst.batch_size)
+    throw std::invalid_argument("invalid sampler row copy");
+  rwkv7_fast_v4::check_cuda(cudaMemcpy(dst.penalties.p + size_t(dst_row) * dst.vocab_size,
+      src.penalties.p + size_t(src_row) * src.vocab_size,
+      src.vocab_size * sizeof(float), cudaMemcpyDeviceToDevice), "move row penalties");
+  const auto bytes = rwkv_sampling::rand_state_bytes(1);
+  rwkv7_fast_v4::check_cuda(cudaMemcpy(dst.rand_states.p + dst_row * bytes,
+      src.rand_states.p + src_row * bytes, bytes, cudaMemcpyDeviceToDevice), "move row RNG");
+}
+
 int sample_repetition_temperature_topk_topp(
     const DeviceLogits& logits,
     SamplerPenaltyState& penalties,

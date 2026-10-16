@@ -257,6 +257,9 @@ class Suite:
         if sid and version:
             self.check('state+adapter pause/resume',lambda: self.controlled('combined','pause',{'state_id':sid,'adapter_id':aid}))
         self.check('concurrent generation requests',self.concurrent)
+        if sid and version:
+            self.check('continuous mixed state/adapter/scale requests',
+                       lambda: self.concurrent_mixed(sid, aid))
         self.check('session header lifecycle',self.session_header)
         for path,body in [('/v1/chat/completions',self.chat),('/v1/batch/completions',self.batch),('/state/chat/completions',self.options|{'session_id':self.session('connection-close'),'contents':['User: Hello.\n\nAssistant:']})]:
             self.check('SSE Connection: close '+path,lambda p=path,b=body:self.connection_close(p,b))
@@ -387,6 +390,23 @@ class Suite:
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures=[pool.submit(self.completion,'/v1/chat/completions',self.chat|{'messages':[{'role':'user','content':f'Count starting at {i}.'}]},1,bool(i%2)) for i in range(4)]
             for f in futures: f.result(timeout=self.args.timeout)
+
+    def concurrent_mixed(self, state_id, adapter_id):
+        barrier = threading.Barrier(8)
+        def run(i):
+            body = self.chat | dict(max_tokens=16, temperature=0.5+i*0.1,
+                                    alpha_presence=i*0.2, alpha_frequency=i*0.03,
+                                    alpha_decay=0.9+i*0.01)
+            if i & 1:
+                body['state_id'] = state_id
+            if i & 2:
+                body.update(adapter_id=adapter_id, adapter_scale=0.5 if i & 4 else 1.0)
+            barrier.wait()
+            return self.completion('/v1/chat/completions', body, 1, bool(i & 4))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(run, i) for i in range(8)]
+            for future in futures:
+                future.result(timeout=self.args.timeout)
 
     def session_header(self):
         session=self.session('header')

@@ -32,6 +32,8 @@ constexpr auto cudaMemcpyDeviceToDevice = hipMemcpyDeviceToDevice;
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaFree hipFree
 #define cudaGetDeviceCount hipGetDeviceCount
+#define cudaGetDevice hipGetDevice
+#define cudaSetDevice hipSetDevice
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaMalloc hipMalloc

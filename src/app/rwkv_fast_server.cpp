@@ -1,4 +1,5 @@
 #include <atomic>
+#include <algorithm>
 #include <cstdlib>
 #include <csignal>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <drogon/drogon.h>
 
 #include "rwkv/server/rwkv_api_service.hpp"
+#include "rwkv/server/router/route_helpers.hpp"
 #include "rwkv/inference/rwkv_inference_engine.hpp"
 #include "rwkv/server/rwkv_model_router.hpp"
 #include "rwkv/runtime/rwkv_server_backend.hpp"
@@ -40,6 +42,7 @@ void print_usage(const char* program) {
       << "  --host <addr>           Host/interface to bind. Default: 127.0.0.1.\n"
       << "                          Use 0.0.0.0 explicitly to listen on all IPv4 interfaces.\n"
       << "  --port <port>           TCP port to bind. Default: 8000.\n"
+      << "  --decode-batch-size <rows> Maximum active continuous decode rows. Default: 64.\n"
       << "  --chunk-size <tokens>   Prefill chunk size. Default: 128.\n"
       << "  --state-db-path <path>  SQLite state cache path. Default: rwkv_sessions.db in cwd.\n"
       << "  --password <token>      Require a bearer token or JSON password field.\n"
@@ -136,6 +139,7 @@ int run_server(int argc, char* argv[]) {
   std::string state_db_path = "rwkv_sessions.db";
   uint16_t port = 8000;
   int prefill_chunk_size = 128;
+  int max_decode_batch_size = 64;
   bool use_wkv32 = false;
   bool chunk_load = false;
   bool enable_dynamic_loading = false;
@@ -154,6 +158,8 @@ int run_server(int argc, char* argv[]) {
     };
     if (arg == "--model-path") {
       model_path = require_value(arg);
+    } else if (arg == "--decode-batch-size") {
+      max_decode_batch_size = parse_positive_int(arg, require_value(arg));
     } else if (arg == "--vocab-path") {
       vocab_path = require_value(arg);
     } else if (arg == "--host") {
@@ -210,12 +216,12 @@ int run_server(int argc, char* argv[]) {
   if (enable_dynamic_loading) {
     models = std::make_unique<rwkv7_server::ModelRouter>(
         model_path, tokenizer, prefill_chunk_size, use_wkv32, chunk_load, cmix_sparse,
-        tune_cache, retune, tune_cache_directory);
+        tune_cache, retune, tune_cache_directory, max_decode_batch_size);
   } else {
     auto model = std::make_shared<rwkv7_server::ModelBackend>(
         model_path, use_wkv32, chunk_load, cmix_sparse, tune_cache, retune,
         tune_cache_directory);
-    auto engine = std::make_shared<rwkv7_server::InferenceEngine>(model, tokenizer, model->model_name(), prefill_chunk_size);
+    auto engine = std::make_shared<rwkv7_server::InferenceEngine>(model, tokenizer, model->model_name(), prefill_chunk_size, 256, max_decode_batch_size);
     models = std::make_unique<rwkv7_server::ModelRouter>(std::move(engine));
   }
   rwkv7_server::StateCacheManager::instance().initialize(16, 32, state_db_path);
@@ -223,6 +229,7 @@ int run_server(int argc, char* argv[]) {
   std::signal(SIGINT, handle_signal);
   std::signal(SIGTERM, handle_signal);
 
+  rwkv7_server::router::configure_generation_workers(std::max(64, max_decode_batch_size));
   rwkv7_server::register_api_routes(*models, password);
   if (enable_dynamic_loading) {
     std::cout << "rwkv_lighting_cuda dynamic_model_directory=" << model_path << std::endl;
@@ -234,6 +241,7 @@ int run_server(int argc, char* argv[]) {
             << " state_db_path=" << state_db_path
             << " host=" << host
             << " port=" << port
+            << " decode_batch_size=" << max_decode_batch_size
             << " prefill_chunk_size=" << prefill_chunk_size
             << " wkv=" << (use_wkv32 ? "fp32io16" : "fp16")
             << " chunk_load=" << (chunk_load ? "enabled" : "disabled")
@@ -272,6 +280,7 @@ int run_server(int argc, char* argv[]) {
       .setClientMaxBodySize(rwkv7_server::kMaxUploadedStateBytes + (1ull << 20))
       .run();
 
+  rwkv7_server::router::shutdown_generation_workers();
   rwkv7_server::UploadedStateStore::instance().shutdown();
   rwkv7_server::StateCacheManager::instance().shutdown();
   return 0;

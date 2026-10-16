@@ -7,6 +7,19 @@
 
 namespace rwkv_sampling {
 
+// One independent configuration per live row; uploaded once per sampling step.
+struct RowSamplingOptions {
+  float presence, frequency, decay, log2_inv_temperature;
+  int top_k;
+  float top_p;
+  int force_reasoning_mask;
+};
+
+cudaError_t sample_rows_raw(
+    const float* logits, float* penalties, int* outputs, void* states,
+    float* probs, int batch_size, int vocab_size,
+    const RowSamplingOptions* options, cudaStream_t stream);
+
 std::size_t rand_state_bytes(int batch_size);
 
 cudaError_t setup_rand_raw(

@@ -81,3 +81,7 @@ publish a new Release with Linux/Windows binaries and SHA-256 checksums; see
 - `cmake/`: dependency, compiler-option, and packaging modules.
 
 The root `CMakeLists.txt` only selects the GPU backend and composes these modules. Target definitions live next to their corresponding source trees in `src/CMakeLists.txt`, `tools/CMakeLists.txt`, and `test/CMakeLists.txt`.
+
+## Continuous batching
+
+The server merges concurrent requests into one persistent GPU decode scheduler, with independent row sampling and MiSS adapter groups. `--decode-batch-size` caps active decode rows (default 64); `--chunk-size` controls interleaved prefill chunks. See the [scheduler notes](docs/continuous-batching.zh-CN.md) and [`tools/bench_continuous_http.py`](tools/bench_continuous_http.py) for configuration and benchmarking.

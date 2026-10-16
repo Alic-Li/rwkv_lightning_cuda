@@ -69,3 +69,6 @@ if(RWKV7_STATE_TUNING)
   add_test(NAME rwkv_bf16_training_test COMMAND rwkv_bf16_training_test)
   set_tests_properties(rwkv_bf16_training_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+rwkv_add_unit_test(rwkv_continuous_batching_test ${CMAKE_CURRENT_SOURCE_DIR}/continuous_batching_test.cpp)
+set_tests_properties(rwkv_continuous_batching_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)

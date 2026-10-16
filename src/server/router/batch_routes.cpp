@@ -11,7 +11,7 @@ void register_batch_routes(
     const std::shared_ptr<PrefillAdmissionController>& admission) {
   app.registerHandler(
       "/v1/batch/completions",
-      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+      asynchronous_generation([&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
@@ -165,7 +165,7 @@ void register_batch_routes(
         resp["choices"] = build_choices(results, stats);
         RequestRegistry::instance().finish(active);
         cb(json_response(std::move(resp)));
-      },
+      }),
       {Post});
 }
 

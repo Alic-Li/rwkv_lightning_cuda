@@ -44,7 +44,8 @@ class ModelRouter {
   ModelRouter(std::filesystem::path model_directory, std::shared_ptr<class TrieTokenizer> tokenizer,
               int prefill_chunk_size, bool use_wkv32, bool chunk_load = false,
               std::string cmix_sparse = "no-fc", std::string tune_cache = {},
-              bool retune = false, std::string tune_cache_directory = {});
+              bool retune = false, std::string tune_cache_directory = {},
+              int max_decode_batch_size = 64);
 
   // Pins the currently loaded model for a request. Request model IDs are not
   // routing directives: switching is exclusively done by load().
@@ -61,6 +62,7 @@ class ModelRouter {
   bool dynamic_ = false;
   std::shared_ptr<class TrieTokenizer> tokenizer_;
   int prefill_chunk_size_ = 128;
+  int max_decode_batch_size_ = 64;
   bool use_wkv32_ = false;
   bool chunk_load_ = false;
   std::string cmix_sparse_ = "no-fc";

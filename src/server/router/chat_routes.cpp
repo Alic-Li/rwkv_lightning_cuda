@@ -14,7 +14,7 @@ void register_chat_routes(
     const std::shared_ptr<PrefillAdmissionController>& admission) {
   app.registerHandler(
       "/v1/chat/completions",
-      [&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+      asynchronous_generation([&engine, password, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
@@ -190,7 +190,7 @@ void register_chat_routes(
         RequestRegistry::instance().finish(active);
 
         cb(json_response(build_openai_response(engine, *json, prompt, completion, stats)));
-      },
+      }),
       {Post});
 }
 

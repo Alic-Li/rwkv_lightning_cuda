@@ -37,9 +37,9 @@ ModelRouter::ModelRouter(std::filesystem::path model_directory,
                          std::shared_ptr<TrieTokenizer> tokenizer,
                          int prefill_chunk_size, bool use_wkv32, bool chunk_load,
                          std::string cmix_sparse, std::string tune_cache, bool retune,
-                         std::string tune_cache_directory)
+                         std::string tune_cache_directory, int max_decode_batch_size)
     : dynamic_(true), tokenizer_(std::move(tokenizer)), prefill_chunk_size_(prefill_chunk_size),
-      use_wkv32_(use_wkv32), chunk_load_(chunk_load), cmix_sparse_(std::move(cmix_sparse)),
+      max_decode_batch_size_(max_decode_batch_size), use_wkv32_(use_wkv32), chunk_load_(chunk_load), cmix_sparse_(std::move(cmix_sparse)),
       tune_cache_(std::move(tune_cache)), retune_(retune),
       tune_cache_directory_(std::move(tune_cache_directory)) {
   if (!std::filesystem::is_directory(model_directory)) {
@@ -106,7 +106,7 @@ void ModelRouter::load(const std::string& requested_model) {
     auto backend = std::make_shared<ModelBackend>(
         model_paths_.at(id).string(), use_wkv32_, chunk_load_, cmix_sparse_, tune_cache_, retune_,
         tune_cache_directory_);
-    loaded = std::make_shared<InferenceEngine>(backend, tokenizer_, backend->model_name(), prefill_chunk_size_);
+    loaded = std::make_shared<InferenceEngine>(backend, tokenizer_, backend->model_name(), prefill_chunk_size_, 256, max_decode_batch_size_);
   } catch (...) {
     lock.lock();
     loading_ = false;

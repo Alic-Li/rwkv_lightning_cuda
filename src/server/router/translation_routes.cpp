@@ -10,7 +10,7 @@ void register_translation_routes(
     const std::shared_ptr<PrefillAdmissionController>& admission) {
   app.registerHandler(
       "/translate/v1/batch-translate",
-      [&engine, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
+      asynchronous_generation([&engine, admission](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
         auto json = req->getJsonObject();
         if (!json) {
           cb(json_response(make_error("Invalid JSON"), k400BadRequest));
@@ -87,7 +87,7 @@ void register_translation_routes(
           resp["translations"].append(item);
         }
         cb(json_response(std::move(resp)));
-      },
+      }),
       {Post});
 }
 

@@ -81,3 +81,7 @@ curl -sS "http://127.0.0.1:8000/v1/server/status"
 - `quant/`：W8A16/W4A16 量化工具。
 - `RWKV_Lightning_CUDA_router/`：多后端负载均衡路由器。
 - `RWKV_Lightning_CUDA_Launcher`: 带 Web UI 的桌面启动器。
+
+## 连续批处理
+
+推理服务默认按设备聚合并发请求，使用逐行采样和按 MiSS adapter 分组的前向。`--decode-batch-size` 控制活动解码槽位数（默认 64），`--chunk-size` 控制交错预填充的块长。配置、状态语义及基准方法见[连续批处理说明](docs/continuous-batching.zh-CN.md)。

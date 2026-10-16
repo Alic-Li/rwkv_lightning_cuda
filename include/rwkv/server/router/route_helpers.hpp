@@ -20,6 +20,13 @@ namespace rwkv7_server::router {
 
 using namespace drogon;
 
+using GenerationHttpHandler = std::function<void(
+    const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&&)>;
+// Synchronous generation must not occupy Drogon's small I/O thread pool.
+void configure_generation_workers(size_t count);
+void shutdown_generation_workers();
+GenerationHttpHandler asynchronous_generation(GenerationHttpHandler handler);
+
 inline constexpr const char* kSessionIdHeader = "X-RWKV-Session-Id";
 inline constexpr const char* kStateIdHeader = "X-RWKV-State-Id";
 

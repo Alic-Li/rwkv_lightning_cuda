@@ -211,14 +211,21 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
           int   *__restrict__ outputs,   // (B,)
           RAND  *__restrict__ states,    // random state, typedef curandStatePhilox4_32_10_t RAND;
           float *__restrict__ probs,     // probs (in L2 cache)
-    const float presence_penalty,
-    const float repetition_penalty,
-    const float penalty_decay,
-    const float log2_inv_temp,
-    const int   top_k,
-    const float top_p
+    const float uniform_presence_penalty,
+    const float uniform_repetition_penalty,
+    const float uniform_penalty_decay,
+    const float uniform_log2_inv_temp,
+    const int   uniform_top_k,
+    const float uniform_top_p,
+    const rwkv_sampling::RowSamplingOptions* row_options = nullptr
 ) {
     const int b = blockIdx.x;
+    const float presence_penalty = row_options ? row_options[b].presence : uniform_presence_penalty;
+    const float repetition_penalty = row_options ? row_options[b].frequency : uniform_repetition_penalty;
+    const float penalty_decay = row_options ? row_options[b].decay : uniform_penalty_decay;
+    const float log2_inv_temp = row_options ? row_options[b].log2_inv_temperature : uniform_log2_inv_temp;
+    const int top_k = row_options ? row_options[b].top_k : uniform_top_k;
+    const float top_p = row_options ? row_options[b].top_p : uniform_top_p;
     const int d = blockDim.x;
     const int t = threadIdx.x;
     const int w = t / 32;
@@ -241,6 +248,12 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     float maxu = -INFINITY;
     for (int i=t; i<V4; i+=d) {
         l4 = ((float4*)logits)[i];
+        if (row_options && row_options[b].force_reasoning_mask) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                if (i * 4 + j == 111 || i * 4 + j == 754)
+                    ((float*)&l4)[j] = -1.0e30f;
+        }
         p4 = ((float4*)penalties)[i];
         #pragma unroll
         for (int j=0; j<4; j++){
@@ -258,6 +271,22 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     }
     blockReduceAll(maxu, MaxOp<float>{}, MaxOp<float>::identity(), reduce_buf);
     __syncthreads();
+    // Greedy rows use a stable token-ID tie break. Besides avoiding random
+    // choices among equal FP16 logits, this skips the top-p search entirely.
+    if (row_options && top_k == 1) {
+        int winner = V;
+        for (int i = t; i < V; i += d)
+            if (probs[i] == maxu) winner = min(winner, i);
+        blockReduceAll(winner, MinOp<int>{}, V, reduce_buf);
+        __syncthreads();
+        if (t == 0) outputs[0] = winner;
+        for (int i = t; i < V; i += d) {
+            const float p = penalties[i];
+            penalties[i] = fmaf(p, penalty_decay,
+                i == winner ? (p == 0 ? presence_penalty : repetition_penalty) : 0);
+        }
+        return;
+    }
     float exp_denom = 0;
     for (int i=t; i<V4; i+=d) {
         l4 = ((float4*)probs)[i];
@@ -526,6 +555,19 @@ cudaError_t batch_sampling_repetition_temperature_topk_topp_raw(
         static_cast<float>(kLog2E / temperature),
         top_k,
         static_cast<float>(top_p));
+    return cudaGetLastError();
+}
+
+
+cudaError_t sample_rows_raw(
+    const float* logits, float* penalties, int* outputs, void* states,
+    float* probs, int batch_size, int vocab_size,
+    const RowSamplingOptions* options, cudaStream_t stream) {
+    if (batch_size <= 0 || vocab_size <= 0 || vocab_size % 4 || vocab_size > 1048576)
+        throw std::invalid_argument("invalid row sampler shape");
+    batch_sampling_repetition_temperature_topk_topp_kernel<<<batch_size, 1024, 0, stream>>>(
+        batch_size, 1, vocab_size, logits, penalties, outputs,
+        reinterpret_cast<RAND*>(states), probs, 0, 0, 1, 1, vocab_size, 1, options);
     return cudaGetLastError();
 }
 
