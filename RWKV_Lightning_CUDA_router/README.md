@@ -3,8 +3,8 @@
 English | [简体中文](README.zh-CN.md)
 
 An HTTP reverse proxy that balances RWKV inference servers by in-flight batch size
-instead of request count. It passes every method, header, response status, and SSE
-stream through unchanged.
+instead of request count. Inference and SSE pass through; State and adapter
+management use a shared replication pipeline.
 
 ## Run
 
@@ -18,6 +18,48 @@ Build a binary with `go build .`.
 `config.toml` must contain a `listen` address and one or more `[[backends]]`.
 Each backend `url` is an HTTP/HTTPS URL; `weight` is its relative capacity and
 defaults to 1.
+
+## Modules and shared replication pipeline
+
+```text
+main.go                         # CLI entry; go run/build . remain supported
+internal/
+  broadcast/                    # HTTP fan-out, retry, deadlines, response limits
+  router/
+    app.go, config.go            # Startup and configuration
+    scheduler.go, proxy.go       # Scheduling, affinity, inference forwarding
+    resource_sync.go             # Shared acknowledgments, errors, discovery
+    state_*.go, adapter_*.go     # Resource identities and replica tracking
+    diagnostics.go              # Routing diagnostics
+cmd/rwkv-batch-loadtest/         # Standalone load-test command
+```
+
+Both resources follow one pipeline: validate and guard the ID, broadcast to every
+worker, retry only failed uploads, wait for all results, validate identities, publish
+readiness, then respond. Readiness is committed before the acknowledgment reaches
+the client. State retains its shared UUID; adapters retain IDs and content versions.
+Existing resource-specific retry configuration keys remain supported.
+
+- Upload, list, delete, and discovery share the HTTP broadcast module. Only uploads
+  retry. Lists/deletes also use the corresponding `*_upload_attempt_timeout_seconds`
+  deadline (120 seconds by default); a shorter global timeout takes precedence.
+  Discovery is bounded to five seconds and preserves auth headers and JSON `password`.
+- Concurrent mutations of the same ID return 409; inference for that ID is blocked
+  during mutations. Deletion requires a valid `deleted: true` acknowledgment.
+  Uncertain deletion stays disabled; only uniform deterministic rejection restores
+  the previous registration.
+- Any failed or inconsistent replica prevents synchronization success. Partial
+  failure returns 502 with `ready_backends` and `failed_backends`; each failure has
+  a worker name, status, and reason. Uniform deterministic rejections pass through.
+- Broadcasts do not follow redirects: acknowledgments must come from configured
+  workers. Each response is limited to 8 MiB.
+- State POST list/delete aliases and OPTIONS remain supported. Preflight does not
+  mutate resource registration.
+
+Run `go test -race ./...` and `go vet ./...` here. Tests cover the shared engine,
+the same failure contract for both resources, and real HTTP sockets connecting the
+router to three independent simulated workers for uploads, lists, and concurrent
+inference. These require no model/GPU and do not verify a deployed production cluster.
 
 ## Scheduling
 
@@ -66,11 +108,13 @@ operation deadline are respected. See the `state_upload_*` configuration keys.
 The runtime checks SHA-256, filename and size before returning an existing record;
 conflicting bytes never overwrite it, and retries preserve the first upload time.
 
-State inference is eligible only on healthy, confirmed replicas, including when
+An upload blocks new inference for that State until the entire broadcast and
+acknowledgment validation finish. State inference then uses only healthy, confirmed
+replicas, including when
 session affinity points elsewhere. Cooldown expiry alone does not confirm a State.
 No ready replica means HTTP 503, with no fallback to a zero State. Partial upload
 failure after retry exhaustion returns HTTP 502 JSON containing `state_id`,
-`ready_backends` and `failed_backends` (name/final status, 0 when no status arrived).
+`ready_backends` and `failed_backends` (name, final status, and error reason; 0 when no status arrived).
 When every worker deterministically rejects the upload, the runtime rejection is
 preserved. Full success retains the original response shape.
 
@@ -134,6 +178,29 @@ router list. An outer Cloudflare 502/timeout can still occur after an upload has
 actually completed; use the cluster-wide router list to confirm the result.
 States must likewise be uploaded through `/v1/state/*`. Files previously uploaded
 to just one worker by an older router are not automatically copied to other hosts.
+
+## Diagnosing lists that fail after a successful upload
+
+A timeout, 401/502, HTML error page, or invalid JSON list no longer erases confirmed
+State or adapter registrations. A valid list confirming absence or a different identity,
+or a runtime `uploaded state not found` / `unknown adapter id/version` response,
+revokes the corresponding replica's readiness. Transport
+failures still trigger connection cooldown; they do not establish deletion.
+The list endpoint continues to report actual upstream failures and differences.
+
+Logs identify each worker's upload attempts, status, elapsed time, and confirmed
+ID/version. List diagnostics include the worker and parsing/status failure. For
+inconsistent lists, `failed_backends[].error` names the reference worker and the
+missing, extra, or manifest-mismatched ID/version pairs. Upload contents and
+credentials are not logged. `route_unavailable` records per-worker health, adapter
+and State readiness, and mutation state.
+
+Generation responses include `X-RWKV-Backend`, the router-selected worker name;
+`route_selected` logs the session ID and adapter version. Requests with the same
+`session_id` or `X-RWKV-Session-Id` remain on that worker, including concurrent
+requests, while it is healthy and holds the required resources. Failure or missing
+resources can move the session. Identical messages alone do not establish affinity.
+Affinity itself does not prove a cache hit; inspect backend cache/generation metrics.
 
 ## Batch load test
 

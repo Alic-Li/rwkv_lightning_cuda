@@ -1,4 +1,4 @@
-package main
+package router
 
 import (
 	"bytes"
@@ -22,7 +22,7 @@ const adapterV2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 func adapterProxy(servers ...*httptest.Server) *proxy {
 	p := testStateProxy(servers...)
-	p.adapterUploadPolicy = uploadRetryPolicy{attempts: 3, attemptTimeout: time.Second, baseDelay: time.Millisecond, maxDelay: 2 * time.Millisecond}
+	p.adapterUploadPolicy = uploadRetryPolicy{Attempts: 3, AttemptTimeout: time.Second, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}
 	return p
 }
 
@@ -478,7 +478,7 @@ func TestAdapterUploadConcurrentMutationAndStaleList(t *testing.T) {
 	if w := <-done; w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
-	p.scheduler.observeAdapterList(p.scheduler.backends[0], stateResponse{status: 200, body: []byte(`{"data":[]}`)}, epoch)
+	p.scheduler.observeAdapterList(p.scheduler.backends[0], resourceResponse{status: 200, body: []byte(`{"data":[]}`)}, epoch)
 	p.scheduler.mu.Lock()
 	ready := p.scheduler.adapterReadyLocked("miss", adapterV1, p.scheduler.backends[0])
 	p.scheduler.mu.Unlock()
@@ -603,7 +603,7 @@ func TestAdapterUploadConfigValidation(t *testing.T) {
 			t.Fatal("invalid policy accepted", c)
 		}
 	}
-	if policy, err := configuredAdapterUploadPolicy(config{}); err != nil || policy.attempts != 3 {
+	if policy, err := configuredAdapterUploadPolicy(config{}); err != nil || policy.Attempts != 3 {
 		t.Fatal(policy, err)
 	}
 }

@@ -1,4 +1,4 @@
-package main
+package router
 
 import (
 	"context"
@@ -21,7 +21,7 @@ func testStateProxy(servers ...*httptest.Server) *proxy {
 		u, _ := url.Parse(server.URL)
 		s.backends = append(s.backends, &backend{name: fmt.Sprintf("node-%d", i), baseURL: u, weight: 1})
 	}
-	return &proxy{scheduler: s, client: servers[0].Client(), uploadPolicy: uploadRetryPolicy{attempts: 3, attemptTimeout: time.Second, baseDelay: 20 * time.Millisecond, maxDelay: 40 * time.Millisecond}}
+	return &proxy{scheduler: s, client: servers[0].Client(), uploadPolicy: uploadRetryPolicy{Attempts: 3, AttemptTimeout: time.Second, BaseDelay: 20 * time.Millisecond, MaxDelay: 40 * time.Millisecond}}
 }
 
 func inferWithState(p *proxy, id, session string) *httptest.ResponseRecorder {
@@ -34,22 +34,7 @@ func inferWithState(p *proxy, id, session string) *httptest.ResponseRecorder {
 	return resp
 }
 
-func awaitReady(t *testing.T, p *proxy, id string, b *backend) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		p.scheduler.mu.Lock()
-		ready := p.scheduler.stateReadyLocked(id, b)
-		p.scheduler.mu.Unlock()
-		if ready {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("State replica did not become ready")
-}
-
-func TestUploadRetryKeepsPendingReplicaOutOfInference(t *testing.T) {
+func TestUploadRetryBlocksRoutingUntilBroadcastCompletes(t *testing.T) {
 	var healthyUploads, unstableUploads, inferA, inferB atomic.Int32
 	stateID := make(chan string, 1)
 	retryEntered := make(chan struct{})
@@ -107,17 +92,16 @@ func TestUploadRetryKeepsPendingReplicaOutOfInference(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("retry not started")
 	}
-	awaitReady(t, p, id, p.scheduler.backends[0])
 	p.scheduler.mu.Lock()
 	p.scheduler.sessions["pinned-to-b"] = p.scheduler.backends[1]
 	p.scheduler.backends[1].unhealthy = time.Time{}
 	p.scheduler.mu.Unlock()
 	for i := 0; i < 4; i++ {
-		if resp := inferWithState(p, id, "pinned-to-b"); resp.Code != 200 {
+		if resp := inferWithState(p, id, "pinned-to-b"); resp.Code != 503 {
 			t.Fatalf("inference: %d %s", resp.Code, resp.Body.String())
 		}
 	}
-	if inferA.Load() != 4 || inferB.Load() != 0 {
+	if inferA.Load() != 0 || inferB.Load() != 0 {
 		t.Fatalf("pending replica received State inference: a=%d b=%d", inferA.Load(), inferB.Load())
 	}
 	allowOnce.Do(func() { close(allowRetry) })
@@ -197,7 +181,7 @@ func TestExhaustedReplicaStaysExcludedAfterCooldown(t *testing.T) {
 	}))
 	defer b.Close()
 	p := testStateProxy(a, b)
-	p.uploadPolicy.attempts = 2
+	p.uploadPolicy.Attempts = 2
 	resp := httptest.NewRecorder()
 	p.ServeHTTP(resp, stateUploadRequest(t, "state.pth", "payload"))
 	var result struct {
@@ -221,7 +205,7 @@ func TestExhaustedReplicaStaysExcludedAfterCooldown(t *testing.T) {
 	if inferB.Load() != 0 {
 		t.Fatal("cooldown expiry re-enabled unconfirmed State")
 	}
-	other := p.scheduler.beginStateMutation("other", false)
+	other, _ := p.scheduler.beginStateMutation("other", false)
 	for _, node := range p.scheduler.backends {
 		p.scheduler.confirmState(node, listedState{ID: "other"})
 	}
@@ -302,7 +286,7 @@ func TestStateUploadAttemptTimeoutCanRecover(t *testing.T) {
 	}))
 	defer server.Close()
 	p := testStateProxy(server)
-	p.uploadPolicy.attemptTimeout = 40 * time.Millisecond
+	p.uploadPolicy.AttemptTimeout = 40 * time.Millisecond
 	resp := httptest.NewRecorder()
 	p.ServeHTTP(resp, stateUploadRequest(t, "state.pth", "payload"))
 	if resp.Code != 200 || attempts.Load() != 2 {
@@ -316,8 +300,8 @@ func TestStateUploadCancellationStopsBackoff(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { attempts.Add(1); close(first); w.WriteHeader(503) }))
 	defer server.Close()
 	p := testStateProxy(server)
-	p.uploadPolicy.baseDelay = time.Second
-	p.uploadPolicy.maxDelay = time.Second
+	p.uploadPolicy.BaseDelay = time.Second
+	p.uploadPolicy.MaxDelay = time.Second
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -341,19 +325,19 @@ func TestStateReadinessIgnoresStaleListsAndDeletion(t *testing.T) {
 	b := &backend{name: "b"}
 	s := &scheduler{backends: []*backend{b}}
 	old := s.stateSnapshot()
-	mutation := s.beginStateMutation("state", false)
+	mutation, _ := s.beginStateMutation("state", false)
 	s.confirmState(b, listedState{ID: "state"})
 	s.finishStateMutation(mutation, false)
-	s.observeStateList(b, stateResponse{status: 200, body: []byte(`{"object":"list","data":[]}`)}, old)
+	s.observeStateList(b, resourceResponse{status: 200, body: []byte(`{"object":"list","data":[]}`)}, old)
 	s.mu.Lock()
 	ready := s.stateReadyLocked("state", b)
 	s.mu.Unlock()
 	if !ready {
 		t.Fatal("stale list erased confirmed upload")
 	}
-	mutation = s.beginStateMutation("state", true)
+	mutation, _ = s.beginStateMutation("state", true)
 	s.finishStateMutation(mutation, false)
-	s.observeStateList(b, stateResponse{status: 200, body: []byte(`{"object":"list","data":[{"state_id":"state"}]}`)}, s.stateSnapshot())
+	s.observeStateList(b, resourceResponse{status: 200, body: []byte(`{"object":"list","data":[{"state_id":"state"}]}`)}, s.stateSnapshot())
 	s.mu.Lock()
 	ready = s.stateReadyLocked("state", b)
 	s.mu.Unlock()
@@ -364,7 +348,7 @@ func TestStateReadinessIgnoresStaleListsAndDeletion(t *testing.T) {
 
 func TestUploadRetryPolicyAndRetryAfter(t *testing.T) {
 	p, err := configuredUploadPolicy(config{})
-	if err != nil || p.attempts != 3 || p.attemptTimeout != 120*time.Second {
+	if err != nil || p.Attempts != 3 || p.AttemptTimeout != 120*time.Second {
 		t.Fatal("incorrect defaults")
 	}
 	for _, c := range []config{{StateUploadMaxAttempts: -1}, {StateUploadMaxAttempts: 11}, {StateUploadRetryBaseMS: 1000, StateUploadRetryMaxMS: 500}} {
@@ -373,8 +357,8 @@ func TestUploadRetryPolicyAndRetryAfter(t *testing.T) {
 		}
 	}
 	for i := 0; i < 10; i++ {
-		delay := p.delay(i)
-		if delay <= 0 || delay > p.maxDelay {
+		delay := p.Delay(i)
+		if delay <= 0 || delay > p.MaxDelay {
 			t.Fatal("backoff out of bounds")
 		}
 	}
@@ -399,7 +383,7 @@ func TestRejectedDeletePreservesStateReadiness(t *testing.T) {
 	}))
 	defer server.Close()
 	p := testStateProxy(server)
-	mutation := p.scheduler.beginStateMutation("existing", false)
+	mutation, _ := p.scheduler.beginStateMutation("existing", false)
 	p.scheduler.confirmState(p.scheduler.backends[0], listedState{ID: "existing"})
 	p.scheduler.finishStateMutation(mutation, false)
 	req := httptest.NewRequest(http.MethodDelete, "/v1/state/delete?state_id=existing", nil)
@@ -422,11 +406,11 @@ func TestRejectedDeletePreservesStateReadiness(t *testing.T) {
 func TestListStartedDuringUploadCannotEraseCompletion(t *testing.T) {
 	b := &backend{name: "b"}
 	s := &scheduler{backends: []*backend{b}}
-	mutation := s.beginStateMutation("state", false)
+	mutation, _ := s.beginStateMutation("state", false)
 	during := s.stateSnapshot()
 	s.confirmState(b, listedState{ID: "state"})
 	s.finishStateMutation(mutation, false)
-	s.observeStateList(b, stateResponse{status: 200, body: []byte(`{"object":"list","data":[]}`)}, during)
+	s.observeStateList(b, resourceResponse{status: 200, body: []byte(`{"object":"list","data":[]}`)}, during)
 	s.mu.Lock()
 	ready := s.stateReadyLocked("state", b)
 	s.mu.Unlock()
@@ -446,7 +430,7 @@ func TestRuntimeLostStateInvalidatesReplicaWithoutInferenceRetry(t *testing.T) {
 	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { callsB.Add(1); io.WriteString(w, `{}`) }))
 	defer b.Close()
 	p := testStateProxy(a, b)
-	mutation := p.scheduler.beginStateMutation("existing", false)
+	mutation, _ := p.scheduler.beginStateMutation("existing", false)
 	for _, node := range p.scheduler.backends {
 		p.scheduler.confirmState(node, listedState{ID: "existing"})
 	}

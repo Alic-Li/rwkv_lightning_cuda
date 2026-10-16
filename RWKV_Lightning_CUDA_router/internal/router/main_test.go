@@ -1,4 +1,4 @@
-package main
+package router
 
 import (
 	"bytes"
@@ -228,7 +228,11 @@ func TestProxySynchronizesStateListAndDelete(t *testing.T) {
 			requests[name+":"+r.URL.Path]++
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"object":"list","data":[]}`)
+			if r.URL.Path == "/v1/state/delete" {
+				io.WriteString(w, `{"deleted":true}`)
+			} else {
+				io.WriteString(w, `{"object":"list","data":[]}`)
+			}
 		}))
 	}
 	serverA, serverB := newBackend("a"), newBackend("b")

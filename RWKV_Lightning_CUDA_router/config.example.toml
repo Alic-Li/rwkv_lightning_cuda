@@ -13,6 +13,7 @@ failure_cooldown_seconds = 5
 
 # Retry only failed State uploads; keep the same UUID/body for every attempt.
 # 1 disables retries. Defaults apply when omitted or 0.
+# The attempt timeout also bounds State list/delete (one attempt, no retry).
 state_upload_max_attempts = 3
 state_upload_attempt_timeout_seconds = 120
 state_upload_retry_base_ms = 250
@@ -20,6 +21,7 @@ state_upload_retry_max_ms = 2000
 
 # Adapter uploads use the same bounded retry behavior, independently configurable.
 # Successful workers are not retried. Multipart is recommended for remote workers.
+# The attempt timeout also bounds adapter list/delete (one attempt, no retry).
 adapter_upload_max_attempts = 3
 adapter_upload_attempt_timeout_seconds = 120
 adapter_upload_retry_base_ms = 250
