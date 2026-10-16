@@ -59,12 +59,13 @@ void register_batch_routes(
           cb(make_sse_response([&engine, admission, active, prompts, state_id, options, model, metrics_requested,
                                 chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
+            auto matched_stops = std::make_shared<std::vector<std::string>>(prompts.size());
             start_streaming_task(
                 std::move(stream),
                 active->id,
                 model,
                 static_cast<int>(prompts.size()),
-                [&, admission, active, prompts, state_id, options, chunk_size, metrics_requested](const InferenceEngine::StreamCallback& emit) {
+                [&, admission, active, prompts, state_id, options, chunk_size, metrics_requested, matched_stops](const InferenceEngine::StreamCallback& emit) {
                   auto permit = admission->acquire(
                       static_cast<int>(prompts.size()),
                       "batch.completions",
@@ -96,7 +97,10 @@ void register_batch_routes(
                       [active]() {
                         return active->stop_requested.load() || active->pause_requested.load();
                       },
-                      on_prefill_complete, state_id);
+                      on_prefill_complete, state_id,
+                      [matched_stops](const InferenceEngine::GenerationStats& stats) {
+                        *matched_stops = stats.matched_stops;
+                      });
                   if (metrics_requested) {
                     record_generation_stats(active, stats);
                   }
@@ -104,7 +108,7 @@ void register_batch_routes(
                 },
                 [active]() {
                   RequestRegistry::instance().finish(active);
-                });
+                }, matched_stops);
           }));
           return;
         }

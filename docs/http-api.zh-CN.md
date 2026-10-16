@@ -267,7 +267,7 @@ OpenAI 风格的聊天接口。`stream:false` 时返回单个 JSON 响应。
 token，仍返回 `stop`。批量请求逐条记录原因。SSE 内容包为
 `finish_reason:null`，最终包以空 `delta` 返回实际原因，随后发送 `[DONE]`。
 显式调用服务端停止或暂停也使用 `stop`。网关原样透传这些值。
-该规则覆盖聊天、批量、State 聊天和恢复续推；停止配置仍使用数字 `stop_tokens`。
+该规则覆盖聊天、批量、State 聊天和恢复续推；所有生成接口均支持互斥的 `stop_tokens` 和 `stop`，规则见下述文本停止串说明。
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions" \
@@ -318,6 +318,25 @@ curl -sS "${AUTH_HEADER[@]}" -N -X POST "http://127.0.0.1:8000/v1/chat/completio
 ```
 
 ## 批量补全
+
+`/v1/chat/completions`、`/v1/batch/completions`、`/state/chat/completions`、
+`/translate/v1/batch-translate` 和 `/v1/server/resume` 均可传 `stop_tokens: [0, ...]`（原有 token ID 检测路径），
+或 `stop: ["</tool_call>", "\nUser:"]`（新文本检测路径）。两个字段同时出现时，
+即使值为空数组或 null，也返回 HTTP 400。`stop` 必须是非空字符串组成的数组。
+两者均不传时保留默认停止 token；`stop: []` 不启用配置的停止条件，也不沿用默认停止 token。
+
+文本模式在每个生成 token 解码后检测各行尾部，与 `chunk_size` 无关；每行仅保留
+最长停止串字节数的尾部，支持跨 token 和 UTF-8 字节边界。检测仅覆盖新生成的文本，
+精确匹配后缀、区分大小写；多个停止串同时命中时返回请求数组中排在前面的那个。
+输出保留停止串，相关 token 计入生成数量。最后一个允许的 token 命中时仍报告 `stop`。
+
+命中后立即结束该行，响应对应 choice 返回 `finish_reason: "stop"` 和
+`matched_stop: "</tool_call>"`。SSE 会立即刷新该行待输出文本，并发送空 `delta`
+及上述两个字段，无需等待其他行。token 停止、取消和长度限制不返回 `matched_stop`。
+翻译接口在 `translations[]` 中返回 `finish_reason` 和命中时的 `matched_stop`。
+动态模型模式的聊天和批量接口同样支持这些参数。恢复接口未传停止参数时沿用暂停时配置，
+并保留用于跨暂停点匹配的文本尾部；显式传入停止参数时替换配置并清空原尾部。
+已结束行不再生成文本；现有固定大小的后端批次仍保留其槽位，直到全部行结束。
 
 为多条 prompt 生成相互独立的续写。每个流式分块通过 `choices[].index` 标识槽位。
 

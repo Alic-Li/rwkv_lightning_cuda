@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "rwkv/runtime/rwkv_gpu_runtime.hpp"
+#include "rwkv/inference/text_stop_matcher.hpp"
 
 namespace rwkv7_server {
 namespace {
@@ -616,12 +617,15 @@ std::string InferenceEngine::generate_one(
   AdapterMetrics adapter_metrics(state);
   GenerationStats stats;
   stats.finish_reasons = {"length"};
+  stats.matched_stops.resize(1);
+  TextStopMatcher text_stops(options.stop.value_or(std::vector<std::string>{}));
   DeviceLogits logits;
   stats.prompt_tokens = prefill_prompt(prompt, state, logits);
 
   std::vector<int> token_buffer;
   std::string utf8_pending;
   std::string result;
+  std::string stop_tail;
 
   auto penalties = make_sampler_penalties(model_->vocab_size());
   for (int step = 0; step < options.max_tokens; ++step) {
@@ -631,7 +635,7 @@ std::string InferenceEngine::generate_one(
     }
     const int token = sample_with_options_mask(logits, penalties, options, step);
     adapter_metrics.token();
-    if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
+    if (!options.stop && std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
       stats.stop_token = true;
       stats.finish_reasons[0] = "stop";
       break;
@@ -639,7 +643,17 @@ std::string InferenceEngine::generate_one(
 
     ++stats.generated_tokens;
     token_buffer.push_back(token);
-    result += tokenizer_->decode(token);
+    const auto decoded = tokenizer_->decode(token);
+    result += decoded;
+    if (options.stop) {
+      stats.matched_stops[0] = text_stops.append(stop_tail, decoded);
+      if (!stats.matched_stops[0].empty()) {
+        stats.finish_reasons[0] = "stop";
+        // Text stops are part of the output and must advance reusable state.
+        model_->forward_decode(std::vector<int64_t>{token}, state, logits);
+        break;
+      }
+    }
 
     if (emit != nullptr && chunk_size > 0 && token_buffer.size() >= static_cast<size_t>(chunk_size)) {
       utf8_pending += tokenizer_->decode(token_buffer);
@@ -664,8 +678,8 @@ std::string InferenceEngine::generate_one(
     if (!tail.empty()) {
       if (!(*emit)(stream_index, tail)) mark_interrupted(stats);
     }
-    // Empty chunks are per-row stop events; length is reported in final stats.
-    if (stats.finish_reasons[0] == "stop" && !(*emit)(stream_index, {})) {
+    // Text-stop metadata is emitted with final stats for this single row.
+    if (stats.finish_reasons[0] == "stop" && stats.matched_stops[0].empty() && !(*emit)(stream_index, {})) {
       mark_interrupted(stats);
     }
   }
@@ -699,6 +713,9 @@ std::vector<std::string> InferenceEngine::batch_generate_with_state(
   }
   GenerationStats stats;
   stats.finish_reasons.assign(prompts.size(), "length");
+  stats.matched_stops.resize(prompts.size());
+  TextStopMatcher text_stops(options.stop.value_or(std::vector<std::string>{}));
+  std::vector<std::string> stop_tails(prompts.size());
   const int batch_size = static_cast<int>(prompts.size());
   if (state.batch_size != batch_size) {
     throw std::runtime_error("generation state batch size mismatch");
@@ -728,7 +745,7 @@ std::vector<std::string> InferenceEngine::batch_generate_with_state(
       }
 
       const int token = sampled_tokens[i];
-      if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
+      if (!options.stop && std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
         finished[i] = true;
         stats.stop_token = true;
         stats.finish_reasons[sorted_to_original[i]] = "stop";
@@ -739,7 +756,18 @@ std::vector<std::string> InferenceEngine::batch_generate_with_state(
 
       ++stats.generated_tokens;
       decode_batch[i] = token;
-      sorted_outputs[i] += tokenizer_->decode(token);
+      const auto decoded = tokenizer_->decode(token);
+      sorted_outputs[i] += decoded;
+      if (options.stop) {
+        const auto matched = text_stops.append(stop_tails[i], decoded);
+        if (!matched.empty()) {
+          finished[i] = true;
+          stats.finish_reasons[sorted_to_original[i]] = "stop";
+          stats.matched_stops[sorted_to_original[i]] = matched;
+          decode_batch[i] = fallback_token;
+          --active;
+        }
+      }
     }
 
     if (active == 0) {
@@ -792,7 +820,8 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
     const StreamCallback& emit,
     const ControlCallback& should_stop,
     const StatsCallback& on_prefill_complete,
-    const std::optional<std::string>& prompt_cache_state_id) const {
+    const std::optional<std::string>& prompt_cache_state_id,
+    const StatsCallback& on_row_stop) const {
   bind_adapter(state, options.adapter);
   AdapterMetrics adapter_metrics(state);
   GenerationStats stats;
@@ -800,6 +829,9 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
     return stats;
   }
   stats.finish_reasons.assign(prompts.size(), "length");
+  stats.matched_stops.resize(prompts.size());
+  TextStopMatcher text_stops(options.stop.value_or(std::vector<std::string>{}));
+  std::vector<std::string> stop_tails(prompts.size());
   const int batch_size = static_cast<int>(prompts.size());
   if (state.batch_size != batch_size) {
     throw std::runtime_error("streaming generation state batch size mismatch");
@@ -848,10 +880,18 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
       }
 
       const int token = sampled_tokens[i];
-      if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
+      std::string matched;
+      if (options.stop) {
+        ++stats.generated_tokens;
+        token_buffers[i].push_back(token);
+        matched = text_stops.append(stop_tails[i], tokenizer_->decode(token));
+      }
+      if (!matched.empty() || (!options.stop && std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end())) {
         finished[i] = true;
-        stats.stop_token = true;
+        stats.stop_token = stats.stop_token || !options.stop;
+        stats.matched_stops[sorted_to_original[i]] = matched;
         stats.finish_reasons[sorted_to_original[i]] = "stop";
+        if (on_row_stop) on_row_stop(stats);
         decode_batch[i] = fallback_token;
         --active;
         if (!token_buffers[i].empty()) {
@@ -870,9 +910,11 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
         continue;
       }
 
-      ++stats.generated_tokens;
+      if (!options.stop) {
+        ++stats.generated_tokens;
+        token_buffers[i].push_back(token);
+      }
       decode_batch[i] = token;
-      token_buffers[i].push_back(token);
 
       if (chunk_size > 0 && token_buffers[i].size() >= static_cast<size_t>(chunk_size)) {
         utf8_pending[i] += tokenizer_->decode(token_buffers[i]);
@@ -929,6 +971,7 @@ int InferenceEngine::prefill_prompt(
     const std::string& prompt,
     GenerationState& state,
     DeviceLogits& logits) const {
+  state.text_stop_tail.clear();
   const auto prompt_ids = encode_prompt(prompt);
   std::vector<std::vector<int64_t>> prefill_batch{prompt_ids};
   prefill_batch_chunked(prefill_batch, state, logits);
@@ -950,6 +993,8 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
 
   GenerationStats stats;
   stats.finish_reasons = {"length"};
+  stats.matched_stops.resize(1);
+  TextStopMatcher text_stops(options.stop.value_or(std::vector<std::string>{}));
   std::vector<int> token_buffer;
   std::string utf8_pending;
   auto penalties = make_sampler_penalties(model_->vocab_size());
@@ -963,7 +1008,7 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
 
     const int token = sample_with_options_mask(logits, penalties, options, step);
     adapter_metrics.token();
-    if (std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
+    if (!options.stop && std::find(options.stop_tokens.begin(), options.stop_tokens.end(), token) != options.stop_tokens.end()) {
       stats.stop_token = true;
       stats.finish_reasons[0] = "stop";
       break;
@@ -971,6 +1016,15 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
 
     ++stats.generated_tokens;
     token_buffer.push_back(token);
+    if (options.stop) {
+      stats.matched_stops[0] = text_stops.append(state.text_stop_tail, tokenizer_->decode(token));
+      if (!stats.matched_stops[0].empty()) {
+        stats.finish_reasons[0] = "stop";
+        model_->forward_decode(std::vector<int64_t>{token}, state, logits);
+        state.text_stop_tail.clear();
+        break;
+      }
+    }
 
     if (chunk_size > 0 && token_buffer.size() >= static_cast<size_t>(chunk_size)) {
       utf8_pending += tokenizer_->decode(token_buffer);
@@ -993,8 +1047,8 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
   if (!tail.empty() && !emit(0, tail)) {
     mark_interrupted(stats);
   }
-  // Same per-row stop event as the prompt-based streaming paths.
-  if (stats.finish_reasons[0] == "stop" && !emit(0, {})) {
+  // Text-stop metadata is emitted with final stats for this single row.
+  if (stats.finish_reasons[0] == "stop" && stats.matched_stops[0].empty() && !emit(0, {})) {
     mark_interrupted(stats);
   }
 

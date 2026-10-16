@@ -116,13 +116,17 @@ void register_dynamic_routes(
       const int chunk_size = parse_chunk_size(*json, batch ? 8 : 2);
       if ((*json).get("stream", false).asBool()) {
         cb(make_sse_response([lease, prompts, state_id, options, model, chunk_size, batch](ResponseStreamPtr stream) {
+          auto matched_stops = std::make_shared<std::vector<std::string>>(prompts.size());
           start_streaming_task(std::move(stream), "chatcmpl-rwkv-fast", model, static_cast<int>(prompts.size()),
-            [lease, prompts, state_id, options, chunk_size, batch](const InferenceEngine::StreamCallback& emit) {
+            [lease, prompts, state_id, options, chunk_size, batch, matched_stops](const InferenceEngine::StreamCallback& emit) {
               auto& engine = lease->engine();
+              const auto on_row_stop = [matched_stops](const InferenceEngine::GenerationStats& stats) {
+                *matched_stops = stats.matched_stops;
+              };
               if (batch) {
                 auto state = create_request_state(engine, state_id, static_cast<int>(prompts.size()));
                 return engine.batch_generate_stream_with_state(
-                    prompts, state, options, chunk_size, emit, {}, {}, state_id);
+                    prompts, state, options, chunk_size, emit, {}, {}, state_id, on_row_stop);
               }
               if (!state_id.empty()) {
                 auto state = create_request_state(
@@ -131,12 +135,14 @@ void register_dynamic_routes(
                   return engine.batch_generate_state_stream(prompts, state, options, chunk_size, emit);
                 } else {
                   return engine.batch_generate_stream_with_state(
-                      prompts, state, options, chunk_size, emit);
+                      prompts, state, options, chunk_size, emit, {}, {}, std::nullopt, on_row_stop);
                 }
               } else {
-                return engine.batch_generate_stream(prompts, options, chunk_size, emit);
+                auto state = engine.model()->create_state(static_cast<int>(prompts.size()));
+                return engine.batch_generate_stream_with_state(
+                    prompts, state, options, chunk_size, emit, {}, {}, std::nullopt, on_row_stop);
               }
-            }, [] {});
+            }, [] {}, matched_stops);
         }));
         return;
       }

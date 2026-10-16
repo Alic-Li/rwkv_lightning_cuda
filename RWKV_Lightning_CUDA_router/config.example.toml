@@ -18,6 +18,13 @@ state_upload_attempt_timeout_seconds = 120
 state_upload_retry_base_ms = 250
 state_upload_retry_max_ms = 2000
 
+# Adapter uploads use the same bounded retry behavior, independently configurable.
+# Successful workers are not retried. Multipart is recommended for remote workers.
+adapter_upload_max_attempts = 3
+adapter_upload_attempt_timeout_seconds = 120
+adapter_upload_retry_base_ms = 250
+adapter_upload_retry_max_ms = 2000
+
 [[backends]]
 name = "gpu-a"
 url = "http://192.168.1.21:8000"

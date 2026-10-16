@@ -7,6 +7,7 @@
 #include "rwkv/inference/rwkv_inference_engine.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
 #include "test_common.hpp"
+#include "rwkv/inference/text_stop_matcher.hpp"
 
 namespace {
 
@@ -88,6 +89,27 @@ int main() {
     invalid_state.batch_size = 2;
     TEST_THROW(engine.batch_generate_state({"prompt"}, invalid_state, rwkv7_server::GenerateOptions{}));
     TEST_THROW(engine.batch_generate_state_stream({"prompt", "prompt"}, invalid_state, rwkv7_server::GenerateOptions{}, 1, [](int, const std::string&) { return true; }));
+
+    // Bounded byte tails work across token and UTF-8 boundaries.
+    rwkv7_server::TextStopMatcher matcher({"</tool_call>", "\nUser:", "结束"});
+    std::string tail;
+    TEST_EQ(matcher.append(tail, std::string(10000, 'x') + "</tool_"), std::string{});
+    TEST_CHECK(tail.size() <= std::string("</tool_call>").size());
+    TEST_EQ(matcher.append(tail, "call>"), std::string("</tool_call>"));
+    tail.clear();
+    const std::string utf8_stop = "结束";
+    TEST_EQ(matcher.append(tail, utf8_stop.substr(0, 2)), std::string{});
+    TEST_EQ(matcher.append(tail, utf8_stop.substr(2)), utf8_stop);
+    tail.clear();
+    TEST_EQ(matcher.append(tail, "\nUser: more"), std::string{});
+    TEST_EQ(matcher.append(tail, "\nUser:"), std::string("\nUser:"));
+    rwkv7_server::TextStopMatcher overlap({"User:", "\nUser:"});
+    tail.clear();
+    TEST_EQ(overlap.append(tail, "\nUser:"), std::string("User:"));
+    rwkv7_server::TextStopMatcher empty({});
+    tail.clear();
+    TEST_EQ(empty.append(tail, "anything"), std::string{});
+    TEST_CHECK(tail.empty());
 
     if (!rwkv_test::cuda_device_available()) {
       std::cout << "rwkv_inference_engine_test partial pass: CPU-only checks passed, GPU generation checks skipped\n";
@@ -230,6 +252,78 @@ int main() {
       TEST_EQ(stats.finish_reasons, std::vector<std::string>{expected});
     }
 
+    // Text stops span tokens and terminate before the output chunk fills.
+    TEST_CHECK(answer_ids.size() >= 2);
+    const std::string prefix = tokenizer->decode(std::vector<int>{answer_ids[0], answer_ids[1]});
+    auto text_options = options;
+    text_options.stop = std::vector<std::string>{prefix};
+    // Text mode ignores even a conflicting legacy ID at the engine level.
+    text_options.stop_tokens = {answer_ids[0]};
+    for (int chunk_size : {0, 1, 100}) {
+      std::vector<std::string> output(2);
+      std::vector<int> stops(2, 0);
+      const auto text_stats = engine.batch_generate_stream(
+          {prompt, longer_prompt}, text_options, chunk_size,
+          [&](int index, const std::string& chunk) {
+            if (chunk.empty()) ++stops[index];
+            else output[index] += chunk;
+            return true;
+          });
+      TEST_EQ(output, (std::vector<std::string>{prefix, prefix}));
+      TEST_EQ(stops, (std::vector<int>{1, 1}));
+      TEST_EQ(text_stats.matched_stops, (std::vector<std::string>{prefix, prefix}));
+      TEST_EQ(text_stats.finish_reasons, (std::vector<std::string>{"stop", "stop"}));
+      TEST_EQ(text_stats.generated_tokens, 4);
+    }
+    rwkv7_server::InferenceEngine::GenerationStats text_stats;
+    TEST_EQ(engine.batch_generate({prompt}, text_options, &text_stats),
+            (std::vector<std::string>{prefix}));
+    TEST_EQ(text_stats.matched_stops[0], prefix);
+    for (int chunk_size : {0, 1, 100}) {
+      text_options.max_tokens = 2;  // Match exactly at the budget boundary.
+      auto state = fake_backend->create_state(1);
+      std::string output;
+      const auto collect = [&](int, const std::string& chunk) { output += chunk; return true; };
+      text_stats = engine.batch_generate_state_stream({prompt}, state, text_options, chunk_size, collect);
+      TEST_EQ(output, prefix);
+      TEST_EQ(text_stats.matched_stops[0], prefix);
+      TEST_EQ(text_stats.finish_reasons[0], std::string("stop"));
+      TEST_EQ(fake_backend->decode_tokens().back()[0], answer_ids[1]);
+      state = fake_backend->create_state(1);
+      TEST_EQ(engine.batch_generate_state({prompt}, state, text_options, &text_stats)[0], prefix);
+      TEST_EQ(text_stats.matched_stops[0], prefix);
+      state = fake_backend->create_state(1);
+      rwkv7_server::DeviceLogits logits;
+      engine.prefill_prompt(prompt, state, logits);
+      output.clear();
+      text_stats = engine.generate_from_logits_stream(state, logits, text_options, chunk_size, collect);
+      TEST_EQ(output, prefix);
+      TEST_EQ(text_stats.matched_stops[0], prefix);
+      TEST_EQ(text_stats.finish_reasons[0], std::string("stop"));
+    }
+    // A stop prefix generated before pause must still match after resume.
+    auto resumed_state = fake_backend->create_state(1);
+    rwkv7_server::DeviceLogits resumed_logits;
+    engine.prefill_prompt(prompt, resumed_state, resumed_logits);
+    int control_calls = 0;
+    text_options.max_tokens = 8;
+    text_stats = engine.generate_from_logits_stream(
+        resumed_state, resumed_logits, text_options, 100,
+        [](int, const std::string&) { return true; }, [&] { return ++control_calls > 1; });
+    TEST_CHECK(text_stats.stopped);
+    TEST_EQ(resumed_state.text_stop_tail, tokenizer->decode(answer_ids[0]));
+    text_stats = engine.generate_from_logits_stream(
+        resumed_state, resumed_logits, text_options, 100,
+        [](int, const std::string&) { return true; });
+    TEST_EQ(text_stats.matched_stops[0], prefix);
+    TEST_EQ(text_stats.generated_tokens, 1);
+    TEST_CHECK(resumed_state.text_stop_tail.empty());
+    text_options.stop = std::vector<std::string>{};
+    text_options.max_tokens = 2;
+    engine.batch_generate({prompt}, text_options, &text_stats);
+    TEST_EQ(text_stats.finish_reasons[0], std::string("length"));
+    TEST_CHECK(text_stats.matched_stops[0].empty());
+
     auto bounded = options;
     bounded.max_tokens = 1;
     bounded.stop_tokens.clear();
@@ -254,6 +348,22 @@ int main() {
         {prompt, longer_prompt}, bounded, 100,
         [](int, const std::string&) { return true; });
     TEST_EQ(stats.finish_reasons, (std::vector<std::string>{"stop", "length"}));
+    text_options.stop = std::vector<std::string>{tokenizer->decode(answer_ids.front())};
+    text_options.max_tokens = 2;
+    auto mixed_state = mixed_backend->create_state(2);
+    int notifications = 0;
+    stats = mixed_engine.batch_generate_stream_with_state(
+        {prompt, longer_prompt}, mixed_state, text_options, 100,
+        [](int, const std::string&) { return true; }, {}, {}, std::nullopt,
+        [&](const rwkv7_server::InferenceEngine::GenerationStats& row_stats) {
+          ++notifications;
+          TEST_EQ(row_stats.matched_stops[1], text_options.stop->front());
+          TEST_EQ(row_stats.finish_reasons[1], std::string("stop"));
+        });
+    TEST_EQ(notifications, 1);
+    TEST_EQ(stats.finish_reasons, (std::vector<std::string>{"length", "stop"}));
+    TEST_CHECK(stats.matched_stops[0].empty());
+
     stats = engine.batch_generate_stream(
         {prompt}, options, 1, [](int, const std::string&) { return true; },
         [] { return true; });

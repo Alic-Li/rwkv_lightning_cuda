@@ -142,6 +142,8 @@ void register_server_routes(
         try {
           options = parse_options(*json, options);
           bind_adapter(*paused->state, options.adapter);
+          if ((*json).isMember("stop") || (*json).isMember("stop_tokens"))
+            paused->state->text_stop_tail.clear();
         } catch (const std::exception &e) {
           RequestRegistry::instance().put_paused(std::move(*paused));
           cb(json_response(make_error(e.what()), k400BadRequest));

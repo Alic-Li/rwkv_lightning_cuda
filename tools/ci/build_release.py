@@ -118,6 +118,13 @@ def main():
     run("go", "build", "-trimpath", f"-ldflags={launcher_ldflags}", "-o",
         bundle / ("rwkv_launcher" + SUFFIX), ".",
         cwd=ROOT / "RWKV_Lightning_CUDA_Launcher", env=launcher_env)
+    # The router is pure Go; keep it independent of host C/CUDA runtimes.
+    router_env = dict(os.environ, CGO_ENABLED="0")
+    run("go", "build", "-trimpath", "-ldflags=-s -w", "-o",
+        bundle / ("rwkv_router" + SUFFIX), ".",
+        cwd=ROOT / "RWKV_Lightning_CUDA_router", env=router_env)
+    shutil.copy2(ROOT / "RWKV_Lightning_CUDA_router/config.example.toml",
+                 bundle / "router.config.example.toml")
     shutil.copytree(ROOT / "RWKV_Lightning_CUDA_Launcher/dist", bundle / "dist")
     shutil.copy2(ROOT / "assets/rwkv_vocab_v20230424.txt", bundle)
     # Check relocated CLIs with a clean library path, without loading a model.
@@ -125,7 +132,7 @@ def main():
     smoke_env.pop("LD_LIBRARY_PATH", None)
     if WINDOWS:
         smoke_env["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
-    for binary in BINARIES:
+    for binary in (*BINARIES, "rwkv_router"):
         run(bundle / (binary + SUFFIX), "--help", cwd=bundle, env=smoke_env)
 
     dist = ROOT / "dist"

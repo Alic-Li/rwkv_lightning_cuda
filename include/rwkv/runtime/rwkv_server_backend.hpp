@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,6 +39,8 @@ struct GenerateOptions {
   std::shared_ptr<const rwkv7_miss::AdapterHandle> adapter;
   int max_tokens = 8192;
   std::vector<int64_t> stop_tokens{0, 261, 24281};
+  // Presence selects text matching, including an explicitly empty list.
+  std::optional<std::vector<std::string>> stop;
   double temperature = 1.0;
   int top_k = 20;
   double top_p = 0.3;
@@ -55,6 +58,8 @@ struct GenerationState {
   std::string adapter_identity;
   std::string initial_state_identity = "zero";
   bool advanced = false;
+  // Bounded decoded suffix retained across pause/resume of logit generation.
+  std::string text_stop_tail;
   bool adapter_cold = false;
   double adapter_h2d_ms = 0;
   std::size_t observed_device_vram_peak = 0;

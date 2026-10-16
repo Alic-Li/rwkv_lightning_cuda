@@ -50,6 +50,8 @@ rwkv_lighting_cuda/
 │   └── index.html
 ├── lib/                  # Linux runtime dependencies
 ├── rwkv_launcher
+├── rwkv_router
+├── router.config.example.toml
 ├── rwkv_lighting_cuda
 ├── rwkv_miss_tune
 ├── rwkv_quantize
@@ -129,3 +131,9 @@ workflow on that updated commit). Re-running an old failed run uses its original
 workflow/code, not this fix. An unpublished version such as `1.4.1` can keep its
 current `VERSION`; no tag/draft deletion is required. A persistent GitHub outage
 can still exhaust retries; retry the updated run once GitHub recovers.
+
+Release bundles also include the standalone `rwkv_router` (`rwkv_router.exe` on
+Windows). Copy `router.config.example.toml` to `router.config.toml`, configure the
+listen address and backends, then run `./rwkv_router -config router.config.toml`
+(use `./rwkv_router.exe` on Windows). CI builds the router with `CGO_ENABLED=0`
+and smoke-tests `--help` before archiving the bundle.

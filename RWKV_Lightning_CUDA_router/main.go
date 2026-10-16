@@ -23,15 +23,19 @@ import (
 )
 
 type config struct {
-	Listen                           string          `toml:"listen"`
-	MaxRequestBodyBytes              int64           `toml:"max_request_body_bytes"`
-	RequestTimeoutSeconds            int             `toml:"request_timeout_seconds"`
-	FailureCooldownSeconds           int             `toml:"failure_cooldown_seconds"`
-	StateUploadMaxAttempts           int             `toml:"state_upload_max_attempts"`
-	StateUploadAttemptTimeoutSeconds int             `toml:"state_upload_attempt_timeout_seconds"`
-	StateUploadRetryBaseMS           int             `toml:"state_upload_retry_base_ms"`
-	StateUploadRetryMaxMS            int             `toml:"state_upload_retry_max_ms"`
-	Backends                         []backendConfig `toml:"backends"`
+	Listen                             string          `toml:"listen"`
+	MaxRequestBodyBytes                int64           `toml:"max_request_body_bytes"`
+	RequestTimeoutSeconds              int             `toml:"request_timeout_seconds"`
+	FailureCooldownSeconds             int             `toml:"failure_cooldown_seconds"`
+	StateUploadMaxAttempts             int             `toml:"state_upload_max_attempts"`
+	StateUploadAttemptTimeoutSeconds   int             `toml:"state_upload_attempt_timeout_seconds"`
+	StateUploadRetryBaseMS             int             `toml:"state_upload_retry_base_ms"`
+	StateUploadRetryMaxMS              int             `toml:"state_upload_retry_max_ms"`
+	AdapterUploadMaxAttempts           int             `toml:"adapter_upload_max_attempts"`
+	AdapterUploadAttemptTimeoutSeconds int             `toml:"adapter_upload_attempt_timeout_seconds"`
+	AdapterUploadRetryBaseMS           int             `toml:"adapter_upload_retry_base_ms"`
+	AdapterUploadRetryMaxMS            int             `toml:"adapter_upload_retry_max_ms"`
+	Backends                           []backendConfig `toml:"backends"`
 }
 
 type backendConfig struct {
@@ -49,13 +53,15 @@ type backend struct {
 }
 
 type scheduler struct {
-	mu         sync.Mutex
-	backends   []*backend
-	next       uint64
-	sessions   map[string]*backend
-	cooldown   time.Duration
-	states     map[string]*statePlacement
-	stateEpoch uint64
+	mu           sync.Mutex
+	backends     []*backend
+	next         uint64
+	sessions     map[string]*backend
+	cooldown     time.Duration
+	states       map[string]*statePlacement
+	stateEpoch   uint64
+	adapters     map[string]*adapterPlacement
+	adapterEpoch uint64
 }
 
 func newScheduler(c config) (*scheduler, error) {
@@ -66,6 +72,9 @@ func newScheduler(c config) (*scheduler, error) {
 		return nil, fmt.Errorf("listen must be host:port: %w", err)
 	}
 	if _, err := configuredUploadPolicy(c); err != nil {
+		return nil, err
+	}
+	if _, err := configuredAdapterUploadPolicy(c); err != nil {
 		return nil, err
 	}
 	if c.MaxRequestBodyBytes < 0 || c.RequestTimeoutSeconds < 0 || c.FailureCooldownSeconds < 0 {
@@ -99,6 +108,10 @@ func newScheduler(c config) (*scheduler, error) {
 }
 
 func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(), error) {
+	return s.acquireWithAdapter(bsz, session, stateID, "", "")
+}
+
+func (s *scheduler) acquireWithAdapter(bsz int64, session, stateID, adapterID, adapterVersion string) (*backend, func(), error) {
 	if bsz < 1 {
 		bsz = 1
 	}
@@ -106,7 +119,7 @@ func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(
 	defer s.mu.Unlock()
 	now := time.Now()
 	if session != "" {
-		if b := s.sessions[session]; b != nil && !now.Before(b.unhealthy) && s.stateReadyLocked(stateID, b) {
+		if b := s.sessions[session]; b != nil && !now.Before(b.unhealthy) && s.stateReadyLocked(stateID, b) && s.adapterReadyLocked(adapterID, adapterVersion, b) {
 			b.inflight += bsz
 			return b, s.releaseFunc(b, bsz), nil
 		}
@@ -115,7 +128,7 @@ func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(
 	best := math.Inf(1)
 	for offset := 0; offset < len(s.backends); offset++ {
 		b := s.backends[(int(s.next)+offset)%len(s.backends)]
-		if now.Before(b.unhealthy) || !s.stateReadyLocked(stateID, b) {
+		if now.Before(b.unhealthy) || !s.stateReadyLocked(stateID, b) || !s.adapterReadyLocked(adapterID, adapterVersion, b) {
 			continue
 		}
 		load := float64(b.inflight) / b.weight
@@ -124,6 +137,9 @@ func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(
 		}
 	}
 	if chosen == nil {
+		if adapterID != "" {
+			return nil, nil, errors.New("no healthy upstream backend has the requested adapter/version and State ready; specify adapter_version when multiple versions are registered")
+		}
 		if stateID == "" {
 			return nil, nil, errors.New("all upstream backends are temporarily unavailable")
 		}
@@ -173,11 +189,12 @@ func (s *scheduler) acquireAll() ([]*backend, func()) {
 }
 
 type proxy struct {
-	scheduler    *scheduler
-	client       *http.Client
-	maxBody      int64
-	timeout      time.Duration
-	uploadPolicy uploadRetryPolicy
+	scheduler           *scheduler
+	client              *http.Client
+	maxBody             int64
+	timeout             time.Duration
+	uploadPolicy        uploadRetryPolicy
+	adapterUploadPolicy uploadRetryPolicy
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -190,6 +207,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveSynchronizedState(w, r, body)
 		return
 	}
+	if r.URL.Path == "/v1/adapters" {
+		p.serveSynchronizedAdapters(w, r, body)
+		return
+	}
 	bsz, session := batchSize(r, body)
 	stateID, err := resolvedRequestStateID(r, body)
 	if err != nil {
@@ -199,7 +220,27 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if stateID != "" && p.scheduler.needsStateRefresh(stateID) {
 		p.refreshState(r, stateID)
 	}
-	b, release, err := p.scheduler.acquire(bsz, session, stateID)
+	adapterID, adapterVersion, err := requestAdapter(body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if adapterID != "" {
+		var refresh bool
+		adapterVersion, refresh = p.scheduler.resolveAdapterVersion(adapterID, adapterVersion)
+		if refresh {
+			p.refreshAdapters(r, body)
+			adapterVersion, _ = p.scheduler.resolveAdapterVersion(adapterID, adapterVersion)
+		}
+		if adapterVersion != "" {
+			var payload map[string]json.RawMessage
+			if json.Unmarshal(body, &payload) == nil {
+				payload["adapter_version"], _ = json.Marshal(adapterVersion)
+				body, _ = json.Marshal(payload)
+			}
+		}
+	}
+	b, release, err := p.scheduler.acquireWithAdapter(bsz, session, stateID, adapterID, adapterVersion)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -225,15 +266,19 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p.scheduler.failed(b)
 		p.scheduler.stateUnavailable(stateID, b)
+		p.scheduler.adapterUnavailable(adapterID, adapterVersion, b)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	if stateID != "" && (resp.StatusCode == 400 || resp.StatusCode == 404) {
+	if (stateID != "" || adapterID != "") && (resp.StatusCode == 400 || resp.StatusCode == 404) {
 		// A restarted runtime can lose its temporary State store.
 		errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		if readErr != nil || bytes.Contains(errorBody, []byte("uploaded state not found")) {
 			p.scheduler.stateUnavailable(stateID, b)
+		}
+		if readErr != nil || bytes.Contains(errorBody, []byte("unknown adapter id")) || bytes.Contains(errorBody, []byte("unknown adapter version")) {
+			p.scheduler.adapterUnavailable(adapterID, adapterVersion, b)
 		}
 		copyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -250,6 +295,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() == nil {
 			p.scheduler.failed(b)
 			p.scheduler.stateUnavailable(stateID, b)
+			p.scheduler.adapterUnavailable(adapterID, adapterVersion, b)
 		}
 		log.Printf("proxy %s: response copy: %v", b.name, err)
 	}
@@ -478,7 +524,8 @@ func main() {
 		log.Fatalf("invalid config: %v", err)
 	}
 	policy, _ := configuredUploadPolicy(c)
-	p := &proxy{uploadPolicy: policy, scheduler: s, maxBody: c.MaxRequestBodyBytes, timeout: time.Duration(c.RequestTimeoutSeconds) * time.Second, client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, MaxIdleConns: 1024, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second, ResponseHeaderTimeout: 0, ExpectContinueTimeout: time.Second}}}
+	adapterPolicy, _ := configuredAdapterUploadPolicy(c)
+	p := &proxy{adapterUploadPolicy: adapterPolicy, uploadPolicy: policy, scheduler: s, maxBody: c.MaxRequestBodyBytes, timeout: time.Duration(c.RequestTimeoutSeconds) * time.Second, client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, MaxIdleConns: 1024, MaxIdleConnsPerHost: 256, IdleConnTimeout: 90 * time.Second, ResponseHeaderTimeout: 0, ExpectContinueTimeout: time.Second}}}
 	server := &http.Server{Addr: c.Listen, Handler: p, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
 	log.Printf("RWKV router listening on %s with %d backends", c.Listen, len(s.backends))
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

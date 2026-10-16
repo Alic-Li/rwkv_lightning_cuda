@@ -206,6 +206,8 @@ class Suite:
         self.matrix('base', {})
         for think in ['none','fast','free','preferChinese','en','enShort','enLong']:
             self.check('thinking ' + think, lambda t=think: self.completion('/v1/chat/completions', self.chat | {'think_type':t, 'max_tokens':2}))
+        self.check('batch text stops', self.batch_text_stops)
+        self.check('other endpoint text stops', self.other_text_stops)
         self.check('batch metrics', lambda: self.completion('/v1/batch/completions', self.batch | {'metrics': True},2))
         self.check('batch metrics status', self.metrics)
         self.check('translation', lambda: require(len(self.call('/translate/v1/batch-translate', {'source_lang':'English','target_lang':'Chinese','text_list':['Hello','Good morning']})['translations']) == 2))
@@ -291,6 +293,66 @@ class Suite:
         r=self.call('/v1/adapters')
         assert r['ram_hits']>0 and r['gpu_hits']>0 and r['gpu_misses']>0,r
         assert r['gpu_peak_bytes']>0 and r['ram_bytes']>0,r
+
+    def batch_text_stops(self):
+        path = '/v1/batch/completions'
+        body = {k: v for k, v in self.batch.items() if k != 'stop_tokens'}
+        for invalid in [None, 'stop', [''], [1], [None]]:
+            self.call(path, body | {'stop': invalid}, expected=400)
+        for legacy in [[], None, [0]]:
+            self.call(path, body | {'stop': [], 'stop_tokens': legacy}, expected=400)
+        # Greedy baseline supplies exact generated text ending at a token boundary.
+        body |= {'contents': [self.batch['contents'][0]], 'max_tokens': 3, 'stop': []}
+        baseline = self.call(path, body)['choices'][0]['message']['content']
+        assert baseline, 'expected non-empty greedy baseline'
+        body |= {'max_tokens': 16, 'stop': [baseline], 'chunk_size': 100}
+        result = self.call(path, body)['choices'][0]
+        assert result['message']['content'] == baseline, result
+        assert result['finish_reason'] == 'stop' and result['matched_stop'] == baseline, result
+        events = self.call(path, body | {'stream': True})
+        assert events[-1] == '[DONE]', events
+        choices = [c for event in events[:-1] for c in event['choices']]
+        assert ''.join(c['delta'].get('content', '') for c in choices) == baseline, choices
+        finishes = [c for c in choices if c.get('finish_reason') is not None]
+        assert len(finishes) == 1, finishes
+        assert finishes[0]['finish_reason'] == 'stop', finishes
+        assert finishes[0]['matched_stop'] == baseline, finishes
+
+    def other_text_stops(self):
+        cases = [
+            ('/v1/chat/completions', self.chat),
+            ('/state/chat/completions', self.options | {'contents': ['User: Hello.\n\nAssistant:']}),
+            ('/translate/v1/batch-translate', self.options | {
+                'source_lang': 'English', 'target_lang': 'Chinese', 'text_list': ['Hello']}),
+        ]
+        for path, original in cases:
+            body = {k: v for k, v in original.items() if k != 'stop_tokens'}
+            stateful = path.startswith('/state/')
+            translation = path.startswith('/translate/')
+            def request(extra):
+                payload = body | extra
+                if stateful:
+                    payload['session_id'] = self.session('text-stop-' + uuid.uuid4().hex[:8])
+                return payload
+            for invalid in [None, 'stop', [''], [1]]:
+                self.call(path, request({'stop': invalid}), expected=400)
+            self.call(path, request({'stop': [], 'stop_tokens': []}), expected=400)
+            baseline = self.call(path, request({'max_tokens': 3, 'stop': []}))
+            baseline = (baseline['translations'][0]['text'] if translation else
+                        baseline['choices'][0]['message']['content'])
+            assert baseline, (path, baseline)
+            extra = {'max_tokens': 16, 'stop': [baseline], 'chunk_size': 100}
+            result = self.call(path, request(extra))
+            choice = result['translations'][0] if translation else result['choices'][0]
+            assert choice['matched_stop'] == baseline and choice['finish_reason'] == 'stop', choice
+            assert (choice['text'] if translation else choice['message']['content']) == baseline, choice
+            if not translation:
+                events = self.call(path, request(extra | {'stream': True}))
+                assert events[-1] == '[DONE]', events
+                choices = [c for e in events[:-1] for c in e['choices']]
+                assert ''.join(c['delta'].get('content', '') for c in choices) == baseline, choices
+                finishes = [c for c in choices if c.get('finish_reason') is not None]
+                assert len(finishes) == 1 and finishes[0]['matched_stop'] == baseline, finishes
 
     def header_stream(self,sid):
         events=self.call('/v1/batch/completions',self.batch|{'stream':True},headers={'X-RWKV-State-Id':sid})

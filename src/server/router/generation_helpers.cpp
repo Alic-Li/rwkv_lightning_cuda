@@ -99,6 +99,19 @@ bool has_explicit_think_type(const Json::Value& body) {
 }
 
 GenerateOptions parse_options(const Json::Value& body, GenerateOptions options) {
+  if (body.isMember("stop") && body.isMember("stop_tokens"))
+    throw std::invalid_argument("stop and stop_tokens are mutually exclusive");
+  if (body.isMember("stop")) {
+    if (!body["stop"].isArray())
+      throw std::invalid_argument("stop must be an array of non-empty strings");
+    options.stop.emplace();
+    options.stop_tokens.clear();
+    for (const auto& item : body["stop"]) {
+      if (!item.isString() || item.asString().empty())
+        throw std::invalid_argument("stop must be an array of non-empty strings");
+      options.stop->push_back(item.asString());
+    }
+  }
   if (body.isMember("adapter_scale") && !body["adapter_scale"].isNumeric())
     throw std::invalid_argument("adapter_scale must be numeric");
   if (body.isMember("adapter_id")) {
@@ -128,6 +141,7 @@ GenerateOptions parse_options(const Json::Value& body, GenerateOptions options) 
 
   const auto& stop_tokens = body["stop_tokens"];
   if (stop_tokens.isArray()) {
+    options.stop.reset();
     options.stop_tokens.clear();
     for (const auto& item : stop_tokens) {
       options.stop_tokens.push_back(item.asInt64());
@@ -209,6 +223,8 @@ Json::Value build_choices(const std::vector<std::string>& texts,
     choice["message"]["role"] = "assistant";
     choice["message"]["content"] = texts[i];
     choice["finish_reason"] = stats.finish_reasons.at(i);
+    if (i < stats.matched_stops.size() && !stats.matched_stops[i].empty())
+      choice["matched_stop"] = stats.matched_stops[i];
     choices.append(choice);
   }
   return choices;
@@ -247,6 +263,8 @@ bool send_finish_chunk(
     choice["index"] = static_cast<int>(i);
     choice["delta"] = Json::objectValue;
     choice["finish_reason"] = stats.finish_reasons[i];
+    if (i < stats.matched_stops.size() && !stats.matched_stops[i].empty())
+      choice["matched_stop"] = stats.matched_stops[i];
     payload["choices"].append(choice);
   }
   if (payload["choices"].empty()) return true;
@@ -269,15 +287,16 @@ void start_streaming_task(
     std::string model,
     int choice_count,
     const std::function<InferenceEngine::GenerationStats(const InferenceEngine::StreamCallback&)>& task,
-    const std::function<void()>& on_done) {
+    const std::function<void()>& on_done,
+    std::shared_ptr<std::vector<std::string>> matched_stops) {
   std::thread([stream = std::move(stream),
                id = std::move(id),
                model = std::move(model),
                choice_count,
                task,
-               on_done]() mutable {
+               on_done, matched_stops]() mutable {
     std::vector<bool> finished(static_cast<size_t>(choice_count), false);
-    auto emit = [&stream, &id, &model, &finished](int index, const std::string& chunk) -> bool {
+    auto emit = [&stream, &id, &model, &finished, &matched_stops](int index, const std::string& chunk) -> bool {
       if (index < 0 || static_cast<size_t>(index) >= finished.size()) {
         throw std::runtime_error("generation returned invalid choice index");
       }
@@ -299,6 +318,8 @@ void start_streaming_task(
       choice["delta"] = Json::objectValue;
       if (chunk.empty()) {
         choice["finish_reason"] = "stop";
+        if (matched_stops && !matched_stops->at(index).empty())
+          choice["matched_stop"] = matched_stops->at(index);
       } else {
         choice["delta"]["content"] = chunk;
         choice["finish_reason"] = Json::nullValue;
@@ -413,6 +434,8 @@ Json::Value build_openai_response(
   choice["message"]["role"] = "assistant";
   choice["message"]["content"] = completion;
   choice["finish_reason"] = stats.finish_reasons.at(0);
+  if (!stats.matched_stops.empty() && !stats.matched_stops[0].empty())
+    choice["matched_stop"] = stats.matched_stops[0];
   resp["choices"].append(choice);
   resp["usage"]["prompt_tokens"] = engine.count_tokens(prompt);
   resp["usage"]["completion_tokens"] = engine.count_tokens(completion);
@@ -431,6 +454,11 @@ Json::Value build_options_debug(const InferenceEngine& engine, const GenerateOpt
   out["alpha_frequency"] = options.alpha_frequency;
   out["alpha_decay"] = options.alpha_decay;
   out["force_reasoning"] = options.force_reasoning;
+  if (options.stop) {
+    out["stop"] = Json::arrayValue;
+    for (const auto& stop : *options.stop) out["stop"].append(stop);
+    return out;
+  }
   out["stop_tokens"] = Json::arrayValue;
   out["stop_texts"] = Json::arrayValue;
   for (const auto token : options.stop_tokens) {

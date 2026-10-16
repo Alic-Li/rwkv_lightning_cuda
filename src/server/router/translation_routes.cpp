@@ -49,6 +49,12 @@ void register_translation_routes(
         options.alpha_presence = 0.0;
         options.alpha_frequency = 0.0;
         options.stop_tokens = {0};
+        try {
+          options = parse_options(*json, options);
+        } catch (const std::exception& error) {
+          cb(json_response(make_error(error.what()), k400BadRequest));
+          return;
+        }
 
         std::optional<PrefillAdmissionController::Permit> permit;
         try {
@@ -60,20 +66,24 @@ void register_translation_routes(
           return;
         }
         std::vector<std::string> results;
+        InferenceEngine::GenerationStats stats;
         try {
           auto state = create_request_state(
               engine, state_id, static_cast<int>(prompts.size()));
-          results = engine.batch_generate_with_state(prompts, state, options);
+          results = engine.batch_generate_with_state(prompts, state, options, &stats);
         } catch (const std::exception& error) {
           cb(json_response(make_error(error.what()), k400BadRequest));
           return;
         }
         Json::Value resp;
         resp["translations"] = Json::arrayValue;
-        for (const auto& text : results) {
+        for (size_t i = 0; i < results.size(); ++i) {
           Json::Value item;
           item["detected_source_lang"] = source_lang == "auto" ? "auto" : source_lang;
-          item["text"] = text;
+          item["text"] = results[i];
+          item["finish_reason"] = stats.finish_reasons.at(i);
+          if (!stats.matched_stops.at(i).empty())
+            item["matched_stop"] = stats.matched_stops[i];
           resp["translations"].append(item);
         }
         cb(json_response(std::move(resp)));

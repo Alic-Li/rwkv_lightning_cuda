@@ -118,7 +118,8 @@ void start_streaming_task(
     std::string model,
     int choice_count,
     const std::function<InferenceEngine::GenerationStats(const InferenceEngine::StreamCallback&)>& task,
-    const std::function<void()>& on_done = {});
+    const std::function<void()>& on_done = {},
+    std::shared_ptr<std::vector<std::string>> matched_stops = {});
 
 std::string format_openai_prompt(
     const Json::Value& body,

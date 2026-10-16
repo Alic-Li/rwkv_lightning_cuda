@@ -208,7 +208,7 @@ content chunks use `finish_reason:null`; the final chunk has an empty `delta`
 and the actual reason, followed by `[DONE]`. Explicit server stop/pause also
 uses `stop`. The gateway forwards these values unchanged. This applies to
 chat, batch, State chat, and resumed generation; `stop_tokens` remains the
-numeric-token stopping mechanism.
+numeric-token stopping mechanism. All generation endpoints additionally support text stops below.
 
 ```bash
 curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions" \
@@ -261,6 +261,32 @@ curl -sS "${AUTH_HEADER[@]}" -N -X POST "http://127.0.0.1:8000/v1/chat/completio
 ```
 
 ## Batch completions
+
+`/v1/chat/completions`, `/v1/batch/completions`, `/state/chat/completions`,
+`/translate/v1/batch-translate`, and `/v1/server/resume` accept either `stop_tokens: [0, ...]` (the existing
+numeric-token path) or `stop: ["</tool_call>", "\nUser:"]`. Providing both keys,
+even empty or null, returns HTTP 400. `stop` must be an array of non-empty
+strings. Omitting both preserves the default token stops; `stop: []` disables
+configured stops, including the default token stops.
+
+Text mode checks the suffix of each row's generated decoded bytes after every
+token, independently of `chunk_size`. Each row retains at most the longest
+stop's byte length, so matches can span tokens and UTF-8 byte boundaries.
+Matching is exact and case-sensitive, covers only generated text, and uses
+request order if multiple strings match the same suffix. The stop string is
+included in output and its tokens count toward generated tokens. A hit on the
+last allowed token still reports `stop`.
+
+On a hit, the row finishes immediately with `finish_reason: "stop"` and
+`matched_stop: "</tool_call>"` in its choice. SSE flushes that row's pending text
+and sends an empty `delta` with these fields immediately, before waiting for
+other rows. `matched_stop` is omitted for token stops, cancellation, and length
+limits. Translation responses expose these fields in `translations[]`. Dynamic-model
+chat and batch routes support the same options. Resume inherits the paused stop
+configuration and decoded tail when neither stop key is supplied, including
+matching across the pause boundary. An explicit stop key replaces the configuration
+and resets that tail. Finished rows stop producing text; the existing fixed-size backend
+batch retains their slots until all rows finish.
 
 Generate independent continuations for multiple prompts. Each streamed chunk uses `choices[].index` to identify the slot.
 

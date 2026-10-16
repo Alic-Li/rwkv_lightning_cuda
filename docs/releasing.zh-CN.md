@@ -43,6 +43,8 @@ rwkv_lighting_cuda/
 │   └── index.html
 ├── lib/                  # Linux 运行时依赖
 ├── rwkv_launcher
+├── rwkv_router
+├── router.config.example.toml
 ├── rwkv_lighting_cuda
 ├── rwkv_miss_tune
 ├── rwkv_quantize
@@ -108,3 +110,8 @@ Windows 使用 MSVC 开发者 shell。先在启动器目录执行
 重新运行旧的失败任务使用的是原始工作流/代码，不会包含修复。
 尚未发布的版本（如 `1.4.1`）可以保持当前 `VERSION`，无需删除标签/草稿。
 持续的 GitHub 故障仍可能耗尽重试；待恢复后重新运行更新后的任务。
+
+发布包同时包含独立的 `rwkv_router`（Windows 为 `rwkv_router.exe`）。
+复制 `router.config.example.toml` 为 `router.config.toml`，修改监听地址和后端配置后，
+运行 `./rwkv_router -config router.config.toml`（Windows 使用 `./rwkv_router.exe`）。
+CI 使用 `CGO_ENABLED=0` 编译 router，并在打包前运行 `--help` 验证。

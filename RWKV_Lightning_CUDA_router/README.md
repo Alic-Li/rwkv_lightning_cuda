@@ -83,6 +83,58 @@ Deletion blocks new uses of that State, uncertain deletion stays blocked, and
 uniform validation/auth rejection restores previous readiness. Stale lists cannot
 undo upload/delete mutations.
 
+## Adapter replication
+
+`POST /v1/adapters` (multipart upload or JSON path registration), `GET /v1/adapters`,
+and `DELETE /v1/adapters` fan out to every configured worker, including workers in
+connection cooldown. Registration succeeds only when all workers accept the same
+`adapter_id` and content `version`. JSON `path` registration requires that path to
+be readable on every worker. Prefer multipart for separate machines: the router
+forwards the same PTH and optional legacy `checkpoint.json` bytes to each worker.
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/adapters \
+  -F 'adapter_id=miss-r16-lr3e-5' \
+  -F 'file=@./rwkv7-g1k-7b-r16-lr3e-5-e2-miss.pth'
+```
+
+Add an `Authorization: Bearer ...` header when needed. Use the ID in generation
+requests, preferably with the returned `version` as `adapter_version`. If omitted,
+the router pins the request to its confirmed current content version instead of
+relying on potentially different per-worker latest registrations. `adapter_scale`,
+text `stop`, and SSE stop metadata are preserved.
+
+- Uploads default to three attempts per failed worker, with a 120-second attempt
+  deadline, bounded exponential backoff, jitter, and `Retry-After` support.
+  `adapter_upload_*` configures this independently of State uploads. Only transport,
+  response-read, timeout, and HTTP 408/429/500/502/503/504 failures retry, with the
+  same ID/body; successful workers and deterministic 4xx responses do not retry.
+- Partial failure returns HTTP 502 JSON with `adapter_id`, the confirmed `version`,
+  `ready_backends`, and `failed_backends`. Successful replicas remain available;
+  inference only uses healthy workers confirmed to hold the requested version.
+  State and adapter requirements must both be satisfied on the selected worker.
+  With no eligible worker, inference returns 503 without dropping either resource.
+  Inference itself is never replayed automatically.
+- New inference for an ID is blocked during its upload/delete. Concurrent mutations
+  of the same ID return 409. Deletion broadcasts to all workers and uncertain
+  results keep the deleted ID/version disabled. Deterministic rejection by all
+  workers, such as unauthorized requests, restores previous readiness.
+- Lists compare `(id, version, manifest)` across all workers, ignoring order and
+  worker-local cache statistics. Differences return 502 instead of a random
+  worker's list. On success, statistics belong to the first worker, not the cluster
+  total. Stale lists cannot overwrite upload/delete results.
+- After restart or an unknown adapter request, a five-second bounded list probe
+  rebuilds readiness. Existing runtime lists do not expose latest-registration
+  order. A sole discovered version can be selected automatically; with multiple
+  versions for an ID, provide `adapter_version` or re-register through the router.
+
+Replication is not a distributed transaction and does not retry forever after
+returning an error. Re-upload with the same ID to synchronize again, then check the
+router list. An outer Cloudflare 502/timeout can still occur after an upload has
+actually completed; use the cluster-wide router list to confirm the result.
+States must likewise be uploaded through `/v1/state/*`. Files previously uploaded
+to just one worker by an older router are not automatically copied to other hosts.
+
 ## Batch load test
 
 The included command sends non-streaming `/v1/batch/completions` requests at each

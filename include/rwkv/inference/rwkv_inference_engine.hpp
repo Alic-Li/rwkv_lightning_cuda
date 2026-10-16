@@ -28,6 +28,7 @@ class InferenceEngine {
     bool stop_token = false;
     // In original prompt order; each choice may terminate independently.
     std::vector<std::string> finish_reasons;
+    std::vector<std::string> matched_stops;
   };
 
   using StatsCallback = std::function<void(const GenerationStats&)>;
@@ -74,7 +75,8 @@ class InferenceEngine {
       const StreamCallback& emit,
       const ControlCallback& should_stop = {},
       const StatsCallback& on_prefill_complete = {},
-      const std::optional<std::string>& prompt_cache_state_id = std::nullopt) const;
+      const std::optional<std::string>& prompt_cache_state_id = std::nullopt,
+      const StatsCallback& on_row_stop = {}) const;
 
   GenerationStats batch_generate_state_stream(
       const std::vector<std::string>& prompts,
