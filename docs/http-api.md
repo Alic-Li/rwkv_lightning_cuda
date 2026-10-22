@@ -260,7 +260,7 @@ curl -sS "${AUTH_HEADER[@]}" -N -X POST "http://127.0.0.1:8000/v1/chat/completio
   }'
 ```
 
-## Batch completions
+## Request stop conditions: token IDs and strings
 
 `/v1/chat/completions`, `/v1/batch/completions`, `/state/chat/completions`,
 `/translate/v1/batch-translate`, and `/v1/server/resume` accept either `stop_tokens: [0, ...]` (the existing
@@ -287,6 +287,19 @@ configuration and decoded tail when neither stop key is supplied, including
 matching across the pause boundary. An explicit stop key replaces the configuration
 and resets that tail. Finished rows stop producing text; the existing fixed-size backend
 batch retains their slots until all rows finish.
+
+String-stop request example (omit `stop_tokens`):
+
+```json
+{
+  "messages": [{"role": "user", "content": "Reply and end with </tool_call>."}],
+  "max_tokens": 256,
+  "stream": false,
+  "stop": ["</tool_call>", "\nUser:"]
+}
+```
+
+## Batch completions
 
 Generate independent continuations for multiple prompts. Each streamed chunk uses `choices[].index` to identify the slot.
 

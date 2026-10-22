@@ -317,7 +317,7 @@ curl -sS "${AUTH_HEADER[@]}" -N -X POST "http://127.0.0.1:8000/v1/chat/completio
   }'
 ```
 
-## 批量补全
+## 请求停止条件：token ID 与字符串
 
 `/v1/chat/completions`、`/v1/batch/completions`、`/state/chat/completions`、
 `/translate/v1/batch-translate` 和 `/v1/server/resume` 均可传 `stop_tokens: [0, ...]`（原有 token ID 检测路径），
@@ -337,6 +337,19 @@ curl -sS "${AUTH_HEADER[@]}" -N -X POST "http://127.0.0.1:8000/v1/chat/completio
 动态模型模式的聊天和批量接口同样支持这些参数。恢复接口未传停止参数时沿用暂停时配置，
 并保留用于跨暂停点匹配的文本尾部；显式传入停止参数时替换配置并清空原尾部。
 已结束行不再生成文本；现有固定大小的后端批次仍保留其槽位，直到全部行结束。
+
+字符串停止请求示例（不要同时传 `stop_tokens`）：
+
+```json
+{
+  "messages": [{"role": "user", "content": "Reply and end with </tool_call>."}],
+  "max_tokens": 256,
+  "stream": false,
+  "stop": ["</tool_call>", "\nUser:"]
+}
+```
+
+## 批量补全
 
 为多条 prompt 生成相互独立的续写。每个流式分块通过 `choices[].index` 标识槽位。
 

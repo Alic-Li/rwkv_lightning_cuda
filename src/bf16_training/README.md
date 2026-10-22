@@ -42,7 +42,8 @@ streaming is now unconditional. Quantized base archives are inference-only.
 ## Chunk training and artifacts
 
 The CLI retains sequential microbatch accumulation. `--chunk` bounds activation
-tapes, and `--wkv_tape` shares the WKV tape across layers through recomputation.
+tapes. WKV tape sharing across layers through recomputation is always enabled;
+`--wkv_tape` is accepted as a compatibility no-op.
 WKV state, attention/FFN shifts and their adjoints pass between chunks without
 detaching; v_first gradients propagate between layers. All samples/chunks finish
 before the optimizer updates parameters.

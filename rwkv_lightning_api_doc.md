@@ -659,7 +659,8 @@ Authorization: Bearer your-password
 | `alpha_presence` | number | `2.0` | presence repetition penalty。 |
 | `alpha_frequency` | number | `0.2` | frequency repetition penalty。 |
 | `alpha_decay` | number | `0.996` | repetition penalty 衰减。 |
-| `stop_tokens` | integer[] | `[0,261,24281]` | 停止 token ID；不是停止字符串数组。命中的 token 不出现在输出中。 |
+| `stop_tokens` | integer[] | `[0,261,24281]` | 停止 token ID；命中的 token 不出现在输出中。与 `stop` 互斥，一次请求只能传其中一个字段。 |
+| `stop` | string[] | 不启用字符串停止 | 非空字符串组成的停止序列数组，例如 `["</tool_call>", "\nUser:"]`；命中的字符串保留在输出中。与 `stop_tokens` 互斥。 |
 | `stream` | boolean | `false` | 是否使用 SSE。 |
 | `chunk_size` | integer | 因路由而异 | 流式输出累计多少 token 后发送一次；小于 `1` 时按 `1` 处理。 |
 | `force_reasoning` | boolean | `false` | 启用内部 reasoning token mask。聊天接口使用 think 字段时会覆盖此值。 |
@@ -674,6 +675,59 @@ Authorization: Bearer your-password
 初始 state 文件的上传、列表和删除，以及 MiSS 适配器的注册、版本选择、列表、删除、
 鉴权和生成示例，统一维护在 [HTTP API 中文文档](docs/http-api.zh-CN.md#状态与适配器端点速查)。
 MiSS 推理包格式与缓存预算见 [MiSS 中文文档](src/miss/README.zh-CN.md)。
+
+#### 请求字符串停止（`stop`）
+
+CUDA 后端的 `/v1/chat/completions`、`/v1/batch/completions`、
+`/state/chat/completions`、`/translate/v1/batch-translate` 和 `/v1/server/resume`
+支持以下两种停止方式，**一次请求只能传其中一个字段**：
+
+| 停止方式 | 请求字段示例 | 命中后的输出 |
+|---|---|---|
+| token ID 停止 | `"stop_tokens": [0, 261, 24281]` | 不包含命中的停止 token。 |
+| 字符串停止 | `"stop": ["</tool_call>", "\nUser:"]` | 包含命中的停止字符串，并返回 `matched_stop`。 |
+
+两个字段同时出现时返回 HTTP `400`，即使其中一个或两个值为 `[]` 或 `null`。
+例如 `{"stop_tokens": [], "stop": ["</tool_call>"]}` 也是无效请求。
+`stop` 必须是数组，元素必须是非空字符串；`"stop": "END"`、`"stop": [""]`
+和 `"stop": null` 均无效。`stop: []` 表示禁用配置的停止条件，也不会沿用默认停止 token。
+普通生成请求两者都不传时使用该接口默认的停止 token；恢复请求的继承规则见下文。
+
+字符串停止请求示例（使用时不要再传 `stop_tokens`）：
+
+```json
+{
+  "messages": [{"role": "user", "content": "请回答问题，最后输出 </tool_call>。"}],
+  "max_tokens": 256,
+  "stream": false,
+  "stop": ["</tool_call>", "\nUser:"]
+}
+```
+
+检测仅针对本次新生成文本，在每个 token 解码后精确匹配文本后缀，区分大小写，
+支持跨 token 和 UTF-8 字节边界，与流式 `chunk_size` 无关。prompt 中的停止串不会触发停止。
+多个停止串同时命中时，`matched_stop` 返回请求数组中最靠前的一个。
+命中的停止串保留在输出中，相关 token 计入生成数量；最后一个允许生成的 token
+命中时仍返回 `finish_reason: "stop"`。
+
+命中后的 choice 示例：
+
+```json
+{
+  "index": 0,
+  "message": {"role": "assistant", "content": "回答内容</tool_call>"},
+  "finish_reason": "stop",
+  "matched_stop": "</tool_call>"
+}
+```
+
+SSE 会立即刷新该行待输出文本，再发送带空 `delta`、`finish_reason: "stop"`
+和 `matched_stop` 的结束事件。批量请求逐行独立检测和结束；翻译接口在
+`translations[]` 中返回结束原因和命中的字符串。token ID 停止、长度限制和管理性中止
+不返回 `matched_stop`。动态模型模式的聊天和批量接口同样支持上述参数。
+
+`/v1/server/resume` 未传两个停止字段时，沿用暂停时的停止配置及文本尾部，
+支持跨暂停点匹配；显式传入其中一个字段时替换原配置，并清空原文本尾部。
 
 ### 5. Thinking 模式
 
@@ -817,9 +871,9 @@ prefill/decode 指标，供 `/v1/server/status` 查询；这些字段不会把 m
 }
 ```
 
-`target_lang` 和非空 `text_list` 为必需字段，`source_lang` 默认 `auto`。该路由使用固定生成参数：
+`target_lang` 和非空 `text_list` 为必需字段，`source_lang` 默认 `auto`。该路由的默认生成参数为：
 `max_tokens=2048`、`temperature=1.0`、`top_k=1`、`top_p=0.0`、无 repetition penalty，
-停止 token 为 `0`。
+停止 token 为 `0`。可通过请求中的 `stop_tokens` 或 `stop` 覆盖停止配置，二者互斥。
 
 ```json
 {
@@ -1056,28 +1110,21 @@ pause 只会令当前生成提前结束，不会产生可供 `/v1/server/resume`
 
 #### 当前实现
 
-所有流式接口使用同一个通用 SSE 收尾函数。推理任务结束后，它无条件发送：
+生成接口按实际结束原因返回 `choices[].finish_reason`：命中 `stop_tokens` 或 `stop`
+时为 `stop`，耗尽 `max_tokens` 时为 `length`；最后一个允许的 token 恰好命中停止条件
+时仍为 `stop`。批量请求逐行记录结束原因，显式调用服务端 stop/pause 也使用 `stop`。
+字符串停止额外返回 `matched_stop`，其余结束方式不返回该字段。
+
+SSE 内容事件不含 `finish_reason`，每行结束时发送空 `delta` 和实际结束原因，
+字符串命中时还包含 `matched_stop`，最后发送 `data: [DONE]`。例如：
 
 ```json
 {
   "choices": [
-    {"index":0,"delta":{},"finish_reason":"stop"}
+    {"index":0,"delta":{},"finish_reason":"stop","matched_stop":"</tool_call>"}
   ]
 }
 ```
-
-然后发送 `data: [DONE]`。因此当前无法从 `finish_reason` 区分以下情况：
-
-- 模型生成 EOS；
-- 命中 `stop_tokens`；
-- 达到 `max_tokens`；
-- `/v1/server/stop` 或 pause 导致的管理性中止；
-- 客户端/发送回调提前终止。
-
-直接原因是推理层虽然对部分路径记录了 `stopped`、`stop_token` 和生成 token 数，但通用
-`start_streaming_task` 没有接收这些结束状态，`send_finish_chunk` 的默认参数又固定为
-`"stop"`。stateful 流路径目前甚至不返回结束统计。因此这是当前实现的兼容性限制，不代表
-上述情况在语义上都属于自然停止。
 
 当前流式响应也不会返回 `usage`，即使请求传入：
 
@@ -1101,7 +1148,7 @@ stateful 和所有流式响应当前均不返回标准 usage 对象。
 
 | 实际结束原因 | 标准/建议 `finish_reason` |
 |---|---|
-| EOS 或命中 `stop_tokens` | `stop` |
+| EOS 或命中 `stop_tokens` / `stop` | `stop` |
 | 达到 `max_tokens` | `length` |
 | tool call | `tool_calls`，当前不支持 |
 | content filter | `content_filter`，当前不支持 |
@@ -1113,8 +1160,8 @@ stateful 和所有流式响应当前均不返回标准 usage 对象。
 `usage: null`。若连接中途断开，客户端可能收不到最终 usage chunk。这也是官方 API
 reference 明确说明的边界。
 
-在上述兼容项实现之前，客户端应自行累计输出，且不要依赖当前 SSE 的
-`finish_reason` 判断是否触达 `max_tokens`。
+流式 usage 兼容项实现之前，客户端如需 token 用量统计，应自行统计；
+可通过 `finish_reason: "length"` 判断是否触达 `max_tokens`。
 
 ### 13. 错误与状态码
 
@@ -1122,7 +1169,7 @@ reference 明确说明的边界。
 |---:|---|
 | `200` | 请求成功；SSE 推理中的运行时异常也可能作为 `data: {"error":"..."}` 事件返回，并保持 HTTP 200。 |
 | `204` | `OPTIONS` 预检。 |
-| `400` | JSON 无效、缺少字段、prompt 列表为空。 |
+| `400` | JSON 无效、缺少字段、prompt 列表为空、同时传入 `stop_tokens` 和 `stop`，或 `stop` 格式无效。 |
 | `401` | 密码无效或缺失。 |
 | `404` | state、session 或 paused request 不存在。 |
 | `500` | 暂停请求状态不完整等服务端错误。 |

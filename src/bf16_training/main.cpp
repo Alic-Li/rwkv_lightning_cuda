@@ -51,7 +51,6 @@ struct Options {
   std::string vocab = RWKV_STATE_TUNE_DEFAULT_VOCAB;
   std::string optimizer = "adam";
   bool chunk_load = false;
-  bool wkv_tape = false;
   int ctx = 128;
   int chunk = 64;
   int epochs = 1;
@@ -84,8 +83,8 @@ struct Options {
   std::cerr
       << "Usage: " << program << " --model MODEL.pth --data TRAIN.jsonl "
       << "--output DIR [options]\n"
-      << "  --wkv_tape            share WKV tape across layers with "
-         "recomputation\n"
+      << "  --wkv_tape            accepted for compatibility; tape replay is "
+         "always enabled\n"
       << "  --chunk-load          accepted for compatibility; BF16 loading "
          "always streams\n"
       << "  --vocab PATH          RWKV vocab file\n"
@@ -151,7 +150,7 @@ Options parse(int argc, char **argv) {
     if (arg == "--help" || arg == "-h")
       usage(argv[0]);
     else if (arg == "--wkv_tape")
-      out.wkv_tape = true;
+      continue; // Compatibility flag: shared WKV tape is always enabled.
     else if (arg == "--chunk-load")
       out.chunk_load = true;
 #ifdef RWKV_MISS_TUNE
@@ -239,7 +238,7 @@ struct OwnedTape {
   DeviceBuffer<bf16> x, ln1, r, raw_w, k, v_base, v, alpha, neg_kk, wkv_k, kka,
       w1_tanh, g1_sigmoid, v_gate, wkv_y, att_group_norm, att_gate, x_after_att,
       ln2, ffn_hid;
-  DeviceBuffer<float> wkv_states, wkv_initial;
+  DeviceBuffer<float> wkv_initial;
   BlockTapeView view;
 
   void allocate(int time, const FrozenBlockWeights &w, bf16 *v_first,
@@ -273,14 +272,10 @@ struct OwnedTape {
     ffn_hid.resize(static_cast<std::size_t>(time) * w.ffn, "tune tape ffn hid");
     const rwkv_bf16_training::WkvShape shape{1, time, w.heads, 64};
     const auto tape_elements = rwkv_bf16_training::wkv_tape_elements(shape);
-    if (shared_tape) {
-      wkv_initial.resize(static_cast<std::size_t>(w.heads) * 64 * 64,
-                         "tune WKV replay initial");
-      view.wkv_replay_initial = wkv_initial.p;
-      view.wkv_replay_final = shared_final;
-    } else {
-      wkv_states.resize(tape_elements, "tune WKV exact tape");
-    }
+    wkv_initial.resize(static_cast<std::size_t>(w.heads) * 64 * 64,
+                       "tune WKV replay initial");
+    view.wkv_replay_initial = wkv_initial.p;
+    view.wkv_replay_final = shared_final;
     view.batch = 1;
     view.time = time;
     view.x = x.p;
@@ -304,7 +299,7 @@ struct OwnedTape {
     view.x_after_att = x_after_att.p;
     view.ln2 = ln2.p;
     view.ffn_hid = ffn_hid.p;
-    view.wkv = {shared_tape ? shared_tape : wkv_states.p, tape_elements};
+    view.wkv = {shared_tape, tape_elements};
   }
 };
 
@@ -447,13 +442,11 @@ int main(int argc, char **argv) {
     std::cout << "Optimizer: " << options.optimizer << '\n';
 
     DeviceBuffer<float> shared_wkv_tape, shared_wkv_final;
-    if (options.wkv_tape) {
-      shared_wkv_tape.resize(
-          rwkv_bf16_training::wkv_tape_elements({1, max_time, H, N}),
-          "shared WKV tape");
-      shared_wkv_final.resize(state_lane, "shared WKV replay final");
-      std::cout << "WKV tape: shared across layers (recompute)\n";
-    }
+    shared_wkv_tape.resize(
+        rwkv_bf16_training::wkv_tape_elements({1, max_time, H, N}),
+        "shared WKV tape");
+    shared_wkv_final.resize(state_lane, "shared WKV replay final");
+    std::cout << "WKV tape: shared across layers (recompute)\n";
     std::vector<OwnedTape> owned(static_cast<std::size_t>(L));
     std::vector<BlockTapeView> tapes(static_cast<std::size_t>(L));
     std::vector<BlockBackwardState> backward(static_cast<std::size_t>(L));
