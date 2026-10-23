@@ -11,6 +11,7 @@
 #include "rwkv/io/pth_archive.hpp"
 #include "rwkv/io/pth_tensor.hpp"
 #include "rwkv_quantized.hpp"
+#include "rwkv/version.hpp"
 
 namespace {
 
@@ -222,8 +223,12 @@ int main(int argc, char** argv) {
   const bool help_requested = argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h");
   if (help_requested) {
     std::cerr << "usage: rwkv_quantize [--format w8a16|w4a16] [--group-size 32|128] "
-                 "<input.pth> <output.rwkvq>\n";
+                 "<input.pth> <output.rwkvq>\n"
+                 "       rwkv_quantize --version\n";
     return 0;
+  }
+  if (argc >= 2 && rwkv::is_version_flag(argv[1])) {
+    return rwkv::print_version("rwkv_quantize");
   }
   QuantMode mode = QuantMode::W8A16;
   int group_size = 128;

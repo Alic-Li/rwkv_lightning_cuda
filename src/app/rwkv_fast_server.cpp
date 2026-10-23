@@ -25,6 +25,7 @@
 #include "rwkv/server/rwkv_state_cache.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
 #include "rwkv/server/rwkv_uploaded_state_store.hpp"
+#include "rwkv/version.hpp"
 
 namespace {
 
@@ -53,7 +54,8 @@ void print_usage(const char* program) {
       << "                          Cache is per-service local state; keep it with the state DB.\n"
       << "  --retune                Force W8A16 tuning even when cache exists.\n"
       << "  --enable-dynamic-loading Treat --model-path as a directory of .pth/.rwkvq models.\n"
-      << "  --help, -h              Show this help text.\n";
+      << "  --help, -h              Show this help text.\n"
+      << "  --version, -v           Print the version and exit.\n";
 }
 
 uint16_t parse_port(const std::string& value) {
@@ -187,6 +189,8 @@ int run_server(int argc, char* argv[]) {
     } else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       return 0;
+    } else if (rwkv::is_version_flag(arg)) {
+      return rwkv::print_version("rwkv_lighting_cuda");
     } else {
       throw std::runtime_error("unknown argument: " + arg);
     }

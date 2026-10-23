@@ -111,7 +111,7 @@ endif()
 if(RWKV7_STATE_TUNING)
   add_executable(rwkv_miss_tune bf16_training/main.cpp state_tuning/dataset.cpp)
   target_include_directories(rwkv_miss_tune PRIVATE state_tuning)
-  target_link_libraries(rwkv_miss_tune PRIVATE rwkv_bf16_training)
+  target_link_libraries(rwkv_miss_tune PRIVATE rwkv_bf16_training rwkv::version)
   target_compile_definitions(rwkv_miss_tune PRIVATE RWKV_MISS_TUNE
     RWKV_STATE_TUNE_DEFAULT_VOCAB="${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt")
   rwkv_optimize_target(rwkv_miss_tune)
@@ -123,7 +123,7 @@ if(RWKV7_STATE_TUNING)
     state_tuning/dataset.cpp
   )
   target_include_directories(rwkv_state_tune PRIVATE state_tuning)
-  target_link_libraries(rwkv_state_tune PRIVATE rwkv_bf16_training)
+  target_link_libraries(rwkv_state_tune PRIVATE rwkv_bf16_training rwkv::version)
   target_compile_definitions(rwkv_state_tune PRIVATE
     RWKV_STATE_TUNE_DEFAULT_VOCAB="${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt"
   )
@@ -152,7 +152,7 @@ if(Drogon_FOUND)
     server/router/uploaded_state_routes.cpp
     server/rwkv_model_router.cpp
   )
-  target_link_libraries(rwkv_lighting_cuda PRIVATE rwkv::backend Drogon::Drogon)
+  target_link_libraries(rwkv_lighting_cuda PRIVATE rwkv::backend Drogon::Drogon rwkv::version)
   rwkv_optimize_target(rwkv_lighting_cuda)
   rwkv_strip_release_binary(rwkv_lighting_cuda)
   rwkv_configure_runtime_bundle(rwkv_lighting_cuda
@@ -165,6 +165,7 @@ endif()
 if(RWKV7_STATE_TUNING AND Drogon_FOUND)
   add_library(rwkv_online_rl STATIC online_rl/server.cpp)
   target_link_libraries(rwkv_online_rl PUBLIC rwkv_bf16_training rwkv::backend Drogon::Drogon)
+  target_link_libraries(rwkv_online_rl PRIVATE rwkv::version)
   target_compile_definitions(rwkv_online_rl PRIVATE
     RWKV_STATE_TUNE_DEFAULT_VOCAB="${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt")
   rwkv_optimize_target(rwkv_online_rl)

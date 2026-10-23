@@ -8,6 +8,7 @@
 #include "rwkv/inference/utf8.hpp"
 #include "rwkv/io/pth_tensor.hpp"
 #include "rwkv/runtime/rwkv_adapter.hpp"
+#include "rwkv/version.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -88,9 +89,13 @@ Options parse(int argc, char **argv, bool miss) {
           << o.lr
           << " --output online-rl-output\n"
              "  --vocab PATH --rank 16 --alpha 16 --targets all (inferred from "
-             "cold adapter)\n";
+             "cold adapter)\n"
+             "  --version, -v prints the version and exits\n";
       std::exit(0);
     }
+    if (rwkv::is_version_flag(key))
+      std::exit(rwkv::print_version(miss ? "rwkv_miss_tune_server"
+                                         : "rwkv_state_tune_server"));
     if (++i >= argc)
       throw std::invalid_argument("missing value for " + key);
     std::string v = argv[i];

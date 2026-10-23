@@ -3,16 +3,34 @@ package router
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 )
 
+// version is stamped by release builds via
+// -ldflags "-X rwkv-lightning-cuda-router/internal/router.version=v<VERSION>".
+var version = "dev"
+
+// versionLine is the --version output: "<program> <version>" on one line,
+// without the tag's "v" prefix so it matches the C++ binaries.
+func versionLine() string {
+	return "rwkv_router " + strings.TrimPrefix(version, "v")
+}
+
 func Main() {
 	path := flag.String("config", "config.toml", "TOML configuration file")
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	flag.BoolVar(showVersion, "v", false, "print the version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(versionLine())
+		return
+	}
 	var c config
 	meta, err := toml.DecodeFile(*path, &c)
 	if err != nil {

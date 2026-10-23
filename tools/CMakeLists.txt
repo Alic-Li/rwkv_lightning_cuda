@@ -23,7 +23,7 @@ target_include_directories(rwkv_quantize PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/quant/modeling
 )
-target_link_libraries(rwkv_quantize PRIVATE ${RWKV_JSON_TARGET} OpenSSL::Crypto)
+target_link_libraries(rwkv_quantize PRIVATE ${RWKV_JSON_TARGET} OpenSSL::Crypto rwkv::version)
 rwkv_optimize_target(rwkv_quantize)
 rwkv_configure_runtime_bundle(rwkv_quantize)
 
