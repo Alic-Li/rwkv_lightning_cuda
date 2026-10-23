@@ -66,16 +66,37 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 | `--host` | `127.0.0.1` |
 | `--port` | MiSS `8848`，State `8849` |
 | `--chunk` | `64`；计算与反向重算块长，不截断梯度 |
-| `--ctx` | `4096`；完整历史 Token 上限，超长请求直接拒绝 |
-| `--max-batch` | `32`；一次生成或训练的最大样本数 |
+| `--ctx` | `4096`；完整历史 Token 上限，超长请求直接拒绝；对显存的影响见下文 |
+| `--max-batch` | `32`；一次生成或训练的最大样本数；同时决定合批解码的最大行数 |
 | `--cache-capacity` | `16`；每个保留版本的 CPU 前缀快照条数，`0` 关闭 |
 | `--keep-versions` | `2`；当前及旧 Actor 快照总数 |
 | `--lr` | MiSS `2e-5`，State `0.01` |
 | `--rank / --alpha / --targets` | 无冷 Adapter 时 `16 / rank / all`；冷启动时推断，显式冲突报错 |
 | `--vocab` | 项目的 `assets/rwkv_vocab_v20230424.txt` |
 | `--output` | `online-rl-output`；显式发布保存的目录 |
+| `--resume` | 无；指向 `checkpoint:true` 发布的目录，恢复优化器状态和 step（见下文） |
 
-7.2B 的一个完整 FP32 WKV State 约 32 MiB。Prefix Cache 在 CPU 上，还包含 BF16 shifts 和末尾 logits；训练在 GPU 上保留每个 Chunk 边界的 State/shift，因此增大 `ctx/chunk` 也会增加显存需求。
+### 显存估算
+
+下表按分配代码估算，**未实测**，只用于选参数；实际值请以 `nvidia-smi` 为准，并预留约 1 GiB 给 CUDA 上下文和 cuBLAS。
+2.9B 按 32 层、C=2560（40 头）计算，7.2B 按 32 层、C=4096（64 头）计算。
+
+| 组成 | 公式 | 2.9B | 7.2B |
+|---|---|---|---|
+| BF16 Backbone | 约 2 字节/参数 | ≈5.8 GB | ≈14.4 GB |
+| 训练 Chunk 边界检查点 | `ceil((最长样本-1)/chunk) × (L·H·16 KiB + L·2·C·2 B)` | 每块 ≈20.3 MiB | 每块 ≈32.5 MiB |
+| 　ctx 4096、chunk 64（64 块） | | ≈1.3 GiB | ≈2.0 GiB |
+| 　ctx 8192、chunk 64（128 块） | | ≈2.5 GiB | ≈4.1 GiB |
+| 　ctx 8192、chunk 128（64 块） | | ≈1.3 GiB | ≈2.0 GiB |
+| Learner + Actor 两个执行器的激活 | `2 × chunk × L × ≈42·C 字节` | chunk 64 ≈0.45 GB | chunk 64 ≈0.7 GB |
+| 合批解码（每请求 B 条 prompt） | `B × L·H·16 KiB` 状态 + `B × L × ≈42·C 字节` 激活 | B=32 ≈0.8 GB | B=32 ≈1.2 GB |
+| MiSS rank 16 全部 targets | FP32 master/梯度/m/v + BF16，约 18 字节/参数 | ≈0.2 GB | ≈0.35 GB |
+
+检查点数量取决于**已训练过的最长样本**，不是 `--ctx` 本身；缓冲区按出现过的最大长度分配后保留。
+长上下文时增大 `--chunk` 可减少检查点（与 chunk 成反比），代价是执行器激活（与 chunk 成正比）；ctx 8192 时 `--chunk 128` 比 64 更省显存，反向重算也更快。
+例：7.2B、ctx 8192、chunk 128、MiSS r16、`--max-batch 32` 约 14.4 + 2.0 + 1.4 + 1.2 + 0.35 ≈ 19.4 GB，另加 CUDA 上下文。
+合批解码缓冲区按请求的 prompt 数分配并保留到下一次 prompt 数变化；State 模式的 Adam 状态约为 3 个 State 大小。
+Prefix Cache 在 CPU 上，每条包含完整 State、BF16 shifts 和末尾 logits。
 
 ## HTTP API
 
@@ -97,6 +118,8 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
   "temperature": 1.0,
   "seed": 1234,
   "stop_token_ids": [0],
+  "stop": ["</tool_call>", "</answer>", "\n\nUser:"],
+  "stop_token_sequences": [[261, 24281]],
   "use_cache": true
 }
 ```
@@ -108,16 +131,39 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
   "tokens": [100,101],
   "logprobs": [-3.25,-2.125],
   "text": "cd",
-  "finish_reason": "length",
+  "finish_reason": "stop",
+  "matched_stop": "</answer>",
   "cached_prompt_tokens": 2,
   "prefill_tokens": 0
 }
 ```
 
 `tokens` 仅包含生成的 Token；`logprobs` 与其一一对应，是 **temperature 后采样策略**的 FP32 log probability。
-停止 Token 也计入返回值、logprob 和缓存。`stop_token_ids: []` 关闭停止 Token；默认 `[0]`。
-`max_tokens: 0` 只做 Prefill/缓存。`temperature` 必须为 `[0.01,100]`，不提供 greedy、Top-K、Top-P 或 Penalty。
-CPU 以数值稳定的普通 `softmax(logits / temperature)` 和标准离散分布采样，不增加 Sampler CUDA Kernel。
+`max_tokens: 0` 只做 Prefill/缓存。`temperature` 必须为 `[0.01,100]`。
+
+**合批解码**：同一请求的所有 prompt 先逐条 Prefill（复用前缀缓存），再放进同一个批次按行并行解码，
+每步一次前向，所有 prompt 共用策略版本和 temperature。在线 worker 的 GEMM 本来就按 32 行固定分块计算，
+因此 32 条以内的 prompt 与单条解码的矩阵乘法开销基本相同；每一行的 logits 与 batch=1 解码**逐位一致**
+（`rwkv_online_rl_forward_test` 检查这一点），所以 `/v1/train` 的 CE 仍与采样 logprob 对应。
+提前结束的行留在批次里空转，直到整批结束或达到 `max_tokens`；不做跨请求的 continuous batching。
+`seed` 决定每条 prompt 的随机流：第 `i` 条使用 `(seed, i)`，结果与同批其他 prompt 无关；不提供 `seed` 时随机选择。
+
+**停止条件**（只匹配生成部分，不匹配 prompt）：
+
+| 字段 | 含义 |
+|---|---|
+| `stop_token_ids` | 单个停止 Token；默认 `[0]`，`[]` 关闭 |
+| `stop_token_sequences` | Token 序列，生成部分以该序列结尾时停止；最多 16 条，每条 1–64 个 Token |
+| `stop` | 字符串或字符串数组，最多 16 条，每条 1–256 字节；按原始 UTF-8 字节匹配，可跨 Token |
+
+命中后在**完成匹配的那个 Token** 处停止：该 Token 计入 `tokens`、`logprobs` 和缓存，之后不再采样，
+因此返回的 Token 与训练时提交的 Token 完全一致。Token 不会被切开，所以 `text` 可能在停止字符串之后还带有该 Token 的剩余字节；
+多轮拼接请以 `tokens` 为准。`finish_reason` 为 `stop` 时，`matched_stop` 给出命中的规则：字符串、Token ID 或 Token 序列。
+同一 Token 命中多条规则时，优先级依次为 `stop_token_ids`、`stop_token_sequences`、`stop`（各自按请求顺序）。
+
+CPU 以数值稳定的普通 `softmax(logits / temperature)` 和标准离散分布采样，多行并行，不增加 Sampler CUDA Kernel。
+不提供 greedy、Top-K、Top-P 或 Penalty：截断采样会改变行为策略，而 `/v1/train` 的 CE 按完整的 tempered softmax 计算，
+两者不一致时梯度不再对应采样分布。若以后加入截断采样，需要训练端同时按相同截断计算 CE 和 logprob。
 
 在线服务的现有 BF16 GEMM 使用固定 32 行计算块及严格 FP32 累加，避免 cuBLAS 在 Prefill、Decode 和不同 Chunk 形状间引入策略数值差异；输入、权重及前向输出仍为 BF16。仅矩阵乘法补齐，WKV 处理真实 Token 数。该设置局限于在线 GPU worker，原 CLI 默认方式不变；小块补齐和严格累加会增加计算开销。
 
@@ -125,6 +171,47 @@ CPU 以数值稳定的普通 `softmax(logits / temperature)` 和标准离散分�
 缓存保存完整 Prompt 和完整输出历史（包含最后一个生成 Token）：
 `AB → ABCD → ABCDEF → ABCDEFGH` 仅执行每步的新增后缀。
 每个 Policy 快照持有自己的 Trie，训练不会访问 Prefix Cache。
+
+### 教师强制 logprob 与参考策略
+
+```json
+POST /v1/logprobs
+{"policy_version": "可省略，默认当前版本", "temperature": 1.0, "sequences": [[98,99,100,101]]}
+```
+
+返回 `logprobs`：每条序列一个数组，长度为 `len(tokens)-1`，第 `i` 项是 `log softmax(logits/temperature)[tokens[i+1]]`。
+它与训练使用同一前向和同一 CE 归约，不使用、也不写入前缀缓存。
+
+服务启动时的策略（冷启动 Adapter/State，或 `--resume` 恢复的策略）作为**参考策略**永久保留，不受 `--keep-versions` 淘汰；
+`/health` 的 `reference_version` 给出其版本，可用于 `/v1/logprobs` 或 `/v1/completions`。
+服务端没有内置 KL 项；需要对 SFT 起点加 KL 约束时，可在客户端把它折进逐 Token Advantage，例如：
+
+```python
+full = prompt + out["tokens"]                     # out 来自 /v1/completions
+ref = call("/v1/logprobs", {"policy_version": health["reference_version"],
+                            "temperature": T, "sequences": [full]})["logprobs"][0]
+ref_gen = ref[len(prompt) - 1:]                   # 与 out["tokens"] 逐个对齐
+advantages = [A - beta * (lp - rp) for lp, rp in zip(out["logprobs"], ref_gen)]
+turn = {"tokens": out["tokens"], "loss_mask": [1] * len(out["tokens"]),
+        "advantages": advantages}
+```
+
+这是常见的“KL 进奖励”写法（k1 估计）；`beta` 及估计方式由客户端决定。
+多轮样本对每个生成 turn 分别这样计算，观察 turn 的 `loss_mask` 为 0，不需要参考 logprob。
+
+### 用外部推理服务采样
+
+`/v1/train` 只校验 `policy_version` 是否为当前版本，不校验 Token 是否由本服务生成，所以技术上可以用
+`rwkv_lighting_cuda` 采样，再把 Token 交回训练。需要清楚的是：
+
+- 训练是纯 on-policy REINFORCE，没有重要性采样修正。推理服务使用不同的前向 Kernel（以及可能的量化、稀疏 cmix），
+  logprob 与本服务不逐位一致，采样分布有小偏差，相当于轻微 off-policy。偏差是否可接受取决于任务，服务端无法保证；
+  可以用 `/v1/logprobs` 对外部轨迹打分，与推理服务返回的 logprob 比较来监控。
+- 每步需要 `publish` 时 `save:true`（或 `checkpoint:true`），再把导出的 `adapter.pth` 注册到推理服务：
+  `POST /v1/adapters`，同机可传 `{"adapter_id":"rl","path":".../adapter.pth"}`，跨机可用 multipart 上传文件。
+  同一 `adapter_id` 每次注册得到新的内容版本，无需重启推理服务；生成时用 `adapter_version` 固定版本，旧版本可 `DELETE`。
+  目前没有不经磁盘直接推送权重的接口。State 模式训练的 State 不走这条路径。
+- 采样请求本身已经合批，通常应优先用本服务采样，省掉导出、注册和数值偏差。
 
 ### RL train step
 
@@ -188,12 +275,22 @@ Backbone 指针始终共享。显式指定旧版本的请求仍使用其旧权�
 版本切换不会重建 Learner 或清空 Adam。
 
 `save:true` 输出 `state.pth`、有 Adapter 时的 `adapter.pth`、`policy.json`。
-State 和 Adapter 按现有格式导出 BF16，可由原推理服务或两个新 Server 冷启动加载。
-导出不是完整在线训练检查点：重新启动会从新 Adam 状态和 step=0 开始；本功能保证进程内优化器持续驻留。
+State 和 Adapter 按现有格式导出 BF16，可由原推理服务或两个新 Server 冷启动加载；用它们冷启动会从新 Adam 状态和 step=0 开始。
+
+`checkpoint:true`（隐含 `save:true`）额外写入 `training/` 子目录，即完整训练检查点：
+
+- MiSS：沿用 `rwkv_miss_tune` 的检查点格式（FP32 master、梯度、Adam m/v、初始 State 和 step）；
+- State：FP32 可训练 State、Adam m/v 和 step。
+
+返回值中的 `checkpoint` 是该子目录。重启时传 `--resume <目录>`：未显式指定时，`adapter.pth`/`state.pth` 也从该目录读取；
+恢复后 `/health` 的 `step` 和 `published_step` 都等于检查点 step，Adam 的偏差校正从该 step 继续。
+MiSS 恢复时会校验 rank、alpha、targets 和 Backbone fingerprint 与检查点一致。
+7.2B r16 的 MiSS 检查点约为 Adapter 参数量 × 16 字节（约 0.3 GB），State 检查点约为 3 个 State 大小（约 100 MB），建议隔几步再存一次。
 
 输入错误返回 400；版本过期/发布 step 不符返回 409；工作队列满返回 503；执行错误返回 500。
-当前采用有界单 GPU worker（最多 32 个排队请求），按请求串行调度；Batch 内样本顺序执行，训练累积整批梯度后更新一次。
-这与现有 CLI 的顺序累积一致，暂未增加并行 Actor/Learner 或 GPU continuous batching。
+当前采用有界单 GPU worker（最多 32 个排队请求），按请求串行调度。
+采样请求内的 prompt 合批解码；训练请求内的样本仍逐条前向/反向、累积整批梯度后更新一次，与现有 CLI 一致。
+采样和训练共用同一个 worker，一步的耗时是两者之和；暂未把 Actor 和 Learner 拆到并行的 worker 或 GPU 上。
 
 ## Python 闭环示例
 
@@ -223,6 +320,53 @@ uv run --with tqdm python tools/online_rl.py \
 
 数据集中的工具结果作为离线观察回放；示例不执行模型生成的工具调用。真实 Agent RL 应由 Python 环境执行动作并提供新的观察和 Judge。
 
+### 真实工具环境的多轮示例
+
+下面是一组 GRPO 轨迹的骨架（`call` 为 POST JSON 的辅助函数，`run_tool`、`judge` 由你的环境提供）。要点：
+
+- 上下文始终是 **Token ID 列表**。工具观察单独用 `/v1/tokenize` 编码后拼到历史末尾，不要把整段文本重新编码，否则 Token 边界会变化，训练的 Token 就和采样时不一致。
+- 生成的 Token（包括命中 stop 的最后一个 Token）原样进入历史和训练样本；`text` 可能在 stop 字符串后多出几个字节，只用于解析动作。
+- `turns` 按时间顺序排列：首个 prompt 和每段观察 `loss_mask` 全 0；每段生成 `loss_mask` 全 1。首 Token 没有前驱，不计入 Loss。
+- 同一组的所有活跃轨迹放进同一次 `/v1/completions`，享受合批解码；结束的轨迹从下一轮请求中去掉。历史前缀会命中前缀缓存，每轮只 Prefill 新增的观察。
+- 历史总长（以及每轮 `prompt + max_tokens`）不能超过 `--ctx`，超长请求返回 400。
+
+```python
+health = call("/health")
+version = health["policy_version"]
+prompt = call("/v1/tokenize", {"text": f"User: {question}\n\nAssistant:"})["tokens"]
+episodes = [{"history": list(prompt), "done": False,
+             "turns": [{"tokens": list(prompt), "loss_mask": [0] * len(prompt)}]}
+            for _ in range(group_size)]
+for turn in range(max_turns):
+    active = [e for e in episodes if not e["done"]]
+    if not active:
+        break
+    outs = call("/v1/completions", {
+        "policy_version": version, "prompts": [e["history"] for e in active],
+        "max_tokens": 1024, "temperature": 1.0, "seed": seed * 100 + turn,
+        "stop": ["</tool_call>", "</answer>", "\n\nUser:"],
+    })["completions"]
+    for e, out in zip(active, outs):
+        e["turns"].append({"tokens": out["tokens"], "loss_mask": [1] * len(out["tokens"])})
+        e["history"] += out["tokens"]
+        if out.get("matched_stop") != "</tool_call>":
+            e["done"] = True          # 回答结束、截断或其它 stop
+            continue
+        observation = run_tool(out["text"])
+        obs = call("/v1/tokenize", {"text": f"\n<tool_response>{observation}</tool_response>\n"})["tokens"]
+        e["turns"].append({"tokens": obs, "loss_mask": [0] * len(obs)})
+        e["history"] += obs
+rewards = [judge(e) for e in episodes]
+mean = sum(rewards) / len(rewards)
+std = (sum((r - mean) ** 2 for r in rewards) / len(rewards)) ** 0.5 or 1.0
+samples = [{"turns": e["turns"], "advantages": (r - mean) / std} for e, r in zip(episodes, rewards)]
+train = call("/v1/train", {"policy_version": version, "temperature": 1.0, "samples": samples})
+if train["updated"]:
+    call("/v1/publish", {"expected_step": train["step"]})
+```
+
+多组时把各组的样本放进同一个 `/v1/train`（总数不超过 `--max-batch`），每步只训练、发布一次。
+
 快速检查管线时显式使用：
 
 ```bash
@@ -245,8 +389,9 @@ HTTP 连接没有数据传输。客户端 `--timeout` 默认 3600 秒，可按�
 遇到断线时不要直接重发 `/v1/train`：GPU 更新可能已经完成。先请求 `/health`；
 若 `step > published_step`，用该 `step` 调用 `/v1/publish`，并设置 `save: true`。
 客户端启动时会检查这个状态，避免用旧策略继续训练。
-重启后可用导出的 `adapter.pth` 和 `state.pth` 冷启动；Adam 状态不在这两个文件中，
-重启会重新初始化 Adam。`--start-row 4` 从数据集第 4 行继续，`--steps` 指本次处理的批数。
+重启后可用导出的 `adapter.pth` 和 `state.pth` 冷启动，但 Adam 状态不在这两个文件中，会重新初始化；
+若发布时使用了 `checkpoint:true`，改用 `--resume <目录>` 即可连同 Adam 状态和 step 一起恢复。
+`--start-row 4` 从数据集第 4 行继续，`--steps` 指本次处理的批数。
 指标文件现在追加写入，不会覆盖已有记录；断线丢失的训练指标不作推测或补造。
 
 例如 `/health` 显示 `step=3`、`published_step=2`，可执行：
@@ -254,11 +399,11 @@ HTTP 连接没有数据传输。客户端 `--timeout` 默认 3600 秒，可按�
 ```bash
 curl -X POST http://127.0.0.1:8848/v1/publish \
   -H 'Content-Type: application/json' \
-  -d '{"expected_step":3,"save":true}'
+  -d '{"expected_step":3,"checkpoint":true}'
 ```
 
-务必将 `3` 换成实际查询到的步数。保存返回 `directory` 后，如需重启，将启动命令的
-`--adapter`、`--state` 指向该目录下的对应文件；没有导出 Adapter 则不传 `--adapter`。
+务必将 `3` 换成实际查询到的步数。保存返回 `directory` 后，如需重启，启动命令加 `--resume <directory>`
+（或只用 `save:true` 时，把 `--adapter`、`--state` 指向该目录下的对应文件，Adam 会重置）。
 确认已完成的数据行后，在原 Python 命令中加 `--start-row 4 --steps 7` 可从第 4 行再处理 7 批。
 这需要手动确认数据位置，不是自动恢复训练检查点。
 
@@ -292,5 +437,5 @@ python3 test/online_rl_http_test.py --build build \
   --state /tmp/miss-acceptance/initial.pth --work /tmp/online-http
 ```
 
-测试覆盖 Signed CE/temperature 与 FP64 softmax 对照、全长与跨 Chunk 梯度、早期 Masked 上下文梯度、正负梯度反转、Radix 分叉/LRU 随机对照、原 Batch Cache，以及 HTTP 多轮、并发、冻结 Actor、旧版本隔离、连续更新和导出重载。
+测试覆盖 Signed CE/temperature 与 FP64 softmax 对照、全长与跨 Chunk 梯度、早期 Masked 上下文梯度、正负梯度反转、Radix 分叉/LRU 随机对照、原 Batch Cache、合批解码与 batch=1 逐位一致、教师强制 logprob，以及 HTTP 多轮、并发、合批采样、字符串/Token 序列 stop、冻结 Actor、旧版本隔离、参考策略、连续更新、导出重载和 `--resume` 恢复。
 CUDA 实测记录见 [验证记录](online-rl-validation.zh-CN.md)。HIP 路径保留同一套源代码和构建依赖，此次未在 AMD 硬件验证。

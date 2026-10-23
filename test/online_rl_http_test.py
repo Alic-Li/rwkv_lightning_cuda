@@ -33,7 +33,7 @@ class API:
 
 
 @contextlib.contextmanager
-def server(args, mode, label, adapter=None, state=None):
+def server(args, mode, label, adapter=None, state=None, resume=None):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]
     log_path = args.work / (label + ".log")
@@ -43,6 +43,7 @@ def server(args, mode, label, adapter=None, state=None):
                "--output", str(args.work / label), "--cache-capacity", "8"]
     if adapter: command += ["--adapter", str(adapter)]
     if state: command += ["--state", str(state)]
+    if resume: command += ["--resume", str(resume)]
     with log_path.open("w") as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         api = API(f"http://127.0.0.1:{port}")
@@ -65,6 +66,7 @@ def server(args, mode, label, adapter=None, state=None):
 def acceptance(api):
     h = api.call("/health"); version = h["policy_version"]
     assert h["backbone_loads"] == 1 and h["dtype"] == "bfloat16"
+    assert h["reference_version"] == version
     def rollout(prompt, **kwargs):
         body = dict(prompts=[prompt], max_tokens=2, seed=42, stop_token_ids=[], policy_version=version)
         body.update(kwargs)
@@ -83,6 +85,29 @@ def acceptance(api):
     history = base + cached["completions"][0]["tokens"]
     inc = rollout(history + [106,107], max_tokens=0)
     assert inc["cached_prompt_tokens"] == len(history) and inc["prefill_tokens"] == 2
+    # Batched decode: a row's sample depends only on (seed, row index) and its
+    # prompt, and matches the batch=1 numerics exactly.
+    batch = rollout(base, use_cache=False, max_tokens=3,
+                    prompts=[base, base[:4], base[:6]], seed=7)
+    single = rollout(base, use_cache=False, max_tokens=3, seed=7)
+    assert batch["completions"][0]["tokens"] == single["completions"][0]["tokens"]
+    assert batch["completions"][0]["logprobs"] == single["completions"][0]["logprobs"]
+    # Stops end on the token that completes the match; that token is kept.
+    reference = cold["completions"][0]["tokens"]
+    sequence = rollout(base, use_cache=False, stop_token_sequences=[reference[:2]])
+    row = sequence["completions"][0]
+    assert row["tokens"] == reference[:2] and row["finish_reason"] == "stop"
+    assert row["matched_stop"] == reference[:2]
+    text = api.call("/v1/detokenize", {"tokens": reference[:2]})["text"]
+    if text:
+        row = rollout(base, use_cache=False, stop=[text])["completions"][0]
+        assert row["finish_reason"] == "stop" and row["matched_stop"] == text, row
+        assert row["tokens"] == reference[:len(row["tokens"])]
+    api.call("/v1/completions", dict(prompts=[base], stop=[""]), 400)
+    # Teacher-forced scores reproduce the sampled log probabilities.
+    scored = api.call("/v1/logprobs", dict(sequences=[base + reference], policy_version=version))
+    tail = scored["logprobs"][0][-len(reference):]
+    assert max(abs(x-y) for x,y in zip(tail, cold["completions"][0]["logprobs"])) < .01
     # Full batch validation occurs before GPU work or any optimizer mutation.
     api.call("/v1/completions", {"prompts": [[98], [-1]]}, 400)
     api.call("/v1/completions", {"prompts": [[98]], "temperature": 0}, 400)
@@ -133,9 +158,16 @@ def acceptance(api):
     request["policy_version"] = new_version
     next_step = api.call("/v1/train", request)
     assert next_step["step"] == 2
-    final = api.call("/v1/publish", {"expected_step": 2, "save": True})
-    rollout_body = dict(prompts=[base], max_tokens=2, seed=42, stop_token_ids=[], policy_version=version)
-    api.call("/v1/completions", rollout_body, 409)  # old version retired
+    final = api.call("/v1/publish", {"expected_step": 2, "checkpoint": True})
+    assert final["checkpoint"].endswith("training")
+    request["policy_version"] = final["policy_version"]
+    assert api.call("/v1/train", request)["step"] == 3
+    api.call("/v1/publish", {"expected_step": 3})
+    rollout_body = dict(prompts=[base], max_tokens=2, seed=42, stop_token_ids=[])
+    api.call("/v1/completions", dict(rollout_body, policy_version=new_version), 409)  # retired
+    # The startup policy stays available as the reference, e.g. for KL.
+    assert api.call("/v1/completions", dict(rollout_body, policy_version=version, use_cache=False)) \
+        ["completions"] == cold["completions"]
     print(json.dumps(dict(mode=h["mode"], first_loss=train["loss"], rollout_loss=score/selected,
                           grad_norm=train["grad_norm"], second_grad_norm=next_step["grad_norm"],
                           first_version=version, final=final), indent=2), flush=True)
@@ -190,6 +222,11 @@ def main():
         with server(args, mode, mode + "-reload", adapter if adapter.exists() else None, exported / "state.pth") as api:
             h = api.call("/health")
             assert h["step"] == 0  # a cold start starts new Adam moments
+            api.call("/v1/completions", dict(prompts=[[98,99]], max_tokens=1))
+        # --resume restores the optimizer state and step of the checkpoint.
+        with server(args, mode, mode + "-resume", resume=exported) as api:
+            h = api.call("/health")
+            assert h["step"] == 2 and h["published_step"] == 2, h
             api.call("/v1/completions", dict(prompts=[[98,99]], max_tokens=1))
     print("HTTP rollout/train/publish/cache/multi-turn/cold-start acceptance passed")
 
