@@ -2,6 +2,8 @@
 
 [English](run.md) | 简体中文 | [返回 README](../README_zh.md)
 
+在线训练使用独立的 [MiSS / State 在线 RL Server](online-rl.zh-CN.md)，其启动参数和 API 与下面的推理服务不同。
+
 ## 运行服务端
 
 ```bash

@@ -47,8 +47,14 @@ rwkv_lighting_cuda/
 ├── router.config.example.toml
 ├── rwkv_lighting_cuda
 ├── rwkv_miss_tune
+├── rwkv_miss_tune_server
 ├── rwkv_quantize
 ├── rwkv_state_tune
+├── rwkv_state_tune_server
+├── tools/online_rl.py
+├── docs/online-rl.md
+├── docs/online-rl.zh-CN.md
+├── docs/online-rl-validation.zh-CN.md
 └── rwkv_vocab_v20230424.txt
 ```
 
@@ -78,7 +84,7 @@ Windows 上将 `Get-FileHash <archive.zip> -Algorithm SHA256` 的结果与 `.sha
 ## CI 验证范围
 
 两个平台均运行路由器测试和 Go vet，编译全部 C++/CUDA 目标（包括 GPU 测试），并运行
-五组纯 CPU CTest：分词器、PTH 文件、量化文件、预填充准入和状态微调 API。
+七组纯 CPU CTest：分词器、PTH 文件、量化文件、预填充准入、状态微调 API、上传 State 存储和前缀缓存索引。
 若运行时依赖无法解析，打包失败；还会执行移动后各 C++ CLI 的 `--help` 进行冒烟检查。
 
 托管运行器没有 CUDA GPU。算子正确性、推理、GPU 状态微调和性能仍需在发布前使用 GPU
@@ -115,3 +121,5 @@ Windows 使用 MSVC 开发者 shell。先在启动器目录执行
 复制 `router.config.example.toml` 为 `router.config.toml`，修改监听地址和后端配置后，
 运行 `./rwkv_router -config router.config.toml`（Windows 使用 `./rwkv_router.exe`）。
 CI 使用 `CGO_ENABLED=0` 编译 router，并在打包前运行 `--help` 验证。
+
+两个在线 RL Server 同样参与依赖打包及迁移后的 `--help` 检查。启动命令、Python 闭环和断线恢复见 [在线 RL 指南](online-rl.zh-CN.md)。解压后运行时应显式传入 `--vocab ./rwkv_vocab_v20230424.txt`。

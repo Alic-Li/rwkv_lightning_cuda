@@ -54,8 +54,14 @@ rwkv_lighting_cuda/
 ├── router.config.example.toml
 ├── rwkv_lighting_cuda
 ├── rwkv_miss_tune
+├── rwkv_miss_tune_server
 ├── rwkv_quantize
 ├── rwkv_state_tune
+├── rwkv_state_tune_server
+├── tools/online_rl.py
+├── docs/online-rl.md
+├── docs/online-rl.zh-CN.md
+├── docs/online-rl-validation.zh-CN.md
 └── rwkv_vocab_v20230424.txt
 ```
 
@@ -89,8 +95,8 @@ file. Checksums detect corruption; they are not signatures.
 ## What CI verifies
 
 Both platforms run router tests and Go vet, compile all C++/CUDA targets (including
-GPU tests), and run five CPU-only CTest suites: tokenizer, PTH archive, quantized
-archive, prefill admission, and state-tuning API. Packaging fails on unresolved
+GPU tests), and run seven CPU-only CTest suites: tokenizer, PTH archive, quantized
+archive, prefill admission, state-tuning API, uploaded-state store, and prefix-cache index. Packaging fails on unresolved
 runtime dependencies and runs each relocated C++ CLI's `--help` as a smoke check.
 
 Hosted runners have no CUDA GPU. Kernel correctness, inference, GPU state tuning
@@ -137,3 +143,5 @@ Windows). Copy `router.config.example.toml` to `router.config.toml`, configure t
 listen address and backends, then run `./rwkv_router -config router.config.toml`
 (use `./rwkv_router.exe` on Windows). CI builds the router with `CGO_ENABLED=0`
 and smoke-tests `--help` before archiving the bundle.
+
+Both online RL servers participate in dependency packaging and relocated `--help` checks. See the [online RL guide](online-rl.md) for startup, the Python loop, and recovery. Pass `--vocab ./rwkv_vocab_v20230424.txt` when running them from an extracted archive.

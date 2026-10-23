@@ -2,6 +2,8 @@
 
 [English](run.md) | [简体中文](run.zh-CN.md) | [Back to README](../README.md)
 
+For online training, use the separate [MiSS / State online RL servers](online-rl.md); their startup flags and API differ from the inference server below.
+
 ## Run server
 
 ```bash

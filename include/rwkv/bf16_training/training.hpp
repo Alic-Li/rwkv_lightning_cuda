@@ -200,12 +200,15 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
 // rows). Rows whose target equals ignore_index add no loss and get zero
 // d_logits; the divisor stays rows, so callers normalising by a count of kept
 // tokens across chunks/samples pass rows / kept. gradient_scale is not loss
-// scaling. d_logits is BF16.
+// scaling. d_logits is BF16. Optional signed row_weights multiply CE and its
+// derivative (REINFORCE); temperature applies to logits and its chain rule.
 void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
                                          int vocab, const bf16 *logits,
                                          const int *targets, int ignore_index,
                                          float *loss, bf16 *d_logits,
-                                         float gradient_scale = 1.0f);
+                                         float gradient_scale = 1.0f,
+                                         const float *row_weights = nullptr,
+                                         float temperature = 1.0f);
 
 // Short-context model forward. input is the existing emb+ln0 BF16 table
 // result [B,T,C]. time_state is FP32 [L,H,K,V] and is broadcast across B.

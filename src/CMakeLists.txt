@@ -88,7 +88,8 @@ if(RWKV7_STATE_TUNING)
     list(APPEND BF16_GPU_SOURCES ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cu)
   endif()
   add_library(rwkv_bf16_training STATIC ${BF16_GPU_SOURCES}
-    bf16_training/model.cpp bf16_training/model_backward.cpp
+    bf16_training/model.cpp bf16_training/model_backward.cpp bf16_training/executor.cpp
+    bf16_training/trainer.cpp
     ${PROJECT_SOURCE_DIR}/cuda/rwkv7_statepassing_clampw.cpp bf16_training/format.cpp
     io/pth_archive.cpp io/pth_tensor.cpp io/pth_writer.cpp io/fingerprint.cpp
     inference/rwkv_tokenizer.cpp utils/tokenizer.cpp)
@@ -108,7 +109,7 @@ if(RWKV7_STATE_TUNING)
 endif()
 
 if(RWKV7_STATE_TUNING)
-  add_executable(rwkv_miss_tune bf16_training/main.cpp state_tuning/dataset.cpp bf16_training/trainer.cpp)
+  add_executable(rwkv_miss_tune bf16_training/main.cpp state_tuning/dataset.cpp)
   target_include_directories(rwkv_miss_tune PRIVATE state_tuning)
   target_link_libraries(rwkv_miss_tune PRIVATE rwkv_bf16_training)
   target_compile_definitions(rwkv_miss_tune PRIVATE RWKV_MISS_TUNE
@@ -159,4 +160,14 @@ if(Drogon_FOUND)
   )
 else()
   message(WARNING "Drogon not found. 'rwkv_lighting_cuda' target will not be built.")
+endif()
+
+if(RWKV7_STATE_TUNING AND Drogon_FOUND)
+  add_library(rwkv_online_rl STATIC online_rl/server.cpp)
+  target_link_libraries(rwkv_online_rl PUBLIC rwkv_bf16_training rwkv::backend Drogon::Drogon)
+  target_compile_definitions(rwkv_online_rl PRIVATE
+    RWKV_STATE_TUNE_DEFAULT_VOCAB="${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt")
+  rwkv_optimize_target(rwkv_online_rl)
+  add_subdirectory(miss_tune_server)
+  add_subdirectory(state_tune_server)
 endif()

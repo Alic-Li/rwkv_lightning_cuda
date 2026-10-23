@@ -18,6 +18,8 @@
 
 #include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 #include "rwkv/inference/text_stop_matcher.hpp"
+#include "rwkv/inference/prefix_cache.hpp"
+#include "rwkv/inference/utf8.hpp"
 
 namespace rwkv7_server {
 namespace {
@@ -98,100 +100,6 @@ ThinkPromptConfig think_prompt_config(ThinkType think_type) {
   return {"<think></think", "", false};
 }
 
-bool is_utf8_continuation(unsigned char byte) {
-  return (byte & 0xC0u) == 0x80u;
-}
-
-int utf8_sequence_length(unsigned char lead) {
-  if (lead <= 0x7Fu) {
-    return 1;
-  }
-  if (lead >= 0xC2u && lead <= 0xDFu) {
-    return 2;
-  }
-  if (lead >= 0xE0u && lead <= 0xEFu) {
-    return 3;
-  }
-  if (lead >= 0xF0u && lead <= 0xF4u) {
-    return 4;
-  }
-  return 0;
-}
-
-bool is_valid_utf8_sequence(const std::string& text, size_t pos, int len) {
-  const auto b0 = static_cast<unsigned char>(text[pos]);
-  switch (len) {
-    case 1:
-      return true;
-    case 2:
-      return is_utf8_continuation(static_cast<unsigned char>(text[pos + 1]));
-    case 3: {
-      const auto b1 = static_cast<unsigned char>(text[pos + 1]);
-      const auto b2 = static_cast<unsigned char>(text[pos + 2]);
-      if (!is_utf8_continuation(b1) || !is_utf8_continuation(b2)) {
-        return false;
-      }
-      if (b0 == 0xE0u && b1 < 0xA0u) {
-        return false;
-      }
-      if (b0 == 0xEDu && b1 >= 0xA0u) {
-        return false;
-      }
-      return true;
-    }
-    case 4: {
-      const auto b1 = static_cast<unsigned char>(text[pos + 1]);
-      const auto b2 = static_cast<unsigned char>(text[pos + 2]);
-      const auto b3 = static_cast<unsigned char>(text[pos + 3]);
-      if (!is_utf8_continuation(b1) || !is_utf8_continuation(b2) || !is_utf8_continuation(b3)) {
-        return false;
-      }
-      if (b0 == 0xF0u && b1 < 0x90u) {
-        return false;
-      }
-      if (b0 == 0xF4u && b1 > 0x8Fu) {
-        return false;
-      }
-      return true;
-    }
-    default:
-      return false;
-  }
-}
-
-std::string take_complete_utf8(std::string& pending, bool flush_all) {
-  std::string out;
-  size_t i = 0;
-  size_t last_copy = 0;
-  while (i < pending.size()) {
-    const auto lead = static_cast<unsigned char>(pending[i]);
-    const int len = utf8_sequence_length(lead);
-    if (len == 0) {
-      out.append(pending, last_copy, i - last_copy);
-      out += "\xEF\xBF\xBD";
-      ++i;
-      last_copy = i;
-      continue;
-    }
-    if (i + static_cast<size_t>(len) > pending.size()) {
-      break;
-    }
-    if (!is_valid_utf8_sequence(pending, i, len)) {
-      out.append(pending, last_copy, i - last_copy);
-      out += "\xEF\xBF\xBD";
-      ++i;
-      last_copy = i;
-      continue;
-    }
-    i += static_cast<size_t>(len);
-  }
-  out.append(pending, last_copy, i - last_copy);
-  pending.erase(0, i);
-  if (flush_all && !pending.empty()) {
-    pending.clear();
-  }
-  return out;
-}
 
 }  // namespace
 
@@ -280,28 +188,13 @@ void upload_prompt_state(const HostPromptState& host, GenerationState& gpu) {
 
 }  // namespace
 
-// Engine-local ownership isolates model lifetimes. Hashes only accelerate lookup;
-// a hit must also match every token and both state/adapter identities.
+// Shared radix index; existing CPU state/logits snapshots retain their format.
 struct InferenceEngine::PromptCache {
-  struct Entry {
-    std::vector<int64_t> tokens;
-    uint64_t hash = 0;
-    std::string state_id, adapter_id, initial_identity, adapter_identity;
-    HostPromptState state;
-    std::vector<float> logits;
-  };
-  explicit PromptCache(size_t limit) : capacity(limit) {}
+  struct Entry { HostPromptState state; std::vector<float> logits; };
+  explicit PromptCache(size_t limit) : capacity(limit), index(limit) {}
   size_t capacity;
   std::mutex mutex;
-  std::list<std::shared_ptr<Entry>> lru;
-
-  static std::vector<uint64_t> hashes(const std::vector<int64_t>& tokens) {
-    std::vector<uint64_t> out{14695981039346656037ULL};
-    for (auto token : tokens) {
-      out.push_back((out.back() ^ static_cast<uint64_t>(token)) * 1099511628211ULL);
-    }
-    return out;
-  }
+  PrefixCache<Entry> index;
 };
 
 void InferenceEngine::prefill_cached(
@@ -319,27 +212,17 @@ void InferenceEngine::prefill_cached(
   const size_t count = prompt_ids.size();
   std::vector<std::shared_ptr<PromptCache::Entry>> hits(count);
   std::vector<size_t> offsets(count, 0), order(count);
+  // Length-prefixed fields avoid ambiguous namespace concatenations.
+  std::string identity;
+  for (const auto &part : {state_id, adapter_id, initial_identity, adapter_identity,
+                           std::string(state.wkv32 ? "fp32" : "fp16")})
+    identity += std::to_string(part.size()) + ":" + part;
   for (size_t i = 0; i < count; ++i) {
-    const auto hashes = PromptCache::hashes(prompt_ids[i]);
     std::lock_guard<std::mutex> lock(cache.mutex);
-    auto best = cache.lru.end();
-    for (auto it = cache.lru.begin(); it != cache.lru.end(); ++it) {
-      const auto& e = **it;
-      const size_t n = e.tokens.size();
-      if (n > offsets[i] && n <= prompt_ids[i].size() &&
-          e.state_id == state_id && e.adapter_id == adapter_id && e.initial_identity == initial_identity &&
-          e.adapter_identity == adapter_identity && e.state.wkv32 == state.wkv32 &&
-          e.hash == hashes[n] &&
-          std::equal(e.tokens.begin(), e.tokens.end(), prompt_ids[i].begin())) {
-        best = it;
-        offsets[i] = n;
-      }
-    }
-    if (best != cache.lru.end()) {
-      hits[i] = *best;
-      cache.lru.splice(cache.lru.begin(), cache.lru, best);
-      stats.cached_prompt_tokens += static_cast<int>(offsets[i]);
-    }
+    auto hit = cache.index.find(identity, prompt_ids[i]);
+    hits[i] = hit.value;
+    offsets[i] = hit.length;
+    stats.cached_prompt_tokens += static_cast<int>(hit.length);
   }
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -380,25 +263,10 @@ void InferenceEngine::prefill_cached(
 
   // Snapshot before any sampling/decode can mutate the prompt state.
   for (size_t row = 0; row < count; ++row) {
-    const auto hash = PromptCache::hashes(prompt_ids[row]).back();
     std::lock_guard<std::mutex> lock(cache.mutex);
-    auto existing = std::find_if(cache.lru.begin(), cache.lru.end(), [&](const auto& e) {
-      return e->hash == hash && e->tokens == prompt_ids[row] &&
-          e->state_id == state_id && e->adapter_id == adapter_id && e->initial_identity == initial_identity &&
-          e->adapter_identity == adapter_identity && e->state.wkv32 == state.wkv32;
-    });
-    if (existing != cache.lru.end()) {
-      cache.lru.splice(cache.lru.begin(), cache.lru, existing);
+    if (cache.index.find(identity, prompt_ids[row]).length == prompt_ids[row].size())
       continue;
-    }
-    while (cache.lru.size() >= cache.capacity) cache.lru.pop_back();
     auto entry = std::make_shared<PromptCache::Entry>();
-    entry->tokens = prompt_ids[row];
-    entry->hash = hash;
-    entry->state_id = state_id;
-    entry->adapter_id = adapter_id;
-    entry->initial_identity = initial_identity;
-    entry->adapter_identity = adapter_identity;
     model_->copy_state_slice(state, static_cast<int>(row), staging, 0, 1);
     entry->state = download_prompt_state(staging);
     entry->logits.resize(logits.vocab_size);
@@ -406,7 +274,7 @@ void InferenceEngine::prefill_cached(
         cudaMemcpy(entry->logits.data(), logits.values.p + row * logits.vocab_size,
                    entry->logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
         "download prompt cache logits");
-    cache.lru.push_front(std::move(entry));
+    cache.index.put(identity, prompt_ids[row], std::move(entry));
   }
 }
 

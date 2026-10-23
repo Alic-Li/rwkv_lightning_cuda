@@ -17,9 +17,12 @@ TRIPLET = "x64-windows" if WINDOWS else "x64-linux"
 ARCHS = os.environ.get("CUDA_ARCHITECTURES", "75;80;86;87;89;90;100;120")
 CPU_TESTS = (
     "tokenizer", "pth_archive", "quantized_archive", "prefill_admission",
-    "state_tuning_api", "uploaded_state_store",
+    "state_tuning_api", "uploaded_state_store", "prefix_cache_index",
 )
-BINARIES = ("rwkv_lighting_cuda", "rwkv_quantize", "rwkv_state_tune", "rwkv_miss_tune")
+BINARIES = (
+    "rwkv_lighting_cuda", "rwkv_quantize", "rwkv_state_tune", "rwkv_miss_tune",
+    "rwkv_miss_tune_server", "rwkv_state_tune_server",
+)
 
 
 def run(*args, cwd=ROOT, env=None):
@@ -127,6 +130,11 @@ def main():
                  bundle / "router.config.example.toml")
     shutil.copytree(ROOT / "RWKV_Lightning_CUDA_Launcher/dist", bundle / "dist")
     shutil.copy2(ROOT / "assets/rwkv_vocab_v20230424.txt", bundle)
+    (bundle / "tools").mkdir(exist_ok=True)
+    shutil.copy2(ROOT / "tools/online_rl.py", bundle / "tools")
+    (bundle / "docs").mkdir(exist_ok=True)
+    for guide in ("online-rl.md", "online-rl.zh-CN.md", "online-rl-validation.zh-CN.md"):
+        shutil.copy2(ROOT / "docs" / guide, bundle / "docs")
     # Check relocated CLIs with a clean library path, without loading a model.
     smoke_env = os.environ.copy()
     smoke_env.pop("LD_LIBRARY_PATH", None)

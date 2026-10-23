@@ -1,6 +1,8 @@
 #include "rwkv/bf16_training/trainer.hpp"
 #include "rwkv/io/pth_tensor.hpp"
+#include "rwkv/runtime/rwkv_adapter.hpp"
 #include "rwkv/io/pth_writer.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -80,21 +82,64 @@ void Trainer::bind_tapes(
   for (const auto &t : targets_)
     tapes[t.layer].miss_reduced[t.target] = reduced_[t.layer][t.target].p;
 }
-void Trainer::update(float lr, uint64_t step) {
+double Trainer::update(float lr, uint64_t step) {
   // Check the whole accumulated gradient before touching any optimizer tensor.
   std::vector<float> g(gradient_.n);
   check(cudaMemcpyAsync(g.data(), gradient_.p, g.size() * 4,
                         cudaMemcpyDeviceToHost, stream_));
   check(cudaStreamSynchronize(stream_));
-  for (float x : g)
+  double norm = 0;
+  for (float x : g) {
+    norm += double(x)*x;
     if (!std::isfinite(x) || std::abs(x) > 1e18f)
       throw std::runtime_error(
           "nonfinite/overflow MiSS gradient; optimizer not executed");
+  }
   rwkv_bf16_training::AdamConfig adam;
   adam.learning_rate = lr;
   rwkv_bf16_training::adam_update_state_f32(
       stream_, master_.p, gradient_.p, m_.p, v_.p, master_.n, step, adam, true);
   cast_master(stream_, master_.p, forward_.p, master_.n);
+  return std::sqrt(norm);
+}
+void Trainer::zero_gradient() {
+  check(cudaMemsetAsync(gradient_.p, 0, gradient_.n * 4, stream_));
+}
+void Trainer::load_adapter(const rwkv7_miss::Package &package) {
+  if (package.base != config_["base_fingerprint"].asString() ||
+      package.manifest["rank"].asInt() != rank_ ||
+      package.scale != alpha_ / rank_ || package.tensors.size() != targets_.size())
+    throw std::invalid_argument("cold adapter base/rank/scale/targets mismatch");
+  std::vector<float> values(master_.n);
+  for (const auto &t : targets_) {
+    auto it = std::find_if(package.tensors.begin(), package.tensors.end(), [&](const auto &p) {
+      return t.layer == p.layer && t.target == p.target;
+    });
+    if (it == package.tensors.end() || it->in != t.in || it->out != t.out || it->rank != t.rank)
+      throw std::invalid_argument("cold adapter tensor mismatch");
+    for (size_t j=0;j<size_t(t.out)*t.rank;++j) {
+      auto bits = package.data.at(it->offset+j);
+      values[t.offset+j] = package.manifest["dtype"] == "bfloat16"
+          ? llm_infer::bf16_bits_to_float(bits) : llm_infer::f16_bits_to_float(bits);
+    }
+  }
+  check(cudaMemcpyAsync(master_.p,values.data(),values.size()*4,cudaMemcpyHostToDevice,stream_));
+  for (auto *p : {gradient_.p,m_.p,v_.p}) check(cudaMemsetAsync(p,0,master_.n*4,stream_));
+  cast_master(stream_,master_.p,forward_.p,master_.n);
+  check(cudaStreamSynchronize(stream_));
+}
+rwkv_bf16_training::DeviceBuffer<bf16>
+Trainer::snapshot(rwkv_bf16_training::FrozenModelView &model) const {
+  rwkv_bf16_training::DeviceBuffer<bf16> result;
+  result.resize(forward_.n,"actor BF16 adapter snapshot");
+  check(cudaMemcpyAsync(result.p,forward_.p,forward_.n*2,cudaMemcpyDeviceToDevice,stream_));
+  for (const auto &t : targets_) {
+    auto &linear=model.blocks[t.layer].miss[t.target];
+    linear.d=result.p+t.offset;
+    linear.gradient=nullptr;
+  }
+  check(cudaStreamSynchronize(stream_));
+  return result;
 }
 void Trainer::checkpoint(const std::string &dir, uint64_t step, int epoch,
                          uint64_t row, const float *initial, size_t states) {

@@ -27,6 +27,8 @@ state tuning, a multi-backend Go router, and a Go desktop launcher with a Web UI
 
 Both training binaries use the independent [BF16 training backbone](src/bf16_training/README.md), with streamed base loading, native state passing and BF16 exports. Inference keeps its existing FP16/quantized paths.
 
+The standalone `rwkv_miss_tune_server` and `rwkv_state_tune_server` add persistent BF16 online RL: batch rollouts, signed-advantage train steps, versioned actor snapshots, and shared prefix caching. See the [online RL guide](docs/online-rl.md).
+
 ## Quick Start
 
 ```bash

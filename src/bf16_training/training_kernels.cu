@@ -49,32 +49,34 @@ __device__ float block_reduce(float value, float *scratch, bool maximum) {
 __global__ void xent_kernel(int vocab, const bf16 *__restrict__ logits,
                             const int *__restrict__ targets, int ignore_index,
                             float scale, float *__restrict__ loss,
-                            bf16 *__restrict__ d_logits) {
+                            bf16 *__restrict__ d_logits,
+                            const float *row_weights, float temperature) {
   const int row = blockIdx.x;
   const int target = targets[row];
+  scale *= row_weights ? row_weights[row] : 1.0f;
   const long long base = static_cast<long long>(row) * vocab;
   __shared__ float scratch[8];
   float local_max = -FLT_MAX;
   for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
-    local_max = fmaxf(local_max, to_float(logits[base + token]));
+    local_max = fmaxf(local_max, (to_float(logits[base + token]) / temperature));
   }
   const float max_logit = block_reduce(local_max, scratch, true);
   float local_sum = 0.0f;
   for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
-    local_sum += expf(to_float(logits[base + token]) - max_logit);
+    local_sum += expf((to_float(logits[base + token]) / temperature) - max_logit);
   }
   const float sum = block_reduce(local_sum, scratch, false);
-  const bool ignored = target == ignore_index;
+  const bool ignored = target == ignore_index || scale == 0.0f;
   for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
     const float probability =
-        expf(to_float(logits[base + token]) - max_logit) / sum;
+        expf((to_float(logits[base + token]) / temperature) - max_logit) / sum;
     const float gradient =
         ignored ? 0.0f
-                : (probability - (token == target ? 1.0f : 0.0f)) * scale;
+                : (probability - (token == target ? 1.0f : 0.0f)) * scale / temperature;
     d_logits[base + token] = to_bf16(gradient);
   }
   if (threadIdx.x == 0 && !ignored) {
-    atomicAdd(loss, (logf(sum) + max_logit - to_float(logits[base + target])) *
+    atomicAdd(loss, (logf(sum) + max_logit - to_float(logits[base + target]) / temperature) *
                         scale);
   }
 }
@@ -199,9 +201,12 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
                                          int vocab, const bf16 *logits,
                                          const int *targets, int ignore_index,
                                          float *loss, bf16 *d_logits,
-                                         float gradient_scale) {
+                                         float gradient_scale,
+                                         const float *row_weights,
+                                         float temperature) {
   if (rows <= 0 || vocab <= 0 || !logits || !targets || !loss || !d_logits ||
-      !std::isfinite(gradient_scale) || gradient_scale <= 0) {
+      !std::isfinite(gradient_scale) || gradient_scale <= 0 ||
+      !std::isfinite(temperature) || temperature <= 0) {
     throw std::invalid_argument("invalid cross entropy arguments");
   }
   const cudaError_t error = cudaMemsetAsync(loss, 0, sizeof(float), stream);
@@ -209,7 +214,7 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
     throw std::runtime_error(cudaGetErrorString(error));
   xent_kernel<<<rows, kThreads, 0, stream>>>(
       vocab, logits, targets, ignore_index, gradient_scale / rows, loss,
-      d_logits);
+      d_logits, row_weights, temperature);
 }
 
 void reduce_state_gradient_f32(cudaStream_t stream, int batch, int heads,

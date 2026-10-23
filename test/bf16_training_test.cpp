@@ -249,6 +249,28 @@ int main() {
     for (int i = 64; i < 128; ++i)
       near(to_float(masked[i]), 0.0, 0.0, "masked row gradient");
     near(download(loss)[0], std::log(64.0), 1e-5, "masked mean loss");
+    // Signed advantages and temperature: compare the existing CE kernel to
+    // an independent FP64 softmax, including a zero-weight masked row.
+    std::vector<bf16> signed_logits(3*64);
+    for(int i=0;i<3*64;++i) signed_logits[i]=to_bf16(.03f*(i%64)-.5f);
+    upload(masked_logits,signed_logits);upload(masked_labels,std::vector<int>{3,7,11});
+    masked_dlogits.resize(3*64,"signed dlogits");
+    DeviceBuffer<float> row_weights;upload(row_weights,std::vector<float>{1.5f,-2.f,0.f});
+    cross_entropy_forward_backward_bf16(nullptr,3,64,masked_logits.p,masked_labels.p,
+        -1,loss.p,masked_dlogits.p,1.0f,row_weights.p,.7f);
+    auto signed_grad=download(masked_dlogits);double expected_loss=0;
+    for(int row=0;row<3;++row) {
+      double sum=0;for(int i=0;i<64;++i) sum+=std::exp(to_float(signed_logits[row*64+i])/.7);
+      const int target=std::array<int,3>{3,7,11}[row];
+      double weight=std::array<double,3>{1.5,-2,0}[row]/3;
+      expected_loss+=weight*(std::log(sum)-to_float(signed_logits[row*64+target])/.7);
+      for(int i=0;i<64;++i) {
+        double p=std::exp(to_float(signed_logits[row*64+i])/.7)/sum;
+        double g=weight*(p-(i==target))/.7;
+        near(to_float(signed_grad[row*64+i]),g,1e-6+std::abs(g)*.004,"signed temperature CE gradient");
+      }
+    }
+    near(download(loss)[0],expected_loss,2e-6,"signed CE loss");
     std::cout << "Native BF16 WKV finite differences, chunk adjoint, LN, "
                  "long-batch and masked CE passed\n";
     return 0;

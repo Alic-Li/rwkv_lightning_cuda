@@ -1,0 +1,5 @@
+add_executable(rwkv_miss_tune_server main.cpp)
+target_link_libraries(rwkv_miss_tune_server PRIVATE rwkv_online_rl)
+rwkv_optimize_target(rwkv_miss_tune_server)
+rwkv_configure_runtime_bundle(rwkv_miss_tune_server
+  ASSETS ${PROJECT_SOURCE_DIR}/assets/rwkv_vocab_v20230424.txt)

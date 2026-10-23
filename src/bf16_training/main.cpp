@@ -3,6 +3,7 @@
 #include "rwkv/bf16_training/trainer.hpp"
 #endif
 #include "rwkv/bf16_training/model.hpp"
+#include "rwkv/bf16_training/executor.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
 #include "rwkv/bf16_training/training.hpp"
 
@@ -24,10 +25,7 @@
 
 namespace {
 
-using rwkv_bf16_training::BlockBackwardState;
-using rwkv_bf16_training::BlockTapeView;
 using rwkv_bf16_training::DeviceBuffer;
-using rwkv_bf16_training::FrozenBlockWeights;
 
 // Target i of a sample predicts tokens[i + 1]; train[i + 1] says whether it
 // contributes to the loss. Untrained prefixes still run forward and backward
@@ -36,8 +34,6 @@ struct Sample {
   std::vector<int> tokens;
   std::vector<unsigned char> train;
 };
-
-constexpr int kIgnoredTarget = -1;
 
 struct Options {
 #ifdef RWKV_MISS_TUNE
@@ -234,75 +230,6 @@ struct Stream {
   }
 };
 
-struct OwnedTape {
-  DeviceBuffer<bf16> x, ln1, r, raw_w, k, v_base, v, alpha, neg_kk, wkv_k, kka,
-      w1_tanh, g1_sigmoid, v_gate, wkv_y, att_group_norm, att_gate, x_after_att,
-      ln2, ffn_hid;
-  DeviceBuffer<float> wkv_initial;
-  BlockTapeView view;
-
-  void allocate(int time, const FrozenBlockWeights &w, bf16 *v_first,
-                float *shared_tape, float *shared_final) {
-    const std::size_t row = static_cast<std::size_t>(time) * w.channels;
-    auto alloc = [row](DeviceBuffer<bf16> &buffer, const char *name) {
-      buffer.resize(row, name);
-    };
-    alloc(x, "tune tape x");
-    alloc(ln1, "tune tape ln1");
-    alloc(r, "tune tape r");
-    alloc(raw_w, "tune tape raw_w");
-    alloc(k, "tune tape k");
-    alloc(v_base, "tune tape v_base");
-    alloc(v, "tune tape v");
-    alloc(alpha, "tune tape alpha");
-    alloc(neg_kk, "tune tape neg_kk");
-    alloc(wkv_k, "tune tape wkv_k");
-    alloc(kka, "tune tape kka");
-    w1_tanh.resize(static_cast<std::size_t>(time) * w.rank_w,
-                   "tune tape w1 tanh");
-    g1_sigmoid.resize(static_cast<std::size_t>(time) * w.rank_g,
-                      "tune tape g1 sigmoid");
-    if (w.rank_v > 0)
-      alloc(v_gate, "tune tape v gate");
-    alloc(wkv_y, "tune tape wkv y");
-    alloc(att_group_norm, "tune tape att group norm");
-    alloc(att_gate, "tune tape att gate");
-    alloc(x_after_att, "tune tape x after att");
-    alloc(ln2, "tune tape ln2");
-    ffn_hid.resize(static_cast<std::size_t>(time) * w.ffn, "tune tape ffn hid");
-    const rwkv_bf16_training::WkvShape shape{1, time, w.heads, 64};
-    const auto tape_elements = rwkv_bf16_training::wkv_tape_elements(shape);
-    wkv_initial.resize(static_cast<std::size_t>(w.heads) * 64 * 64,
-                       "tune WKV replay initial");
-    view.wkv_replay_initial = wkv_initial.p;
-    view.wkv_replay_final = shared_final;
-    view.batch = 1;
-    view.time = time;
-    view.x = x.p;
-    view.ln1 = ln1.p;
-    view.r = r.p;
-    view.raw_w = raw_w.p;
-    view.k = k.p;
-    view.v_base = v_base.p;
-    view.v_first = v_first;
-    view.v = v.p;
-    view.alpha = alpha.p;
-    view.neg_kk = neg_kk.p;
-    view.wkv_k = wkv_k.p;
-    view.kka = kka.p;
-    view.w1_tanh = w1_tanh.p;
-    view.g1_sigmoid = g1_sigmoid.p;
-    view.v_gate = v_gate.p;
-    view.wkv_y = wkv_y.p;
-    view.att_group_norm = att_group_norm.p;
-    view.att_gate = att_gate.p;
-    view.x_after_att = x_after_att.p;
-    view.ln2 = ln2.p;
-    view.ffn_hid = ffn_hid.p;
-    view.wkv = {shared_tape, tape_elements};
-  }
-};
-
 float learning_rate(const Options &o, std::uint64_t next_step,
                     std::uint64_t planned_steps) {
   if (o.warmup_steps && next_step <= o.warmup_steps)
@@ -360,7 +287,6 @@ int main(int argc, char **argv) {
     const int N = C / H;
     if (N != 64)
       throw std::runtime_error("state tuning currently requires head size 64");
-    const std::size_t R = static_cast<std::size_t>(max_time) * C;
     const std::size_t state_lane = static_cast<std::size_t>(H) * N * N;
 
     Stream stream;
@@ -389,124 +315,28 @@ int main(int argc, char **argv) {
                                  options.targets, max_time, config,
                                  stream.value);
 #endif
-    DeviceBuffer<bf16> input, activation_ping, activation_pong, final_norm,
-        logits, d_logits, grad_ping, grad_pong, shifts, shift_grad, v_first,
-        v_first_grad, block_workspace;
-    DeviceBuffer<int> targets;
-    DeviceBuffer<float> time_state, state_gradient, adam_m, adam_v,
-        per_batch_state_gradient, state_batch, state_final, loss;
-    input.resize(R, "tune input");
-    activation_ping.resize(R, "tune activation ping");
-    activation_pong.resize(R, "tune activation pong");
-    final_norm.resize(R, "tune final norm");
-    logits.resize(static_cast<std::size_t>(max_time) * V, "tune logits");
-    d_logits.resize(static_cast<std::size_t>(max_time) * V, "tune dlogits");
-    grad_ping.resize(R, "tune grad ping");
-    grad_pong.resize(R, "tune grad pong");
-    shifts.resize(static_cast<std::size_t>(L) * 2 * C, "tune shifts");
-    shift_grad.resize(static_cast<std::size_t>(L) * 2 * C,
-                      "tune shift gradients");
-    v_first.resize(R, "tune v_first");
-    v_first_grad.resize(R, "tune v_first gradient");
-    targets.resize(max_time, "tune targets");
     const std::size_t state_count = static_cast<std::size_t>(L) * state_lane;
+    DeviceBuffer<float> time_state, state_gradient, adam_m, adam_v;
     time_state.resize(state_count, "tune time_state");
     state_gradient.resize(state_count, "tune dState");
+    time_state.zero("zero tune time_state");
 #ifndef RWKV_MISS_TUNE
     adam_m.resize(state_count, "tune Adam m");
-    if (options.optimizer == "adam")
-      adam_v.resize(state_count, "tune Adam v");
-#endif
-    per_batch_state_gradient.resize(state_count, "tune per-batch dState");
-    state_batch.resize(state_lane, "tune expanded state");
-    state_final.resize(state_lane, "tune final state");
-    loss.resize(1, "tune loss");
-    time_state.zero("zero tune time_state");
-    state_gradient.zero("zero tune dState");
-#ifndef RWKV_MISS_TUNE
     adam_m.zero("zero tune Adam m");
-    if (options.optimizer == "adam")
+    if (options.optimizer == "adam") {
+      adam_v.resize(state_count, "tune Adam v");
       adam_v.zero("zero tune Adam v");
-#endif
-#ifdef RWKV_MISS_TUNE
-    if (!options.state.empty()) {
-      auto initial = model.load_state(options.state);
-      // Backend created in FP32 state mode for MiSS.
-      check(cudaMemcpyAsync(time_state.p, initial.p,
-                            state_count * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream.value),
-            "load MiSS initial state");
-      check(cudaStreamSynchronize(stream.value), "initial state ready");
     }
+#else
+    if (!options.state.empty()) time_state = model.load_state(options.state);
 #endif
-    std::cout << "Optimizer: " << options.optimizer << '\n';
-
-    DeviceBuffer<float> shared_wkv_tape, shared_wkv_final;
-    shared_wkv_tape.resize(
-        rwkv_bf16_training::wkv_tape_elements({1, max_time, H, N}),
-        "shared WKV tape");
-    shared_wkv_final.resize(state_lane, "shared WKV replay final");
-    std::cout << "WKV tape: shared across layers (recompute)\n";
-    std::vector<OwnedTape> owned(static_cast<std::size_t>(L));
-    std::vector<BlockTapeView> tapes(static_cast<std::size_t>(L));
-    std::vector<BlockBackwardState> backward(static_cast<std::size_t>(L));
-    std::size_t workspace_count = 0;
-    for (int layer = 0; layer < L; ++layer) {
-      owned[static_cast<std::size_t>(layer)].allocate(
-          max_time, frozen.blocks[static_cast<std::size_t>(layer)], v_first.p,
-          shared_wkv_tape.p, shared_wkv_final.p);
-      tapes[static_cast<std::size_t>(layer)] =
-          owned[static_cast<std::size_t>(layer)].view;
-      workspace_count = std::max(
-          workspace_count,
-          rwkv_bf16_training::block_forward_workspace_bf16_elements(
-              1, max_time, frozen.blocks[static_cast<std::size_t>(layer)]));
-      workspace_count = std::max(
-          workspace_count,
-          rwkv_bf16_training::block_backward_workspace_bf16_elements(
-              1, max_time, frozen.blocks[static_cast<std::size_t>(layer)]));
-      backward[static_cast<std::size_t>(layer)] = {
-          nullptr,
-          per_batch_state_gradient.p +
-              static_cast<std::size_t>(layer) * state_lane,
-          shift_grad.p + static_cast<std::size_t>(layer) * 2 * C,
-          shift_grad.p + static_cast<std::size_t>(layer) * 2 * C + C,
-          v_first_grad.p};
-    }
+    rwkv_bf16_training::Executor executor(frozen, max_time, stream.value);
 #ifdef RWKV_MISS_TUNE
-    miss.bind_tapes(tapes);
+    miss.bind_tapes(executor.tapes());
 #endif
-    block_workspace.resize(workspace_count, "tune block workspace");
+    std::cout << "Optimizer: " << options.optimizer << '\n'
+              << "WKV tape: shared across layers (recompute)\n";
     std::filesystem::create_directories(options.output);
-
-    // Only chunk boundary recurrent states persist; all activation tapes are
-    // overwritten and recomputed when traversing chunks in reverse.
-    const std::size_t shift_count = static_cast<std::size_t>(L) * 2 * C;
-    DeviceBuffer<float> carried;
-    DeviceBuffer<bf16> terminal_shift;
-    carried.resize(state_count, "carried WKV state");
-    terminal_shift.resize(shift_count, "terminal shift gradient");
-    const int max_chunks = 1 + (options.ctx - 1) / max_time;
-    std::vector<DeviceBuffer<float>> checkpoints(max_chunks);
-    std::vector<DeviceBuffer<bf16>> shift_checkpoints(max_chunks);
-    for (int j = 0; j < max_chunks; ++j) {
-      checkpoints[j].resize(state_count, "WKV boundary checkpoint");
-      shift_checkpoints[j].resize(shift_count, "shift boundary checkpoint");
-    }
-    auto copy_device = [&](void *to, const void *from, std::size_t bytes) {
-      check(cudaMemcpyAsync(to, from, bytes, cudaMemcpyDeviceToDevice,
-                            stream.value),
-            "copy chunk boundary");
-    };
-    auto zero_device = [&](void *to, std::size_t bytes) {
-      check(cudaMemsetAsync(to, 0, bytes, stream.value),
-            "clear chunk gradient");
-    };
-    for (int l = 0; l < L; ++l) {
-      backward[l].final_state_grad = state_gradient.p + l * state_lane;
-      backward[l].final_att_shift_grad = terminal_shift.p + l * 2 * C;
-      backward[l].final_ffn_shift_grad = terminal_shift.p + l * 2 * C + C;
-    }
 
     std::uint64_t global_step = 0;
     std::size_t skipped = 0;
@@ -585,91 +415,11 @@ int main(int argc, char **argv) {
 #endif
         float batch_loss = 0.0f;
         for (const auto &sample : batch) {
-          const auto &tokens = sample.tokens;
-          const int length = static_cast<int>(tokens.size()) - 1;
-          const int chunks = 1 + (length - 1) / max_time;
-          copy_device(carried.p, time_state.p, state_count * sizeof(float));
-          zero_device(shifts.p, shift_count * sizeof(bf16));
-          std::vector<std::uint16_t> host_input;
-          std::vector<int> host_targets;
-          auto forward_chunk = [&](int j) -> const bf16 * {
-            const int offset = j * max_time;
-            const int T = std::min(max_time, length - offset);
-            host_input.resize(static_cast<std::size_t>(T) * C);
-            host_targets.resize(T);
-            for (int t = 0; t < T; ++t) {
-              const int token = tokens[offset + t];
-              const int target = tokens[offset + t + 1];
-              if (token < 0 || token >= V || target < 0 || target >= V)
-                throw std::runtime_error("out-of-range token or target");
-              const auto *source =
-                  frozen.cpu_emb_ln0_bf16 + static_cast<std::size_t>(token) * C;
-              std::copy(source, source + C,
-                        host_input.data() + static_cast<std::size_t>(t) * C);
-              host_targets[t] =
-                  sample.train[offset + t + 1] ? target : kIgnoredTarget;
-            }
-            check(cudaMemcpyAsync(input.p, host_input.data(),
-                                  host_input.size() * sizeof(std::uint16_t),
-                                  cudaMemcpyHostToDevice, stream.value),
-                  "copy input");
-            check(cudaMemcpyAsync(targets.p, host_targets.data(),
-                                  host_targets.size() * sizeof(int),
-                                  cudaMemcpyHostToDevice, stream.value),
-                  "copy targets");
-            for (auto &tape : tapes)
-              tape.time = T;
-            return rwkv_bf16_training::model_forward_state_tuning_bf16(
-                stream.value, L, 1, T, frozen.blocks.data(), tapes.data(),
-                input.p, time_state.p, shifts.p, frozen.ln_out_weight,
-                frozen.ln_out_bias, frozen.head_weight_orig, V,
-                activation_ping.p, activation_pong.p, state_batch.p,
-                state_final.p, block_workspace.p, block_workspace.n,
-                final_norm.p, logits.p, carried.p);
-          };
-          for (int j = 0; j < chunks; ++j) {
-            copy_device(checkpoints[j].p, carried.p,
-                        state_count * sizeof(float));
-            copy_device(shift_checkpoints[j].p, shifts.p,
-                        shift_count * sizeof(bf16));
-            if (j + 1 < chunks) {
-              forward_chunk(j);
-              check(cudaStreamSynchronize(stream.value), "checkpoint forward");
-            }
-          }
-          zero_device(state_gradient.p, state_count * sizeof(float));
-          zero_device(terminal_shift.p, shift_count * sizeof(bf16));
-          for (int j = chunks - 1; j >= 0; --j) {
-            copy_device(carried.p, checkpoints[j].p,
-                        state_count * sizeof(float));
-            copy_device(shifts.p, shift_checkpoints[j].p,
-                        shift_count * sizeof(bf16));
-            const bf16 *final_block = forward_chunk(j);
-            const int T = std::min(max_time, length - j * max_time);
-            rwkv_bf16_training::cross_entropy_forward_backward_bf16(
-                stream.value, T, V, logits.p, targets.p, kIgnoredTarget, loss.p,
-                d_logits.p, static_cast<float>(T) / batch_tokens);
-            rwkv_bf16_training::model_output_backward_state_only(
-                stream.value, L, 1, T, frozen.blocks.data(), tapes.data(),
-                backward.data(), final_block, frozen.ln_out_weight,
-                frozen.head_weight_orig, V, d_logits.p, grad_ping.p,
-                grad_pong.p, block_workspace.p, block_workspace.n);
-            copy_device(state_gradient.p, per_batch_state_gradient.p,
-                        state_count * sizeof(float));
-            copy_device(terminal_shift.p, shift_grad.p,
-                        shift_count * sizeof(bf16));
-            float chunk_loss;
-            check(cudaMemcpyAsync(&chunk_loss, loss.p, sizeof(float),
-                                  cudaMemcpyDeviceToHost, stream.value),
-                  "copy chunk loss");
-            check(cudaStreamSynchronize(stream.value), "chunk backward");
-            if (!std::isfinite(chunk_loss))
-              throw std::runtime_error(
-                  "nonfinite loss before optimizer; state not updated");
-            batch_loss += chunk_loss;
-          }
+          std::vector<float> weights(sample.train.begin(), sample.train.end());
+          batch_loss += executor.backward(frozen, sample.tokens, weights,
+                                           time_state.p, batch_tokens);
 #ifndef RWKV_MISS_TUNE
-          check(cudaMemcpyAsync(host_gradient.data(), state_gradient.p,
+          check(cudaMemcpyAsync(host_gradient.data(), executor.state_gradient(),
                                 state_count * sizeof(float),
                                 cudaMemcpyDeviceToHost, stream.value),
                 "validate initial state gradient");

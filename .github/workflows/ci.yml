@@ -198,7 +198,9 @@ jobs:
           restore-keys: |
             vcpkg-${{ matrix.os }}-2025.06.13-${{ hashFiles('tools/ci/vcpkg.json') }}-
             vcpkg-${{ matrix.os }}-2025.06.13-${{ hashFiles('tools/ci/vcpkg.json') }}
-      - name: Build, test and package
+      # Includes both online RL servers, runtime dependencies, guides and client;
+      # relocated --help checks run without a GPU or model on hosted runners.
+      - name: Build, test and package CLIs and online RL servers
         run: python tools/ci/build_release.py
       - name: Save C++ dependencies
         if: >-

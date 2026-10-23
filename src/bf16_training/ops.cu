@@ -5,6 +5,7 @@
 #else
 #include <cublas_v2.h>
 #endif
+#include <algorithm>
 #include <cmath>
 namespace rwkv_bf16_training {
 namespace {
@@ -101,8 +102,9 @@ __global__ void post(int H, const bf16 *x, const bf16 *r, const bf16 *k,
       to_bf16((d * inv * to_float(w[c]) + to_float(b[c]) + q * to_float(v[i])) *
               to_float(g[i]));
 }
-void gemm(cudaStream_t st, int M, int K, int N, const bf16 *x, const bf16 *w,
-          bf16 *y, bool orig) {
+thread_local bool consistent_forward = false;
+void gemm_raw(cudaStream_t st, int M, int K, int N, const bf16 *x,
+              const bf16 *w, bf16 *y, bool orig) {
   float a = 1, b = 0;
 #ifdef RWKV_USE_HIP
   struct Handle {
@@ -132,15 +134,51 @@ void gemm(cudaStream_t st, int M, int K, int N, const bf16 *x, const bf16 *w,
   };
   static thread_local Handle h;
   cublasSetStream(h.h, st);
-  auto e = cublasGemmEx(h.h, orig ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, N,
-                        M, K, &a, w, CUDA_R_16BF, orig ? K : N, x, CUDA_R_16BF,
-                        K, &b, y, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  auto e = cublasGemmEx(
+      h.h, orig ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &a, w,
+      CUDA_R_16BF, orig ? K : N, x, CUDA_R_16BF, K, &b, y, CUDA_R_16BF, N,
+      consistent_forward ? CUBLAS_COMPUTE_32F_PEDANTIC : CUBLAS_COMPUTE_32F,
+      consistent_forward ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   if (e != CUBLAS_STATUS_SUCCESS)
     throw std::runtime_error("BF16 cublasGemmEx");
 #endif
 }
+// Online RL needs the same numerical policy for prefill, cached suffixes,
+// decode and teacher forcing. Fixed row tiles and strict FP32 accumulation
+// avoid shape-dependent reduced-precision sums. Only GEMMs are padded; WKV
+// still sees the true sequence length. CLI behavior remains unchanged.
+void gemm(cudaStream_t st, int M, int K, int N, const bf16 *x, const bf16 *w,
+          bf16 *y, bool orig) {
+  if (!consistent_forward) {
+    gemm_raw(st, M, K, N, x, w, y, orig);
+    return;
+  }
+  constexpr int tile = 32;
+  thread_local DeviceBuffer<bf16> padded_x, padded_y;
+  for (int row = 0; row < M; row += tile) {
+    int count = std::min(tile, M - row);
+    // Reuse staging buffers sized for the largest linear width.
+    if (padded_x.n < size_t(tile) * K)
+      padded_x.resize(size_t(tile) * K, "BF16 fixed-tile input");
+    if (padded_y.n < size_t(tile) * N)
+      padded_y.resize(size_t(tile) * N, "BF16 fixed-tile output");
+    gpu_check(cudaMemcpyAsync(padded_x.p, x + size_t(row) * K,
+                              size_t(count) * K * 2, cudaMemcpyDeviceToDevice,
+                              st),
+              "pad GEMM input");
+    if (count < tile)
+      gpu_check(cudaMemsetAsync(padded_x.p + size_t(count) * K, 0,
+                                size_t(tile - count) * K * 2, st),
+                "zero GEMM padding");
+    gemm_raw(st, tile, K, N, padded_x.p, w, padded_y.p, orig);
+    gpu_check(cudaMemcpyAsync(y + size_t(row) * N, padded_y.p,
+                              size_t(count) * N * 2, cudaMemcpyDeviceToDevice,
+                              st),
+              "copy GEMM output");
+  }
+}
 } // namespace
+void set_consistent_forward(bool enabled) { consistent_forward = enabled; }
 void rwkv7_v3a_linear_bf16_launch(cudaStream_t s, int M, int K, int N,
                                   const bf16 *x, const bf16 *w, bf16 *y) {
   gemm(s, M, K, N, x, w, y, false);
