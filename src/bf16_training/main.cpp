@@ -8,6 +8,7 @@
 #include "rwkv/bf16_training/training.hpp"
 
 #include "rwkv/bf16_training/runtime.hpp"
+#include "rwkv/version.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -98,6 +99,7 @@ struct Options {
       << "  --warmup-steps N      linear warmup updates (default 10)\n"
       << "  --save-every N        periodic checkpoint interval (default 0)\n"
       << "  --seed N              deterministic run seed (default 1234)\n"
+      << "  --version, -v         print the version and exit\n"
       << "JSONL rows: {\"text\": ...} trains every token; "
          "{\"segments\": [{\"text\": ..., \"train\": bool}, ...]}\n"
       << "computes loss only on tokens from train=true segments\n";
@@ -145,6 +147,12 @@ Options parse(int argc, char **argv) {
     const std::string arg = argv[i];
     if (arg == "--help" || arg == "-h")
       usage(argv[0]);
+    else if (rwkv::is_version_flag(arg))
+#ifdef RWKV_MISS_TUNE
+      std::exit(rwkv::print_version("rwkv_miss_tune"));
+#else
+      std::exit(rwkv::print_version("rwkv_state_tune"));
+#endif
     else if (arg == "--wkv_tape")
       continue; // Compatibility flag: shared WKV tape is always enabled.
     else if (arg == "--chunk-load")

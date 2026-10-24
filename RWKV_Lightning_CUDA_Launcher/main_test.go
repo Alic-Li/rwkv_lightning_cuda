@@ -458,3 +458,14 @@ func TestStaticHostAndSecurity(t *testing.T) {
 		t.Fatal("status leaked secret")
 	}
 }
+
+func TestVersionLine(t *testing.T) {
+	saved := launcherVersion
+	defer func() { launcherVersion = saved }()
+	for stamped, want := range map[string]string{"dev": "rwkv_launcher dev", "v1.8.7": "rwkv_launcher 1.8.7"} {
+		launcherVersion = stamped
+		if got := versionLine(); got != want {
+			t.Fatalf("version %q: got %q, want %q", stamped, got, want)
+		}
+	}
+}

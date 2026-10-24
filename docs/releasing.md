@@ -92,12 +92,28 @@ sha256sum --check rwkv-lightning-v0.1.0-linux-x64-cuda12.9.tar.gz.sha256
 On Windows, compare `Get-FileHash <archive.zip> -Algorithm SHA256` with the `.sha256`
 file. Checksums detect corruption; they are not signatures.
 
+Every executable in the package prints its own version with `--version` or `-v`
+and exits: one line, `<program> <version>`, on stdout.
+
+```console
+$ ./rwkv_lighting_cuda --version
+rwkv_lighting_cuda 1.8.7
+$ ./rwkv_router -v | cut -d' ' -f2
+1.8.7
+```
+
+The C++ binaries take the version from `VERSION` at CMake configure time. The Go
+launcher and router are stamped at packaging time and print `dev` when built
+with a plain `go build`.
+
 ## What CI verifies
 
 Both platforms run router tests and Go vet, compile all C++/CUDA targets (including
 GPU tests), and run seven CPU-only CTest suites: tokenizer, PTH archive, quantized
 archive, prefill admission, state-tuning API, uploaded-state store, and prefix-cache index. Packaging fails on unresolved
-runtime dependencies and runs each relocated C++ CLI's `--help` as a smoke check.
+runtime dependencies and runs each relocated C++ CLI's `--help` as a smoke check,
+then checks that every packaged executable's `--version` and `-v` print exactly
+`<program> <version>`.
 
 Hosted runners have no CUDA GPU. Kernel correctness, inference, GPU state tuning
 and performance still require validation on a GPU before publishing; CI does not

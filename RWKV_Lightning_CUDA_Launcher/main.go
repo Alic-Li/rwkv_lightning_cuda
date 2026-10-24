@@ -36,6 +36,12 @@ const defaultListen = "127.0.0.1:10721"
 // -ldflags "-X main.launcherVersion=v<VERSION>".
 var launcherVersion = "dev"
 
+// versionLine is the --version output: "<program> <version>" on one line,
+// without the tag's "v" prefix so it matches the C++ binaries.
+func versionLine() string {
+	return "rwkv_launcher " + strings.TrimPrefix(launcherVersion, "v")
+}
+
 //go:embed dist/*
 var webFiles embed.FS
 
@@ -1022,7 +1028,13 @@ func main() {
 	client := flag.Bool("client", false, "run as a pure Client: WebUI + backend registry, no local runtime")
 	configPath := flag.String("config", defaultConfigPath(), "backend registry file (JSON, 0600)")
 	card := flag.String("card", "", "default GPU selection for managed processes (CUDA_VISIBLE_DEVICES style, e.g. 0 or 0,1)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	flag.BoolVar(showVersion, "v", false, "print the version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(versionLine())
+		return
+	}
 
 	l := newLauncher()
 	l.listen, l.token, l.clientOnly, l.card = *listen, *token, *client, *card

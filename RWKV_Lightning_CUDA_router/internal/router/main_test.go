@@ -382,3 +382,14 @@ func TestProxyPreservesFinishReasons(t *testing.T) {
 		})
 	}
 }
+
+func TestVersionLine(t *testing.T) {
+	saved := version
+	defer func() { version = saved }()
+	for stamped, want := range map[string]string{"dev": "rwkv_router dev", "v1.8.7": "rwkv_router 1.8.7"} {
+		version = stamped
+		if got := versionLine(); got != want {
+			t.Fatalf("version %q: got %q, want %q", stamped, got, want)
+		}
+	}
+}
