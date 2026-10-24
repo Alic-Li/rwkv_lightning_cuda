@@ -81,11 +81,25 @@ sha256sum --check rwkv-lightning-v0.1.0-linux-x64-cuda12.9.tar.gz.sha256
 Windows 上将 `Get-FileHash <archive.zip> -Algorithm SHA256` 的结果与 `.sha256`
 文件比较。校验和用于检测损坏，不是签名。
 
+包内每个可执行文件都支持 `--version` 或 `-v`，输出自身版本后退出：
+stdout 上仅一行，格式为 `<程序名> <版本号>`。
+
+```console
+$ ./rwkv_lighting_cuda --version
+rwkv_lighting_cuda 1.8.7
+$ ./rwkv_router -v | cut -d' ' -f2
+1.8.7
+```
+
+C++ 程序在 CMake 配置时读取 `VERSION`；Go 启动器和路由器在打包时注入版本，
+直接 `go build` 得到的版本为 `dev`。
+
 ## CI 验证范围
 
 两个平台均运行路由器测试和 Go vet，编译全部 C++/CUDA 目标（包括 GPU 测试），并运行
 七组纯 CPU CTest：分词器、PTH 文件、量化文件、预填充准入、状态微调 API、上传 State 存储和前缀缓存索引。
-若运行时依赖无法解析，打包失败；还会执行移动后各 C++ CLI 的 `--help` 进行冒烟检查。
+若运行时依赖无法解析，打包失败；还会执行移动后各 C++ CLI 的 `--help` 进行冒烟检查，
+并检查每个打包的可执行文件的 `--version` 与 `-v` 输出恰好为 `<程序名> <版本号>`。
 
 托管运行器没有 CUDA GPU。算子正确性、推理、GPU 状态微调和性能仍需在发布前使用 GPU
 验证；CI 不声称这些测试已通过。即使失败，CTest 日志也会上传。

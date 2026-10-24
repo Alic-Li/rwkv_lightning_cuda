@@ -9,6 +9,7 @@
 #include "rwkv/io/pth_tensor.hpp"
 #include "rwkv/io/pth_writer.hpp"
 #include "rwkv/runtime/rwkv_adapter.hpp"
+#include "rwkv/version.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -92,12 +93,12 @@ Options parse(int argc, char **argv, bool miss) {
           << " --output online-rl-output\n"
              "  --vocab PATH --rank 16 --alpha 16 --targets all (inferred from "
              "cold adapter)\n"
-             "  --resume DIR  restore a publish directory saved with "
-             "checkpoint:true\n"
-             "                (adapter.pth/state.pth default to the same "
-             "directory)\n";
+             "  --version, -v prints the version and exits\n";
       std::exit(0);
     }
+    if (rwkv::is_version_flag(key))
+      std::exit(rwkv::print_version(miss ? "rwkv_miss_tune_server"
+                                         : "rwkv_state_tune_server"));
     if (++i >= argc)
       throw std::invalid_argument("missing value for " + key);
     std::string v = argv[i];

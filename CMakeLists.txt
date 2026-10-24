@@ -28,6 +28,7 @@ include(RwkvOptions)
 include(RwkvDependencies)
 include(RwkvCompilerOptions)
 include(RwkvPackaging)
+include(RwkvVersion)
 
 add_subdirectory(src)
 add_subdirectory(tools)

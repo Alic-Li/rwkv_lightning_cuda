@@ -24,11 +24,21 @@ BINARIES = (
     "rwkv_miss_tune_server", "rwkv_state_tune_server",
 )
 
+GO_BINARIES = ("rwkv_launcher", "rwkv_router")
+
 
 def run(*args, cwd=ROOT, env=None):
     command = [str(arg) for arg in args]
     print("+", subprocess.list2cmdline(command), flush=True)
     subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def check_version(binary, flag, expected, cwd, env):
+    print("+", subprocess.list2cmdline([str(binary), flag]), flush=True)
+    output = subprocess.run([str(binary), flag], cwd=cwd, env=env, check=True,
+                            capture_output=True, text=True).stdout
+    if output.strip() != expected or output.count("\n") != 1:
+        raise RuntimeError(f"{binary.name} {flag}: expected {expected!r}, got {output!r}")
 
 
 def package_version():
@@ -123,7 +133,11 @@ def main():
         cwd=ROOT / "RWKV_Lightning_CUDA_Launcher", env=launcher_env)
     # The router is pure Go; keep it independent of host C/CUDA runtimes.
     router_env = dict(os.environ, CGO_ENABLED="0")
-    run("go", "build", "-trimpath", "-ldflags=-s -w", "-o",
+    router_ldflags = "-s -w"
+    if os.environ.get("RWKV_RELEASE_VERSION"):
+        router_ldflags += (" -X rwkv-lightning-cuda-router/internal/router.version="
+                           + package_version())
+    run("go", "build", "-trimpath", f"-ldflags={router_ldflags}", "-o",
         bundle / ("rwkv_router" + SUFFIX), ".",
         cwd=ROOT / "RWKV_Lightning_CUDA_router", env=router_env)
     shutil.copy2(ROOT / "RWKV_Lightning_CUDA_router/config.example.toml",
@@ -142,6 +156,16 @@ def main():
         smoke_env["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
     for binary in (*BINARIES, "rwkv_router"):
         run(bundle / (binary + SUFFIX), "--help", cwd=bundle, env=smoke_env)
+    # Every shipped binary answers -v/--version with exactly "<name> <version>".
+    # The C++ binaries take the version from VERSION at configure time; the Go
+    # ones only know it when stamped above.
+    file_version = (ROOT / "VERSION").read_text().strip()
+    go_version = (package_version().removeprefix("v")
+                  if os.environ.get("RWKV_RELEASE_VERSION") else "dev")
+    for binary in (*BINARIES, "rwkv_launcher", "rwkv_router"):
+        expected = f"{binary} {go_version if binary in GO_BINARIES else file_version}"
+        for flag in ("--version", "-v"):
+            check_version(bundle / (binary + SUFFIX), flag, expected, bundle, smoke_env)
 
     dist = ROOT / "dist"
     dist.mkdir(exist_ok=True)
