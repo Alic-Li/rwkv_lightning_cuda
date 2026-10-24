@@ -38,6 +38,7 @@ RWKV_Lightning_CUDA_router/rwkv_router.exe
 html_vibe_rwkv_clean.jsonl
 
 miss_output/*
+online-rl-output/
 
 # CI dependency cache and release packages
 .vcpkg-cache/
