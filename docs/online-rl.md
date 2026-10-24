@@ -67,10 +67,28 @@ Cold adapters supply rank/alpha/targets and must match the base model.
 
 `--ctx` limits complete history; oversized requests are rejected, never silently
 truncated. `--chunk` controls checkpoint/recompute blocks without detaching gradients.
-The batch limit applies to both rollout and train requests; samples execute
-sequentially on one GPU worker. Prefix snapshots reside on CPU and are isolated
-by policy version. Strict FP32 GEMM accumulation with BF16 inputs/outputs improves
-actor/learner consistency but adds compute cost.
+The batch limit applies to both rollout and train requests. Prompts of one rollout
+request are decoded together as one batch (see below); training samples still run
+one after another, and rollout and training share one GPU worker. Prefix snapshots
+reside on CPU and are isolated by policy version. Strict FP32 GEMM accumulation in
+fixed 32-row tiles with BF16 inputs/outputs keeps actor and learner numerics equal
+but adds compute cost. `--resume DIR` restores a checkpoint (see below).
+
+GPU memory, estimated from the allocation code (not measured; add about 1 GiB for
+the CUDA context). 2.9B assumes 32 layers, C=2560; 7.2B assumes 32 layers, C=4096.
+
+| Part | Formula | 2.9B | 7.2B |
+|---|---|---|---|
+| BF16 backbone | ~2 bytes/parameter | ~5.8 GB | ~14.4 GB |
+| Chunk-boundary checkpoints | `ceil((longest sample-1)/chunk) × (L·H·16 KiB + L·2·C·2 B)` | 20.3 MiB each | 32.5 MiB each |
+| ctx 8192, chunk 64 / 128 | | ~2.5 / ~1.3 GiB | ~4.1 / ~2.0 GiB |
+| Learner + actor activations | `2 × chunk × L × ~42·C bytes` | ~0.45 GB at chunk 64 | ~0.7 GB at chunk 64 |
+| Batched decode, B prompts | `B × L·H·16 KiB` + `B × L × ~42·C bytes` | ~0.8 GB at B=32 | ~1.2 GB at B=32 |
+| MiSS rank 16, all targets | ~18 bytes/parameter | ~0.2 GB | ~0.35 GB |
+
+Checkpoints follow the longest sample trained so far, not `--ctx` itself. For long
+contexts a larger `--chunk` trades fewer checkpoints for larger activations; at ctx
+8192, chunk 128 needs less memory than 64.
 
 ## Run the Python loop
 
@@ -97,6 +115,11 @@ for generated assistant turns. The default judge is token unigram F1, a plumbing
 example rather than a task-specific reward. Replace it with `--judge module:function`;
 the callable accepts generated and reference token-ID lists and returns a scalar.
 Tool observations are replayed from data; the example does not execute tool calls.
+For real tool environments, tokenize each observation separately with `/v1/tokenize`
+and append its IDs to the history (never re-tokenize the whole text), keep generated
+tokens as returned, and send `turns` with `loss_mask` 0 for the prompt and observations
+and 1 for generated turns. A complete multi-turn GRPO skeleton is in the
+[Chinese guide](online-rl.zh-CN.md#真实工具环境的多轮示例).
 
 `--steps` counts processed batches, not optimizer updates. Equal group rewards
 produce zero advantages and skip Adam. `--smoke` explicitly shortens the prompt
@@ -113,11 +136,28 @@ All POST bodies are JSON. Use the opaque `policy_version` returned by the server
 | `GET /health` | Current policy, learner step, published step and limits |
 | `POST /v1/tokenize`, `/v1/detokenize` | Convert text to/from token IDs |
 | `POST /v1/completions` | Batch prompts; return generated token IDs and aligned FP32 logprobs |
+| `POST /v1/logprobs` | Teacher-forced logprobs of token sequences under a policy |
 | `POST /v1/train` | One Adam step with tokens/turns, loss masks and signed advantages |
-| `POST /v1/publish` | Publish the updated actor and optionally export files |
+| `POST /v1/publish` | Publish the updated actor; optionally export files or a full checkpoint |
 
 Sampling uses plain softmax(logits / temperature); logprobs reflect that temperature.
-Use the same temperature for training. The loss is signed-advantage CE normalized
+Use the same temperature for training. Top-k/top-p are not offered: training CE uses
+the full tempered softmax, so truncated sampling would no longer match it.
+
+All prompts of a completions request are prefilled one by one (with the prefix
+cache) and then decoded together, one forward per step. Each row's logits are bit
+for bit those of a batch=1 decode. Row `i` samples from its own stream seeded by
+`(seed, i)`. Stops match generated output only and end on the token that completes
+the match, which stays in `tokens`/`logprobs`: `stop_token_ids` (default `[0]`),
+`stop_token_sequences` (up to 16 token-ID sequences) and `stop` (a string or up to 16
+strings, matched on raw UTF-8 bytes across tokens). `matched_stop` reports the rule.
+`text` may extend past a stop string to the end of its last token; use `tokens` for
+multi-turn histories.
+
+The startup policy stays available as `reference_version` in `/health` and is never
+retired. `/v1/logprobs` scores `sequences` under any live policy with the same
+forward and reductions as training (`len(tokens)-1` values each), which lets a client
+fold a KL penalty against the reference into per-token advantages. The loss is signed-advantage CE normalized
 by the number of selected predictable tokens, without PPO clipping or a KL term.
 Masked observations still carry gradients across chunks and turns. Training never
 uses inference prefix snapshots. Collect rollouts, judge, train once, publish,
@@ -127,10 +167,21 @@ See the [full request/response examples](online-rl.zh-CN.md#http-api).
 ## Save and recover
 
 `--save` in the Python client requests exports on publication. A returned directory
-contains `state.pth`, `adapter.pth` when applicable, and `policy.json`. Publication
-keeps Adam intact; these files are inference exports, not optimizer checkpoints.
-Restarting with `--adapter <export>/adapter.pth --state <export>/state.pth` restores
-parameters but resets Adam and the server step counter. Omit adapter if none was exported.
+contains `state.pth`, `adapter.pth` when applicable, and `policy.json`. Restarting with
+`--adapter <export>/adapter.pth --state <export>/state.pth` restores parameters but
+resets Adam and the server step counter. Omit adapter if none was exported.
+
+Publishing with `"checkpoint": true` (implies `save`) also writes `training/`: for
+MiSS the `rwkv_miss_tune` checkpoint (FP32 master, gradient, Adam m/v, initial state,
+step); for State the FP32 state, Adam m/v and step. Restart with `--resume <directory>`
+to continue with the same optimizer state and step; adapter and state default to the
+files in that directory. MiSS resume checks rank, alpha, targets and the backbone.
+
+External sampling: `/v1/train` checks only `policy_version`, so tokens sampled by
+`rwkv_lighting_cuda` with the exported adapter (registered per step through
+`POST /v1/adapters`, by path or multipart upload) are accepted. Its kernels are not
+bit-identical to this server, and training applies no importance correction, so such
+batches are slightly off-policy; compare with `/v1/logprobs` if you rely on it.
 
 The server disables Drogon's default 60-second idle connection timeout for long GPU
 jobs. The client's `--timeout` defaults to 3600 seconds. If a request disconnects,
@@ -143,6 +194,7 @@ curl -X POST http://127.0.0.1:8848/v1/publish \
   -d '{"expected_step":3,"save":true}'
 ```
 
+Use `"checkpoint":true` instead of `"save":true` to be able to `--resume` with Adam state.
 Replace `3` with the observed step. The client refuses to start with an unpublished
 update. After confirming which data rows completed, use `--start-row 4 --steps 7`
 to process seven further batches starting at dataset line four; this is an explicit

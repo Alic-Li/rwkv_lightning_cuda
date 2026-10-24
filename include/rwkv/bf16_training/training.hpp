@@ -210,6 +210,12 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
                                          const float *row_weights = nullptr,
                                          float temperature = 1.0f);
 
+// out[row] = log softmax(logits[row] / temperature)[targets[row]] in FP32,
+// reduced exactly like the CE kernel above.
+void target_logprobs_bf16(cudaStream_t stream, int rows, int vocab,
+                          const bf16 *logits, const int *targets, float *out,
+                          float temperature = 1.0f);
+
 // Short-context model forward. input is the existing emb+ln0 BF16 table
 // result [B,T,C]. time_state is FP32 [L,H,K,V] and is broadcast across B.
 // Without carried_states, shifts is zeroed and time_state is broadcast.

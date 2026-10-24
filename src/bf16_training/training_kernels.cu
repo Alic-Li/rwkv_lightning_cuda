@@ -81,6 +81,30 @@ __global__ void xent_kernel(int vocab, const bf16 *__restrict__ logits,
   }
 }
 
+// Per-row log softmax(logits / temperature)[target], with the same reductions
+// as xent_kernel so a score is exactly the negated unweighted CE row loss.
+__global__ void target_logprob_kernel(int vocab, const bf16 *__restrict__ logits,
+                                      const int *__restrict__ targets,
+                                      float *__restrict__ out,
+                                      float temperature) {
+  const int row = blockIdx.x;
+  const long long base = static_cast<long long>(row) * vocab;
+  __shared__ float scratch[8];
+  float local_max = -FLT_MAX;
+  for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
+    local_max = fmaxf(local_max, (to_float(logits[base + token]) / temperature));
+  }
+  const float max_logit = block_reduce(local_max, scratch, true);
+  float local_sum = 0.0f;
+  for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
+    local_sum += expf((to_float(logits[base + token]) / temperature) - max_logit);
+  }
+  const float sum = block_reduce(local_sum, scratch, false);
+  if (threadIdx.x == 0)
+    out[row] = to_float(logits[base + targets[row]]) / temperature - max_logit -
+               logf(sum);
+}
+
 __global__ void reduce_state_kernel(int B, std::size_t lane,
                                     const float *__restrict__ source,
                                     float *__restrict__ destination,
@@ -215,6 +239,17 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
   xent_kernel<<<rows, kThreads, 0, stream>>>(
       vocab, logits, targets, ignore_index, gradient_scale / rows, loss,
       d_logits, row_weights, temperature);
+}
+
+void target_logprobs_bf16(cudaStream_t stream, int rows, int vocab,
+                          const bf16 *logits, const int *targets, float *out,
+                          float temperature) {
+  if (rows <= 0 || vocab <= 0 || !logits || !targets || !out ||
+      !std::isfinite(temperature) || temperature <= 0) {
+    throw std::invalid_argument("invalid target log-probability arguments");
+  }
+  target_logprob_kernel<<<rows, kThreads, 0, stream>>>(vocab, logits, targets,
+                                                       out, temperature);
 }
 
 void reduce_state_gradient_f32(cudaStream_t stream, int batch, int heads,

@@ -39,6 +39,7 @@ constexpr auto cudaMemcpyDeviceToDevice = hipMemcpyDeviceToDevice;
 #define cudaMalloc hipMalloc
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaMemcpy hipMemcpy
+#define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync

@@ -12,8 +12,9 @@ struct OwnedTape {
   std::array<DeviceBuffer<float>, rwkv_bf16_miss::TargetCount> miss_reduced;
   BlockTapeView view;
 
+  // replay=false leaves WKV unrecorded (decode only, never differentiated).
   void allocate(int time, const FrozenBlockWeights &w, bf16 *v_first,
-                float *shared_tape, float *shared_final) {
+                float *shared_tape, float *shared_final, bool replay = true) {
     const std::size_t row = static_cast<std::size_t>(time) * w.channels;
     auto alloc = [row](DeviceBuffer<bf16> &buffer, const char *name) {
       buffer.resize(row, name);
@@ -41,12 +42,14 @@ struct OwnedTape {
     alloc(x_after_att, "tune tape x after att");
     alloc(ln2, "tune tape ln2");
     ffn_hid.resize(static_cast<std::size_t>(time) * w.ffn, "tune tape ffn hid");
-    const rwkv_bf16_training::WkvShape shape{1, time, w.heads, 64};
-    const auto tape_elements = rwkv_bf16_training::wkv_tape_elements(shape);
-    wkv_initial.resize(static_cast<std::size_t>(w.heads) * 64 * 64,
-                       "tune WKV replay initial");
-    view.wkv_replay_initial = wkv_initial.p;
-    view.wkv_replay_final = shared_final;
+    if (replay) {
+      const rwkv_bf16_training::WkvShape shape{1, time, w.heads, 64};
+      wkv_initial.resize(static_cast<std::size_t>(w.heads) * 64 * 64,
+                         "tune WKV replay initial");
+      view.wkv_replay_initial = wkv_initial.p;
+      view.wkv_replay_final = shared_final;
+      view.wkv = {shared_tape, rwkv_bf16_training::wkv_tape_elements(shape)};
+    }
     view.batch = 1;
     view.time = time;
     view.x = x.p;
@@ -70,7 +73,6 @@ struct OwnedTape {
     view.x_after_att = x_after_att.p;
     view.ln2 = ln2.p;
     view.ffn_hid = ffn_hid.p;
-    view.wkv = {shared_tape, tape_elements};
     // Frozen adapters still use the same reduction order as the learner.
     // These scratch buffers belong to this executor, never another graph.
     for (int i = 0; i < rwkv_bf16_miss::TargetCount; ++i)
@@ -269,5 +271,150 @@ float Executor::backward(const FrozenModelView &m,
     total += loss;
   }
   return total;
+}
+std::vector<float> Executor::score(const FrozenModelView &m,
+                                   const std::vector<int> &tokens,
+                                   const float *initial, float temperature) {
+  auto &w = *impl_;
+  if (tokens.size() < 2)
+    throw std::invalid_argument("score needs at least two tokens");
+  const int length = int(tokens.size()) - 1;
+  std::vector<float> result(length);
+  DeviceBuffer<float> out;
+  out.resize(w.chunk, "teacher-forced log probabilities");
+  reset(initial);
+  for (int off = 0; off < length; off += w.chunk) {
+    const int T = std::min(w.chunk, length - off);
+    w.forward(m, tokens.data() + off, T);
+    gpu_check(cudaMemcpyAsync(w.targets.p, tokens.data() + off + 1,
+                              T * sizeof(int), cudaMemcpyHostToDevice,
+                              w.stream),
+              "upload score targets");
+    target_logprobs_bf16(w.stream, T, w.V, w.logits.p, w.targets.p, out.p,
+                         temperature);
+    gpu_check(cudaMemcpyAsync(result.data() + off, out.p, T * sizeof(float),
+                              cudaMemcpyDeviceToHost, w.stream),
+              "download log probabilities");
+    w.sync();
+  }
+  return result;
+}
+
+struct BatchDecoder::Impl {
+  int L, C, H, V, B;
+  size_t lane;
+  cudaStream_t stream;
+  DeviceBuffer<bf16> input, ping, pong, norm, logits, shifts, first, workspace;
+  DeviceBuffer<float> carried, state_batch, state_final;
+  std::vector<OwnedTape> owned;
+  std::vector<BlockTapeView> tapes;
+  std::vector<uint16_t> host_input;
+  bool ready = false;
+  Impl(const FrozenModelView &m, int rows, cudaStream_t s)
+      : L(m.layers), C(m.channels), H(m.heads), V(m.vocab), B(rows),
+        lane(size_t(H) * 4096), stream(s) {
+    if (rows <= 0 || L <= 0 || H <= 0 || C != H * 64 || V <= 0)
+      throw std::invalid_argument("invalid BF16 batch decoder dimensions");
+    const size_t activations = size_t(B) * C;
+    for (auto *b : {&input, &ping, &pong, &norm, &first})
+      b->resize(activations, "decoder activations");
+    logits.resize(size_t(B) * V, "decoder logits");
+    shifts.resize(size_t(L) * 2 * B * C, "decoder shifts");
+    carried.resize(size_t(L) * B * lane, "decoder states");
+    for (auto *b : {&state_batch, &state_final})
+      b->resize(size_t(B) * lane, "decoder state scratch");
+    carried.zero("zero decoder states");
+    shifts.zero("zero decoder shifts");
+    owned.resize(L);
+    tapes.resize(L);
+    size_t scratch = 0;
+    for (int l = 0; l < L; ++l) {
+      // One token per row: a [B,1] step needs B rows of activation storage.
+      owned[l].allocate(B, m.blocks[l], first.p, nullptr, nullptr, false);
+      tapes[l] = owned[l].view;
+      scratch = std::max(
+          scratch, block_forward_workspace_bf16_elements(B, 1, m.blocks[l]));
+    }
+    workspace.resize(scratch, "decoder block workspace");
+  }
+  void sync() const {
+    gpu_check(cudaStreamSynchronize(stream), "BF16 batch decode");
+  }
+};
+BatchDecoder::BatchDecoder(const FrozenModelView &m, int rows, cudaStream_t s)
+    : impl_(std::make_unique<Impl>(m, rows, s)) {}
+BatchDecoder::~BatchDecoder() = default;
+int BatchDecoder::rows() const { return impl_->B; }
+void BatchDecoder::load(int row, const float *state, const bf16 *shifts) {
+  auto &w = *impl_;
+  if (row < 0 || row >= w.B || !state || !shifts)
+    throw std::invalid_argument("decoder row");
+  // Layer-major layouts: one strided 2D copy per tensor.
+  gpu_check(cudaMemcpy2DAsync(w.carried.p + size_t(row) * w.lane,
+                              size_t(w.B) * w.lane * 4, state, w.lane * 4,
+                              w.lane * 4, w.L, cudaMemcpyDeviceToDevice,
+                              w.stream),
+            "load decoder state");
+  gpu_check(cudaMemcpy2DAsync(w.shifts.p + size_t(row) * w.C,
+                              size_t(w.B) * w.C * 2, shifts, size_t(w.C) * 2,
+                              size_t(w.C) * 2, size_t(w.L) * 2,
+                              cudaMemcpyDeviceToDevice, w.stream),
+            "load decoder shifts");
+}
+void BatchDecoder::download(int row, std::vector<float> &state,
+                            std::vector<bf16> &shifts) const {
+  auto &w = *impl_;
+  if (row < 0 || row >= w.B)
+    throw std::invalid_argument("decoder row");
+  state.resize(size_t(w.L) * w.lane);
+  shifts.resize(size_t(w.L) * 2 * w.C);
+  gpu_check(cudaMemcpy2DAsync(state.data(), w.lane * 4,
+                              w.carried.p + size_t(row) * w.lane,
+                              size_t(w.B) * w.lane * 4, w.lane * 4, w.L,
+                              cudaMemcpyDeviceToHost, w.stream),
+            "download decoder state");
+  gpu_check(cudaMemcpy2DAsync(shifts.data(), size_t(w.C) * 2,
+                              w.shifts.p + size_t(row) * w.C,
+                              size_t(w.B) * w.C * 2, size_t(w.C) * 2,
+                              size_t(w.L) * 2, cudaMemcpyDeviceToHost,
+                              w.stream),
+            "download decoder shifts");
+  w.sync();
+}
+void BatchDecoder::forward(const FrozenModelView &m, const int *tokens) {
+  auto &w = *impl_;
+  w.host_input.resize(size_t(w.B) * w.C);
+  for (int b = 0; b < w.B; ++b) {
+    if (tokens[b] < 0 || tokens[b] >= w.V)
+      throw std::invalid_argument("token out of range");
+    std::copy_n(m.cpu_emb_ln0_bf16 + size_t(tokens[b]) * w.C, w.C,
+                w.host_input.data() + size_t(b) * w.C);
+  }
+  gpu_check(cudaMemcpyAsync(w.input.p, w.host_input.data(),
+                            w.host_input.size() * 2, cudaMemcpyHostToDevice,
+                            w.stream),
+            "upload decoder embeddings");
+  model_forward_state_tuning_bf16(
+      w.stream, w.L, w.B, 1, m.blocks.data(), w.tapes.data(), w.input.p,
+      w.carried.p, w.shifts.p, m.ln_out_weight, m.ln_out_bias,
+      m.head_weight_orig, w.V, w.ping.p, w.pong.p, w.state_batch.p,
+      w.state_final.p, w.workspace.p, w.workspace.n, w.norm.p, w.logits.p,
+      w.carried.p);
+  w.ready = true;
+  w.sync(); // host input staging may be reused after returning
+}
+std::vector<float> BatchDecoder::logits() const {
+  auto &w = *impl_;
+  if (!w.ready)
+    throw std::logic_error("no decoder logits");
+  std::vector<bf16> bits(size_t(w.B) * w.V);
+  gpu_check(cudaMemcpyAsync(bits.data(), w.logits.p, bits.size() * 2,
+                            cudaMemcpyDeviceToHost, w.stream),
+            "download decoder logits");
+  w.sync();
+  std::vector<float> result(bits.size());
+  for (size_t i = 0; i < bits.size(); ++i)
+    result[i] = to_float(bits[i]);
+  return result;
 }
 } // namespace rwkv_bf16_training

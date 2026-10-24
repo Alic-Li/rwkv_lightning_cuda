@@ -76,6 +76,65 @@ int main(int argc, char **argv) {
     if (whole != split || whole != run(inference, actor, 1, false) ||
         whole != run(inference, actor, 7, false))
       throw std::runtime_error("fixed-tile chunk/decode policy changed");
+
+    // Batched decode: each row must match a batch=1 decode of its own history
+    // bit for bit, including rows that start from different prompt lengths.
+    const int rows = 3, steps = 4, V = m.vocab;
+    BatchDecoder decoder(actor, rows, nullptr);
+    std::vector<std::vector<int>> histories(rows);
+    for (int r = 0; r < rows; ++r) {
+      histories[r].assign(ids.begin(), ids.begin() + 5 + 7 * r);
+      inference.reset(initial.p);
+      inference.forward(actor, histories[r].data(), int(histories[r].size()));
+      decoder.load(r, inference.state().p, inference.shifts().p);
+    }
+    for (int step = 0; step < steps; ++step) {
+      std::vector<int> feed(rows);
+      for (int r = 0; r < rows; ++r) {
+        feed[r] = 100 + (r * 3 + step) % 8;
+        histories[r].push_back(feed[r]);
+      }
+      decoder.forward(actor, feed.data());
+      const auto batched = decoder.logits();
+      for (int r = 0; r < rows; ++r) {
+        inference.reset(initial.p);
+        for (int t : histories[r])
+          inference.forward(actor, &t, 1);
+        const auto single = inference.last_logits();
+        if (!std::equal(single.begin(), single.end(),
+                        batched.begin() + size_t(r) * V))
+          throw std::runtime_error("batched decode row differs from batch=1");
+      }
+    }
+    std::vector<float> state;
+    std::vector<bf16> shifts;
+    decoder.download(1, state, shifts);
+    if (state.size() != inference.state().n || shifts.size() != inference.shifts().n)
+      throw std::runtime_error("decoder row download layout");
+
+    // Teacher-forced scores are log softmax of the same forward logits.
+    const float temperature = 0.7f;
+    const auto scores = inference.score(actor, ids, initial.p, temperature);
+    if (scores.size() != ids.size() - 1)
+      throw std::runtime_error("score length");
+    double worst = 0;
+    inference.reset(initial.p);
+    for (size_t i = 0; i + 1 < ids.size(); ++i) {
+      inference.forward(actor, &ids[i], 1);
+      const auto logits = inference.last_logits();
+      const float top = *std::max_element(logits.begin(), logits.end());
+      double sum = 0;
+      for (float x : logits)
+        sum += std::exp((double(x) - top) / temperature);
+      const double expected =
+          (double(logits[ids[i + 1]]) - top) / temperature - std::log(sum);
+      worst = std::max(worst, std::abs(expected - scores[i]));
+    }
+    if (worst > 1e-3)
+      throw std::runtime_error("teacher-forced score differs from logits");
+    std::cout << "Batched decode: bitwise equal to batch=1 for " << rows
+              << " rows x " << steps << " steps; score max_abs=" << worst
+              << '\n';
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;
