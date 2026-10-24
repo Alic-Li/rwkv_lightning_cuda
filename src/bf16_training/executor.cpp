@@ -1,4 +1,5 @@
 #include "rwkv/bf16_training/executor.hpp"
+#include "rwkv/bf16_training/ops.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -156,7 +157,8 @@ struct Executor::Impl {
   void sync() const {
     gpu_check(cudaStreamSynchronize(stream), "BF16 execution");
   }
-  void forward(const FrozenModelView &m, const int *tokens, int T) {
+  void forward(const FrozenModelView &m, const int *tokens, int T,
+               LogitsMode mode = LogitsMode::All) {
     if (T <= 0 || T > chunk)
       throw std::invalid_argument("forward chunk length");
     host_input.resize(size_t(T) * C);
@@ -175,8 +177,15 @@ struct Executor::Impl {
         stream, L, 1, T, m.blocks.data(), tapes.data(), input.p, carried.p,
         shifts.p, m.ln_out_weight, m.ln_out_bias, m.head_weight_orig, V, ping.p,
         pong.p, state_batch.p, state_final.p, workspace.p, workspace.n, norm.p,
-        logits.p, carried.p);
-    last_time = T;
+        logits.p, carried.p, mode == LogitsMode::All);
+    if (mode == LogitsMode::Last) {
+      rwkv7_v3a_layer_norm_bf16_launch(
+          stream, 1, C, final_block + size_t(T - 1) * C, m.ln_out_weight,
+          m.ln_out_bias, norm.p, 1.0e-5f);
+      rwkv7_v3a_linear_bf16_orig_launch(stream, 1, C, V, norm.p,
+                                        m.head_weight_orig, logits.p);
+    }
+    last_time = mode == LogitsMode::None ? 0 : mode == LogitsMode::Last ? 1 : T;
     sync(); // host input staging may be reused after returning
   }
 };
@@ -194,8 +203,9 @@ void Executor::reset(const float *initial) {
   w.copy(w.carried.p, initial, w.states * 4);
   w.zero(w.shifts.p, w.shift_count * 2);
 }
-void Executor::forward(const FrozenModelView &m, const int *tokens, int count) {
-  impl_->forward(m, tokens, count);
+void Executor::forward(const FrozenModelView &m, const int *tokens, int count,
+                       LogitsMode mode) {
+  impl_->forward(m, tokens, count, mode);
 }
 std::vector<float> Executor::last_logits() const {
   auto &w = *impl_;
@@ -218,13 +228,24 @@ float Executor::backward(const FrozenModelView &m,
                          const float *initial, size_t normalizer,
                          float temperature) {
   auto &w = *impl_;
-  if (tokens.size() < 2 || weights.size() != tokens.size() || !normalizer)
+  if (tokens.size() < 2 || weights.size() != tokens.size() || !normalizer ||
+      !std::isfinite(temperature) || temperature <= 0)
     throw std::invalid_argument("backward tokens/weights/normalizer");
   for (size_t i = 0; i < tokens.size(); ++i)
     if (tokens[i] < 0 || tokens[i] >= w.V || !std::isfinite(weights[i]))
       throw std::invalid_argument("invalid backward token/weight");
-  const int length = int(tokens.size()) - 1,
-            chunks = 1 + (length - 1) / w.chunk;
+  // A suffix after the last nonzero target has no loss and no terminal
+  // adjoint. Earlier masked context must still participate in full BPTT.
+  int length = int(tokens.size()) - 1;
+  while (length > 0 && weights[length] == 0)
+    --length;
+  w.zero(w.state_gradient.p, w.states * 4);
+  w.zero(w.terminal_shift.p, w.shift_count * 2);
+  if (!length) {
+    w.sync();
+    return 0;
+  }
+  const int chunks = 1 + (length - 1) / w.chunk;
   w.checkpoints.resize(chunks);
   w.shift_checkpoints.resize(chunks);
   reset(initial);
@@ -234,31 +255,44 @@ float Executor::backward(const FrozenModelView &m,
     w.copy(w.checkpoints[j].p, w.carried.p, w.states * 4);
     w.copy(w.shift_checkpoints[j].p, w.shifts.p, w.shift_count * 2);
     if (j + 1 < chunks)
-      w.forward(m, tokens.data() + j * w.chunk, w.chunk);
+      w.forward(m, tokens.data() + j * w.chunk, w.chunk, LogitsMode::None);
   }
-  w.zero(w.state_gradient.p, w.states * 4);
-  w.zero(w.terminal_shift.p, w.shift_count * 2);
   float total = 0;
   for (int j = chunks - 1; j >= 0; --j) {
     int off = j * w.chunk, T = std::min(w.chunk, length - off);
     w.copy(w.carried.p, w.checkpoints[j].p, w.states * 4);
     w.copy(w.shifts.p, w.shift_checkpoints[j].p, w.shift_count * 2);
-    w.forward(m, tokens.data() + off, T);
-    gpu_check(cudaMemcpyAsync(w.targets.p, tokens.data() + off + 1,
-                              T * sizeof(int), cudaMemcpyHostToDevice,
-                              w.stream),
-              "upload targets");
-    gpu_check(cudaMemcpyAsync(w.weights.p, weights.data() + off + 1,
-                              T * sizeof(float), cudaMemcpyHostToDevice,
-                              w.stream),
-              "upload loss weights");
-    cross_entropy_forward_backward_bf16(
-        w.stream, T, w.V, w.logits.p, w.targets.p, -1, w.loss.p, w.dlogits.p,
-        float(T) / normalizer, w.weights.p, temperature);
-    model_output_backward_state_only(
-        w.stream, w.L, 1, T, m.blocks.data(), w.tapes.data(),
-        w.gradients.data(), w.final_block, m.ln_out_weight, m.head_weight_orig,
-        w.V, w.dlogits.p, w.gping.p, w.gpong.p, w.workspace.p, w.workspace.n);
+    const bool supervised =
+        std::any_of(weights.begin() + off + 1, weights.begin() + off + T + 1,
+                    [](float x) { return x != 0; });
+    w.forward(m, tokens.data() + off, T,
+              supervised ? LogitsMode::All : LogitsMode::None);
+    if (supervised) {
+      gpu_check(cudaMemcpyAsync(w.targets.p, tokens.data() + off + 1,
+                                T * sizeof(int), cudaMemcpyHostToDevice,
+                                w.stream),
+                "upload targets");
+      gpu_check(cudaMemcpyAsync(w.weights.p, weights.data() + off + 1,
+                                T * sizeof(float), cudaMemcpyHostToDevice,
+                                w.stream),
+                "upload loss weights");
+      cross_entropy_forward_backward_bf16(
+          w.stream, T, w.V, w.logits.p, w.targets.p, -1, w.loss.p, w.dlogits.p,
+          float(T) / normalizer, w.weights.p, temperature);
+      model_output_backward_state_only(
+          w.stream, w.L, 1, T, m.blocks.data(), w.tapes.data(),
+          w.gradients.data(), w.final_block, m.ln_out_weight,
+          m.head_weight_orig, w.V, w.dlogits.p, w.gping.p, w.gpong.p,
+          w.workspace.p, w.workspace.n);
+    } else {
+      // No local CE/head derivative, but recurrent and shift adjoints from
+      // later supervised chunks still flow through every frozen block.
+      w.zero(w.gping.p, size_t(T) * w.C * sizeof(bf16));
+      w.zero(w.loss.p, sizeof(float));
+      model_backward_state_only(w.stream, w.L, m.blocks.data(), w.tapes.data(),
+                                w.gradients.data(), w.gping.p, w.gping.p,
+                                w.gpong.p, w.workspace.p, w.workspace.n);
+    }
     w.copy(w.state_gradient.p, w.per_batch_gradient.p, w.states * 4);
     w.copy(w.terminal_shift.p, w.shift_grad.p, w.shift_count * 2);
     float loss;
@@ -373,11 +407,10 @@ void BatchDecoder::download(int row, std::vector<float> &state,
                               size_t(w.B) * w.lane * 4, w.lane * 4, w.L,
                               cudaMemcpyDeviceToHost, w.stream),
             "download decoder state");
-  gpu_check(cudaMemcpy2DAsync(shifts.data(), size_t(w.C) * 2,
-                              w.shifts.p + size_t(row) * w.C,
-                              size_t(w.B) * w.C * 2, size_t(w.C) * 2,
-                              size_t(w.L) * 2, cudaMemcpyDeviceToHost,
-                              w.stream),
+  gpu_check(cudaMemcpy2DAsync(
+                shifts.data(), size_t(w.C) * 2, w.shifts.p + size_t(row) * w.C,
+                size_t(w.B) * w.C * 2, size_t(w.C) * 2, size_t(w.L) * 2,
+                cudaMemcpyDeviceToHost, w.stream),
             "download decoder shifts");
   w.sync();
 }

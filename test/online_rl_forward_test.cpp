@@ -6,14 +6,46 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <string>
 using namespace rwkv_bf16_training;
+// BF16 rounds between layers. Check distribution drift as well as logits;
+// strict mode continues to require bitwise equality across all row shapes.
+double compare(const std::vector<float> &a, const std::vector<float> &b,
+               bool strict, const char *name) {
+  double error = 0, max_abs = 0, za = 0, zb = 0;
+  const float ma = *std::max_element(a.begin(), a.end());
+  const float mb = *std::max_element(b.begin(), b.end());
+  for (size_t i = 0; i < a.size(); ++i) {
+    error += std::pow(double(a[i]) - b[i], 2);
+    max_abs = std::max(max_abs, std::abs(double(a[i]) - b[i]));
+    za += std::exp(double(a[i]) - ma);
+    zb += std::exp(double(b[i]) - mb);
+  }
+  double kl = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    double la = a[i] - ma - std::log(za), lb = b[i] - mb - std::log(zb);
+    kl += std::exp(la) * (la - lb);
+  }
+  double rms = std::sqrt(error / a.size());
+  std::cout << name << ": max_abs=" << max_abs << " rms=" << rms << " kl=" << kl
+            << std::endl;
+  // KL is invariant to an unimportant common logit offset and downweights
+  // tail tokens. Raw maximum/RMS logit differences remain diagnostics.
+  if ((strict && a != b) || !std::isfinite(kl) || !std::isfinite(rms) ||
+      kl > .02)
+    throw std::runtime_error(name);
+  return kl;
+}
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    std::cerr << "usage: online_rl_forward_test model adapter state\n";
+  if (argc != 4 && argc != 5) {
+    std::cerr << "usage: online_rl_forward_test model adapter state [bf16]\n";
     return 77;
   }
   try {
-    set_consistent_forward(true);
+    const bool strict = argc == 4;
+    if (!strict && std::string(argv[4]) != "bf16")
+      throw std::invalid_argument("expected bf16 mode");
+    set_consistent_forward(true, !strict);
     Model model(argv[1]);
     auto m = model.state_tuning_model_view();
     auto package = rwkv7_miss::load_package(argv[2]);
@@ -32,10 +64,13 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < ids.size(); ++i)
       ids[i] = 98 + i % 8;
     auto run = [&](Executor &e, const FrozenModelView &view, int chunk,
-                   bool roundtrip) {
+                   bool roundtrip, bool last_only = false) {
       e.reset(initial.p);
       for (int i = 0; i < int(ids.size()); i += chunk) {
-        e.forward(view, ids.data() + i, std::min(chunk, int(ids.size()) - i));
+        e.forward(view, ids.data() + i, std::min(chunk, int(ids.size()) - i),
+                  !last_only                     ? LogitsMode::All
+                  : i + chunk >= int(ids.size()) ? LogitsMode::Last
+                                                 : LogitsMode::None);
         if (roundtrip) {
           std::vector<float> state(e.state().n);
           std::vector<bf16> shifts(e.shifts().n);
@@ -62,24 +97,20 @@ int main(int argc, char **argv) {
       throw std::runtime_error("CPU prefix snapshots changed logits");
     if (whole != run(learner, m, 40, false))
       throw std::runtime_error("actor/learner same-shape forward differs");
-    double max_abs = 0, squared = 0;
-    for (size_t i = 0; i < whole.size(); ++i) {
-      double d = std::abs(whole[i] - split[i]);
-      max_abs = std::max(max_abs, d);
-      squared += d * d;
-    }
-    double rms = std::sqrt(squared / whole.size());
     std::cout << "CPU cache roundtrip: bitwise equal; actor/learner same-shape "
-                 "logits: bitwise equal\n"
-              << "BF16 chunk 40 vs 2: max_abs=" << max_abs << " rms=" << rms
-              << '\n';
-    if (whole != split || whole != run(inference, actor, 1, false) ||
-        whole != run(inference, actor, 7, false))
-      throw std::runtime_error("fixed-tile chunk/decode policy changed");
+                 "logits: bitwise equal\n";
+    compare(whole, split, strict, "chunk 40 vs 2");
+    compare(whole, run(inference, actor, 1, false), strict, "chunk 40 vs 1");
+    compare(whole, run(inference, actor, 7, false), strict, "chunk 40 vs 7");
+    compare(whole, run(inference, actor, 40, false, true), strict,
+            "full vs final-only output head");
+    compare(whole, run(inference, actor, 7, false, true), strict,
+            "state-only prefill plus final output head");
 
-    // Batched decode: each row must match a batch=1 decode of its own history
-    // bit for bit, including rows that start from different prompt lengths.
+    // Compare each row with its own batch=1 history, including unequal
+    // prompt lengths. Strict mode additionally requires bitwise equality.
     const int rows = 3, steps = 4, V = m.vocab;
+    double decode_kl = 0;
     BatchDecoder decoder(actor, rows, nullptr);
     std::vector<std::vector<int>> histories(rows);
     for (int r = 0; r < rows; ++r) {
@@ -101,15 +132,22 @@ int main(int argc, char **argv) {
         for (int t : histories[r])
           inference.forward(actor, &t, 1);
         const auto single = inference.last_logits();
-        if (!std::equal(single.begin(), single.end(),
-                        batched.begin() + size_t(r) * V))
-          throw std::runtime_error("batched decode row differs from batch=1");
+        decode_kl +=
+            compare(single,
+                    std::vector<float>(batched.begin() + size_t(r) * V,
+                                       batched.begin() + size_t(r + 1) * V),
+                    strict, "batched decode vs batch=1");
       }
     }
+    std::cout << "Mean batched/single decode KL=" << decode_kl / (rows * steps)
+              << std::endl;
+    if (decode_kl / (rows * steps) > .005)
+      throw std::runtime_error("mean batched/single decode distribution drift");
     std::vector<float> state;
     std::vector<bf16> shifts;
     decoder.download(1, state, shifts);
-    if (state.size() != inference.state().n || shifts.size() != inference.shifts().n)
+    if (state.size() != inference.state().n ||
+        shifts.size() != inference.shifts().n)
       throw std::runtime_error("decoder row download layout");
 
     // Teacher-forced scores are log softmax of the same forward logits.
@@ -130,11 +168,11 @@ int main(int argc, char **argv) {
           (double(logits[ids[i + 1]]) - top) / temperature - std::log(sum);
       worst = std::max(worst, std::abs(expected - scores[i]));
     }
-    if (worst > 1e-3)
+    std::cout << "Teacher-forced score max_abs=" << worst << std::endl;
+    if (worst > (strict ? 1e-3 : .25))
       throw std::runtime_error("teacher-forced score differs from logits");
-    std::cout << "Batched decode: bitwise equal to batch=1 for " << rows
-              << " rows x " << steps << " steps; score max_abs=" << worst
-              << '\n';
+    std::cout << "Batched decode validated for " << rows << " rows x " << steps
+              << " steps; score max_abs=" << worst << '\n';
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;

@@ -103,6 +103,7 @@ __global__ void post(int H, const bf16 *x, const bf16 *r, const bf16 *k,
               to_float(g[i]));
 }
 thread_local bool consistent_forward = false;
+thread_local bool tensor_forward = false;
 void gemm_raw(cudaStream_t st, int M, int K, int N, const bf16 *x,
               const bf16 *w, bf16 *y, bool orig) {
   float a = 1, b = 0;
@@ -134,19 +135,25 @@ void gemm_raw(cudaStream_t st, int M, int K, int N, const bf16 *x,
   };
   static thread_local Handle h;
   cublasSetStream(h.h, st);
+  // Keep FP32 reductions while allowing BF16 Tensor Cores in online mode.
+  if (cublasSetMathMode(h.h, tensor_forward
+                                ? CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION
+                                : CUBLAS_DEFAULT_MATH) != CUBLAS_STATUS_SUCCESS)
+    throw std::runtime_error("BF16 cublasSetMathMode");
   auto e = cublasGemmEx(
       h.h, orig ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &a, w,
       CUDA_R_16BF, orig ? K : N, x, CUDA_R_16BF, K, &b, y, CUDA_R_16BF, N,
-      consistent_forward ? CUBLAS_COMPUTE_32F_PEDANTIC : CUBLAS_COMPUTE_32F,
-      consistent_forward ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      consistent_forward && !tensor_forward ? CUBLAS_COMPUTE_32F_PEDANTIC
+                                             : CUBLAS_COMPUTE_32F,
+      consistent_forward && !tensor_forward ? CUBLAS_GEMM_DEFAULT
+                                             : CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   if (e != CUBLAS_STATUS_SUCCESS)
     throw std::runtime_error("BF16 cublasGemmEx");
 #endif
 }
-// Online RL needs the same numerical policy for prefill, cached suffixes,
-// decode and teacher forcing. Fixed row tiles and strict FP32 accumulation
-// avoid shape-dependent reduced-precision sums. Only GEMMs are padded; WKV
-// still sees the true sequence length. CLI behavior remains unchanged.
+// Online BF16 and strict policies keep fixed row tiles to limit numerical
+// drift between prefill, decode and teacher forcing. Only GEMMs are padded;
+// WKV always sees the true sequence length. Offline CLI behavior is unchanged.
 void gemm(cudaStream_t st, int M, int K, int N, const bf16 *x, const bf16 *w,
           bf16 *y, bool orig) {
   if (!consistent_forward) {
@@ -178,7 +185,10 @@ void gemm(cudaStream_t st, int M, int K, int N, const bf16 *x, const bf16 *w,
   }
 }
 } // namespace
-void set_consistent_forward(bool enabled) { consistent_forward = enabled; }
+void set_consistent_forward(bool enabled, bool tensor_cores) {
+  consistent_forward = enabled;
+  tensor_forward = tensor_cores;
+}
 void rwkv7_v3a_linear_bf16_launch(cudaStream_t s, int M, int K, int N,
                                   const bf16 *x, const bf16 *w, bf16 *y) {
   gemm(s, M, K, N, x, w, y, false);

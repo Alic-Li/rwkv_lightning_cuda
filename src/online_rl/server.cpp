@@ -5,6 +5,7 @@
 #include "rwkv/bf16_training/trainer.hpp"
 #include "rwkv/inference/prefix_cache.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
+#include "rwkv/inference/text_stop_matcher.hpp"
 #include "rwkv/inference/utf8.hpp"
 #include "rwkv/io/pth_tensor.hpp"
 #include "rwkv/io/pth_writer.hpp"
@@ -24,6 +25,7 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <sstream>
 #include <thread>
 
 namespace rwkv_online_rl {
@@ -64,12 +66,31 @@ bool flag(const Json::Value &v, const char *key, bool fallback) {
   require(v[key].isBool(), std::string(key) + " must be boolean");
   return v[key].asBool();
 }
+std::vector<std::string> text_stops(const Json::Value &value) {
+  Json::Value list = value;
+  if (value.isString()) {
+    list = Json::Value(Json::arrayValue);
+    list.append(value);
+  }
+  require(list.isArray() && list.size() <= 16,
+          "stop must be a string or an array of at most 16 strings");
+  std::vector<std::string> result;
+  for (const auto &s : list) {
+    require(s.isString() && !s.asString().empty() &&
+                s.asString().size() <= 256,
+            "each stop string must be 1..256 bytes");
+    result.push_back(s.asString());
+  }
+  return result;
+}
 struct Options {
   std::string model, adapter, state, resume, host = "127.0.0.1",
                                              output = "online-rl-output";
   std::string vocab = RWKV_STATE_TUNE_DEFAULT_VOCAB, targets = "all";
+  std::string gemm_mode = "bf16";
+  std::vector<std::string> stop = {"</tool_call>", "</answer>", "\n\nUser:"};
   int port = 8848, chunk = 64, ctx = 4096, batch = 32, cache = 16, versions = 2,
-      rank = 16;
+      rank = 16, max_tokens = 1024;
   float alpha = 16, lr = 2e-5f;
   bool rank_set = false, alpha_set = false, targets_set = false;
 };
@@ -91,6 +112,9 @@ Options parse(int argc, char **argv, bool miss) {
              "  --cache-capacity 16 --keep-versions 2 --lr "
           << o.lr
           << " --output online-rl-output\n"
+             "  --gemm-mode bf16|strict (default: bf16 Tensor Cores)\n"
+             "  --max-tokens 1024 (generation safety cap, not a target length)\n"
+             "  --stop JSON (default: [\"</tool_call>\",\"</answer>\",\"\\n\\nUser:\"])\n"
              "  --vocab PATH --rank 16 --alpha 16 --targets all (inferred from "
              "cold adapter)\n"
              "  --version, -v prints the version and exits\n";
@@ -130,6 +154,17 @@ Options parse(int argc, char **argv, bool miss) {
       o.host = v;
     else if (key == "--output")
       o.output = v;
+    else if (key == "--gemm-mode")
+      o.gemm_mode = v;
+    else if (key == "--max-tokens")
+      o.max_tokens = integer();
+    else if (key == "--stop") {
+      Json::Value stops;
+      std::istringstream input(v);
+      if (!(input >> stops))
+        throw std::invalid_argument("--stop requires JSON strings");
+      o.stop = text_stops(stops);
+    }
     else if (key == "--port")
       o.port = integer();
     else if (key == "--chunk")
@@ -159,9 +194,11 @@ Options parse(int argc, char **argv, bool miss) {
   if (o.model.empty() || o.port < 1 || o.port > 65535 || o.chunk < 1 ||
       o.ctx < 2 || o.chunk > o.ctx || o.chunk > 65535 || o.ctx > 1048576 ||
       o.batch < 1 || o.batch > 1024 || o.cache < 0 || o.versions < 1 ||
-      o.versions > 32 || o.lr <= 0 || o.rank < 1 || o.rank > 1024)
+      o.versions > 32 || o.lr <= 0 || o.rank < 1 || o.rank > 1024 ||
+      (o.gemm_mode != "bf16" && o.gemm_mode != "strict") ||
+      o.max_tokens < 1 || o.max_tokens > 1048576)
     throw std::invalid_argument(
-        "invalid model/port/chunk/ctx/batch/cache/versions/lr/rank");
+        "invalid model/port/chunk/ctx/batch/cache/versions/lr/rank/gemm-mode/max-tokens");
   if (!o.alpha_set)
     o.alpha = float(o.rank);
   return o;
@@ -221,9 +258,10 @@ struct Rollout {
   std::vector<int> prompt, generated;
   std::vector<int64_t> prefix;
   std::vector<float> logprobs;
-  std::string bytes; // raw decoded bytes of generated, for string stops
+  std::string stop_tail; // same bounded byte suffix as the inference engine
   std::mt19937_64 rng;
   size_t cached = 0;
+  int limit = 0;
   bool active = true;
   std::string finish = "length";
   Json::Value matched;
@@ -359,6 +397,10 @@ class Runtime {
   }
   StopRules stop_rules(const Json::Value &r) const {
     StopRules rules;
+    const bool numeric = r.isMember("stop_token_ids") ||
+                         r.isMember("stop_token_sequences");
+    require(!r.isMember("stop") || !numeric,
+            "stop and token stop rules are mutually exclusive");
     if (r.isMember("stop_token_ids")) {
       require(r["stop_token_ids"].isArray(), "stop_token_ids must be an array");
       for (const auto &id : r["stop_token_ids"]) {
@@ -366,8 +408,7 @@ class Runtime {
                 "invalid stop token");
         rules.ids.insert(id.asInt());
       }
-    } else
-      rules.ids.insert(0);
+    }
     if (r.isMember("stop_token_sequences")) {
       const auto &list = r["stop_token_sequences"];
       require(list.isArray() && list.size() <= 16,
@@ -378,25 +419,15 @@ class Runtime {
         rules.sequences.push_back(tokens(sequence, 64));
       }
     }
-    if (r.isMember("stop")) {
-      Json::Value list = r["stop"];
-      if (list.isString()) {
-        list = Json::Value(Json::arrayValue);
-        list.append(r["stop"]);
-      }
-      require(list.isArray() && list.size() <= 16,
-              "stop must be a string or an array of at most 16 strings");
-      for (const auto &s : list) {
-        require(s.isString() && !s.asString().empty() &&
-                    s.asString().size() <= 256,
-                "each stop string must be 1..256 bytes");
-        rules.strings.push_back(s.asString());
-      }
-    }
+    if (r.isMember("stop"))
+      rules.strings = text_stops(r["stop"]);
+    else if (!numeric)
+      rules.strings = o_.stop;
     return rules;
   }
   // Checks the newest generated token; matches only generated tokens/text.
-  bool stopped(const StopRules &rules, Rollout &row) const {
+  bool stopped(const StopRules &rules,
+               const rwkv7_server::TextStopMatcher &matcher, Rollout &row) const {
     const int id = row.generated.back();
     if (rules.ids.count(id)) {
       row.matched = id;
@@ -411,18 +442,13 @@ class Runtime {
           row.matched.append(t);
         return true;
       }
-    if (rules.strings.empty())
-      return false;
-    const size_t before = row.bytes.size();
-    row.bytes += tokenizer_.decode(std::vector<int>{id});
-    // A stop may end anywhere inside the newest token's bytes and may start
-    // in earlier tokens; first match in request order wins.
-    for (const auto &s : rules.strings) {
-      const size_t from = before >= s.size() - 1 ? before - (s.size() - 1) : 0;
-      if (row.bytes.find(s, from) != std::string::npos) {
-        row.matched = s;
-        return true;
-      }
+    // Reuse inference semantics exactly: match only the generated suffix at
+    // a token boundary, preserving raw UTF-8 bytes and request order.
+    auto matched = matcher.append(row.stop_tail, tokenizer_.decode(id));
+    if (!matched.empty()) {
+      row.matched = std::move(matched);
+      row.stop_tail.clear();
+      return true;
     }
     return false;
   }
@@ -624,6 +650,11 @@ public:
     r["status"] = "ok";
     r["mode"] = miss_ ? "miss" : "state";
     r["dtype"] = "bfloat16";
+    r["wkv_kernel"] = "rwkv7_statepassing_clampw";
+    r["wkv_io_dtype"] = "bfloat16";
+    r["wkv_state_dtype"] = "float32";
+    r["gemm_mode"] = o_.gemm_mode;
+    r["gemm_tile_rows"] = 32;
     r["backbone_loads"] = 1;
     r["step"] = Json::UInt64(step_);
     r["policy_version"] = policies_.back()->version;
@@ -634,6 +665,10 @@ public:
     r["ctx"] = o_.ctx;
     r["vocab_size"] = learner_.vocab;
     r["max_batch"] = o_.batch;
+    r["default_max_tokens"] = o_.max_tokens;
+    r["default_stop"] = Json::Value(Json::arrayValue);
+    for (const auto &stop : o_.stop)
+      r["default_stop"].append(stop);
     r["policies"] = Json::Value(Json::arrayValue);
     for (const auto &p : policies_) {
       Json::Value v;
@@ -664,10 +699,13 @@ public:
     require(prompts.isArray() && !prompts.empty() &&
                 prompts.size() <= unsigned(o_.batch),
             "invalid prompts batch");
-    int max_new = number(r, "max_tokens", 32, 0, o_.ctx);
+    const int requested_max_new =
+        number(r, "max_tokens", o_.max_tokens, 0, 1048576);
+    int max_new = 0, active = 0;
     float temperature = real(r, "temperature", 1.0f, 0.01f, 100.0f);
     bool use_cache = flag(r, "use_cache", true);
     const StopRules rules = stop_rules(r);
+    const rwkv7_server::TextStopMatcher matcher(rules.strings);
     require(!r.isMember("seed") || r["seed"].isUInt64(),
             "seed must be a nonnegative integer");
     // Row i draws from its own stream seeded by (seed, i), so a prompt's
@@ -680,11 +718,12 @@ public:
     for (size_t i = 0; i < rows.size(); ++i) {
       auto &row = rows[i];
       row.prompt = tokens(prompts[Json::ArrayIndex(i)], o_.ctx);
-      require(row.prompt.size() + max_new <= size_t(o_.ctx),
-              "prompt " + std::to_string(i) + ": " +
-                  std::to_string(row.prompt.size()) + " + max_tokens " +
-                  std::to_string(max_new) + " exceeds ctx " +
-                  std::to_string(o_.ctx));
+      // A safety cap need not fit in the remaining context. Stop each row
+      // at its own capacity, without truncating any existing history.
+      row.limit = std::min(requested_max_new, o_.ctx - int(row.prompt.size()));
+      row.active = row.limit > 0;
+      active += row.active;
+      max_new = std::max(max_new, row.limit);
       std::seed_seq seq{uint32_t(seed), uint32_t(seed >> 32), uint32_t(i)};
       row.rng.seed(seq);
     }
@@ -712,7 +751,9 @@ public:
       for (size_t off = hit.length; off < row.prompt.size(); off += o_.chunk)
         actor_exec_->forward(
             p->view, row.prompt.data() + off,
-            int(std::min(size_t(o_.chunk), row.prompt.size() - off)));
+            int(std::min(size_t(o_.chunk), row.prompt.size() - off)),
+            off + o_.chunk >= row.prompt.size() ? LogitsMode::Last
+                                                : LogitsMode::None);
       if (hit.length < row.prompt.size()) {
         last = actor_exec_->last_logits();
         if (use_cache)
@@ -724,11 +765,7 @@ public:
         decoder_->load(i, actor_exec_->state().p, actor_exec_->shifts().p);
     }
     sync();
-    if (max_new == 0)
-      for (auto &row : rows)
-        row.active = false;
     std::vector<int> feed(B, 0);
-    int active = max_new > 0 ? B : 0;
     for (int j = 0; j < max_new && active; ++j) {
       parallel_for(rows.size(), [&](size_t i) {
         auto &row = rows[i];
@@ -753,10 +790,10 @@ public:
         auto &row = rows[i];
         if (!row.active)
           continue;
-        const bool stop = stopped(rules, row);
+        const bool stop = stopped(rules, matcher, row);
         if (stop)
           row.finish = "stop";
-        if (stop || int(row.generated.size()) == max_new) {
+        if (stop || int(row.generated.size()) == row.limit) {
           row.active = false;
           --active;
           if (use_cache)
@@ -771,6 +808,7 @@ public:
     out["policy_version"] = p->version;
     out["step"] = Json::UInt64(p->step);
     out["temperature"] = temperature;
+    out["max_tokens"] = requested_max_new;
     out["completions"] = Json::Value(Json::arrayValue);
     size_t cached = 0, prefilled = 0, generated = 0;
     for (const auto &row : rows) {
@@ -784,6 +822,12 @@ public:
       item["cached_prompt_tokens"] = Json::UInt64(row.cached);
       item["prefill_tokens"] = Json::UInt64(row.prompt.size() - row.cached);
       item["finish_reason"] = row.finish;
+      item["max_tokens"] = row.limit;
+      const bool truncated = requested_max_new > 0 && row.finish == "length";
+      item["truncated"] = truncated;
+      if (truncated)
+        item["truncation_reason"] =
+            row.limit < requested_max_new ? "context_length" : "max_tokens";
       if (!row.matched.isNull())
         item["matched_stop"] = row.matched;
       auto text = tokenizer_.decode(row.generated);
@@ -911,24 +955,16 @@ public:
     if (any_weight) {
       if (trainer_)
         trainer_->zero_gradient();
-      std::vector<float> accumulated(miss_ ? 0 : initial_.n, 0.0f);
+      else
+        gpu_check(cudaMemsetAsync(gradient_.p, 0, gradient_.n * sizeof(float),
+                                  stream_.value), "clear state gradient");
       for (const auto &s : batch) {
         loss += learner_exec_->backward(learner_, s.tokens, s.weights,
                                         initial_.p, kept, s.temperature);
         if (!miss_) {
-          std::vector<float> g(initial_.n);
-          gpu_check(cudaMemcpyAsync(g.data(), learner_exec_->state_gradient(),
-                                    g.size() * 4, cudaMemcpyDeviceToHost,
-                                    stream_.value),
-                    "read state gradient");
-          sync();
-          for (size_t i = 0; i < g.size(); ++i) {
-            accumulated[i] += g[i];
-            if (!std::isfinite(accumulated[i]) ||
-                std::abs(accumulated[i]) > 1e18f)
-              throw std::runtime_error(
-                  "nonfinite/overflow state gradient; optimizer not executed");
-          }
+          reduce_state_gradient_f32(
+              stream_.value, 1, learner_.layers * learner_.heads, 64,
+              learner_exec_->state_gradient(), gradient_.p, true);
         }
       }
       if (!std::isfinite(loss))
@@ -937,10 +973,15 @@ public:
       if (trainer_)
         grad_norm = trainer_->update(lr, step_ + 1);
       else {
-        for (float v : accumulated)
+        // Accumulate samples on GPU and transfer only once for validation.
+        const auto accumulated = download(gradient_, stream_.value);
+        for (float v : accumulated) {
+          if (!std::isfinite(v) || std::abs(v) > 1e18f)
+            throw std::runtime_error(
+                "nonfinite/overflow state gradient; optimizer not executed");
           grad_norm += double(v) * v;
+        }
         grad_norm = std::sqrt(grad_norm);
-        upload(gradient_, accumulated, stream_.value);
         AdamConfig adam;
         adam.learning_rate = lr;
         adam_update_state_f32(stream_.value, initial_.p, gradient_.p, adam_m_.p,
@@ -999,6 +1040,7 @@ public:
         meta["policy_version"] = next->version;
         meta["step"] = Json::UInt64(step_);
         meta["mode"] = miss_ ? "miss" : "state";
+        meta["gemm_mode"] = o_.gemm_mode;
         meta["base_fingerprint"] = model_.base_fingerprint();
         std::ofstream f(temp + "/policy.json");
         f << meta;
@@ -1047,9 +1089,9 @@ class Worker {
   std::thread thread_;
 
 public:
-  Worker()
-      : thread_([this] {
-          set_consistent_forward(true);
+  explicit Worker(bool strict)
+      : thread_([this, strict] {
+          set_consistent_forward(true, !strict);
           for (;;) {
             std::function<void()> job;
             {
@@ -1091,7 +1133,7 @@ int run(int argc, char **argv, bool miss) {
   try {
     Options o = parse(argc, argv, miss);
     Runtime runtime(o, miss);
-    Worker worker;
+    Worker worker(o.gemm_mode == "strict");
     auto route = [&](const std::string &path, drogon::HttpMethod method,
                      auto action) {
       drogon::app().registerHandler(

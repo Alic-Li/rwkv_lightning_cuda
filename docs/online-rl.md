@@ -70,9 +70,27 @@ truncated. `--chunk` controls checkpoint/recompute blocks without detaching grad
 The batch limit applies to both rollout and train requests. Prompts of one rollout
 request are decoded together as one batch (see below); training samples still run
 one after another, and rollout and training share one GPU worker. Prefix snapshots
-reside on CPU and are isolated by policy version. Strict FP32 GEMM accumulation in
-fixed 32-row tiles with BF16 inputs/outputs keeps actor and learner numerics equal
-but adds compute cost. `--resume DIR` restores a checkpoint (see below).
+reside on CPU and are isolated by policy version. The default `--gemm-mode bf16`
+uses BF16 Tensor Core GEMMs for both rollout and training, with FP32 accumulation
+and reduced-precision reductions disabled. Fixed 32-row tiles are retained to
+limit numerical drift, without pedantic accumulation. Different batch/chunk
+shapes can introduce BF16 rounding differences, including different samples for
+the same seed. `--gemm-mode strict` restores the legacy fixed 32-row, pedantic
+path for bitwise comparisons. `--resume DIR` restores a checkpoint (see below);
+use the same GEMM mode recorded in its `policy.json` for numerical continuity.
+
+Both modes directly reuse `cuda/rwkv7_statepassing_clampw.cu`: BF16 sequence
+inputs/outputs and gradients, FP32 recurrent state and state adjoints. `/health`
+reports the GEMM mode, kernel and dtypes. Prefill computes only the final output
+head. Checkpoint sweeps and masked-only chunks skip unnecessary output heads,
+while all preceding context retains full recurrent/shift backpropagation.
+Zero-weight samples and loss-free trailing suffixes skip computation; State
+gradients accumulate on GPU. Client metrics include rollout/train/publish times
+and training token throughput. CUDA has been validated; HIP numerical and
+performance behavior needs separate validation.
+`rollout_loss` independently reconstructs the objective from sampled logprobs
+and advantages; `loss_abs_error` compares it with the learner loss without
+additional GPU work.
 
 GPU memory, estimated from the allocation code (not measured; add about 1 GiB for
 the CUDA context). 2.9B assumes 32 layers, C=2560; 7.2B assumes 32 layers, C=4096.
@@ -98,7 +116,7 @@ Wait for `ready`, then use a second terminal:
 curl http://127.0.0.1:8848/health
 uv run --with tqdm python tools/online_rl.py \
   --url http://127.0.0.1:8848 --data /path/to/segments.jsonl \
-  --steps 10 --group-size 4 --max-turns 2 --max-new-tokens 64 \
+  --steps 10 --group-size 4 --max-turns 2 --max-tokens 1024 \
   --temperature 1.0 --seed 1234 --timeout 3600 \
   --save --metrics ./miss-online-metrics.jsonl
 ```
@@ -109,6 +127,20 @@ HTTP uses the standard library. Each JSONL record has this structure:
 ```json
 {"segments":[{"text":"User: question\nAssistant:","train":false},{"text":"reference answer","train":true}]}
 ```
+
+Both Server and client default to string stops: `</tool_call>`, `</answer>`, and
+`\n\nUser:`. The Server's `--max-tokens 1024` is a per-turn safety cap against
+runaway repetition, not a target response length. The client inherits both
+settings from `/health`. Override the cap with `--max-tokens` (legacy alias:
+`--max-new-tokens`) or the strings with `--stop '["</tool_call>", "\n\nUser:"]'`;
+`--stop '[]'` explicitly disables stops. The same JSON option configures Server
+defaults. Restart an old Server before using the updated client.
+
+The client budgets actual history lengths instead of assuming every turn fills
+its cap. A truncated episode keeps its sampled tokens/logprobs and receives no
+further replayed observations. Rewards still come from the judge. Metrics include
+`finish_reasons`, `matched_stops`, `truncated_samples`, `truncation_reasons`, and
+`completed_turns`; the progress bar shows the number of truncated samples.
 
 Nontraining segments are observations; training segments provide reference answers
 for generated assistant turns. The default judge is token unigram F1, a plumbing
@@ -145,14 +177,31 @@ Use the same temperature for training. Top-k/top-p are not offered: training CE 
 the full tempered softmax, so truncated sampling would no longer match it.
 
 All prompts of a completions request are prefilled one by one (with the prefix
-cache) and then decoded together, one forward per step. Each row's logits are bit
-for bit those of a batch=1 decode. Row `i` samples from its own stream seeded by
-`(seed, i)`. Stops match generated output only and end on the token that completes
-the match, which stays in `tokens`/`logprobs`: `stop_token_ids` (default `[0]`),
-`stop_token_sequences` (up to 16 token-ID sequences) and `stop` (a string or up to 16
-strings, matched on raw UTF-8 bytes across tokens). `matched_stop` reports the rule.
-`text` may extend past a stop string to the end of its last token; use `tokens` for
+cache) and then decoded together, one forward per step. Strict mode reproduces
+batch=1 logits bit for bit; BF16 Tensor Core mode permits rounding differences.
+Row `i` samples from its own random stream seeded by
+`(seed, i)`. String stops directly reuse the inference engine's `TextStopMatcher`:
+after each token, match only the suffix of generated raw bytes, retaining at most
+the longest stop's byte length. Matching spans token/UTF-8 boundaries, excludes
+the prompt, is case-sensitive, and resolves overlapping suffixes in request
+order. A substring inside a token does not trigger a stop. The matching token
+stays in `tokens`, `logprobs`, text and the cached state. Use token IDs for
 multi-turn histories.
+
+Omitting stop rules uses Server defaults. `stop: []` disables them, including
+token 0. Explicit `stop_token_ids` or `stop_token_sequences` selects the legacy
+numeric path instead; combining either with `stop` returns 400, even with empty
+arrays. The string list supports up to 16 strings, each 1–256 UTF-8 bytes.
+`matched_stop` reports the matched rule.
+
+Each row can generate at most `min(max_tokens, ctx - prompt_length)` tokens.
+Reaching that budget returns `finish_reason: "length"`, `truncated: true`, and
+`truncation_reason: "max_tokens"` or `"context_length"`. Existing history is never
+trimmed; prompts exceeding `ctx` are rejected. A string hit on the last allowed
+token takes precedence and returns `finish_reason: "stop"`, `truncated: false`.
+`max_tokens: 0` remains prefill-only and is not marked truncated. `/health` exposes
+`default_stop` and `default_max_tokens`; a completion's `max_tokens` reports its
+effective per-row capacity.
 
 The startup policy stays available as `reference_version` in `/health` and is never
 retired. `/v1/logprobs` scores `sequences` under any live policy with the same

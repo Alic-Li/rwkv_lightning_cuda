@@ -220,7 +220,8 @@ void target_logprobs_bf16(cudaStream_t stream, int rows, int vocab,
 // result [B,T,C]. time_state is FP32 [L,H,K,V] and is broadcast across B.
 // Without carried_states, shifts is zeroed and time_state is broadcast.
 // With carried_states [L,B,H,K,V], both states and shifts are advanced in
-// place. Tapes and all tape storage are caller-owned.
+// place. Tapes and all tape storage are caller-owned. compute_logits=false
+// skips ln_out/head (boundary checkpoint sweeps and masked-only chunks).
 const bf16 *model_forward_state_tuning_bf16(
     cudaStream_t stream, int layers, int batch, int time,
     const FrozenBlockWeights *weights, BlockTapeView *tapes, const bf16 *input,
@@ -229,7 +230,7 @@ const bf16 *model_forward_state_tuning_bf16(
     bf16 *activation_ping, bf16 *activation_pong, float *state_batch,
     float *state_final, bf16 *block_workspace,
     std::size_t block_workspace_elements, bf16 *final_normalized, bf16 *logits,
-    float *carried_states = nullptr);
+    float *carried_states = nullptr, bool compute_logits = true);
 
 void add_last_shift_gradient(cudaStream_t stream, int batch, int time,
                              int channels, bf16 *dx, const bf16 *dshift);

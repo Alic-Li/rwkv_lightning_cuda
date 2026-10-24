@@ -3,6 +3,7 @@
 #include <memory>
 
 namespace rwkv_bf16_training {
+enum class LogitsMode { All, Last, None };
 // Shared CLI/server execution workspace. Only recurrent boundary checkpoints
 // survive a forward sweep; backward replays each chunk and propagates BOTH WKV
 // and attention/FFN shift adjoints, including through masked prompt tokens.
@@ -17,7 +18,10 @@ public:
   DeviceBuffer<bf16> &shifts();
   const float *state_gradient() const;
   void reset(const float *initial);
-  void forward(const FrozenModelView &, const int *tokens, int count);
+  // Last computes only the final token's output head; None advances states
+  // without an output head. last_logits() is unavailable after None.
+  void forward(const FrozenModelView &, const int *tokens, int count,
+               LogitsMode = LogitsMode::All);
   std::vector<float> last_logits() const;
   // weights[i] applies to tokens[i], predicted from tokens[i-1]. weights[0]
   // is unused. Normalizer is the batch count of selected targets, never the
@@ -39,7 +43,7 @@ private:
 
 // Decodes `rows` independent sequences one token per row per step. States are
 // carried as [L,rows,H,K,V] and shifts as [L,2,rows,C]; nothing is recorded
-// for backward. With set_consistent_forward(true) every GEMM row is computed
+// for backward. With set_consistent_forward(true, false) every GEMM row is computed
 // in the same fixed 32-row tile shape as Executor, so each row's logits match
 // a batch=1 decode of that sequence bit for bit.
 class BatchDecoder {

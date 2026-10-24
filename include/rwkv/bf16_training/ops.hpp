@@ -1,9 +1,11 @@
 #pragma once
 #include "rwkv/bf16_training/runtime.hpp"
 namespace rwkv_bf16_training {
-// Thread-local fixed GEMM row tiles and strict FP32 accumulation for online policies.
-// Uses existing cuBLAS/hipBLAS BF16 kernels; default false preserves CLI behavior.
-void set_consistent_forward(bool enabled);
+// Thread-local GEMM policy. enabled fixes rows to 32; without tensor_cores it
+// also requests pedantic accumulation (legacy, bitwise comparison mode).
+// (false, true) uses native BF16 Tensor Core shapes with FP32 reductions.
+// The default thread policy remains the original offline CLI behavior.
+void set_consistent_forward(bool enabled, bool tensor_cores = false);
 void rwkv7_tmix_mix6_launch(cudaStream_t stream, int B, int T, int C,
                             const bf16 *x, bf16 *shift_state, const bf16 *x_r,
                             const bf16 *x_w, const bf16 *x_k, const bf16 *x_v,

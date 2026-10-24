@@ -2,9 +2,11 @@
 #include "rwkv/bf16_training/model.hpp"
 #include "rwkv/bf16_training/ops.hpp"
 #include "rwkv/bf16_training/trainer.hpp"
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <numeric>
+#include <string>
 using namespace rwkv_bf16_training;
 std::vector<float> read(const float *p, size_t n) {
   std::vector<float> out(n);
@@ -26,12 +28,14 @@ void compare(const std::vector<float> &a, const std::vector<float> &b,
     throw std::runtime_error(name);
 }
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::cerr << "usage: online_rl_training_test tiny-model.pth\n";
+  if (argc != 2 && argc != 3) {
+    std::cerr << "usage: online_rl_training_test tiny-model.pth [bf16]\n";
     return 77;
   }
   try {
-    set_consistent_forward(true);
+    if (argc == 3 && std::string(argv[2]) != "bf16")
+      throw std::invalid_argument("expected bf16 mode");
+    set_consistent_forward(true, argc == 3);
     Model model(argv[1]);
     auto view = model.state_tuning_model_view();
     if (view.channels > 128)
@@ -94,6 +98,27 @@ int main(int argc, char **argv) {
             "signed state direction");
     if (std::abs(lf + ln) > 1e-5)
       throw std::runtime_error("signed loss direction");
+    // Trailing observations with zero weight cannot affect earlier loss or
+    // gradients. A zero-weight sample must not reuse the previous adjoint.
+    ids.resize(45, 100);
+    weights.resize(45, 0);
+    trainer.zero_gradient();
+    float trailing = full.backward(view, ids, weights, initial.p, 3, .7f);
+    compare(gf, gradients(), 1e-5, "masked suffix MiSS");
+    compare(sf, read(full.state_gradient(), initial.n), 1e-5,
+            "masked suffix state");
+    if (std::abs(trailing - ln) > 1e-5)
+      throw std::runtime_error("masked suffix changed loss");
+    std::fill(weights.begin(), weights.end(), 0);
+    trainer.zero_gradient();
+    if (full.backward(view, ids, weights, initial.p, 3, .7f) != 0)
+      throw std::runtime_error("zero-weight loss");
+    for (float g : gradients())
+      if (g != 0)
+        throw std::runtime_error("zero-weight MiSS gradient");
+    for (float g : read(full.state_gradient(), initial.n))
+      if (g != 0)
+        throw std::runtime_error("stale zero-weight state gradient");
     std::cout << "Full cross-chunk/masked multi-turn gradients passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

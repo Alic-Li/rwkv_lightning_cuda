@@ -5,6 +5,7 @@ Starts and stops its own servers; never touches existing inference processes.
 import argparse
 import concurrent.futures
 import contextlib
+import copy
 import http.client
 import json
 import math
@@ -41,6 +42,11 @@ def server(args, mode, label, adapter=None, state=None, resume=None):
                "--vocab", str(args.vocab), "--port", str(port), "--chunk", str(args.chunk),
                "--ctx", str(getattr(args, "ctx", 512)), "--lr", ".001" if mode == "miss" else ".01",
                "--output", str(args.work / label), "--cache-capacity", "8"]
+    command += ["--gemm-mode", getattr(args, "gemm_mode", "bf16")]
+    if getattr(args, "default_stop", None) is not None:
+        command += ["--stop", json.dumps(args.default_stop)]
+    if getattr(args, "default_max_tokens", None) is not None:
+        command += ["--max-tokens", str(args.default_max_tokens)]
     if adapter: command += ["--adapter", str(adapter)]
     if state: command += ["--state", str(state)]
     if resume: command += ["--resume", str(resume)]
@@ -66,9 +72,17 @@ def server(args, mode, label, adapter=None, state=None, resume=None):
 def acceptance(api):
     h = api.call("/health"); version = h["policy_version"]
     assert h["backbone_loads"] == 1 and h["dtype"] == "bfloat16"
+    assert h["wkv_kernel"] == "rwkv7_statepassing_clampw"
+    assert h["wkv_io_dtype"] == "bfloat16" and h["wkv_state_dtype"] == "float32"
     assert h["reference_version"] == version
+    assert h["default_stop"] == ["</tool_call>", "</answer>", "\n\nUser:"]
+    assert h["default_max_tokens"] == 1024
+    strict = h["gemm_mode"] == "strict"
+    logprob_tolerance = .01 if strict else .25
     def rollout(prompt, **kwargs):
-        body = dict(prompts=[prompt], max_tokens=2, seed=42, stop_token_ids=[], policy_version=version)
+        body = dict(prompts=[prompt], max_tokens=2, seed=42, stop=[], policy_version=version)
+        if "stop_token_ids" in kwargs or "stop_token_sequences" in kwargs:
+            body.pop("stop")
         body.update(kwargs)
         return api.call("/v1/completions", body)
     # AB -> ABCD -> ABCDEF -> ABCDEFGH; exact prefill work is 2 each time.
@@ -78,36 +92,68 @@ def acceptance(api):
         assert r["cached_prompt_tokens"] == n - 2 and r["prefill_tokens"] == 2, r
     cached = rollout(base)
     cold = rollout(base, use_cache=False)
+    assert cold["completions"][0]["truncated"]
+    assert cold["completions"][0]["truncation_reason"] == "max_tokens"
     for a, b in zip(cached["completions"], cold["completions"]):
-        assert a["tokens"] == b["tokens"]
-        assert max(abs(x-y) for x,y in zip(a["logprobs"],b["logprobs"])) < .01
+        if strict:
+            assert a["tokens"] == b["tokens"]
+        if a["tokens"] == b["tokens"]:
+            assert max(abs(x-y) for x,y in zip(a["logprobs"],b["logprobs"])) < logprob_tolerance
     # Complete returned generation is available as the next round's prefix.
     history = base + cached["completions"][0]["tokens"]
     inc = rollout(history + [106,107], max_tokens=0)
     assert inc["cached_prompt_tokens"] == len(history) and inc["prefill_tokens"] == 2
-    # Batched decode: a row's sample depends only on (seed, row index) and its
-    # prompt, and matches the batch=1 numerics exactly.
+    # Fixed-shape requests remain reproducible. Cross-shape bitwise sampling
+    # is a strict-mode guarantee; BF16 distribution drift is tested in C++.
     batch = rollout(base, use_cache=False, max_tokens=3,
                     prompts=[base, base[:4], base[:6]], seed=7)
     single = rollout(base, use_cache=False, max_tokens=3, seed=7)
-    assert batch["completions"][0]["tokens"] == single["completions"][0]["tokens"]
-    assert batch["completions"][0]["logprobs"] == single["completions"][0]["logprobs"]
+    if strict:
+        assert batch["completions"][0]["tokens"] == single["completions"][0]["tokens"]
+        assert batch["completions"][0]["logprobs"] == single["completions"][0]["logprobs"]
+    repeated = rollout(base, use_cache=False, max_tokens=3,
+                       prompts=[base, base[:4], base[:6]], seed=7)
+    assert repeated["completions"] == batch["completions"]
     # Stops end on the token that completes the match; that token is kept.
     reference = cold["completions"][0]["tokens"]
     sequence = rollout(base, use_cache=False, stop_token_sequences=[reference[:2]])
     row = sequence["completions"][0]
     assert row["tokens"] == reference[:2] and row["finish_reason"] == "stop"
     assert row["matched_stop"] == reference[:2]
+    assert not row["truncated"] and "truncation_reason" not in row
     text = api.call("/v1/detokenize", {"tokens": reference[:2]})["text"]
-    if text:
+    # detokenize replaces incomplete UTF-8 with U+FFFD; stop strings match
+    # original bytes, so replacement text is not a valid roundtrip fixture.
+    if text and "\ufffd" not in text:
         row = rollout(base, use_cache=False, stop=[text])["completions"][0]
         assert row["finish_reason"] == "stop" and row["matched_stop"] == text, row
         assert row["tokens"] == reference[:len(row["tokens"])]
+        assert not row["truncated"]  # a hit at max_tokens wins over length
+        # The complete stop token must be consumed before caching the state.
+        finished_history = base + row["tokens"]
+        hit = rollout(finished_history, max_tokens=0)
+        assert hit["cached_prompt_tokens"] == len(finished_history)
+        assert not hit["completions"][0]["truncated"]
+    # A substring inside a token is not a suffix match (same as inference).
+    first = api.call("/v1/detokenize", {"tokens": reference[:1]})["text"]
+    if len(first) > 1 and "\ufffd" not in first and first[0] != first[-1]:
+        inside = rollout(base, max_tokens=1, use_cache=False, stop=[first[0]])["completions"][0]
+        assert inside["finish_reason"] == "length" and inside["tokens"] == reference[:1], inside
+    api.call("/v1/completions", dict(prompts=[base], stop=[], stop_token_ids=[]), 400)
+    api.call("/v1/completions", dict(prompts=[base], stop=[], stop_token_sequences=[]), 400)
     api.call("/v1/completions", dict(prompts=[base], stop=[""]), 400)
+    # Per-row context capacity is a cap, not a reason to reject the batch.
+    bounded = rollout(base, use_cache=False, prompts=[[98] * (h["ctx"] - 1), base], max_tokens=2)
+    near_limit, ordinary = bounded["completions"]
+    assert len(near_limit["tokens"]) == 1 and near_limit["max_tokens"] == 1
+    assert near_limit["truncated"] and near_limit["truncation_reason"] == "context_length"
+    assert len(ordinary["tokens"]) == 2 and ordinary["truncation_reason"] == "max_tokens"
+    full = rollout([98] * h["ctx"], max_tokens=1)["completions"][0]
+    assert full["tokens"] == [] and full["truncation_reason"] == "context_length"
     # Teacher-forced scores reproduce the sampled log probabilities.
     scored = api.call("/v1/logprobs", dict(sequences=[base + reference], policy_version=version))
     tail = scored["logprobs"][0][-len(reference):]
-    assert max(abs(x-y) for x,y in zip(tail, cold["completions"][0]["logprobs"])) < .01
+    assert max(abs(x-y) for x,y in zip(tail, cold["completions"][0]["logprobs"])) < logprob_tolerance
     # Full batch validation occurs before GPU work or any optimizer mutation.
     api.call("/v1/completions", {"prompts": [[98], [-1]]}, 400)
     api.call("/v1/completions", {"prompts": [[98]], "temperature": 0}, 400)
@@ -209,6 +255,7 @@ def main():
     p.add_argument("--state", type=Path)
     p.add_argument("--work", type=Path, required=True)
     p.add_argument("--chunk", type=int, default=7)
+    p.add_argument("--gemm-mode", choices=["bf16", "strict"], default="bf16")
     p.add_argument("--check-idle-timeout", action="store_true", help="also test a 75-second silent HTTP connection per mode")
     p.add_argument("--modes", nargs="+", choices=["miss", "state"], default=["miss", "state"])
     args = p.parse_args(); args.work.mkdir(parents=True, exist_ok=True)
@@ -222,12 +269,37 @@ def main():
         with server(args, mode, mode + "-reload", adapter if adapter.exists() else None, exported / "state.pth") as api:
             h = api.call("/health")
             assert h["step"] == 0  # a cold start starts new Adam moments
-            api.call("/v1/completions", dict(prompts=[[98,99]], max_tokens=1))
+            # Select an actual decoded suffix, then configure it as the
+            # resumed Server's default. This tests inheritance end to end.
+            stop_fixture = None
+            for seed in range(8):
+                probe = api.call("/v1/completions", dict(prompts=[[98,99]], max_tokens=2,
+                                                       seed=seed, stop=[]))["completions"][0]
+                for count in range(1, 3):
+                    ids = probe["tokens"][:count]
+                    text = api.call("/v1/detokenize", dict(tokens=ids))["text"]
+                    if text and "\ufffd" not in text and len(text.encode("utf-8")) <= 256:
+                        stop_fixture = (seed, ids, text)
+                        break
+                if stop_fixture:
+                    break
+            assert stop_fixture is not None, "no valid UTF-8 default-stop fixture"
         # --resume restores the optimizer state and step of the checkpoint.
-        with server(args, mode, mode + "-resume", resume=exported) as api:
+        resume_args = copy.copy(args)
+        resume_args.default_stop = [stop_fixture[2]]
+        resume_args.default_max_tokens = 2
+        with server(resume_args, mode, mode + "-resume", resume=exported) as api:
             h = api.call("/health")
             assert h["step"] == 2 and h["published_step"] == 2, h
-            api.call("/v1/completions", dict(prompts=[[98,99]], max_tokens=1))
+            assert h["default_stop"] == resume_args.default_stop and h["default_max_tokens"] == 2
+            body = dict(prompts=[[98,99]], seed=stop_fixture[0])
+            row = api.call("/v1/completions", body)["completions"][0]
+            assert row["tokens"] == stop_fixture[1] and row["matched_stop"] == stop_fixture[2], row
+            assert row["finish_reason"] == "stop" and not row["truncated"]
+            disabled = api.call("/v1/completions", dict(body, stop=[]))["completions"][0]
+            assert len(disabled["tokens"]) == 2 and disabled["truncation_reason"] == "max_tokens"
+            numeric = api.call("/v1/completions", dict(body, stop_token_ids=[row["tokens"][0]]))["completions"][0]
+            assert numeric["tokens"] == row["tokens"][:1] and numeric["finish_reason"] == "stop"
     print("HTTP rollout/train/publish/cache/multi-turn/cold-start acceptance passed")
 
 

@@ -42,7 +42,7 @@ const bf16 *model_forward_state_tuning_bf16(
     bf16 *activation_ping, bf16 *activation_pong, float *state_batch,
     float *state_final, bf16 *block_workspace,
     std::size_t block_workspace_elements, bf16 *final_normalized, bf16 *logits,
-    float *carried_states) {
+    float *carried_states, bool compute_logits) {
   if (layers <= 0 || B <= 0 || T <= 0 || vocab <= 0 || !weights || !tapes ||
       !input || !time_state || !shifts || !ln_out_weight || !ln_out_bias ||
       !head_weight_orig || !activation_ping || !activation_pong ||
@@ -100,10 +100,12 @@ const bf16 *model_forward_state_tuning_bf16(
     current = next;
     next = next == activation_ping ? activation_pong : activation_ping;
   }
-  rwkv7_v3a_layer_norm_bf16_launch(stream, B * T, C, current, ln_out_weight,
-                                   ln_out_bias, final_normalized, kLnEps);
-  rwkv7_v3a_linear_bf16_orig_launch(stream, B * T, C, vocab, final_normalized,
-                                    head_weight_orig, logits);
+  if (compute_logits) {
+    rwkv7_v3a_layer_norm_bf16_launch(stream, B * T, C, current, ln_out_weight,
+                                    ln_out_bias, final_normalized, kLnEps);
+    rwkv7_v3a_linear_bf16_orig_launch(stream, B * T, C, vocab, final_normalized,
+                                     head_weight_orig, logits);
+  }
   return current;
 }
 

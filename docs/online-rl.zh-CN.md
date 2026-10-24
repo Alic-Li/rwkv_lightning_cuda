@@ -67,6 +67,8 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 | `--port` | MiSS `8848`，State `8849` |
 | `--chunk` | `64`；计算与反向重算块长，不截断梯度 |
 | `--ctx` | `4096`；完整历史 Token 上限，超长请求直接拒绝；对显存的影响见下文 |
+| `--max-tokens` | `1024`；每轮生成的防复读硬上限，命中停止串会提前结束；请求可以覆盖 |
+| `--stop` | JSON 字符串数组；默认 `["</tool_call>", "</answer>", "\n\nUser:"]`；请求可以覆盖 |
 | `--max-batch` | `32`；一次生成或训练的最大样本数；同时决定合批解码的最大行数 |
 | `--cache-capacity` | `16`；每个保留版本的 CPU 前缀快照条数，`0` 关闭 |
 | `--keep-versions` | `2`；当前及旧 Actor 快照总数 |
@@ -114,12 +116,10 @@ Prefix Cache 在 CPU 上，每条包含完整 State、BF16 shifts 和末尾 logi
 {
   "policy_version": "从 health 获得",
   "prompts": [[98,99], [98,99,100,101]],
-  "max_tokens": 16,
+  "max_tokens": 1024,
   "temperature": 1.0,
   "seed": 1234,
-  "stop_token_ids": [0],
   "stop": ["</tool_call>", "</answer>", "\n\nUser:"],
-  "stop_token_sequences": [[261, 24281]],
   "use_cache": true
 }
 ```
@@ -132,6 +132,7 @@ Prefix Cache 在 CPU 上，每条包含完整 State、BF16 shifts 和末尾 logi
   "logprobs": [-3.25,-2.125],
   "text": "cd",
   "finish_reason": "stop",
+  "truncated": false,
   "matched_stop": "</answer>",
   "cached_prompt_tokens": 2,
   "prefill_tokens": 0
@@ -140,32 +141,56 @@ Prefix Cache 在 CPU 上，每条包含完整 State、BF16 shifts 和末尾 logi
 
 `tokens` 仅包含生成的 Token；`logprobs` 与其一一对应，是 **temperature 后采样策略**的 FP32 log probability。
 `max_tokens: 0` 只做 Prefill/缓存。`temperature` 必须为 `[0.01,100]`。
+`max_tokens` 是防止复读的硬上限，默认继承 Server 的 `--max-tokens 1024`，不是目标生成长度。
+每条轨迹在命中字符串后立即结束；没有命中时，最多生成 `min(max_tokens, ctx - prompt长度)` 个 Token。
+达到上限返回 `finish_reason: "length"`、`truncated: true`，`truncation_reason` 为 `max_tokens`
+或 `context_length`。同批各行独立计算剩余容量，不截断已有 Prompt。命中停止串与上限同一步发生时优先返回 `stop`。
+`max_tokens: 0` 的纯 Prefill 返回 `truncated: false`。
 
 **合批解码**：同一请求的所有 prompt 先逐条 Prefill（复用前缀缓存），再放进同一个批次按行并行解码，
-每步一次前向，所有 prompt 共用策略版本和 temperature。在线 worker 的 GEMM 本来就按 32 行固定分块计算，
-因此 32 条以内的 prompt 与单条解码的矩阵乘法开销基本相同；每一行的 logits 与 batch=1 解码**逐位一致**
-（`rwkv_online_rl_forward_test` 检查这一点），所以 `/v1/train` 的 CE 仍与采样 logprob 对应。
+每步一次前向，所有 prompt 共用策略版本和 temperature。Rollout 与训练默认统一使用 BF16 Tensor Core
+矩阵乘法和 FP32 累加。保留固定 32 行分块以减少数值漂移，但不再使用慢速 pedantic 累加。
+不同 batch/chunk 形状仍允许 BF16 舍入差异，
+`rwkv_online_rl_forward_test ... bf16` 检查 logits、分布 KL 和教师强制 logprob 偏差。
 提前结束的行留在批次里空转，直到整批结束或达到 `max_tokens`；不做跨请求的 continuous batching。
-`seed` 决定每条 prompt 的随机流：第 `i` 条使用 `(seed, i)`，结果与同批其他 prompt 无关；不提供 `seed` 时随机选择。
+`seed` 决定每条 prompt 的随机流：第 `i` 条使用 `(seed, i)`；不提供 `seed` 时随机选择。
+BF16 模式下改变 batch/chunk 形状可能因舍入差异改变采样结果；固定 seed 不代表跨形状逐位一致。
 
 **停止条件**（只匹配生成部分，不匹配 prompt）：
 
 | 字段 | 含义 |
 |---|---|
-| `stop_token_ids` | 单个停止 Token；默认 `[0]`，`[]` 关闭 |
+| `stop_token_ids` | 显式选择 Token ID 停止模式；不再默认启用 Token 0 |
 | `stop_token_sequences` | Token 序列，生成部分以该序列结尾时停止；最多 16 条，每条 1–64 个 Token |
-| `stop` | 字符串或字符串数组，最多 16 条，每条 1–256 字节；按原始 UTF-8 字节匹配，可跨 Token |
+| `stop` | 默认继承 Server 的停止串；最多 16 条，每条 1–256 字节；`[]` 显式关闭停止条件 |
 
 命中后在**完成匹配的那个 Token** 处停止：该 Token 计入 `tokens`、`logprobs` 和缓存，之后不再采样，
-因此返回的 Token 与训练时提交的 Token 完全一致。Token 不会被切开，所以 `text` 可能在停止字符串之后还带有该 Token 的剩余字节；
-多轮拼接请以 `tokens` 为准。`finish_reason` 为 `stop` 时，`matched_stop` 给出命中的规则：字符串、Token ID 或 Token 序列。
-同一 Token 命中多条规则时，优先级依次为 `stop_token_ids`、`stop_token_sequences`、`stop`（各自按请求顺序）。
+因此返回的 Token 与训练时提交的 Token 完全一致。多轮拼接请以 `tokens` 为准。
+在线 RL 直接复用推理引擎的 `TextStopMatcher`：每个 Token 后只检查生成字节串的**末尾**，
+只保留最长停止串长度的字节尾部，支持跨 Token 和跨 UTF-8 字节；区分大小写，不匹配 Prompt，
+不因 Token 中间包含子串就停止。多个后缀同时命中时按配置顺序选择。
+`finish_reason: "stop"` 时 `matched_stop` 给出命中的字符串、Token ID 或 Token 序列。
+字符串模式与 `stop_token_ids` / `stop_token_sequences` 互斥，同时提供（包括空数组）返回 400；
+显式 Token 规则会替换默认字符串规则。Token 模式中单 ID 优先于序列。
 
 CPU 以数值稳定的普通 `softmax(logits / temperature)` 和标准离散分布采样，多行并行，不增加 Sampler CUDA Kernel。
 不提供 greedy、Top-K、Top-P 或 Penalty：截断采样会改变行为策略，而 `/v1/train` 的 CE 按完整的 tempered softmax 计算，
 两者不一致时梯度不再对应采样分布。若以后加入截断采样，需要训练端同时按相同截断计算 CE 和 logprob。
 
-在线服务的现有 BF16 GEMM 使用固定 32 行计算块及严格 FP32 累加，避免 cuBLAS 在 Prefill、Decode 和不同 Chunk 形状间引入策略数值差异；输入、权重及前向输出仍为 BF16。仅矩阵乘法补齐，WKV 处理真实 Token 数。该设置局限于在线 GPU worker，原 CLI 默认方式不变；小块补齐和严格累加会增加计算开销。
+默认 `--gemm-mode bf16` 使用现有 cuBLAS BF16 Tensor Core 路径，并禁止低精度中间归约；
+输入、权重、激活和 WKV 的序列梯度都是 BF16，WKV State/状态梯度和 Adam 参数仍为 FP32。
+前向、重算和反向直接复用 `cuda/rwkv7_statepassing_clampw.cu`，没有另建 RL WKV Kernel。
+需要旧版逐位一致对照时使用 `--gemm-mode strict`，恢复固定 32 行与 pedantic 累加，速度会较慢。
+`/health` 返回 `gemm_mode`、`gemm_tile_rows`、`wkv_kernel`、`wkv_io_dtype` 和 `wkv_state_dtype`；导出的 `policy.json` 记录 GEMM 模式。
+这些配置局限于在线 worker，原 CLI 默认数值策略不变。CUDA 路径已验证，HIP 不保证相同的精度及性能。
+
+Prefill 只在最后一个 Token 计算输出层；训练保存边界的前向扫描不计算输出层。
+没有非零 Advantage 的 Chunk 跳过 CE 和输出层反传，仍完整反传 WKV 和 shift 的跨块梯度。
+最后一个非零监督目标之后的无损失后缀不参与计算，零 Advantage 样本直接返回零梯度。
+State 模式在 GPU 累加各样本梯度，再统一检查并更新。客户端指标增加 `rollout_seconds`、
+`train_seconds`、`publish_seconds` 和 `train_tokens_per_second`，便于区分生成、训练和保存耗时。
+`rollout_loss` 根据实际采样 logprob 与本批 Advantage 独立计算，`loss_abs_error` 是它与训练 Loss 的
+绝对差，可持续观察 BF16 推训数值漂移；这些指标不增加 GPU 前向次数。
 
 缓存复用最长的已保存 Token 前缀，同时恢复 WKV、attention/FFN shifts 和 next-token logits。
 缓存保存完整 Prompt 和完整输出历史（包含最后一个生成 Token）：
@@ -300,7 +325,7 @@ MiSS 恢复时会校验 rank、alpha、targets 和 Backbone fingerprint 与检�
 uv run --with tqdm python tools/online_rl.py \
   --url http://127.0.0.1:8848 \
   --data /mnt/nvme0n1/no22/segments-2-2.jsonl \
-  --steps 10 --group-size 4 --max-turns 2 --max-new-tokens 64 \
+  --steps 10 --group-size 4 --max-turns 2 --max-tokens 1024 \
   --temperature 1.0 --seed 1234 --timeout 3600 \
   --save --metrics ./miss-online-metrics.jsonl
 ```
@@ -313,6 +338,12 @@ uv run --with tqdm python tools/online_rl.py \
 ```
 
 `--steps` 是本次处理的批数，不是 Adam 更新次数；`--group-size` 不能超过服务的 `--max-batch`。
+客户端默认继承 Server 的字符串停止配置和生成上限；`--max-tokens`（兼容旧名称 `--max-new-tokens`）
+只设置每轮硬上限。可用 `--stop '["</tool_call>", "</answer>", "\n\nUser:"]'` 覆盖停止串，或用 `--stop '[]'` 显式关闭。
+不再按“每轮一定生成上限数量”预先跳过多轮数据，而是按各轨迹的实际历史长度判断剩余容量。
+超限轨迹保留已生成 Token 及其 logprob，结束本条轨迹，不再追加后续观察；奖励仍交给 Judge 计算。
+指标记录 `finish_reasons`、`matched_stops`、`truncated_samples`、`truncation_reasons` 和 `completed_turns`。
+进度条的 `trunc` 显示本批截断样本数。首个 Prompt 已占满 `ctx` 的数据行会跳过。
 换成 `:8849` 并使用独立指标文件可测 State。进度条与 JSONL 指标包含 Reward 均值/标准差、Loss、梯度范数、更新步数、吞吐和缓存命中率。
 默认 Judge 是生成 Token 与参考答案的 unigram F1，仅供演示。实际任务可用
 `--judge your_module:reward` 替换；函数接收 `(generated_token_ids, reference_token_ids)`，返回标量奖励。
@@ -325,10 +356,10 @@ uv run --with tqdm python tools/online_rl.py \
 下面是一组 GRPO 轨迹的骨架（`call` 为 POST JSON 的辅助函数，`run_tool`、`judge` 由你的环境提供）。要点：
 
 - 上下文始终是 **Token ID 列表**。工具观察单独用 `/v1/tokenize` 编码后拼到历史末尾，不要把整段文本重新编码，否则 Token 边界会变化，训练的 Token 就和采样时不一致。
-- 生成的 Token（包括命中 stop 的最后一个 Token）原样进入历史和训练样本；`text` 可能在 stop 字符串后多出几个字节，只用于解析动作。
+- 生成的 Token（包括命中 stop 的最后一个 Token）原样进入历史和训练样本；`text` 用于解析动作。
 - `turns` 按时间顺序排列：首个 prompt 和每段观察 `loss_mask` 全 0；每段生成 `loss_mask` 全 1。首 Token 没有前驱，不计入 Loss。
 - 同一组的所有活跃轨迹放进同一次 `/v1/completions`，享受合批解码；结束的轨迹从下一轮请求中去掉。历史前缀会命中前缀缓存，每轮只 Prefill 新增的观察。
-- 历史总长（以及每轮 `prompt + max_tokens`）不能超过 `--ctx`，超长请求返回 400。
+- Prompt 不能超过 `--ctx`；生成按每行剩余容量和 `max_tokens` 中的较小值封顶，并明确标记截断原因。
 
 ```python
 health = call("/health")
