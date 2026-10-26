@@ -25,7 +25,8 @@ public:
 
 private:
   cudaStream_t stream_;
-  Json::Value config_;
+  // Missing optional-key reads must not change later checkpoint configs.
+  const Json::Value config_;
   int rank_;
   float alpha_;
   std::vector<HostTensor> targets_;
