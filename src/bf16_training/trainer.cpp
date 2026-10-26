@@ -1,4 +1,5 @@
 #include "rwkv/bf16_training/trainer.hpp"
+#include "rwkv/bf16_training/checkpoint_config.hpp"
 #include "rwkv/io/pth_tensor.hpp"
 #include "rwkv/runtime/rwkv_adapter.hpp"
 #include "rwkv/io/pth_writer.hpp"
@@ -210,8 +211,7 @@ void Trainer::resume(const std::string &dir, uint64_t &step, int &epoch,
   f >> m;
   if (m["kind"] != "miss_training_checkpoint" || m["format_version"] != 1 ||
       m["config"]["training_dtype"] != "bfloat16" ||
-      Json::writeString(Json::StreamWriterBuilder{}, m["config"]) !=
-          Json::writeString(Json::StreamWriterBuilder{}, config_))
+      !checkpoint_config_matches(m["config"], config_))
     throw std::runtime_error(
         "resume requires a matching BF16 training checkpoint/config");
   if (m["tensor_digest"].asString() != fingerprint_file(dir + "/training.pth"))

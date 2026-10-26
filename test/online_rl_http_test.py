@@ -206,9 +206,17 @@ def acceptance(api):
     assert next_step["step"] == 2
     final = api.call("/v1/publish", {"expected_step": 2, "checkpoint": True})
     assert final["checkpoint"].endswith("training")
-    request["policy_version"] = final["policy_version"]
-    assert api.call("/v1/train", request)["step"] == 3
-    api.call("/v1/publish", {"expected_step": 3})
+    checkpoints = [Path(final["directory"])]
+    for step in range(3, 7):
+        request["policy_version"] = final["policy_version"]
+        assert api.call("/v1/train", request)["step"] == step
+        final = api.call("/v1/publish", {"expected_step": step, "checkpoint": True})
+        checkpoints.append(Path(final["directory"]))
+    if h["mode"] == "miss":
+        configs = [json.loads((path / "training" / "checkpoint.json").read_text())["config"]
+                   for path in checkpoints]
+        assert len(configs[0]) == 6 and "seed" not in configs[0] and "planned_steps" not in configs[0]
+        assert all(config == configs[0] for config in configs), configs
     rollout_body = dict(prompts=[base], max_tokens=2, seed=42, stop_token_ids=[])
     api.call("/v1/completions", dict(rollout_body, policy_version=new_version), 409)  # retired
     # The startup policy stays available as the reference, e.g. for KL.
@@ -217,7 +225,7 @@ def acceptance(api):
     print(json.dumps(dict(mode=h["mode"], first_loss=train["loss"], rollout_loss=score/selected,
                           grad_norm=train["grad_norm"], second_grad_norm=next_step["grad_norm"],
                           first_version=version, final=final), indent=2), flush=True)
-    return Path(final["directory"])
+    return checkpoints
 
 
 def idle_connection_acceptance(api):
@@ -263,7 +271,13 @@ def main():
         with server(args, mode, mode, args.adapter, args.state) as api:
             if args.check_idle_timeout:
                 idle_connection_acceptance(api)
-            exported = acceptance(api)
+            checkpoints = acceptance(api)
+        exported = checkpoints[-1]
+        # Every checkpoint from the same writer must resume in a fresh process.
+        for step, path in enumerate(checkpoints[:-1], 2):
+            with server(args, mode, f"{mode}-resume-{step}", resume=path) as api:
+                h = api.call("/health")
+                assert h["step"] == step and h["published_step"] == step, h
         # Exercise both cold-start files produced by this process, too.
         adapter = exported / "adapter.pth"
         with server(args, mode, mode + "-reload", adapter if adapter.exists() else None, exported / "state.pth") as api:
@@ -290,7 +304,7 @@ def main():
         resume_args.default_max_tokens = 2
         with server(resume_args, mode, mode + "-resume", resume=exported) as api:
             h = api.call("/health")
-            assert h["step"] == 2 and h["published_step"] == 2, h
+            assert h["step"] == 6 and h["published_step"] == 6, h
             assert h["default_stop"] == resume_args.default_stop and h["default_max_tokens"] == 2
             body = dict(prompts=[[98,99]], seed=stop_fixture[0])
             row = api.call("/v1/completions", body)["completions"][0]
@@ -300,6 +314,19 @@ def main():
             assert len(disabled["tokens"]) == 2 and disabled["truncation_reason"] == "max_tokens"
             numeric = api.call("/v1/completions", dict(body, stop_token_ids=[row["tokens"][0]]))["completions"][0]
             assert numeric["tokens"] == row["tokens"][:1] and numeric["finish_reason"] == "stop"
+        if mode == "miss":
+            # Old servers polluted all but their first checkpoint with nulls.
+            metadata = exported / "training" / "checkpoint.json"
+            original = metadata.read_text()
+            legacy = json.loads(original)
+            legacy["config"].update(seed=None, planned_steps=None)
+            try:
+                metadata.write_text(json.dumps(legacy))
+                with server(args, mode, mode + "-resume-legacy", resume=exported) as api:
+                    h = api.call("/health")
+                    assert h["step"] == 6 and h["published_step"] == 6, h
+            finally:
+                metadata.write_text(original)
     print("HTTP rollout/train/publish/cache/multi-turn/cold-start acceptance passed")
 
 
