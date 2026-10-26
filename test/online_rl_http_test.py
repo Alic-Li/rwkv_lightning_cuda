@@ -40,8 +40,10 @@ def server(args, mode, label, adapter=None, state=None, resume=None):
     log_path = args.work / (label + ".log")
     command = [str(args.build / f"rwkv_{mode}_tune_server"), "--model", str(args.model),
                "--vocab", str(args.vocab), "--port", str(port), "--chunk", str(args.chunk),
-               "--ctx", str(getattr(args, "ctx", 512)), "--lr", ".001" if mode == "miss" else ".01",
-               "--output", str(args.work / label), "--cache-capacity", "8"]
+               "--ctx", str(getattr(args, "ctx", 512)),
+               "--output", str(args.work / label),
+               "--cache-capacity", str(getattr(args, "cache_capacity", 8)),
+               "--cache-memory-mb", str(getattr(args, "cache_memory_mb", 4096))]
     command += ["--gemm-mode", getattr(args, "gemm_mode", "bf16")]
     if getattr(args, "default_stop", None) is not None:
         command += ["--stop", json.dumps(args.default_stop)]
@@ -69,14 +71,96 @@ def server(args, mode, label, adapter=None, state=None, resume=None):
             except subprocess.TimeoutExpired: process.kill(); process.wait()
 
 
+def check_cache_health(api):
+    h = api.call("/health")
+    c = h["cache"]
+    assert c["scope"] == "global" and c["eviction_policy"] == "lru"
+    assert c["effective_capacity"] == min(c["capacity"], c["memory_limit_bytes"] // c["entry_bytes"])
+    assert c["cached_prefixes"] <= c["allocated_slots"] <= c["effective_capacity"]
+    assert c["used_bytes"] == c["cached_prefixes"] * c["entry_bytes"]
+    assert c["allocated_bytes"] == c["allocated_slots"] * c["entry_bytes"] <= c["memory_limit_bytes"]
+    assert c["free_slots"] == c["allocated_slots"] - c["cached_prefixes"]
+    assert sum(p["cached_prefixes"] for p in h["policies"]) == c["cached_prefixes"]
+    assert sum(p["cache_bytes"] for p in h["policies"]) == c["used_bytes"]
+    refs = [p for p in h["policies"] if p["version"] == h["reference_version"]]
+    assert h["reference_cached_prefixes"] == (refs[0]["cached_prefixes"] if refs else 0)
+    assert h["reference_cache_bytes"] == h["reference_cached_prefixes"] * c["entry_bytes"]
+    if not refs:
+        assert not h["reference_cache_enabled"]
+    return h
+
+
+def cache_pool_acceptance(api):
+    """Exercise actual state-buffer reuse, LRU touches and disabled/small budgets."""
+    h = check_cache_health(api)
+    capacity = h["cache"]["effective_capacity"]
+    def prefix(i):
+        # Valid even for the tiny vocab, disjoint keys with a shared radix edge.
+        return [98, 99 + i % 20, 99 + i // 20]
+    def request(i):
+        return api.call("/v1/completions", dict(prompts=[prefix(i)], max_tokens=0))
+    if capacity == 0:
+        for _ in range(3):
+            assert request(0)["cached_prompt_tokens"] == 0
+        assert check_cache_health(api)["cache"]["allocated_bytes"] == 0
+        return
+    assert 1 <= capacity <= 100, capacity  # deliberately small test fixture pool
+    for i in range(capacity):
+        assert request(i)["cached_prompt_tokens"] == 0
+    assert request(0)["cached_prompt_tokens"] == 3  # oldest is now MRU
+    request(capacity)  # evicts key 1, or key 0 with a single slot
+    if capacity > 1:
+        assert request(0)["cached_prompt_tokens"] == 3
+        assert request(1)["cached_prompt_tokens"] == 0
+    else:
+        assert request(0)["cached_prompt_tokens"] == 0
+    for cycle in range(4):
+        for i in range(capacity + 1):
+            request(i)
+        c = check_cache_health(api)["cache"]
+        assert c["allocated_slots"] == capacity and c["cached_prefixes"] == capacity
+        assert c["evictions"] > 0 and c["skipped_inserts"] == 0
+    # Reused snapshots must still produce the same output as a cold prefill.
+    request(0)
+    body = dict(prompts=[prefix(0)], max_tokens=2, stop=[], seed=17)
+    warm = api.call("/v1/completions", body)["completions"][0]
+    assert warm["cached_prompt_tokens"] == 3
+    cold = api.call("/v1/completions", dict(body, use_cache=False))["completions"][0]
+    assert warm["tokens"] == cold["tokens"]
+    assert max(abs(x-y) for x,y in zip(warm["logprobs"], cold["logprobs"])) < .01
+
+
+def learning_rate_acceptance(args, mode):
+    """Identical initial policies/batches must update differently at different LR."""
+    initial_scores, updated_scores, norms = [], [], []
+    base_lr = .001 if mode == "miss" else .01
+    sequence = [98, 99, 100, 101, 102, 103]
+    for factor in (1, 4):
+        with server(args, mode, f"{mode}-lr-{factor}", args.adapter, args.state) as api:
+            version = api.call("/health")["policy_version"]
+            initial_scores.append(api.call("/v1/logprobs", {"sequences": [sequence]})["logprobs"])
+            result = api.call("/v1/train", dict(
+                policy_version=version, learning_rate=base_lr * factor,
+                samples=[dict(tokens=sequence, loss_mask=[0, 1, 1, 1, 1, 1], advantages=1.0)]))
+            assert result["step"] == 1 and result["updated"]
+            norms.append(result["grad_norm"])
+            api.call("/v1/publish", {"expected_step": 1})
+            updated_scores.append(api.call("/v1/logprobs", {"sequences": [sequence]})["logprobs"])
+    assert initial_scores[0] == initial_scores[1]
+    assert math.isclose(norms[0], norms[1], rel_tol=1e-6)
+    assert updated_scores[0] != updated_scores[1], "request LR did not affect the actual update"
+
+
 def acceptance(api):
     h = api.call("/health"); version = h["policy_version"]
+    learning_rate = .001 if h["mode"] == "miss" else .01
     assert h["backbone_loads"] == 1 and h["dtype"] == "bfloat16"
     assert h["wkv_kernel"] == "rwkv7_statepassing_clampw"
     assert h["wkv_io_dtype"] == "bfloat16" and h["wkv_state_dtype"] == "float32"
     assert h["reference_version"] == version
     assert h["default_stop"] == ["</tool_call>", "</answer>", "\n\nUser:"]
     assert h["default_max_tokens"] == 1024
+    check_cache_health(api)
     strict = h["gemm_mode"] == "strict"
     logprob_tolerance = .01 if strict else .25
     def rollout(prompt, **kwargs):
@@ -125,7 +209,9 @@ def acceptance(api):
     # detokenize replaces incomplete UTF-8 with U+FFFD; stop strings match
     # original bytes, so replacement text is not a valid roundtrip fixture.
     if text and "\ufffd" not in text:
-        row = rollout(base, use_cache=False, stop=[text])["completions"][0]
+        # This request must write its stopped state; a cache-disabled request
+        # cannot promise that a shorter, previously unseen suffix is cached.
+        row = rollout(base, use_cache=True, stop=[text])["completions"][0]
         assert row["finish_reason"] == "stop" and row["matched_stop"] == text, row
         assert row["tokens"] == reference[:len(row["tokens"])]
         assert not row["truncated"]  # a hit at max_tokens wins over length
@@ -157,7 +243,7 @@ def acceptance(api):
     # Full batch validation occurs before GPU work or any optimizer mutation.
     api.call("/v1/completions", {"prompts": [[98], [-1]]}, 400)
     api.call("/v1/completions", {"prompts": [[98]], "temperature": 0}, 400)
-    api.call("/v1/train", {"policy_version": version, "samples": [
+    api.call("/v1/train", {"policy_version": version, "learning_rate": learning_rate, "samples": [
         dict(tokens=[98,99], loss_mask=[0,0], advantages=1)]}, 400)
     assert api.call("/health")["step"] == 0
     api.call("/v1/detokenize", {"tokens": [129]})  # partial/invalid byte-token text must still be valid JSON
@@ -179,13 +265,20 @@ def acceptance(api):
             advantage = (1., -.5)[i]
             score -= advantage * sum(row["logprobs"])
             selected += len(row["tokens"])
-    request = dict(policy_version=version, temperature=.7,
+    request = dict(policy_version=version, temperature=.7, learning_rate=learning_rate,
                    samples=[dict(turns=t, advantages=a) for t,a in zip(episodes,(1.,-.5))])
+    missing_lr = dict(request)
+    missing_lr.pop("learning_rate")
+    assert "learning_rate" in api.call("/v1/train", missing_lr, 400)["error"]
+    for invalid in (None, True, "0.001", [], -1, 0, 1e-20, 10.1, 1e100):
+        api.call("/v1/train", dict(request, learning_rate=invalid), 400)
+    assert api.call("/health")["step"] == 0
     zero = dict(request, samples=[dict(turns=t, advantages=0.) for t in episodes])
     z = api.call("/v1/train", zero)
     assert not z["updated"] and z["step"] == 0
     train = api.call("/v1/train", request)
     assert train["step"] == 1 and math.isfinite(train["grad_norm"]) and train["grad_norm"] > 0
+    assert math.isclose(train["learning_rate"], learning_rate, rel_tol=1e-6)
     # Learner CE and actor log probabilities describe the same tempered policy.
     assert abs(train["loss"] - score / selected) < .02, (train["loss"], score / selected)
     assert rollout(base, use_cache=False)["completions"] == cold["completions"]
@@ -202,15 +295,36 @@ def acceptance(api):
     changed = rollout(base, policy_version=new_version, use_cache=False)
     assert changed["completions"][0]["logprobs"] != cold["completions"][0]["logprobs"]
     request["policy_version"] = new_version
+    # There is no sticky/default learning rate, even after a successful update.
+    missing_lr["policy_version"] = new_version
+    api.call("/v1/train", missing_lr, 400)
+    assert api.call("/health")["step"] == 1
+    request["learning_rate"] = learning_rate / 2
     next_step = api.call("/v1/train", request)
     assert next_step["step"] == 2
+    assert math.isclose(next_step["learning_rate"], learning_rate / 2, rel_tol=1e-6)
+    # Ensure reference has cached data immediately before it is retired.
+    rollout(base, max_tokens=0)
+    assert check_cache_health(api)["reference_cached_prefixes"] > 0
     final = api.call("/v1/publish", {"expected_step": 2, "checkpoint": True})
     assert final["checkpoint"].endswith("training")
+    retired = check_cache_health(api)
+    assert retired["reference_cached_prefixes"] == 0 and not retired["reference_cache_enabled"]
+    assert retired["cache"]["retired_prefixes"] > 0
+    # KL weights survive; old-reference completions cannot repopulate its cache.
+    reference_scores = api.call("/v1/logprobs", dict(sequences=[base + reference], policy_version=version))
+    assert reference_scores["logprobs"] == scored["logprobs"]
+    assert rollout(base, max_tokens=0)["cached_prompt_tokens"] == 0
+    assert check_cache_health(api)["reference_cache_bytes"] == 0
     checkpoints = [Path(final["directory"])]
     for step in range(3, 7):
         request["policy_version"] = final["policy_version"]
-        assert api.call("/v1/train", request)["step"] == step
+        request["learning_rate"] = learning_rate / step
+        result = api.call("/v1/train", request)
+        assert result["step"] == step
+        assert math.isclose(result["learning_rate"], request["learning_rate"], rel_tol=1e-6)
         final = api.call("/v1/publish", {"expected_step": step, "checkpoint": True})
+        check_cache_health(api)
         checkpoints.append(Path(final["directory"]))
     if h["mode"] == "miss":
         configs = [json.loads((path / "training" / "checkpoint.json").read_text())["config"]
@@ -268,6 +382,15 @@ def main():
     p.add_argument("--modes", nargs="+", choices=["miss", "state"], default=["miss", "state"])
     args = p.parse_args(); args.work.mkdir(parents=True, exist_ok=True)
     for mode in args.modes:
+        learning_rate_acceptance(args, mode)
+        for label, count, memory_mb in (("bounded-cache", 10000, 1),
+                                       ("single-slot-cache", 1, 4096),
+                                       ("disabled-cache", 8, 0)):
+            cache_args = copy.copy(args)
+            cache_args.cache_capacity = count
+            cache_args.cache_memory_mb = memory_mb
+            with server(cache_args, mode, f"{mode}-{label}", args.adapter, args.state) as api:
+                cache_pool_acceptance(api)
         with server(args, mode, mode, args.adapter, args.state) as api:
             if args.check_idle_timeout:
                 idle_connection_acceptance(api)

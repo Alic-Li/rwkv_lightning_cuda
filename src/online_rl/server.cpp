@@ -3,7 +3,7 @@
 #include "rwkv/bf16_training/model.hpp"
 #include "rwkv/bf16_training/ops.hpp"
 #include "rwkv/bf16_training/trainer.hpp"
-#include "rwkv/inference/prefix_cache.hpp"
+#include "rwkv/inference/prefix_cache_pool.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
 #include "rwkv/inference/text_stop_matcher.hpp"
 #include "rwkv/inference/utf8.hpp"
@@ -90,16 +90,14 @@ struct Options {
   std::string gemm_mode = "bf16";
   std::vector<std::string> stop = {"</tool_call>", "</answer>", "\n\nUser:"};
   int port = 8848, chunk = 64, ctx = 4096, batch = 32, cache = 16, versions = 2,
-      rank = 16, max_tokens = 1024;
-  float alpha = 16, lr = 2e-5f;
+      rank = 16, max_tokens = 1024, cache_memory_mb = 4096;
+  float alpha = 16;
   bool rank_set = false, alpha_set = false, targets_set = false;
 };
 Options parse(int argc, char **argv, bool miss) {
   Options o;
-  if (!miss) {
+  if (!miss)
     o.port = 8849;
-    o.lr = 0.01f;
-  }
   for (int i = 1; i < argc; ++i) {
     std::string key = argv[i];
     if (key == "--help" || key == "-h") {
@@ -109,9 +107,10 @@ Options parse(int argc, char **argv, bool miss) {
              "  --host 127.0.0.1 --port "
           << o.port
           << " --chunk 64 --ctx 4096 --max-batch 32\n"
-             "  --cache-capacity 16 --keep-versions 2 --lr "
-          << o.lr
-          << " --output online-rl-output\n"
+             "  --cache-capacity 16 --keep-versions 2 --output online-rl-output\n"
+             "  learning_rate is required in every POST /v1/train request\n"
+             "  --cache-memory-mb 4096 (global CPU snapshot pool MiB; 0 disables)\n"
+             "  --cache-capacity is a GLOBAL entry limit shared by all versions\n"
              "  --gemm-mode bf16|strict (default: bf16 Tensor Cores)\n"
              "  --max-tokens 1024 (generation safety cap, not a target length)\n"
              "  --stop JSON (default: [\"</tool_call>\",\"</answer>\",\"\\n\\nUser:\"])\n"
@@ -123,6 +122,9 @@ Options parse(int argc, char **argv, bool miss) {
     if (rwkv::is_version_flag(key))
       std::exit(rwkv::print_version(miss ? "rwkv_miss_tune_server"
                                          : "rwkv_state_tune_server"));
+    if (key == "--lr")
+      throw std::invalid_argument(
+          "--lr was removed; send learning_rate in every POST /v1/train request");
     if (++i >= argc)
       throw std::invalid_argument("missing value for " + key);
     std::string v = argv[i];
@@ -175,10 +177,10 @@ Options parse(int argc, char **argv, bool miss) {
       o.batch = integer();
     else if (key == "--cache-capacity")
       o.cache = integer();
+    else if (key == "--cache-memory-mb")
+      o.cache_memory_mb = integer();
     else if (key == "--keep-versions")
       o.versions = integer();
-    else if (key == "--lr")
-      o.lr = floating();
     else if (key == "--rank") {
       o.rank = integer();
       o.rank_set = true;
@@ -194,11 +196,12 @@ Options parse(int argc, char **argv, bool miss) {
   if (o.model.empty() || o.port < 1 || o.port > 65535 || o.chunk < 1 ||
       o.ctx < 2 || o.chunk > o.ctx || o.chunk > 65535 || o.ctx > 1048576 ||
       o.batch < 1 || o.batch > 1024 || o.cache < 0 || o.versions < 1 ||
-      o.versions > 32 || o.lr <= 0 || o.rank < 1 || o.rank > 1024 ||
+      o.cache_memory_mb < 0 || o.cache_memory_mb > 1048576 ||
+      o.versions > 32 || o.rank < 1 || o.rank > 1024 ||
       (o.gemm_mode != "bf16" && o.gemm_mode != "strict") ||
       o.max_tokens < 1 || o.max_tokens > 1048576)
     throw std::invalid_argument(
-        "invalid model/port/chunk/ctx/batch/cache/versions/lr/rank/gemm-mode/max-tokens");
+        "invalid model/port/chunk/ctx/batch/cache/cache-memory-mb/versions/rank/gemm-mode/max-tokens");
   if (!o.alpha_set)
     o.alpha = float(o.rank);
   return o;
@@ -231,6 +234,8 @@ void upload(DeviceBuffer<T> &d, const std::vector<T> &h, cudaStream_t s) {
 struct CachedState {
   std::vector<float> state, logits;
   std::vector<bf16> shifts;
+  CachedState(size_t states, size_t shift_count, size_t vocab)
+      : state(states), logits(vocab), shifts(shift_count) {}
 };
 struct Policy {
   std::string version, directory;
@@ -238,8 +243,7 @@ struct Policy {
   FrozenModelView view;
   DeviceBuffer<float> initial;
   DeviceBuffer<bf16> adapter;
-  rwkv7_server::PrefixCache<CachedState> cache;
-  explicit Policy(size_t capacity) : cache(capacity) {}
+  bool cache_enabled = true;
 };
 struct Sample {
   std::vector<int> tokens;
@@ -332,6 +336,7 @@ class Runtime {
   FrozenModelView actor_view_;
   std::unique_ptr<BatchDecoder> decoder_;
   rwkv7_server::TrieTokenizer tokenizer_;
+  std::unique_ptr<rwkv7_server::PrefixCachePool<CachedState>> cache_;
   std::deque<std::shared_ptr<Policy>> policies_;
   // Startup policy; never retired, so clients can score against it (KL).
   std::shared_ptr<Policy> reference_;
@@ -370,7 +375,7 @@ class Runtime {
     throw HttpError(409, "policy version is unknown or retired");
   }
   std::shared_ptr<Policy> snapshot() {
-    auto p = std::make_shared<Policy>(o_.cache);
+    auto p = std::make_shared<Policy>();
     p->version = run_id_ + ":" + std::to_string(version_);
     p->step = step_;
     p->view = learner_;
@@ -383,17 +388,24 @@ class Runtime {
   }
   // row < 0 caches the actor executor's state, otherwise that decoder row.
   void cache_put(Policy &p, const std::vector<int64_t> &prefix,
-                 std::vector<float> logits, int row = -1) {
-    if (!o_.cache)
+                 const float *logits, int row = -1) {
+    if (!p.cache_enabled)
       return;
-    auto c = std::make_shared<CachedState>();
-    if (row < 0) {
-      c->state = download(actor_exec_->state(), stream_.value);
-      c->shifts = download(actor_exec_->shifts(), stream_.value);
-    } else
-      decoder_->download(row, c->state, c->shifts);
-    c->logits = std::move(logits);
-    p.cache.put(p.version, prefix, std::move(c));
+    cache_->put(p.version, prefix, [&](CachedState &c) {
+      if (row < 0) {
+        gpu_check(cudaMemcpyAsync(c.state.data(), actor_exec_->state().p,
+                                  c.state.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream_.value),
+                  "cache state");
+        gpu_check(cudaMemcpyAsync(c.shifts.data(), actor_exec_->shifts().p,
+                                  c.shifts.size() * sizeof(bf16),
+                                  cudaMemcpyDeviceToHost, stream_.value),
+                  "cache shifts");
+        sync();
+      } else
+        decoder_->download(row, c.state, c.shifts);
+      std::copy_n(logits, c.logits.size(), c.logits.data());
+    });
   }
   StopRules stop_rules(const Json::Value &r) const {
     StopRules rules;
@@ -539,6 +551,16 @@ public:
         learner_(model_.state_tuning_model_view()) {
     if (tokenizer_.load(o_.vocab) != rwkv7_server::kTokenizerSuccess)
       throw std::runtime_error("failed to load vocabulary");
+    const size_t states = size_t(learner_.layers) * learner_.heads * 4096;
+    const size_t shifts = size_t(learner_.layers) * 2 * learner_.channels;
+    const size_t vocab = learner_.vocab;
+    const size_t entry_bytes = (states + vocab) * sizeof(float) +
+                               shifts * sizeof(bf16);
+    cache_ = std::make_unique<rwkv7_server::PrefixCachePool<CachedState>>(
+        size_t(o_.cache), size_t(o_.cache_memory_mb) * 1024 * 1024,
+        entry_bytes, [states, shifts, vocab] {
+          return std::make_shared<CachedState>(states, shifts, vocab);
+        });
     if (!o_.resume.empty()) {
       const auto dir = std::filesystem::path(o_.resume);
       if (!std::filesystem::is_directory(dir / "training"))
@@ -661,6 +683,29 @@ public:
     r["published_step"] = Json::UInt64(policies_.back()->step);
     r["reference_version"] = reference_->version;
     r["reference_step"] = Json::UInt64(reference_->step);
+    r["reference_cache_enabled"] =
+        reference_->cache_enabled && cache_->capacity() > 0;
+    r["reference_cached_prefixes"] =
+        Json::UInt64(cache_->size(reference_->version));
+    r["reference_cache_bytes"] =
+        Json::UInt64(cache_->size(reference_->version) * cache_->entry_bytes());
+    auto &cache = r["cache"];
+    cache["scope"] = "global";
+    cache["eviction_policy"] = "lru";
+    cache["capacity"] = o_.cache;
+    cache["effective_capacity"] = Json::UInt64(cache_->capacity());
+    cache["memory_limit_bytes"] = Json::UInt64(cache_->memory_limit());
+    cache["entry_bytes"] = Json::UInt64(cache_->entry_bytes());
+    cache["cached_prefixes"] = Json::UInt64(cache_->size());
+    cache["used_bytes"] = Json::UInt64(cache_->used_bytes());
+    cache["allocated_slots"] = Json::UInt64(cache_->allocated_slots());
+    cache["allocated_bytes"] = Json::UInt64(cache_->allocated_bytes());
+    cache["free_slots"] = Json::UInt64(cache_->allocated_slots() - cache_->size());
+    cache["hits"] = Json::UInt64(cache_->hits());
+    cache["misses"] = Json::UInt64(cache_->misses());
+    cache["evictions"] = Json::UInt64(cache_->evictions());
+    cache["retired_prefixes"] = Json::UInt64(cache_->retired());
+    cache["skipped_inserts"] = Json::UInt64(cache_->skipped());
     r["chunk"] = o_.chunk;
     r["ctx"] = o_.ctx;
     r["vocab_size"] = learner_.vocab;
@@ -674,7 +719,10 @@ public:
       Json::Value v;
       v["version"] = p->version;
       v["step"] = Json::UInt64(p->step);
-      v["cached_prefixes"] = Json::UInt64(p->cache.size());
+      v["cache_enabled"] = p->cache_enabled && cache_->capacity() > 0;
+      v["cached_prefixes"] = Json::UInt64(cache_->size(p->version));
+      v["cache_bytes"] =
+          Json::UInt64(cache_->size(p->version) * cache_->entry_bytes());
       r["policies"].append(v);
     }
     return r;
@@ -703,7 +751,8 @@ public:
         number(r, "max_tokens", o_.max_tokens, 0, 1048576);
     int max_new = 0, active = 0;
     float temperature = real(r, "temperature", 1.0f, 0.01f, 100.0f);
-    bool use_cache = flag(r, "use_cache", true);
+    bool use_cache = flag(r, "use_cache", true) && p->cache_enabled &&
+                     cache_->capacity() > 0;
     const StopRules rules = stop_rules(r);
     const rwkv7_server::TextStopMatcher matcher(rules.strings);
     require(!r.isMember("seed") || r["seed"].isUInt64(),
@@ -739,7 +788,7 @@ public:
     for (int i = 0; i < B; ++i) {
       auto &row = rows[i];
       row.prefix.assign(row.prompt.begin(), row.prompt.end());
-      auto hit = use_cache ? p->cache.find(p->version, row.prefix)
+      auto hit = use_cache ? cache_->find(p->version, row.prefix)
                            : rwkv7_server::PrefixCache<CachedState>::Match{};
       std::vector<float> last;
       if (hit.value) {
@@ -748,6 +797,9 @@ public:
         last = hit.value->logits;
       } else
         actor_exec_->reset(p->initial.p);
+      // GPU uploads are synchronized; release the reader before the pool may
+      // recycle this buffer for a longer prefix (also works with one slot).
+      hit.value.reset();
       for (size_t off = hit.length; off < row.prompt.size(); off += o_.chunk)
         actor_exec_->forward(
             p->view, row.prompt.data() + off,
@@ -757,7 +809,7 @@ public:
       if (hit.length < row.prompt.size()) {
         last = actor_exec_->last_logits();
         if (use_cache)
-          cache_put(*p, row.prefix, last);
+          cache_put(*p, row.prefix, last.data());
       }
       row.cached = hit.length;
       std::copy(last.begin(), last.end(), logits.begin() + size_t(i) * V);
@@ -797,10 +849,7 @@ public:
           row.active = false;
           --active;
           if (use_cache)
-            cache_put(*p, row.prefix,
-                      std::vector<float>(logits.begin() + size_t(i) * V,
-                                         logits.begin() + size_t(i + 1) * V),
-                      i);
+            cache_put(*p, row.prefix, logits.data() + size_t(i) * V, i);
         }
       }
     }
@@ -885,7 +934,9 @@ public:
     require(rows.isArray() && !rows.empty() &&
                 rows.size() <= unsigned(o_.batch),
             "invalid training batch");
-    float lr = real(r, "learning_rate", o_.lr, 1e-12f, 10.0f);
+    require(r.isMember("learning_rate"),
+            "train requires learning_rate for every step");
+    const float lr = real(r, "learning_rate", 0.0f, 1e-12f, 10.0f);
     float temperature = real(r, "temperature", 1.0f, 0.01f, 100.0f);
     std::vector<Sample> batch;
     size_t kept = 0, positions = 0;
@@ -1067,11 +1118,17 @@ public:
       out["checkpoint"] = dir.string();
     }
     // The single worker finishes old requests before this atomic publication.
-    // Explicit old-version requests keep their own immutable weights and trie.
+    // Retained versions share one bounded cache. Reference weights survive
+    // retirement for KL scoring, but their rollout prefixes must not survive
+    // or repopulate an otherwise retired namespace.
     if (changed)
       policies_.push_back(std::move(next));
-    while (policies_.size() > size_t(o_.versions))
+    while (policies_.size() > size_t(o_.versions)) {
+      auto &retired = policies_.front();
+      retired->cache_enabled = false;
+      cache_->erase_identity(retired->version);
       policies_.pop_front();
+    }
     out["policy_version"] = policies_.back()->version;
     out["step"] = Json::UInt64(step_);
     return out;

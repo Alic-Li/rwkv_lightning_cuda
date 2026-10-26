@@ -36,7 +36,7 @@ MiSS (Linux shell):
   --vocab ./rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 --port 8848 \
   --chunk 64 --ctx 4096 --max-batch 8 \
-  --cache-capacity 8 --keep-versions 2 --lr 2e-5 \
+  --cache-capacity 8 --keep-versions 2 \
   --output ./online-rl-output/miss
 ```
 
@@ -49,21 +49,23 @@ State (Linux shell):
   --vocab ./rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 --port 8849 \
   --chunk 64 --ctx 4096 --max-batch 8 \
-  --cache-capacity 8 --keep-versions 2 --lr 0.01 \
+  --cache-capacity 8 --keep-versions 2 \
   --output ./online-rl-output/state
 ```
 
 Windows PowerShell (single-line commands avoid shell-specific continuations):
 
 ```powershell
-.\rwkv_miss_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8848 --chunk 64 --ctx 4096 --max-batch 8 --lr 2e-5 --output .\online-rl-output\miss
-.\rwkv_state_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8849 --chunk 64 --ctx 4096 --max-batch 8 --lr 0.01 --output .\online-rl-output\state
+.\rwkv_miss_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8848 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\miss
+.\rwkv_state_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8849 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\state
 ```
 
 Run only the command for your chosen mode. Omit `--adapter` to initialize MiSS D
 at zero (or use no adapter in State mode); omit `--state` for zero initial state.
 Cold adapters supply rank/alpha/targets and must match the base model.
 `--help` lists all startup flags without loading a model.
+Neither server accepts startup `--lr` anymore. Every `POST /v1/train` request
+must supply `learning_rate`; the server has no default or sticky learning rate.
 
 `--ctx` limits complete history; oversized requests are rejected, never silently
 truncated. `--chunk` controls checkpoint/recompute blocks without detaching gradients.
@@ -78,6 +80,37 @@ shapes can introduce BF16 rounding differences, including different samples for
 the same seed. `--gemm-mode strict` restores the legacy fixed 32-row, pedantic
 path for bitwise comparisons. `--resume DIR` restores a checkpoint (see below);
 use the same GEMM mode recorded in its `policy.json` for numerical continuity.
+
+The CPU prefix cache now uses **one shared, bounded LRU pool across all policy
+versions**. `--cache-capacity` (default 16) is a global entry limit, no longer a
+per-version limit. `--cache-memory-mb` (default 4096, in MiB) also caps the pool's
+tensor storage. Either flag set to zero disables caching. Effective capacity is
+the smaller of the entry limit and the byte budget divided by the snapshot size.
+Buffers are allocated on demand, then reused after eviction; a full pool evicts
+the least recently used entry before writing its replacement. Keys remain
+isolated by policy version. Retiring a policy removes its prefixes. The startup
+reference keeps its weights for KL, but its cache is cleared and disabled once
+it leaves the retained-policy list.
+
+Each snapshot stores FP32 WKV state, BF16 shifts and FP32 logits:
+`L*H*64*64*4 + L*2*C*2 + vocab*4` bytes. For the 2.9B model with 32 layers,
+40 heads and vocab 65536 this is 20.56 MiB. For 128 rollout trajectories,
+`--cache-capacity 256 --cache-memory-mb 6144 --keep-versions 2` allows 256 shared
+slots (~5.14 GiB of tensor storage). A 4096 MiB budget reduces this to 199 slots.
+Smaller caches can require more prefill work; eviction does not truncate history
+or remove training samples. The budget is **not a total process RSS limit**:
+trie/token metadata (bounded by entry count and context limit), models, HTTP
+requests, allocator overhead and training workspaces require additional memory.
+
+`/health.cache` reports `scope`, `eviction_policy`, `capacity`,
+`effective_capacity`, `memory_limit_bytes`, `entry_bytes`, `cached_prefixes`,
+`used_bytes`, `allocated_slots`, `allocated_bytes`, `free_slots`, `hits`, `misses`,
+`evictions`, `retired_prefixes` and `skipped_inserts`. Byte counts describe tensor
+storage. `allocated_bytes` includes free slots retained for reuse, so it need not
+drop on retirement, but never exceeds the budget. Each `policies[]` item adds
+`cache_bytes` and `cache_enabled`. Top-level `reference_cached_prefixes`,
+`reference_cache_bytes` and `reference_cache_enabled` expose the reference cache;
+while reference is retained, these overlap its policy counters, not extra storage.
 
 Both modes directly reuse `cuda/rwkv7_statepassing_clampw.cu`: BF16 sequence
 inputs/outputs and gradients, FP32 recurrent state and state adjoints. `/health`
@@ -117,11 +150,14 @@ curl http://127.0.0.1:8848/health
 uv run --with tqdm python tools/online_rl.py \
   --url http://127.0.0.1:8848 --data /path/to/segments.jsonl \
   --steps 10 --group-size 4 --max-turns 2 --max-tokens 1024 \
-  --temperature 1.0 --seed 1234 --timeout 3600 \
+  --temperature 1.0 --lr 2e-5 --seed 1234 --timeout 3600 \
   --save --metrics ./miss-online-metrics.jsonl
 ```
 
-For State use port `8849` and a separate metrics file. Python needs only `tqdm`;
+For State use port `8849`, client `--lr 0.01`, and a separate metrics file.
+The example client's `--lr` is required and is sent in every train request;
+custom loops can schedule that field independently for each optimizer step.
+Python needs only `tqdm`;
 HTTP uses the standard library. Each JSONL record has this structure:
 
 ```json
@@ -169,12 +205,25 @@ All POST bodies are JSON. Use the opaque `policy_version` returned by the server
 | `POST /v1/tokenize`, `/v1/detokenize` | Convert text to/from token IDs |
 | `POST /v1/completions` | Batch prompts; return generated token IDs and aligned FP32 logprobs |
 | `POST /v1/logprobs` | Teacher-forced logprobs of token sequences under a policy |
-| `POST /v1/train` | One Adam step with tokens/turns, loss masks and signed advantages |
+| `POST /v1/train` | One Adam step with required `learning_rate`, tokens/turns, loss masks and signed advantages |
 | `POST /v1/publish` | Publish the updated actor; optionally export files or a full checkpoint |
 
 Sampling uses plain softmax(logits / temperature); logprobs reflect that temperature.
 Use the same temperature for training. Top-k/top-p are not offered: training CE uses
 the full tempered softmax, so truncated sampling would no longer match it.
+
+`learning_rate` is required in **every** training request, including the first
+request after `--resume`. It must be a finite number in `1e-12..10`; missing or
+invalid values return HTTP 400 without an optimizer update. Each request sets
+only that step's LR, while Adam moments and the step counter persist. The response
+echoes the LR actually used. This lets the client implement warmup or decay using
+the current optimizer step without restarting the server. For example:
+
+```python
+lr = learning_rate_for_step(health["step"] + 1)
+train = call("/v1/train", {"policy_version": version, "learning_rate": lr,
+                         "temperature": 1.0, "samples": samples})
+```
 
 All prompts of a completions request are prefilled one by one (with the prefix
 cache) and then decoded together, one forward per step. Strict mode reproduces

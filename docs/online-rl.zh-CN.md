@@ -24,7 +24,7 @@ cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server
   --state /home/alic-li/rwkv_lightning_cuda/rwkv-state-agentic.pth \
   --vocab ./assets/rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 --port 8848 --chunk 64 --ctx 4096 \
-  --max-batch 8 --cache-capacity 8 --keep-versions 2 --lr 2e-5 \
+  --max-batch 8 --cache-capacity 8 --keep-versions 2 \
   --output ./online-rl-output/miss
 ```
 
@@ -37,7 +37,7 @@ cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server
   --state /home/alic-li/rwkv_lightning_cuda/rwkv-state-agentic.pth \
   --vocab ./assets/rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 --port 8849 --chunk 64 --ctx 4096 \
-  --max-batch 8 --cache-capacity 8 --keep-versions 2 --lr 0.01 \
+  --max-batch 8 --cache-capacity 8 --keep-versions 2 \
   --output ./online-rl-output/state
 ```
 
@@ -50,8 +50,8 @@ cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server
 Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 
 ```powershell
-.\rwkv_miss_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8848 --chunk 64 --ctx 4096 --max-batch 8 --lr 2e-5 --output .\online-rl-output\miss
-.\rwkv_state_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8849 --chunk 64 --ctx 4096 --max-batch 8 --lr 0.01 --output .\online-rl-output\state
+.\rwkv_miss_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8848 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\miss
+.\rwkv_state_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8849 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\state
 ```
 
 选择一种模式启动即可；`--help` 无需加载模型，可检查可执行文件及依赖是否可用。
@@ -59,6 +59,8 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 
 不指定 Adapter 时 MiSS 从零 `D` 开始；不指定 State 时使用零初始 State。
 冷 Adapter 自动提供 rank、alpha、targets，并校验基模 fingerprint 和维度。
+两个 Server 均不再接受启动参数 `--lr`，每次 `POST /v1/train` 必须显式传入 `learning_rate`。
+学习率由客户端逐步控制，服务端不提供默认值，也不沿用上一次请求的学习率。
 每个 Server 进程仅加载一份 Backbone；同时启动两个进程会各自加载一份。
 
 | 参数 | 默认值与含义 |
@@ -70,13 +72,57 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 | `--max-tokens` | `1024`；每轮生成的防复读硬上限，命中停止串会提前结束；请求可以覆盖 |
 | `--stop` | JSON 字符串数组；默认 `["</tool_call>", "</answer>", "\n\nUser:"]`；请求可以覆盖 |
 | `--max-batch` | `32`；一次生成或训练的最大样本数；同时决定合批解码的最大行数 |
-| `--cache-capacity` | `16`；每个保留版本的 CPU 前缀快照条数，`0` 关闭 |
+| `--cache-capacity` | `16`；整个进程共享的 CPU 前缀快照池条数上限，`0` 关闭。所有策略版本合计受限 |
+| `--cache-memory-mb` | `4096`；CPU 前缀快照池的张量缓冲区预算，单位 MiB，`0` 关闭。与条数上限取更小值 |
 | `--keep-versions` | `2`；当前及旧 Actor 快照总数 |
-| `--lr` | MiSS `2e-5`，State `0.01` |
 | `--rank / --alpha / --targets` | 无冷 Adapter 时 `16 / rank / all`；冷启动时推断，显式冲突报错 |
 | `--vocab` | 项目的 `assets/rwkv_vocab_v20230424.txt` |
 | `--output` | `online-rl-output`；显式发布保存的目录 |
 | `--resume` | 无；指向 `checkpoint:true` 发布的目录，恢复优化器状态和 step（见下文） |
+
+### 前缀缓存与系统内存
+
+前缀缓存保存处理完一段 Token 后的完整 WKV State、shift 和下一 Token 的 logits。
+后续请求命中同一策略版本的最长前缀时，从该状态继续，只计算新增的 Token。
+它不是训练参数或梯度；淘汰后会重新 prefill，不会丢弃训练样本或缩短上下文。
+
+**缓存现在是整个进程共享的固定容量池，不再为每个策略版本单独分配配额。**
+`--cache-capacity` 的含义因此从“每版本条数”改为“全局条数”。
+条目按命中/写入更新 LRU 顺序，池满时先淘汰最久未使用的前缀，再复用它的张量缓冲区，
+不会先额外分配一份完整 State。池按需分配，已腾出的槽位留在池内复用，避免反复分配大块内存。
+版本退出 `--keep-versions` 列表时，立即移除该版本的缓存；即使是初始 reference，
+也只保留参考权重和初始 State 用于 KL，之后对它做 rollout 不会重新填充缓存。
+`--keep-versions` 不再倍增缓存池大小，保留版本仍有各自的 Adapter/初始 State 权重开销。
+
+每个槽位的张量字节数为：
+
+```text
+L × H × 64 × 64 × 4 + L × 2 × C × 2 + vocab × 4
+有效槽位数 = min(cache-capacity, floor(cache-memory-mb × 1048576 / 每槽字节数))
+```
+
+2.9B（32 层、40 头、C=2560、词表 65536）每槽约 20.56 MiB。
+例如每批 16 题 × 8 条轨迹，可从以下配置开始，保留约两倍轨迹数的缓存槽位供多轮复用：
+
+```bash
+--cache-capacity 256 --cache-memory-mb 6144 --keep-versions 2
+```
+
+此时所有版本共享最多 256 槽，张量缓冲区约 5.14 GiB；若预算改为 4096 MiB，
+有效槽位数为 199。小预算可能降低命中率、增加 prefill 重算，应结合吞吐调整。
+**字节预算限制缓存张量缓冲区，不是进程 RSS 上限**：前缀索引/Token 元数据另外占用少量内存
+（受槽位数和 `--ctx` 限制），模型、HTTP 请求、分配器和训练工作区也有各自开销。
+
+`GET /health` 的 `cache` 对象报告 `scope: "global"`、`eviction_policy: "lru"`、
+`capacity`、`effective_capacity`、`memory_limit_bytes`、`entry_bytes`、`cached_prefixes`、
+`used_bytes`、`allocated_slots`、`allocated_bytes`、`free_slots`、`hits`、`misses`、
+`evictions`、`retired_prefixes` 和 `skipped_inserts`。
+其中 `used_bytes` 是已索引快照的张量字节数，`allocated_bytes` 包含池内待复用的空闲槽位，
+所以清空某个版本后后者不一定下降，但不会超过预算。
+`policies[]` 各自提供 `cached_prefixes`、`cache_bytes`、`cache_enabled`；顶层
+`reference_cached_prefixes`、`reference_cache_bytes`、`reference_cache_enabled` 单独报告 reference。
+reference 仍在普通版本列表时，这些是同一份缓存的统计，不能再次相加。
+退出列表后 reference 缓存恒为零，KL 打分仍然可用。
 
 ### 显存估算
 
@@ -240,6 +286,11 @@ turn = {"tokens": out["tokens"], "loss_mask": [1] * len(out["tokens"]),
 
 ### RL train step
 
+每个请求的 `learning_rate` **必填**，须为有限数值，范围 `1e-12..10`。
+缺失、非数值或越界返回 HTTP 400，不执行优化器更新。每次请求独立生效，
+可以由客户端按当前 `step` 计算 warmup、衰减等调度；Adam m/v 和更新步数仍跨请求保留。
+启动和 `--resume` 都不设置学习率，恢复后的第一步也必须传入该字段。
+
 ```json
 {
   "policy_version": "rollout 返回的版本",
@@ -280,7 +331,7 @@ loss = - sum(mask[t] * advantage[t] * log softmax(logits[t-1]/temperature)[token
 复用原 CE Kernel，加入逐行 signed weight 和 temperature 的链式导数；没有 PPO clipping、KL 项或重要性修正。
 GRPO 的组内 Reward 归一化在 Python 中完成。服务每次执行一次 Adam 更新，跨请求保持 FP32 master、梯度和 Adam m/v。
 
-返回 `loss`、`grad_norm`（FP32 梯度的 L2）、`step`、`trained_tokens`、`total_tokens`、`seconds`、`updated` 和 `publish_required`。
+返回 `loss`、`grad_norm`（FP32 梯度的 L2）、本次实际使用的 `learning_rate`、`step`、`trained_tokens`、`total_tokens`、`seconds`、`updated` 和 `publish_required`。
 全零 Advantage 返回 `updated:false`，不推进 Adam。全零 Loss Mask 返回 400。
 
 服务要求 `policy_version` 是当前发布版本且其 `published_step == learner.step`。
@@ -326,7 +377,7 @@ uv run --with tqdm python tools/online_rl.py \
   --url http://127.0.0.1:8848 \
   --data /mnt/nvme0n1/no22/segments-2-2.jsonl \
   --steps 10 --group-size 4 --max-turns 2 --max-tokens 1024 \
-  --temperature 1.0 --seed 1234 --timeout 3600 \
+  --temperature 1.0 --lr 2e-5 --seed 1234 --timeout 3600 \
   --save --metrics ./miss-online-metrics.jsonl
 ```
 
@@ -344,7 +395,9 @@ uv run --with tqdm python tools/online_rl.py \
 超限轨迹保留已生成 Token 及其 logprob，结束本条轨迹，不再追加后续观察；奖励仍交给 Judge 计算。
 指标记录 `finish_reasons`、`matched_stops`、`truncated_samples`、`truncation_reasons` 和 `completed_turns`。
 进度条的 `trunc` 显示本批截断样本数。首个 Prompt 已占满 `ctx` 的数据行会跳过。
-换成 `:8849` 并使用独立指标文件可测 State。进度条与 JSONL 指标包含 Reward 均值/标准差、Loss、梯度范数、更新步数、吞吐和缓存命中率。
+换成 `:8849`、设置客户端 `--lr 0.01` 并使用独立指标文件可测 State。
+示例客户端的 `--lr` 必填，它在每个训练请求中发送 `learning_rate`；自定义循环可逐步改变此值。
+进度条与 JSONL 指标包含 Reward 均值/标准差、Loss、梯度范数、实际学习率、更新步数、吞吐和缓存命中率。
 默认 Judge 是生成 Token 与参考答案的 unigram F1，仅供演示。实际任务可用
 `--judge your_module:reward` 替换；函数接收 `(generated_token_ids, reference_token_ids)`，返回标量奖励。
 组内 Reward 无方差时 Advantage 全零，会跳过更新。
@@ -391,7 +444,9 @@ rewards = [judge(e) for e in episodes]
 mean = sum(rewards) / len(rewards)
 std = (sum((r - mean) ** 2 for r in rewards) / len(rewards)) ** 0.5 or 1.0
 samples = [{"turns": e["turns"], "advantages": (r - mean) / std} for e, r in zip(episodes, rewards)]
-train = call("/v1/train", {"policy_version": version, "temperature": 1.0, "samples": samples})
+lr = learning_rate_for_step(health["step"] + 1)  # 由客户端的调度函数决定本次 Adam 更新的 LR
+train = call("/v1/train", {"policy_version": version, "temperature": 1.0,
+                         "learning_rate": lr, "samples": samples})
 if train["updated"]:
     call("/v1/publish", {"expected_step": train["step"]})
 ```
@@ -405,7 +460,7 @@ uv run --with tqdm python tools/online_rl.py \
   --url http://127.0.0.1:8848 \
   --data /mnt/nvme0n1/no22/segments-2-2.jsonl \
   --steps 2 --group-size 2 --max-turns 1 --max-new-tokens 4 \
-  --smoke --save --metrics /tmp/miss-smoke.jsonl
+  --lr 2e-5 --smoke --save --metrics /tmp/miss-smoke.jsonl
 ```
 
 `--smoke` 只保留初始上下文末尾 64 Tokens，Reward 相同时使用人工正负 Advantage，并在指标中标记 `synthetic_advantages`。

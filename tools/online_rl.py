@@ -7,6 +7,7 @@ from collections import Counter
 import importlib
 import http.client
 import json
+import math
 from pathlib import Path
 import statistics
 import time
@@ -143,12 +144,16 @@ def main():
     p.add_argument("--stop", type=parse_stops,
                    help='JSON array of stop strings; default: server strings; [] explicitly disables stops')
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--lr", type=float, required=True,
+                   help="learning rate sent in every train request; custom loops may schedule it per step")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--judge", help="module:function taking (generated_token_ids, reference_token_ids), returning reward")
     p.add_argument("--metrics", type=Path, default=Path("online-rl-metrics.jsonl"))
     p.add_argument("--save", action="store_true", help="export adapter/state on each publish")
     p.add_argument("--smoke", action="store_true", help="plumbing test: shorten initial context to 64 tokens; use synthetic +/- advantages if rewards tie")
     args = p.parse_args()
+    if not math.isfinite(args.lr) or not 1e-12 <= args.lr <= 10.0:
+        p.error("lr must be finite and in 1e-12..10")
     if args.start_row < 1 or not 0 < args.timeout < float("inf"):
         p.error("start-row and timeout must be positive and finite")
     if min(args.steps, args.group_size, args.max_turns) < 1 or args.group_size < 2:
@@ -220,6 +225,7 @@ def main():
                 advantages = [1.0 if i % 2 == 0 else -1.0 for i in range(args.group_size)]
             train = api.call("/v1/train", {
                 "policy_version": version, "temperature": args.temperature,
+                "learning_rate": args.lr,
                 "samples": [{"turns": t, "advantages": a} for t, a in zip(turns, advantages)],
             })
             publish_seconds = 0.0

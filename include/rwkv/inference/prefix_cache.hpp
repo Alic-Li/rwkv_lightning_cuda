@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <list>
 #include <map>
 #include <memory>
@@ -73,6 +74,15 @@ template <class Value> class PrefixCache {
       it->second = std::move(next);
     }
   }
+  std::shared_ptr<Value> extract(typename Order::iterator position) {
+    auto entry = *position;
+    auto root = roots_.find(entry->identity);
+    erase(root->second, entry->tokens, 0);
+    if (root->second.children.empty())
+      roots_.erase(root);
+    order_.erase(position);
+    return std::move(entry->value);
+  }
 
 public:
   struct Match {
@@ -81,6 +91,43 @@ public:
   };
   explicit PrefixCache(size_t capacity) : capacity_(capacity) {}
   size_t size() const { return order_.size(); }
+  size_t size(const std::string &identity) const {
+    return std::count_if(order_.begin(), order_.end(), [&](const auto &entry) {
+      return entry->identity == identity;
+    });
+  }
+  // Removing an entry returns its snapshot so a bounded pool can reuse it.
+  std::shared_ptr<Value> extract_lru() {
+    return order_.empty() ? nullptr : extract(std::prev(order_.end()));
+  }
+  std::shared_ptr<Value> extract_exact(const std::string &identity,
+                                      const std::vector<int64_t> &tokens) {
+    auto root = roots_.find(identity);
+    if (root == roots_.end())
+      return {};
+    auto *node = &root->second;
+    size_t offset = 0;
+    while (offset < tokens.size()) {
+      auto it = node->children.find(tokens[offset]);
+      if (it == node->children.end())
+        return {};
+      node = it->second.get();
+      if (offset + node->edge.size() > tokens.size() ||
+          !std::equal(node->edge.begin(), node->edge.end(),
+                      tokens.begin() + offset))
+        return {};
+      offset += node->edge.size();
+    }
+    return node->entry ? extract(node->entry->position) : nullptr;
+  }
+  template <class Recycle>
+  void erase_identity(const std::string &identity, Recycle recycle) {
+    for (auto it = order_.begin(); it != order_.end();) {
+      auto current = it++;
+      if ((*current)->identity == identity)
+        recycle(extract(current));
+    }
+  }
   void clear() {
     roots_.clear();
     order_.clear();
@@ -127,14 +174,8 @@ public:
     order_.push_front(entry);
     entry->position = order_.begin();
     node.entry = entry;
-    while (order_.size() > capacity_) {
-      auto old = order_.back();
-      auto root = roots_.find(old->identity);
-      erase(root->second, old->tokens, 0);
-      if (root->second.children.empty())
-        roots_.erase(root);
-      order_.pop_back();
-    }
+    while (order_.size() > capacity_)
+      extract_lru();
   }
 };
 } // namespace rwkv7_server
