@@ -78,6 +78,9 @@ def main():
         "-DRWKV7_FAST_BUILD_TESTS=ON", "-DRWKV7_STATE_TUNING=ON",
     ]
     if WINDOWS:
+        # CUDA compiler probes otherwise use Debug (/Zi), whose shared PDB
+        # cannot be replayed by sccache's nvcc/MSVC integration.
+        configure += ["-DCMAKE_TRY_COMPILE_CONFIGURATION=Release"]
         configure += ["-DCMAKE_CXX_FLAGS=/Zc:preprocessor /EHsc /utf-8",
                       "-DCMAKE_CUDA_FLAGS=-Xcompiler=/Zc:preprocessor"]
     run(*configure)
