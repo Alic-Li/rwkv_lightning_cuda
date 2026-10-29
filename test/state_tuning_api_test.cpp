@@ -13,9 +13,22 @@ int main() {
   using namespace rwkv7_state_tuning;
   try {
     const WkvShape shape{2, 7, 3, 64};
-    const std::size_t expected = static_cast<std::size_t>(2) * 3 * 7 * 64 * 64;
+    // 14 rows: one checkpoint slot per lane, plus [B,H,interval] scratch.
+    const std::size_t expected =
+        static_cast<std::size_t>(2 * 3 + 2 * 3 * kWkvCheckpointInterval) *
+        64 * 64;
     if (wkv_tape_elements(shape) != expected) {
       throw std::runtime_error("unexpected exact WKV tape size");
+    }
+    const int fake_offsets[1] = {};
+    // 40 packed rows over 3 lanes: ceil(40/16) slots plus one per extra lane.
+    const WkvShape packed{3, 40, 2, 64, fake_offsets};
+    if (wkv_checkpoint_elements(packed) != static_cast<std::size_t>(5 * 2) *
+                                               64 * 64 ||
+        wkv_tape_elements(packed) !=
+            static_cast<std::size_t>(5 * 2 + 3 * 2 * kWkvCheckpointInterval) *
+                64 * 64) {
+      throw std::runtime_error("unexpected packed WKV tape size");
     }
     bool rejected = false;
     try {

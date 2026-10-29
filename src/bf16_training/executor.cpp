@@ -46,7 +46,9 @@ struct OwnedTape {
     alloc(ln2, "tune tape ln2");
     ffn_hid.resize(static_cast<std::size_t>(time) * w.ffn, "tune tape ffn hid");
     if (replay) {
-      const rwkv_bf16_training::WkvShape shape{1, time, w.heads, 64};
+      // time = lanes * chunk rows; the tape also holds per-lane scratch.
+      const rwkv_bf16_training::WkvShape shape{lanes, time / lanes, w.heads,
+                                               64};
       wkv_initial.resize(static_cast<std::size_t>(lanes) * w.heads * 64 * 64,
                          "tune WKV replay initial");
       view.wkv_replay_initial = wkv_initial.p;
@@ -143,7 +145,7 @@ struct Executor::Impl {
     for (auto *b : {&state_batch, &state_final, &shared_final})
       b->resize(B * lane, "executor state scratch");
     loss.resize(1, "executor loss");
-    shared_tape.resize(wkv_tape_elements({1, capacity, H, 64}),
+    shared_tape.resize(wkv_tape_elements({B, chunk, H, 64}),
                        "shared WKV replay tape");
     owned.resize(L);
     tapes.resize(L);
