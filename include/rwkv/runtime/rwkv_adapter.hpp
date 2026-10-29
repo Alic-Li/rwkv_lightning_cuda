@@ -11,7 +11,7 @@ namespace rwkv7_miss {
 extern const std::array<const char *, TargetCount> target_names;
 struct HostTensor {
   int layer = 0, target = 0, in = 0, out = 0, rank = 0;
-  std::size_t offset = 0;
+  std::size_t offset = 0, a_offset = 0;
 };
 struct Package {
   Json::Value manifest;

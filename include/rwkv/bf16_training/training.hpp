@@ -127,6 +127,9 @@ struct FrozenModelView {
 // recorder owns these buffers; no activation is attached to inference state.
 struct BlockTapeView {
   std::array<float *, rwkv_bf16_miss::TargetCount> miss_reduced{};
+  bf16 *nora_att_shift = nullptr, *nora_ffn_shift = nullptr;
+  bf16 *nora_input = nullptr; // executor-owned shared replay scratch
+  float *nora_ds = nullptr;
   int batch = 0;
   int time = 0;
   bf16 *x = nullptr;

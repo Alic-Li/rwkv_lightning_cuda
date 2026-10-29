@@ -1357,6 +1357,7 @@ void run_backend_forward(
                  static_cast<std::size_t>(rows) * F +
                  static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * V);
 
+  DeviceBuffer<float> nora_latent;
   DeviceBuffer<unsigned char> lt_workspace;
   lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc backend hipblasLt workspace");
 
@@ -1444,7 +1445,12 @@ void run_backend_forward(
         return;
       auto linear = state.adapter_gpu->blocks[layer][target];
       linear.scale = state.adapter->scale;
-      rwkv7_miss::forward(stream, rows, linear, input, output);
+      float *latent=nullptr;
+      if(linear.a && rows>1) {
+        nora_latent.resize(size_t(rows)*linear.rank,"NoRA latent workspace");
+        latent=nora_latent.p;
+      }
+      rwkv7_miss::forward(stream, rows, linear, input, output, latent);
     };
     const bool miss_value =
         state.adapter && layer < int(state.adapter_gpu->blocks.size()) &&

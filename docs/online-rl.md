@@ -1,5 +1,7 @@
 # Persistent BF16 online RL servers
 
+`rwkv_nora_tune_server` supports the same API, trains both NoRA A/B factors, and defaults to port 8850. See [NoRA-init](../src/nora/README.md).
+
 English | [简体中文 / full API examples](online-rl.zh-CN.md)
 
 `rwkv_miss_tune_server` trains MiSS D parameters with a fixed initial state.

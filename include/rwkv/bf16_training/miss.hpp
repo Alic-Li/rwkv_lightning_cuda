@@ -11,7 +11,9 @@ struct Linear {
   int in = 0, out = 0, rank = 0;
   float scale = 1;
   const bf16 *d = nullptr;
-  float *gradient = nullptr; // optional, FP32 accumulator; never a base dW
+  float *gradient = nullptr; // optional D/B FP32 accumulator; never a base dW
+  const bf16 *a = nullptr;   // NoRA A[rank,in]; null selects MiSS
+  float *gradient_a = nullptr;
 };
 using Block = std::array<Linear, TargetCount>;
 // reduced may be null for inference (fused reduction/project/add), otherwise

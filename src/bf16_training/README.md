@@ -1,6 +1,6 @@
 # Native BF16 training backbone
 
-`rwkv_state_tune` and `rwkv_miss_tune` now build from this directory and link
+`rwkv_state_tune`, `rwkv_miss_tune`, and `rwkv_nora_tune` build from this directory and link
 `rwkv_bf16_training`, independently of `rwkv7_fast_backend_core`. The existing
 FP16 inference backend remains unchanged apart from accepting BF16 adapter
 files. The legacy FP16 training sidecar has been removed. The layer forward/reverse
@@ -75,3 +75,5 @@ PyTorch gradients, all six targets, shared tapes, chunk/accumulation consistency
 loss decrease, exact BF16 checkpoint resume/export, streamed source conversion,
 and FP16/W8A16/W4A16 serving. CUDA is exercised locally; HIP execution requires
 an AMD GPU and must not be inferred from CUDA results.
+
+NoRA-init shares the trainer and chunk executor. See [NoRA](../nora/README.md) for random A initialization, both-factor gradients, checkpoint layout and launch examples.

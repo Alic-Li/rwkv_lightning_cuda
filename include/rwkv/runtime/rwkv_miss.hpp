@@ -10,7 +10,8 @@ enum Target { Receptance, Key, Value, Output, FfnKey, FfnValue, TargetCount };
 struct Linear {
   int in = 0, out = 0, rank = 0;
   float scale = 1;
-  const half *d = nullptr;
+  const half *d = nullptr; // MiSS D, or NoRA B
+  const half *a = nullptr; // NoRA A[rank,in]; null selects MiSS
 };
 using Block = std::array<Linear, TargetCount>;
 // Inference uses fused reduction/project/add when reduced is null.

@@ -1,5 +1,7 @@
 # HTTP API examples
 
+The adapter endpoints and generation adapter fields also accept [NoRA-init packages](../src/nora/README.md). Method selection is automatic from the manifest; both A and B count toward cache budgets.
+
 [English](http-api.md) | [简体中文](http-api.zh-CN.md) | [Back to README](../README.md)
 
 This page covers the native inference service. For Launcher Client/Agent control, authentication and backend forwarding, see the [integration guide (Chinese)](../RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md).

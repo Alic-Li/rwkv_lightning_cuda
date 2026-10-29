@@ -1,4 +1,5 @@
 #include "rwkv/runtime/rwkv_miss.hpp"
+#include "rwkv/runtime/rwkv_nora.hpp"
 #include <cmath>
 #include <stdexcept>
 namespace rwkv7_miss {
@@ -75,6 +76,8 @@ void checked() {
 } // namespace
 void forward(cudaStream_t stream, int rows, const Linear &w, const half *x,
              half *y, float *s) {
+  if (w.a)
+    return rwkv7_nora::forward(stream, rows, w, x, y, s);
   if (!w.d)
     return;
   validate(rows, w);

@@ -1,5 +1,5 @@
 #include "../state_tuning/dataset.hpp"
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
 #include "rwkv/bf16_training/trainer.hpp"
 #endif
 #include "rwkv/bf16_training/model.hpp"
@@ -37,7 +37,7 @@ struct Sample {
 };
 
 struct Options {
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
   std::string state, resume, targets = "all";
   int rank = 16;
   float alpha = -1;
@@ -53,12 +53,12 @@ struct Options {
   int epochs = 1;
   int batch_size = 1;
   std::uint64_t max_steps = 0;
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
   float lr = 1.0e-3f;
 #else
   float lr = 1.0f;
 #endif
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
   float lr_final = 1.0e-4f;
 #else
   float lr_final = 0.01f;
@@ -71,11 +71,20 @@ struct Options {
 [[noreturn]] void usage(const char *program, const std::string &error = {}) {
   if (!error.empty())
     std::cerr << "error: " << error << "\n\n";
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
+#ifdef RWKV_NORA_TUNE
+  std::cerr << "NoRA-init: --rank 16 --alpha RANK --targets "
+               "all|comma-separated-weight-names\n"
+            << "  Random column-normalized A, zero B; Adam trains A and B. "
+               "alpha must equal rank.\n"
+            << "  --state initial.pth --resume checkpoint-directory\n"
+            << "  default lr=0.001 lr-final=0.0001\n";
+#else
   std::cerr << "MiSS: --rank 16 --alpha RANK --targets "
                "all|comma-separated-weight-names\n"
             << "      --state initial.pth --resume checkpoint-directory\n"
             << "      default lr=0.001 lr-final=0.0001; Adam updates only D\n";
+#endif
 #endif
   std::cerr
       << "Usage: " << program << " --model MODEL.pth --data TRAIN.jsonl "
@@ -93,9 +102,15 @@ struct Options {
       << "  --batch-size N        samples per update, accumulated sequentially "
          "(default 1)\n"
       << "  --max-steps N         stop after N optimizer updates\n"
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
+      << "  --optimizer adam      adapter optimizer\n"
+      << "  --lr FLOAT            initial learning rate (default 0.001)\n"
+      << "  --lr-final FLOAT      final learning rate (default 0.0001)\n"
+#else
       << "  --optimizer adam|muon optimizer (default adam)\n"
       << "  --lr FLOAT            initial learning rate (default 1.0)\n"
       << "  --lr-final FLOAT      final learning rate (default 0.01)\n"
+#endif
       << "  --warmup-steps N      linear warmup updates (default 10)\n"
       << "  --save-every N        periodic checkpoint interval (default 0)\n"
       << "  --seed N              deterministic run seed (default 1234)\n"
@@ -148,8 +163,12 @@ Options parse(int argc, char **argv) {
     if (arg == "--help" || arg == "-h")
       usage(argv[0]);
     else if (rwkv::is_version_flag(arg))
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
+#ifdef RWKV_NORA_TUNE
+      std::exit(rwkv::print_version("rwkv_nora_tune"));
+#else
       std::exit(rwkv::print_version("rwkv_miss_tune"));
+#endif
 #else
       std::exit(rwkv::print_version("rwkv_state_tune"));
 #endif
@@ -157,7 +176,7 @@ Options parse(int argc, char **argv) {
       continue; // Compatibility flag: shared WKV tape is always enabled.
     else if (arg == "--chunk-load")
       out.chunk_load = true;
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
     else if (arg == "--state")
       out.state = value(i, argc, argv);
     else if (arg == "--resume")
@@ -211,11 +230,15 @@ Options parse(int argc, char **argv) {
   if (out.ctx <= 0 || out.chunk <= 0 || out.epochs <= 0 ||
       out.batch_size <= 0 || out.lr <= 0 || out.lr_final <= 0)
     usage(argv[0], "ctx/chunk/epochs/lr values must be positive");
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
   if (out.rank < 1 || out.rank > 1024 || out.optimizer != "adam")
-    usage(argv[0], "MiSS requires rank 1..1024 and Adam");
+    usage(argv[0], "adapter tuning requires rank 1..1024 and Adam");
   if (out.alpha == -1)
     out.alpha = out.rank;
+#ifdef RWKV_NORA_TUNE
+  if (out.alpha != out.rank)
+    usage(argv[0], "NoRA requires alpha/rank = 1");
+#endif
 #endif
   return out;
 }
@@ -273,7 +296,7 @@ int main(int argc, char **argv) {
     std::uint64_t planned =
         static_cast<std::uint64_t>(options.epochs) *
         ((dataset_rows + options.batch_size - 1) / options.batch_size);
-#ifndef RWKV_MISS_TUNE
+#if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
     if (options.max_steps)
       planned = std::min(planned, options.max_steps);
 #endif
@@ -298,7 +321,7 @@ int main(int argc, char **argv) {
     const std::size_t state_lane = static_cast<std::size_t>(H) * N * N;
 
     Stream stream;
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
     Json::Value config;
     config["base_fingerprint"] = model.base_fingerprint();
     config["data_fingerprint"] = rwkv7_miss::fingerprint_file(options.data);
@@ -319,6 +342,10 @@ int main(int argc, char **argv) {
     config["planned_steps"] = Json::UInt64(planned);
     config["seed"] = Json::UInt64(options.seed);
     config["training_dtype"] = "bfloat16";
+#ifdef RWKV_NORA_TUNE
+    config["method"] = "nora";
+    config["initialization"] = "nora_init";
+#endif
     rwkv_bf16_miss::Trainer miss(frozen, options.rank, options.alpha,
                                  options.targets, max_time, config,
                                  stream.value);
@@ -328,7 +355,7 @@ int main(int argc, char **argv) {
     time_state.resize(state_count, "tune time_state");
     state_gradient.resize(state_count, "tune dState");
     time_state.zero("zero tune time_state");
-#ifndef RWKV_MISS_TUNE
+#if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
     adam_m.resize(state_count, "tune Adam m");
     adam_m.zero("zero tune Adam m");
     if (options.optimizer == "adam") {
@@ -339,7 +366,7 @@ int main(int argc, char **argv) {
     if (!options.state.empty()) time_state = model.load_state(options.state);
 #endif
     rwkv_bf16_training::Executor executor(frozen, max_time, stream.value);
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
     miss.bind_tapes(executor.tapes());
 #endif
     std::cout << "Optimizer: " << options.optimizer << '\n'
@@ -351,12 +378,12 @@ int main(int argc, char **argv) {
     bool stop = false;
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t processed_tokens = 0;
-#ifndef RWKV_MISS_TUNE
+#if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
     std::vector<float> host_gradient(state_count), accumulated(state_count);
 #endif
     int resume_epoch = 1;
     std::uint64_t resume_row = 0;
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
     if (!options.resume.empty())
       miss.resume(options.resume, global_step, resume_epoch, resume_row,
                   time_state.p, state_count);
@@ -366,7 +393,7 @@ int main(int argc, char **argv) {
     for (int epoch = resume_epoch; epoch <= options.epochs && !stop; ++epoch) {
       rwkv7_state_tuning::JsonlTextReader dataset(options.data);
       std::uint64_t data_row = 0;
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
       if (epoch == resume_epoch) {
         std::vector<rwkv7_state_tuning::TextSegment> skipped_row;
         while (data_row < resume_row) {
@@ -418,7 +445,7 @@ int main(int argc, char **argv) {
         }
         if (batch.empty())
           break;
-#ifndef RWKV_MISS_TUNE
+#if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
         std::fill(accumulated.begin(), accumulated.end(), 0.0f);
 #endif
         float batch_loss = 0.0f;
@@ -426,7 +453,7 @@ int main(int argc, char **argv) {
           std::vector<float> weights(sample.train.begin(), sample.train.end());
           batch_loss += executor.backward(frozen, sample.tokens, weights,
                                            time_state.p, batch_tokens);
-#ifndef RWKV_MISS_TUNE
+#if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
           check(cudaMemcpyAsync(host_gradient.data(), executor.state_gradient(),
                                 state_count * sizeof(float),
                                 cudaMemcpyDeviceToHost, stream.value),
@@ -446,7 +473,7 @@ int main(int argc, char **argv) {
           }
 #endif
         }
-#ifndef RWKV_MISS_TUNE
+#if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
         check(cudaMemcpyAsync(state_gradient.p, accumulated.data(),
                               state_count * sizeof(float),
                               cudaMemcpyHostToDevice, stream.value),
@@ -454,7 +481,7 @@ int main(int argc, char **argv) {
 #endif
         const std::uint64_t next_step = global_step + 1;
         const float lr = learning_rate(options, next_step, planned);
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
         miss.update(lr, next_step);
 #else
         if (options.optimizer == "muon") {
@@ -494,7 +521,7 @@ int main(int argc, char **argv) {
                   << elapsed / global_step * (planned - global_step) << "s   "
                   << std::flush;
         if (options.save_every && global_step % options.save_every == 0) {
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
           const auto path = (std::filesystem::path(options.output) /
                              ("checkpoint-" + std::to_string(global_step)))
                                 .string();
@@ -514,7 +541,7 @@ int main(int argc, char **argv) {
       }
     }
     std::cout << '\n';
-#ifdef RWKV_MISS_TUNE
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
     const std::string final_path =
         (std::filesystem::path(options.output) / "adapter-final.pth").string();
     miss.export_adapter(final_path);
@@ -531,7 +558,9 @@ int main(int argc, char **argv) {
               << " seed=" << options.seed << '\n';
   } catch (const std::exception &error) {
     std::cerr <<
-#ifdef RWKV_MISS_TUNE
+#ifdef RWKV_NORA_TUNE
+        "\nrwkv_nora_tune: "
+#elif defined(RWKV_MISS_TUNE)
         "\nrwkv_miss_tune: "
 #else
         "\nrwkv_state_tune: "

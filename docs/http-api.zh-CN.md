@@ -1,5 +1,7 @@
 # HTTP API 示例
 
+适配器接口及生成请求中的适配器字段也支持 [NoRA-init 包](../src/nora/README.md)，根据 manifest 自动选择算法，缓存预算包含 A、B 两组参数。
+
 [English](http-api.md) | 简体中文 | [返回 README](../README_zh.md)
 
 本页介绍原生推理服务；Launcher 的 Client/Agent 控制、鉴权和后端转发请看[联调指南](../RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md)。

@@ -133,7 +133,7 @@ def cache_pool_acceptance(api):
 def learning_rate_acceptance(args, mode):
     """Identical initial policies/batches must update differently at different LR."""
     initial_scores, updated_scores, norms = [], [], []
-    base_lr = .001 if mode == "miss" else .01
+    base_lr = .001 if mode in ("miss", "nora") else .01
     sequence = [98, 99, 100, 101, 102, 103]
     for factor in (1, 4):
         with server(args, mode, f"{mode}-lr-{factor}", args.adapter, args.state) as api:
@@ -153,7 +153,7 @@ def learning_rate_acceptance(args, mode):
 
 def acceptance(api):
     h = api.call("/health"); version = h["policy_version"]
-    learning_rate = .001 if h["mode"] == "miss" else .01
+    learning_rate = .001 if h["mode"] in ("miss", "nora") else .01
     assert h["backbone_loads"] == 1 and h["dtype"] == "bfloat16"
     assert h["wkv_kernel"] == "rwkv7_statepassing_clampw"
     assert h["wkv_io_dtype"] == "bfloat16" and h["wkv_state_dtype"] == "float32"
@@ -326,10 +326,10 @@ def acceptance(api):
         final = api.call("/v1/publish", {"expected_step": step, "checkpoint": True})
         check_cache_health(api)
         checkpoints.append(Path(final["directory"]))
-    if h["mode"] == "miss":
+    if h["mode"] in ("miss", "nora"):
         configs = [json.loads((path / "training" / "checkpoint.json").read_text())["config"]
                    for path in checkpoints]
-        assert len(configs[0]) == 6 and "seed" not in configs[0] and "planned_steps" not in configs[0]
+        assert len(configs[0]) == (8 if h["mode"] == "nora" else 6) and "seed" not in configs[0] and "planned_steps" not in configs[0]
         assert all(config == configs[0] for config in configs), configs
     rollout_body = dict(prompts=[base], max_tokens=2, seed=42, stop_token_ids=[])
     api.call("/v1/completions", dict(rollout_body, policy_version=new_version), 409)  # retired
@@ -379,7 +379,7 @@ def main():
     p.add_argument("--chunk", type=int, default=7)
     p.add_argument("--gemm-mode", choices=["bf16", "strict"], default="bf16")
     p.add_argument("--check-idle-timeout", action="store_true", help="also test a 75-second silent HTTP connection per mode")
-    p.add_argument("--modes", nargs="+", choices=["miss", "state"], default=["miss", "state"])
+    p.add_argument("--modes", nargs="+", choices=["miss", "nora", "state"], default=["miss", "state"])
     args = p.parse_args(); args.work.mkdir(parents=True, exist_ok=True)
     for mode in args.modes:
         learning_rate_acceptance(args, mode)
@@ -437,7 +437,7 @@ def main():
             assert len(disabled["tokens"]) == 2 and disabled["truncation_reason"] == "max_tokens"
             numeric = api.call("/v1/completions", dict(body, stop_token_ids=[row["tokens"][0]]))["completions"][0]
             assert numeric["tokens"] == row["tokens"][:1] and numeric["finish_reason"] == "stop"
-        if mode == "miss":
+        if mode in ("miss", "nora"):
             # Old servers polluted all but their first checkpoint with nulls.
             metadata = exported / "training" / "checkpoint.json"
             original = metadata.read_text()

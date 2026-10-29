@@ -215,6 +215,10 @@ void block_forward_state_tuning_bf16(
   bf16 *ffn_act = arena.take(F);
   bf16 *ffn_out = arena.take(R);
 
+  if (tape.nora_att_shift)
+    copy(stream, attention_shift, tape.nora_att_shift, size_t(B) * C);
+  if (tape.nora_ffn_shift)
+    copy(stream, ffn_shift, tape.nora_ffn_shift, size_t(B) * C);
   copy(stream, input, tape.x, R);
   rwkv7_v3a_layer_norm_bf16_launch(stream, rows, C, input, w.ln1_weight,
                                    w.ln1_bias, tape.ln1, kLnEps);

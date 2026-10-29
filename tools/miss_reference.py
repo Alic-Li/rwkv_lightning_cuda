@@ -16,6 +16,10 @@ def forward(weights, adapters, tokens, rank, scale=1, dtype=torch.float16):
         get = lambda n: w[prefix+n]
         def linear(x, name):
             base = q(x @ get(name).T)
+            a = adapters.get(prefix+name+'.A')
+            if a is not None:
+                b = adapters[prefix+name+'.B']
+                return q(base + scale * (x @ q(a).T) @ q(b).T)
             d = adapters.get(prefix+name+'.D')
             if d is None: return base
             padded = F.pad(x, (0, (-x.shape[-1]) % rank))

@@ -46,8 +46,10 @@ int main(int argc, char **argv) {
       TEST_CHECK(std::abs(expected[i] - chunked[i]) < .015f);
     const auto variant_path = rwkv_test::unique_temp_path("miss_variant");
     auto variant_data = h->package->data;
-    for (auto &bits : variant_data)
-      bits ^= 0x8000;
+    for (const auto &t : h->package->tensors)
+      for (size_t i = 0; i < size_t(t.out) * t.rank; ++i)
+        variant_data[t.offset + i] ^=
+            0x8000; // Flip D/B only; flipping A too cancels BA.
     save_package(variant_path.string(), h->package->manifest,
                  h->package->tensors, variant_data);
     cache.register_adapter("variant", variant_path.string());

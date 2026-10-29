@@ -8,7 +8,7 @@ namespace {
 struct OwnedTape {
   DeviceBuffer<bf16> x, ln1, r, raw_w, k, v_base, v, alpha, neg_kk, wkv_k, kka,
       w1_tanh, g1_sigmoid, v_gate, wkv_y, att_group_norm, att_gate, x_after_att,
-      ln2, ffn_hid;
+      ln2, ffn_hid, nora_att_shift, nora_ffn_shift;
   DeviceBuffer<float> wkv_initial;
   std::array<DeviceBuffer<float>, rwkv_bf16_miss::TargetCount> miss_reduced;
   BlockTapeView view;
@@ -51,6 +51,13 @@ struct OwnedTape {
       view.wkv_replay_final = shared_final;
       view.wkv = {shared_tape, rwkv_bf16_training::wkv_tape_elements(shape)};
     }
+    if (replay && std::any_of(w.miss.begin(), w.miss.end(),
+                              [](const auto &a) { return a.a != nullptr; })) {
+      nora_att_shift.resize(w.channels, "NoRA incoming attention shift");
+      nora_ffn_shift.resize(w.channels, "NoRA incoming FFN shift");
+      view.nora_att_shift = nora_att_shift.p;
+      view.nora_ffn_shift = nora_ffn_shift.p;
+    }
     view.batch = 1;
     view.time = time;
     view.x = x.p;
@@ -91,7 +98,9 @@ struct Executor::Impl {
   size_t lane, states, shift_count;
   cudaStream_t stream;
   DeviceBuffer<bf16> input, ping, pong, norm, logits, dlogits, gping, gpong,
-      shifts, shift_grad, first, first_grad, workspace, terminal_shift;
+      shifts, shift_grad, first, first_grad, workspace, terminal_shift,
+      nora_input;
+  DeviceBuffer<float> nora_ds;
   DeviceBuffer<int> targets;
   DeviceBuffer<float> state_gradient, per_batch_gradient, state_batch,
       state_final, loss, shared_tape, shared_final, carried, weights;
@@ -144,6 +153,21 @@ struct Executor::Impl {
                       first_grad.p,
                       terminal_shift.p + size_t(l) * 2 * C,
                       terminal_shift.p + size_t(l) * 2 * C + C};
+    }
+    size_t nora_in = 0, nora_rank = 0;
+    for (const auto &b : m.blocks)
+      for (const auto &a : b.miss)
+        if (a.a) {
+          nora_in = std::max(nora_in, size_t(chunk) * a.in);
+          nora_rank = std::max(nora_rank, size_t(chunk) * a.rank);
+        }
+    if (nora_in) {
+      nora_input.resize(nora_in, "NoRA shared input replay");
+      nora_ds.resize(nora_rank, "NoRA shared latent adjoint");
+      for (auto &t : tapes) {
+        t.nora_input = nora_input.p;
+        t.nora_ds = nora_ds.p;
+      }
     }
     workspace.resize(scratch, "executor block workspace");
   }

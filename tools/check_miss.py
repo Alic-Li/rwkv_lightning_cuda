@@ -10,7 +10,9 @@ import torch
 p = argparse.ArgumentParser()
 p.add_argument('--build', type=pathlib.Path, required=True)
 p.add_argument('--work', type=pathlib.Path, required=True)
+p.add_argument('--method', choices=['miss','nora'], default='miss')
 a = p.parse_args()
+nora = a.method == 'nora'
 a.work.mkdir(parents=True, exist_ok=True)
 torch.manual_seed(1234)
 # Independent explicit fixed A reference for FP16 inference, including ragged blocks.
@@ -23,7 +25,7 @@ A = torch.eye(16).repeat(1, 5)[:, :67]
 base = (X @ W.T).half()
 torch.save(dict(X=X, D=D, base_Y=base, Y=base.float() + X @ A.T @ D.T),
            a.work/'reference.pth')
-subprocess.run([a.build/'test/rwkv_miss_test', a.work/'reference.pth'], check=True)
+subprocess.run([a.build/('test/rwkv_nora_test' if nora else 'test/rwkv_miss_test'), a.work/'reference.pth'], check=True)
 # Two layers exercise v_first cross-layer gradients; nonzero mixes exercise shifts.
 C, F, V, R, L = 64, 128, 256, 16, 2
 w = {}
@@ -53,7 +55,7 @@ repo=pathlib.Path(__file__).resolve().parents[1]
 (a.work/'vocab.txt').write_text(''.join((repo/'assets/rwkv_vocab_v20230424.txt').read_text().splitlines(True)[:127]))
 (a.work/'train.jsonl').write_text((json.dumps({'text':'abcabcabcabcabcabcabcabcabcabcabc'})+'\n')*4)
 def run(out, chunk, steps, resume=None, batch=1, extra=(), model=None):
-    cmd=[str(a.build/'rwkv_miss_tune'),'--model',str(model or a.work/'tiny.pth'),'--data',str(a.work/'train.jsonl'),
+    cmd=[str(a.build/f'rwkv_{a.method}_tune'),'--model',str(model or a.work/'tiny.pth'),'--data',str(a.work/'train.jsonl'),
          '--vocab',str(a.work/'vocab.txt'),'--output',str(a.work/out),'--rank','8','--ctx','30','--chunk',str(chunk),
          '--epochs','4','--lr','.003','--lr-final','.003','--warmup-steps','0','--max-steps',str(steps),'--save-every','1']
     cmd+=['--batch-size',str(batch),*extra]
@@ -71,7 +73,7 @@ for k in x:
 # Full model autograd checks all six targets, both layers and v_first.
 from miss_reference import forward
 checkpoint=torch.load(a.work/'full/checkpoint-1/training.pth',weights_only=True)
-adapters={k.removesuffix('.master'):torch.zeros_like(v,requires_grad=True)
+adapters={k.removesuffix('.master'):(v.clone() if nora and k.endswith('.A.master') else torch.zeros_like(v)).requires_grad_()
           for k,v in checkpoint.items() if k.endswith('.master')}
 tokens=torch.tensor([ord(c)+1 for c in 'abcabcabcabcabcabcabcabcabcabcabc'][:31])
 logits=forward(w,adapters,tokens[:-1],8,dtype=torch.bfloat16)
@@ -83,6 +85,33 @@ for name,d in adapters.items():
     torch.testing.assert_close(actual,d.grad,atol=4e-4,rtol=.02)
     assert (actual-d.grad).norm() / d.grad.norm().clamp_min(1e-12) < .02
 print('Full model autograd loss:',loss.item())
+if nora:
+    for name, value in adapters.items():
+        if name.endswith('.A'):
+            torch.testing.assert_close(value.norm(dim=0),torch.ones(value.shape[1]),atol=2e-7,rtol=2e-7)
+            assert checkpoint[name+'.adam_m'].count_nonzero() == 0
+            assert value.std() > .01
+    run('second',30,2)
+    second=torch.load(a.work/'second/checkpoint-2/training.pth',weights_only=True)
+    trained={k.removesuffix('.master'):v.clone().requires_grad_() for k,v in checkpoint.items() if k.endswith('.master')}
+    second_logits=forward(w,trained,tokens[:-1],8,dtype=torch.bfloat16)
+    torch.nn.functional.cross_entropy(second_logits,tokens[1:]).backward()
+    for name,value in trained.items():
+        actual=(second[name+'.adam_m']-.9*checkpoint[name+'.adam_m'])/.1
+        torch.testing.assert_close(actual,value.grad,atol=6e-4,rtol=.04)
+        assert (actual-value.grad).norm()/value.grad.norm().clamp_min(1e-12)<.04,name
+    assert any(not torch.equal(second[k],checkpoint[k]) for k in checkpoint if k.endswith('.A.master'))
+    run('second-chunked',7,2)
+    second_chunked=torch.load(a.work/'second-chunked/checkpoint-2/training.pth',weights_only=True)
+    for key in second:
+        if key.endswith('.adam_m'):
+            torch.testing.assert_close(second[key],second_chunked[key],atol=3e-5,rtol=.04)
+    assert any((second[k].norm(dim=0)-1).abs().max()>1e-4 for k in second if k.endswith('.A.master'))
+
+    bad=subprocess.run([str(a.build/'rwkv_nora_tune'),'--model','unused','--data','unused',
+                        '--output','unused','--rank','8','--alpha','16'],capture_output=True,text=True)
+    assert bad.returncode and 'alpha/rank = 1' in bad.stderr
+
 run('batch',7,1,batch=2)
 run('shared-tape',7,1,extra=['--wkv_tape'])
 run('batch-tape',7,1,batch=2,extra=['--wkv_tape'])
@@ -116,7 +145,7 @@ log=run('learn',7,16)
 import re
 losses=[float(x) for x in re.findall(r'loss=([0-9.]+)',log)]
 assert losses[-1]<losses[0],losses
-print('MiSS acceptance passed; loss',losses[0],'->',losses[-1])
+print(a.method+' acceptance passed; loss',losses[0],'->',losses[-1])
 
 # Dynamic runtime must reuse the same adapter semantics for all base formats.
 for fmt in ['fp16','w8a16','w4a16']:

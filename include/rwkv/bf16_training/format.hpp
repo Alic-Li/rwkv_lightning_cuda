@@ -12,6 +12,7 @@ inline constexpr std::array<const char *, 6> target_names = {
 struct HostTensor {
   int layer, target, in, out, rank;
   size_t offset;
+  size_t a_offset = 0;
 };
 Json::Value adapter_manifest(Json::Value, const std::vector<HostTensor> &,
                              const std::vector<uint16_t> &);

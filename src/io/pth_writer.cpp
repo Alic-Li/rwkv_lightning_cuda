@@ -148,9 +148,9 @@ std::vector<std::uint8_t> data_of(const std::string &value) {
 }
 
 } // namespace
-void write_pth(const std::string &path,
-               const std::vector<WriteTensor> &tensors,
-               const std::string &miss_manifest) {
+void write_pth(const std::string &path, const std::vector<WriteTensor> &tensors,
+               const std::string &adapter_manifest,
+               const std::string &manifest_entry) {
   std::vector<std::uint8_t> p{0x80, 2, '}', '('};
   std::vector<Entry> entries;
   for (size_t i = 0; i < tensors.size(); ++i) {
@@ -201,8 +201,8 @@ void write_pth(const std::string &path,
   entries.push_back({"archive/data.pkl", p});
   entries.push_back({"archive/byteorder", data_of("little")});
   entries.push_back({"archive/version", data_of("3\n")});
-  if (!miss_manifest.empty())
-    entries.push_back({"archive/miss.json", data_of(miss_manifest)});
+  if (!adapter_manifest.empty())
+    entries.push_back({manifest_entry, data_of(adapter_manifest)});
   const auto temp = path + ".tmp";
   write_zip(temp, std::move(entries));
   auto archive = PthArchive::open(temp);

@@ -1,3 +1,4 @@
+#include "rwkv/bf16_training/nora.hpp"
 // Copied from src/miss/kernels.cu; BF16 tensors, FP32 reduction/accumulation.
 #include "rwkv/bf16_training/miss.hpp"
 #include <cmath>
@@ -163,6 +164,8 @@ void checked() {
 } // namespace
 void forward(cudaStream_t stream, int rows, const Linear &w, const bf16 *x,
              bf16 *y, float *s) {
+  if (w.a)
+    return rwkv_bf16_nora::forward(stream, rows, w, x, y, s);
   if (!w.d)
     return;
   validate(rows, w);

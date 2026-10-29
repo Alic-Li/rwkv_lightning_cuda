@@ -13,5 +13,6 @@ struct WriteTensor {
 };
 // Atomic stored-ZIP PyTorch state dictionary. No Python runtime dependency.
 void write_pth(const std::string &, const std::vector<WriteTensor> &,
-               const std::string &miss_manifest = {});
+               const std::string &adapter_manifest = {},
+               const std::string &manifest_entry = "archive/miss.json");
 } // namespace llm_infer

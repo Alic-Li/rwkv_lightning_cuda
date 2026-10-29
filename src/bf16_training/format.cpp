@@ -1,4 +1,5 @@
 #include "rwkv/bf16_training/format.hpp"
+#include "rwkv/io/adapter_layout.hpp"
 #include "rwkv/io/pth_writer.hpp"
 #include <cstring>
 #include <filesystem>
@@ -33,9 +34,9 @@ std::string json(const Json::Value &v) {
   w["indentation"] = "";
   return Json::writeString(w, v);
 }
-std::string tensor_name(const HostTensor &t) {
+std::string tensor_name(const HostTensor &t, const char *factor = "D") {
   return "blocks." + std::to_string(t.layer) + "." + target_names[t.target] +
-         ".D";
+         "." + factor;
 }
 } // namespace
 std::string content_version(const Json::Value &manifest,
@@ -51,14 +52,22 @@ std::string content_version(const Json::Value &manifest,
 Json::Value adapter_manifest(Json::Value m, const std::vector<HostTensor> &ts,
                              const std::vector<std::uint16_t> &data) {
   m["format_version"] = 1;
-  m["method"] = "miss";
+  const bool nora = m["method"] == "nora";
+  m["method"] = nora ? "nora" : "miss";
   m["dtype"] = "bfloat16";
-  m["layout"] = "modulo_rank_zero_pad";
+  m["layout"] = nora ? "low_rank_ba" : "modulo_rank_zero_pad";
+  if (nora)
+    m["initialization"] = "nora_init";
   m["kind"] = "inference_adapter";
   m["targets"] = Json::Value(Json::arrayValue);
   for (const auto &t : ts) {
     Json::Value v;
-    v["name"] = tensor_name(t);
+    v["name"] = tensor_name(t, nora ? "B" : "D");
+    if (nora) {
+      v["a_name"] = tensor_name(t, "A");
+      v["a_shape"].append(t.rank);
+      v["a_shape"].append(t.in);
+    }
     v["layer"] = t.layer;
     v["target"] = target_names[t.target];
     v["in_features"] = t.in;
@@ -74,17 +83,24 @@ void save_adapter_pth(const std::string &path, Json::Value m,
                       const std::vector<std::uint16_t> &data) {
   if (std::filesystem::exists(path))
     throw std::runtime_error("adapter destination already exists: " + path);
+  m["dtype"] = "bfloat16";
   std::vector<llm_infer::WriteTensor> write;
-  for (const auto &t : ts) {
-    const size_t n = size_t(t.out) * t.rank;
-    if (t.offset + n > data.size())
-      throw std::runtime_error("adapter data bounds");
-    llm_infer::WriteTensor w{tensor_name(t), {t.out, t.rank}, false, {}};
-    w.bf16 = true;
-    w.data.resize(n * 2);
-    std::memcpy(w.data.data(), data.data() + t.offset, n * 2);
-    write.push_back(std::move(w));
-  }
-  llm_infer::write_pth(path, write, json(adapter_manifest(m, ts, data)));
+  const bool nora = m["method"] == "nora";
+  for (const auto &t : ts)
+    rwkv_adapter_detail::components(
+        t, nora, target_names,
+        [&](const std::string &name, int rows, int cols, size_t offset) {
+          size_t n = size_t(rows) * cols;
+          if (offset > data.size() || n > data.size() - offset)
+            throw std::runtime_error("adapter data bounds");
+          llm_infer::WriteTensor w{
+              name, {rows, cols}, m["dtype"] != "bfloat16", {}};
+          w.bf16 = m["dtype"] == "bfloat16";
+          w.data.resize(n * 2);
+          std::memcpy(w.data.data(), data.data() + offset, n * 2);
+          write.push_back(std::move(w));
+        });
+  llm_infer::write_pth(path, write, json(adapter_manifest(m, ts, data)),
+                       nora ? "archive/nora.json" : "archive/miss.json");
 }
 } // namespace rwkv_bf16_miss

@@ -47,6 +47,8 @@ rwkv_lighting_cuda/
 ├── router.config.example.toml
 ├── rwkv_lighting_cuda
 ├── rwkv_miss_tune
+├── rwkv_nora_tune
+├── rwkv_nora_tune_server
 ├── rwkv_miss_tune_server
 ├── rwkv_quantize
 ├── rwkv_state_tune

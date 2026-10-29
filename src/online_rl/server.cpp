@@ -94,10 +94,12 @@ struct Options {
   float alpha = 16;
   bool rank_set = false, alpha_set = false, targets_set = false;
 };
-Options parse(int argc, char **argv, bool miss) {
+Options parse(int argc, char **argv, bool miss, bool nora) {
   Options o;
   if (!miss)
     o.port = 8849;
+  if (nora)
+    o.port = 8850;
   for (int i = 1; i < argc; ++i) {
     std::string key = argv[i];
     if (key == "--help" || key == "-h") {
@@ -117,11 +119,15 @@ Options parse(int argc, char **argv, bool miss) {
              "  --vocab PATH --rank 16 --alpha 16 --targets all (inferred from "
              "cold adapter)\n"
              "  --version, -v prints the version and exits\n";
+      if (nora)
+        std::cout << "  NoRA-init: random column-normalized A, zero B; trains "
+                     "both. alpha must equal rank.\n";
       std::exit(0);
     }
     if (rwkv::is_version_flag(key))
-      std::exit(rwkv::print_version(miss ? "rwkv_miss_tune_server"
-                                         : "rwkv_state_tune_server"));
+      std::exit(rwkv::print_version(nora   ? "rwkv_nora_tune_server"
+                                    : miss ? "rwkv_miss_tune_server"
+                                           : "rwkv_state_tune_server"));
     if (key == "--lr")
       throw std::invalid_argument(
           "--lr was removed; send learning_rate in every POST /v1/train request");
@@ -204,6 +210,10 @@ Options parse(int argc, char **argv, bool miss) {
         "invalid model/port/chunk/ctx/batch/cache/cache-memory-mb/versions/rank/gemm-mode/max-tokens");
   if (!o.alpha_set)
     o.alpha = float(o.rank);
+  if (nora && o.alpha_set &&
+      (o.rank_set || (o.adapter.empty() && o.resume.empty())) &&
+      o.alpha != o.rank)
+    throw std::invalid_argument("NoRA requires alpha/rank = 1");
   return o;
 }
 struct Stream {
@@ -321,7 +331,7 @@ template <class F> void parallel_for(size_t n, const F &f) {
 
 class Runtime {
   Options o_;
-  bool miss_;
+  bool miss_, nora_;
   // Exactly one Model owns all backbone allocations. Views only borrow them.
   Model model_;
   Stream stream_;
@@ -546,8 +556,8 @@ class Runtime {
   }
 
 public:
-  Runtime(Options o, bool miss)
-      : o_(std::move(o)), miss_(miss), model_(o_.model),
+  Runtime(Options o, bool miss, bool nora)
+      : o_(std::move(o)), miss_(miss), nora_(nora), model_(o_.model),
         learner_(model_.state_tuning_model_view()) {
     if (tokenizer_.load(o_.vocab) != rwkv7_server::kTokenizerSuccess)
       throw std::runtime_error("failed to load vocabulary");
@@ -597,12 +607,29 @@ public:
         }
       }
     }
+    if (miss_ && !o_.resume.empty() && !o_.targets_set) {
+      // A fresh run may save "all" (or a user-ordered list), whereas an
+      // exported package enumerates targets in canonical order. Restore the
+      // original spelling before the trainer's exact config comparison.
+      // load_adapter below still checks every selected tensor and dimension.
+      std::ifstream file(std::filesystem::path(o_.resume) / "training" /
+                          "checkpoint.json");
+      Json::Value checkpoint;
+      if (!file || !(file >> checkpoint) ||
+          !checkpoint["config"]["targets"].isString())
+        throw std::invalid_argument("invalid adapter resume target metadata");
+      o_.targets = checkpoint["config"]["targets"].asString();
+    }
     if (miss_) {
       Json::Value config;
       config["base_fingerprint"] = model_.base_fingerprint();
       // Trainer::resume() compares this whole object with the checkpoint's.
       config["training_dtype"] = "bfloat16";
       config["kind"] = "online_rl";
+      if (nora_) {
+        config["method"] = "nora";
+        config["initialization"] = "nora_init";
+      }
       config["rank"] = o_.rank;
       config["alpha"] = o_.alpha;
       config["targets"] = o_.targets;
@@ -639,6 +666,10 @@ public:
                               t.rank,
                               package->scale,
                               fixed_adapter_.p + t.offset,
+                              nullptr,
+                              package->manifest["method"] == "nora"
+                                  ? fixed_adapter_.p + t.a_offset
+                                  : nullptr,
                               nullptr};
         }
       }
@@ -647,8 +678,10 @@ public:
         std::make_unique<Executor>(learner_, o_.chunk, stream_.value);
     auto actor_view = learner_;
     for (auto &b : actor_view.blocks)
-      for (auto &linear : b.miss)
+      for (auto &linear : b.miss) {
         linear.gradient = nullptr;
+        linear.gradient_a = nullptr;
+      }
     actor_exec_ =
         std::make_unique<Executor>(actor_view, o_.chunk, stream_.value);
     actor_view_ = actor_view;
@@ -670,7 +703,7 @@ public:
   Json::Value health() const {
     Json::Value r;
     r["status"] = "ok";
-    r["mode"] = miss_ ? "miss" : "state";
+    r["mode"] = nora_ ? "nora" : miss_ ? "miss" : "state";
     r["dtype"] = "bfloat16";
     r["wkv_kernel"] = "rwkv7_statepassing_clampw";
     r["wkv_io_dtype"] = "bfloat16";
@@ -1090,7 +1123,7 @@ public:
         Json::Value meta;
         meta["policy_version"] = next->version;
         meta["step"] = Json::UInt64(step_);
-        meta["mode"] = miss_ ? "miss" : "state";
+        meta["mode"] = nora_ ? "nora" : miss_ ? "miss" : "state";
         meta["gemm_mode"] = o_.gemm_mode;
         meta["base_fingerprint"] = model_.base_fingerprint();
         std::ofstream f(temp + "/policy.json");
@@ -1186,10 +1219,10 @@ void respond(const std::function<void(const drogon::HttpResponsePtr &)> &cb,
   cb(response);
 }
 } // namespace
-int run(int argc, char **argv, bool miss) {
+int run(int argc, char **argv, bool miss, bool nora) {
   try {
-    Options o = parse(argc, argv, miss);
-    Runtime runtime(o, miss);
+    Options o = parse(argc, argv, miss, nora);
+    Runtime runtime(o, miss, nora);
     Worker worker(o.gemm_mode == "strict");
     auto route = [&](const std::string &path, drogon::HttpMethod method,
                      auto action) {
@@ -1241,8 +1274,11 @@ int run(int argc, char **argv, bool miss) {
           [&](const Json::Value &r) { return runtime.train(r); });
     route("/v1/publish", drogon::Post,
           [&](const Json::Value &r) { return runtime.publish(r); });
-    std::cout << "Online RL " << (miss ? "MiSS" : "state") << " ready http://"
-              << o.host << ':' << o.port << std::endl;
+    std::cout << "Online RL "
+              << (nora   ? "NoRA"
+                  : miss ? "MiSS"
+                         : "state")
+              << " ready http://" << o.host << ':' << o.port << std::endl;
     drogon::app()
         // GPU jobs can run for minutes without socket traffic. Drogon's default
         // 60-second idle timeout otherwise closes a live training request.

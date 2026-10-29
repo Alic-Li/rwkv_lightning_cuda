@@ -23,6 +23,7 @@ CPU_TESTS = (
 BINARIES = (
     "rwkv_lighting_cuda", "rwkv_quantize", "rwkv_state_tune", "rwkv_miss_tune",
     "rwkv_miss_tune_server", "rwkv_state_tune_server",
+    "rwkv_nora_tune", "rwkv_nora_tune_server",
 )
 
 GO_BINARIES = ("rwkv_launcher", "rwkv_router")

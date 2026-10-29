@@ -1,5 +1,7 @@
 # 常驻 BF16 在线 RL Server
 
+`rwkv_nora_tune_server` 复用相同 API，训练 NoRA 的 A/B 两组参数，默认端口 8850。详见 [NoRA-init](../src/nora/README.md)。
+
 [English](online-rl.md) | 简体中文
 
 `rwkv_miss_tune_server` 更新 MiSS `D`；`rwkv_state_tune_server` 更新初始 `time_state`。
