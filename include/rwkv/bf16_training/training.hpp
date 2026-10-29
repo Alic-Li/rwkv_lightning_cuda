@@ -41,12 +41,13 @@ void group_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
                                     const bf16 *frozen_weight, const bf16 *dy,
                                     bf16 *dx, float eps);
 
-// Backward of branches of x + (prev-x)*mix. d_shift may be null.
+// Backward of branches of x + (prev-x)*mix. d_shift may be null. With device
+// offsets[batch + 1], batch is the lane count and time the packed row count.
 void time_mix_backward_input_bf16(cudaStream_t stream, int batch, int time,
                                   int channels, int branches,
                                   const bf16 *const *branch_grads,
                                   const bf16 *const *frozen_mixes, bf16 *dx,
-                                  bf16 *d_shift);
+                                  bf16 *d_shift, const int *offsets = nullptr);
 
 void relu_square_backward_input_bf16(cudaStream_t stream, const bf16 *x,
                                      const bf16 *dy, bf16 *dx,
@@ -132,6 +133,8 @@ struct BlockTapeView {
   float *nora_ds = nullptr;
   int batch = 0;
   int time = 0;
+  // Packed lanes: device offsets[batch + 1]; time is then the total row count.
+  const int *offsets = nullptr;
   bf16 *x = nullptr;
   bf16 *ln1 = nullptr;
   bf16 *r = nullptr;
@@ -160,6 +163,10 @@ struct BlockTapeView {
   float *wkv_replay_final = nullptr;
 };
 
+inline int tape_rows(const BlockTapeView &tape) {
+  return tape.offsets ? tape.time : tape.batch * tape.time;
+}
+
 std::size_t
 block_forward_workspace_bf16_elements(int batch, int time,
                                       const FrozenBlockWeights &weights);
@@ -167,12 +174,15 @@ block_forward_workspace_bf16_elements(int batch, int time,
 // Reuses the inference BF16 kernels and records only the values required by
 // block_backward_state_only. initial/final WKV states are FP32 [B,H,K,V].
 // v_first is a shared [B,T,C] buffer: layer 0 writes it, later layers read it.
+// With device offsets[batch + 1], rows are packed lanes: time is the total
+// row count while states and shifts keep one entry per lane.
 void block_forward_state_tuning_bf16(
     cudaStream_t stream, int batch, int time, const bf16 *input,
     bf16 *attention_shift, bf16 *ffn_shift, const float *initial_state,
     float *final_state, bf16 *v_first, bf16 *output,
     const FrozenBlockWeights &frozen_weights, BlockTapeView &tape,
-    bf16 *workspace, std::size_t workspace_elements, bool layer_zero);
+    bf16 *workspace, std::size_t workspace_elements, bool layer_zero,
+    const int *offsets = nullptr);
 
 struct BlockBackwardState {
   const float *final_state_grad = nullptr; // optional [B,H,K,V]
@@ -225,6 +235,7 @@ void target_logprobs_bf16(cudaStream_t stream, int rows, int vocab,
 // With carried_states [L,B,H,K,V], both states and shifts are advanced in
 // place. Tapes and all tape storage are caller-owned. compute_logits=false
 // skips ln_out/head (boundary checkpoint sweeps and masked-only chunks).
+// offsets selects the packed-lane layout described at the block forward.
 const bf16 *model_forward_state_tuning_bf16(
     cudaStream_t stream, int layers, int batch, int time,
     const FrozenBlockWeights *weights, BlockTapeView *tapes, const bf16 *input,
@@ -233,10 +244,12 @@ const bf16 *model_forward_state_tuning_bf16(
     bf16 *activation_ping, bf16 *activation_pong, float *state_batch,
     float *state_final, bf16 *block_workspace,
     std::size_t block_workspace_elements, bf16 *final_normalized, bf16 *logits,
-    float *carried_states = nullptr, bool compute_logits = true);
+    float *carried_states = nullptr, bool compute_logits = true,
+    const int *offsets = nullptr);
 
 void add_last_shift_gradient(cudaStream_t stream, int batch, int time,
-                             int channels, bf16 *dx, const bf16 *dshift);
+                             int channels, bf16 *dx, const bf16 *dshift,
+                             const int *offsets = nullptr);
 
 // Frozen output head backward: logits -> ln_out -> last block. Returns the
 // same ping/pong alias contract as model_backward_state_only.

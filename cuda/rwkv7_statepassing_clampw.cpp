@@ -11,7 +11,9 @@ std::size_t wkv_tape_elements(const WkvShape &shape) {
     throw std::invalid_argument(
         "state-tuning WKV requires B,T,H > 0 and head_size == 64");
   }
-  const std::size_t values[] = {static_cast<std::size_t>(shape.batch),
+  // Packed shapes store one tape row per token, independent of lane count.
+  const std::size_t values[] = {static_cast<std::size_t>(
+                                    shape.offsets ? 1 : shape.batch),
                                 static_cast<std::size_t>(shape.heads),
                                 static_cast<std::size_t>(shape.time),
                                 static_cast<std::size_t>(shape.head_size),

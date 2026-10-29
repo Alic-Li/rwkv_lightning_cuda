@@ -14,9 +14,13 @@ struct WkvShape {
   int time = 0;
   int heads = 0;
   int head_size = 64;
+  // Optional device [batch + 1] row offsets. Lane b then owns packed rows
+  // [offsets[b], offsets[b + 1]) and time is the total row count; an empty
+  // lane passes its state through unchanged.
+  const int *offsets = nullptr;
 };
 
-// Exact short-context tape: FP32 [B,H,T,K,V]. A later checkpoint/recompute
+// Exact short-context tape: FP32 [rows,H,K,V]. A later checkpoint/recompute
 // implementation can change the storage policy without changing the API.
 struct WkvTapeView {
   float *state_before = nullptr;
@@ -25,7 +29,7 @@ struct WkvTapeView {
 
 std::size_t wkv_tape_elements(const WkvShape &shape);
 
-// r/w/k/v/a/b/y are [B,T,H,N]. w is the raw clamp-w input including w0.
+// r/w/k/v/a/b/y are [B,T,H,N] (packed: [rows,H,N]). w is the raw clamp-w input including w0.
 // Initial/final states use the inference physical ABI [B,H,K,V].
 // An empty tape disables recording for forward only.
 void wkv_forward(cudaStream_t stream, IoType io_type, const WkvShape &shape,

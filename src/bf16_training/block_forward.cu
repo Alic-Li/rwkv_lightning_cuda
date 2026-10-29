@@ -129,19 +129,23 @@ void block_forward_state_tuning_bf16(
     bf16 *ffn_shift, const float *initial_state, float *final_state,
     bf16 *v_first, bf16 *output, const FrozenBlockWeights &w,
     BlockTapeView &tape, bf16 *workspace, std::size_t workspace_elements,
-    bool layer_zero) {
-  const std::size_t required = block_forward_workspace_bf16_elements(B, T, w);
+    bool layer_zero, const int *offsets) {
+  // Row-wise kernels see packed lanes as one dense batch of T rows.
+  const int dense = offsets ? 1 : B;
+  const std::size_t required =
+      block_forward_workspace_bf16_elements(dense, T, w);
   if (!input || !attention_shift || !ffn_shift || !initial_state ||
       !final_state || !v_first || !output || !workspace ||
       workspace_elements < required) {
     throw std::invalid_argument("invalid block forward arguments");
   }
-  const int rows = B * T;
+  const int rows = dense * T;
   const int C = w.channels;
   const std::size_t R = static_cast<std::size_t>(rows) * C;
   const std::size_t F = static_cast<std::size_t>(rows) * w.ffn;
   tape.batch = B;
   tape.time = T;
+  tape.offsets = offsets;
   for (void *pointer :
        {static_cast<void *>(tape.x), static_cast<void *>(tape.ln1),
         static_cast<void *>(tape.r), static_cast<void *>(tape.raw_w),
@@ -224,7 +228,7 @@ void block_forward_state_tuning_bf16(
                                    w.ln1_bias, tape.ln1, kLnEps);
   rwkv7_tmix_mix6_launch(stream, B, T, C, tape.ln1, attention_shift, w.mix_r,
                          w.mix_w, w.mix_k, w.mix_v, w.mix_a, w.mix_g, xr, xw,
-                         xk, xv, xa, xg);
+                         xk, xv, xa, xg, offsets);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, C, xr, w.receptance,
                                     tape.r);
   rwkv_bf16_miss::forward(stream, rows, w.miss[0], xr, tape.r,
@@ -266,7 +270,7 @@ void block_forward_state_tuning_bf16(
   }
   tape.v_first = v_first;
 
-  rwkv7_tmix_kk_a_gate_launch(stream, B, T, C, w.heads, tape.k, w.k_k, w.a0,
+  rwkv7_tmix_kk_a_gate_launch(stream, dense, T, C, w.heads, tape.k, w.k_k, w.a0,
                               a12, w.k_a, tape.wkv_k, tape.neg_kk, tape.kka);
   if (tape.wkv_replay_initial) {
     if (!tape.wkv_replay_final)
@@ -278,7 +282,7 @@ void block_forward_state_tuning_bf16(
     if (error != cudaSuccess)
       throw std::runtime_error(cudaGetErrorString(error));
   }
-  wkv_forward(stream, IoType::BF16, {B, T, w.heads, kN}, initial_state, tape.r,
+  wkv_forward(stream, IoType::BF16, {B, T, w.heads, kN, offsets}, initial_state, tape.r,
               tape.raw_w, tape.wkv_k, tape.v, tape.neg_kk, tape.kka, tape.wkv_y,
               final_state, tape.wkv_replay_initial ? WkvTapeView{} : tape.wkv);
 
@@ -286,7 +290,7 @@ void block_forward_state_tuning_bf16(
       w.heads, tape.wkv_y, w.att_group_norm_weight, w.att_group_norm_bias,
       tape.att_group_norm);
   rwkv7_tmix_lnx_rkvres_xg_launch(
-      stream, B, T, C, w.heads, tape.wkv_y, tape.r, tape.wkv_k, tape.v, w.r_k,
+      stream, dense, T, C, w.heads, tape.wkv_y, tape.r, tape.wkv_k, tape.v, w.r_k,
       w.att_group_norm_weight, w.att_group_norm_bias, tape.att_gate,
       attention_post);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, C, attention_post,
@@ -298,7 +302,7 @@ void block_forward_state_tuning_bf16(
   rwkv7_v3a_layer_norm_bf16_launch(stream, rows, C, tape.x_after_att,
                                    w.ln2_weight, w.ln2_bias, tape.ln2, kLnEps);
   rwkv7_cmix_mix_launch(stream, B, T, C, tape.ln2, ffn_shift, w.ffn_mix,
-                        ffn_mixed);
+                        ffn_mixed, offsets);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, w.ffn, ffn_mixed,
                                     w.ffn_key, tape.ffn_hid);
   rwkv_bf16_miss::forward(stream, rows, w.miss[4], ffn_mixed, tape.ffn_hid,

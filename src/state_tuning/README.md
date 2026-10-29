@@ -36,10 +36,18 @@ accumulates later-layer value-residual gradients and consumes them in layer 0.
   gradients across boundaries, without detaching the recurrent graph.
 - One chunk activation tape is reused. Boundary checkpoints currently remain
   on GPU, so their memory grows with the number of chunks.
-- `--batch-size N` (alias `--batch`) accumulates N independent samples
-  sequentially, then runs one optimizer update. This supports variable lengths
-  without padding; it does not execute samples in parallel on GPU. Loss and
-  gradients are weighted by the total number of valid tokens in the batch.
+- `--batch-size N` (alias `--batch`) accumulates N independent samples, then
+  runs one optimizer update. Loss and gradients are weighted by the total
+  number of valid tokens in the batch.
+- `--micro-bsz N` runs N of those samples together without padding: each chunk
+  step packs every sample's next tokens back to back, and finished samples
+  take no rows. Activation memory scales with `N * chunk`. The same applies to
+  `rwkv_miss_tune`, `rwkv_nora_tune` and the online RL servers.
+- `--gemm-mode bf16` (default) pins one GEMM kernel per shape with FP32
+  reductions, so a row's result never depends on how many rows share the GEMM:
+  `--micro-bsz` and `--chunk` change no bits of the forward pass. `strict`
+  uses pedantic FP32 accumulation; `auto` restores the previous per-call
+  cuBLAS choice (which may use reduced-precision split-K reductions).
 - Nonfinite loss/dState stops training before the optimizer, preserving the last good
   optimizer state. The progress bar reports updates, loss, tokens/s, and ETA.
 

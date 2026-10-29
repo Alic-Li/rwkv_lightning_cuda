@@ -41,7 +41,7 @@ const bf16 *model_backward_state_only(
       !block_workspace) {
     throw std::invalid_argument("invalid model backward arguments");
   }
-  const int rows = tapes[0].batch * tapes[0].time;
+  const int rows = tape_rows(tapes[0]);
   const int channels = weights[0].channels;
   if (rows <= 0 || channels <= 0) {
     throw std::invalid_argument("invalid model backward shape");
@@ -73,14 +73,14 @@ const bf16 *model_backward_state_only(
   const bf16 *current = gradient_ping;
   bf16 *next = gradient_pong;
   for (int layer = layers - 1; layer >= 0; --layer) {
-    if (tapes[layer].batch * tapes[layer].time != rows ||
+    if (tape_rows(tapes[layer]) != rows ||
         weights[layer].channels != channels) {
       throw std::invalid_argument("all model backward layers must share B,T,C");
     }
     if (layers > 1)
       state_gradients[layer].v_first_grad = v_first_gradient;
-    const std::size_t layer_workspace = block_backward_workspace_bf16_elements(
-        tapes[layer].batch, tapes[layer].time, weights[layer]);
+    const std::size_t layer_workspace =
+        block_backward_workspace_bf16_elements(1, rows, weights[layer]);
     if (layer_workspace > block_workspace_elements) {
       throw std::invalid_argument("model block workspace is too small");
     }

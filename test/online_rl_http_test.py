@@ -45,6 +45,7 @@ def server(args, mode, label, adapter=None, state=None, resume=None):
                "--cache-capacity", str(getattr(args, "cache_capacity", 8)),
                "--cache-memory-mb", str(getattr(args, "cache_memory_mb", 4096))]
     command += ["--gemm-mode", getattr(args, "gemm_mode", "bf16")]
+    command += ["--micro-bsz", str(getattr(args, "micro_bsz", 1))]
     if getattr(args, "default_stop", None) is not None:
         command += ["--stop", json.dumps(args.default_stop)]
     if getattr(args, "default_max_tokens", None) is not None:
@@ -378,6 +379,7 @@ def main():
     p.add_argument("--work", type=Path, required=True)
     p.add_argument("--chunk", type=int, default=7)
     p.add_argument("--gemm-mode", choices=["bf16", "strict"], default="bf16")
+    p.add_argument("--micro-bsz", type=int, default=1, help="training samples packed per pass")
     p.add_argument("--check-idle-timeout", action="store_true", help="also test a 75-second silent HTTP connection per mode")
     p.add_argument("--modes", nargs="+", choices=["miss", "nora", "state"], default=["miss", "state"])
     args = p.parse_args(); args.work.mkdir(parents=True, exist_ok=True)
