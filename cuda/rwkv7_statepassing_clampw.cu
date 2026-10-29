@@ -49,6 +49,12 @@ __device__ __forceinline__ long long checkpoint_slot(int t, int batch) {
   return t / kCheckpointInterval + batch;
 }
 
+// One row's raw inputs for this thread's channel. The forward loads the next
+// row's while it computes the current one.
+template <typename IO> struct RowInputs {
+  IO r, w, k, v, a, b;
+};
+
 template <typename IO>
 __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
     int T, int H, const int *__restrict__ offsets,
@@ -73,8 +79,19 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
   // Packed lanes own rows [offsets[b], offsets[b + 1]); dense lanes own T.
   const int begin = offsets ? offsets[batch] : batch * T;
   const int end = offsets ? offsets[batch + 1] : begin + T;
+  const auto load_row = [&](int t) {
+    const long long i = (static_cast<long long>(t) * H + head) * kN + value;
+    return RowInputs<IO>{r_ptr[i], w_ptr[i], k_ptr[i],
+                         v_ptr[i], a_ptr[i], b_ptr[i]};
+  };
+  RowInputs<IO> next{};
+  if (begin < end)
+    next = load_row(begin);
   for (int t = begin; t < end; ++t) {
     const long long token = (static_cast<long long>(t) * H + head) * kN;
+    const RowInputs<IO> row = next;
+    if (t + 1 < end)
+      next = load_row(t + 1);
     if (checkpoints && (t - begin) % kCheckpointInterval == 0) {
       const long long slot =
           (checkpoint_slot(t, batch) * H + head) * kN * kN;
@@ -83,18 +100,18 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
         checkpoints[slot + key * kN + value] = state[key];
     }
     __syncthreads();
-    r[value] = as_float(r_ptr[token + value]);
-    w[value] = effective_w(as_float(w_ptr[token + value]));
-    k[value] = as_float(k_ptr[token + value]);
-    a[value] = as_float(a_ptr[token + value]);
-    b[value] = as_float(b_ptr[token + value]);
+    r[value] = as_float(row.r);
+    w[value] = effective_w(as_float(row.w));
+    k[value] = as_float(row.k);
+    a[value] = as_float(row.a);
+    b[value] = as_float(row.b);
     __syncthreads();
 
     float sa = 0.0f;
 #pragma unroll
     for (int key = 0; key < kN; ++key)
       sa += state[key] * a[key];
-    const float vv = as_float(v_ptr[token + value]);
+    const float vv = as_float(row.v);
     float yy = 0.0f;
 #pragma unroll
     for (int key = 0; key < kN; ++key) {
