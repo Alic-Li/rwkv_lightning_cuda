@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -364,6 +365,83 @@ int main() {
                      std::vector<bf16>(dense_y.begin(),
                                        dense_y.begin() + 5 * N)))
         throw std::runtime_error("packed lane output differs from dense");
+    }
+    // Determinism at a training-sized shape: 32 heads over four packed lanes
+    // keeps both warps of many blocks racing, so a missing barrier shows up.
+    {
+      constexpr int H = 32;
+      const std::vector<int> lane_offsets{0, 256, 257, 274, 474};
+      const int rows = lane_offsets.back();
+      const size_t DE = size_t(rows) * H * N, DS = size_t(4) * H * S;
+      std::mt19937 rng(7);
+      std::normal_distribution<float> normal(0, 1);
+      std::uniform_real_distribution<float> uniform(0, 1);
+      std::array<std::vector<bf16>, 7> host_in;
+      for (auto &h : host_in)
+        h.resize(DE);
+      for (size_t i = 0; i < DE; i += N) {
+        float kk[N], norm = 0;
+        for (float &x : kk)
+          norm += (x = normal(rng)) * x;
+        norm = std::sqrt(norm);
+        for (int j = 0; j < N; ++j) {
+          // r w k v a b dy, with a = -kk and b = kk * alpha as in the model.
+          host_in[0][i + j] = to_bf16(0.5f * normal(rng));
+          host_in[1][i + j] = to_bf16(normal(rng) - 0.5f);
+          host_in[2][i + j] = to_bf16(0.5f * normal(rng));
+          host_in[3][i + j] = to_bf16(normal(rng));
+          host_in[4][i + j] = to_bf16(-kk[j] / norm);
+          host_in[5][i + j] = to_bf16(kk[j] / norm * uniform(rng));
+          host_in[6][i + j] = to_bf16(0.1f * normal(rng));
+        }
+      }
+      std::vector<float> hs0(DS), hdst(DS);
+      for (float &x : hs0)
+        x = 0.1f * normal(rng);
+      for (float &x : hdst)
+        x = 0.01f * normal(rng);
+      std::array<DeviceBuffer<bf16>, 7> in;
+      std::array<DeviceBuffer<bf16>, 6> out;
+      for (int p = 0; p < 7; ++p)
+        upload(in[p], host_in[p]);
+      for (auto &g : out)
+        g.resize(DE, "determinism gradient");
+      DeviceBuffer<int> offsets;
+      DeviceBuffer<float> ps0, pdst, pst, pds, ptape;
+      DeviceBuffer<bf16> py;
+      upload(offsets, lane_offsets);
+      upload(ps0, hs0);
+      upload(pdst, hdst);
+      pst.resize(DS, "determinism final");
+      pds.resize(DS, "determinism ds0");
+      py.resize(DE, "determinism y");
+      const WkvShape shape{4, rows, H, N, offsets.p};
+      ptape.resize(wkv_tape_elements(shape), "determinism tape");
+      std::vector<std::vector<bf16>> reference;
+      std::vector<float> reference_ds;
+      for (int repeat = 0; repeat < 4; ++repeat) {
+        upload(ptape, std::vector<float>(ptape.n, repeat ? NAN : 0.0f));
+        const WkvTapeView view{ptape.p, ptape.n};
+        wkv_forward(nullptr, IoType::BF16, shape, ps0.p, in[0].p, in[1].p,
+                    in[2].p, in[3].p, in[4].p, in[5].p, py.p, pst.p, view);
+        wkv_backward_input(nullptr, IoType::BF16, shape, in[0].p, in[1].p,
+                           in[2].p, in[3].p, in[4].p, in[5].p, in[6].p,
+                           pdst.p, view, pds.p, out[0].p, out[1].p, out[2].p,
+                           out[3].p, out[4].p, out[5].p);
+        std::vector<std::vector<bf16>> run;
+        for (auto &g : out)
+          run.push_back(download(g));
+        if (!repeat) {
+          reference = run;
+          reference_ds = download(pds);
+          continue;
+        }
+        bool same = same_bits(download(pds), reference_ds);
+        for (int p = 0; p < 6; ++p)
+          same = same && same_bits(run[p], reference[p]);
+        if (!same)
+          throw std::runtime_error("WKV backward is not deterministic");
+      }
     }
     // Exercise shared reduction reuse across eight warps with nonzero mean.
     for (int width : {64, 4096}) {
