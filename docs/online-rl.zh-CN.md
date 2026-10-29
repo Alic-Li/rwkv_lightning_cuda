@@ -74,6 +74,7 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 | `--max-tokens` | `1024`；每轮生成的防复读硬上限，命中停止串会提前结束；请求可以覆盖 |
 | `--stop` | JSON 字符串数组；默认 `["</tool_call>", "</answer>", "\n\nUser:"]`；请求可以覆盖 |
 | `--max-batch` | `32`；一次生成或训练的最大样本数；同时决定合批解码的最大行数 |
+| `--micro-bsz` | `1`；训练时同时计算的样本数，各样本的 Token 首尾相接、不加 padding。结果与逐条相同（State 逐位一致；Adapter 梯度只差 FP32 求和顺序）。Learner 激活显存随 `micro-bsz × chunk` 增长 |
 | `--cache-capacity` | `16`；整个进程共享的 CPU 前缀快照池条数上限，`0` 关闭。所有策略版本合计受限 |
 | `--cache-memory-mb` | `4096`；CPU 前缀快照池的张量缓冲区预算，单位 MiB，`0` 关闭。与条数上限取更小值 |
 | `--keep-versions` | `2`；当前及旧 Actor 快照总数 |
@@ -225,12 +226,14 @@ CPU 以数值稳定的普通 `softmax(logits / temperature)` 和标准离散分�
 不提供 greedy、Top-K、Top-P 或 Penalty：截断采样会改变行为策略，而 `/v1/train` 的 CE 按完整的 tempered softmax 计算，
 两者不一致时梯度不再对应采样分布。若以后加入截断采样，需要训练端同时按相同截断计算 CE 和 logprob。
 
-默认 `--gemm-mode bf16` 使用现有 cuBLAS BF16 Tensor Core 路径，并禁止低精度中间归约；
+默认 `--gemm-mode bf16` 使用 cuBLAS BF16 Tensor Core，并禁止低精度中间归约。CUDA 上每种 GEMM 形状固定一个
+cuBLASLt 算法（按 64 行选出，不用 workspace、不做 split-K），每一行的结果与这次 GEMM 有多少行无关，所以
+rollout 解码、prefill 和训练逐位一致，且一次 GEMM 只读一遍权重，不再按 32 行分块重复读取；HIP 仍按 32 行分块。
 输入、权重、激活和 WKV 的序列梯度都是 BF16，WKV State/状态梯度和 Adam 参数仍为 FP32。
 前向、重算和反向直接复用 `cuda/rwkv7_statepassing_clampw.cu`，没有另建 RL WKV Kernel。
-需要旧版逐位一致对照时使用 `--gemm-mode strict`，恢复固定 32 行与 pedantic 累加，速度会较慢。
-`/health` 返回 `gemm_mode`、`gemm_tile_rows`、`wkv_kernel`、`wkv_io_dtype` 和 `wkv_state_dtype`；导出的 `policy.json` 记录 GEMM 模式。
-这些配置局限于在线 worker，原 CLI 默认数值策略不变。CUDA 路径已验证，HIP 不保证相同的精度及性能。
+`--gemm-mode strict` 使用同样的固定算法与 pedantic FP32 累加，速度较慢。
+`/health` 返回 `gemm_mode`、`gemm_pinned_rows`（HIP 为 `gemm_tile_rows`）、`wkv_kernel`、`wkv_io_dtype` 和 `wkv_state_dtype`；导出的 `policy.json` 记录 GEMM 模式。
+离线 CLI（`rwkv_*_tune`）现在同样默认 `--gemm-mode bf16`（按 256 行选算法），`--gemm-mode auto` 恢复旧的逐次自选行为。CUDA 路径已验证，HIP 不保证相同的精度及性能。
 
 Prefill 只在最后一个 Token 计算输出层；训练保存边界的前向扫描不计算输出层。
 没有非零 Advantage 的 Chunk 跳过 CE 和输出层反传，仍完整反传 WKV 和 shift 的跨块梯度。

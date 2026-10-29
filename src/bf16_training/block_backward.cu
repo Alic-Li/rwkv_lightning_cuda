@@ -191,8 +191,9 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
                                const FrozenBlockWeights &w, bf16 *workspace,
                                std::size_t workspace_elements,
                                bool layer_zero) {
+  const int rows = tape_rows(tape);
   const std::size_t required =
-      block_backward_workspace_bf16_elements(tape.batch, tape.time, w);
+      block_backward_workspace_bf16_elements(1, rows, w);
   if (!workspace || workspace_elements < required || !grad_out || !grad_in ||
       !state_grad.initial_state_grad) {
     throw std::invalid_argument("invalid block backward buffers");
@@ -251,13 +252,13 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
 
   // Regenerate only this layer's WKV history just before consuming it.
   if (tape.wkv_replay_initial) {
-    wkv_forward(stream, IoType::BF16, {tape.batch, tape.time, w.heads, kN},
+    wkv_forward(stream, IoType::BF16,
+                {tape.batch, tape.time, w.heads, kN, tape.offsets},
                 tape.wkv_replay_initial, tape.r, tape.raw_w, tape.wkv_k, tape.v,
                 tape.neg_kk, tape.kka, tape.wkv_y, tape.wkv_replay_final,
                 tape.wkv);
   }
 
-  const int rows = tape.batch * tape.time;
   const int C = w.channels;
   const std::size_t R = static_cast<std::size_t>(rows) * C;
   const std::size_t F = static_cast<std::size_t>(rows) * w.ffn;
@@ -305,9 +306,10 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   const bf16 *ffn_grads[] = {d_mixed};
   const bf16 *ffn_mixes[] = {w.ffn_mix};
   time_mix_backward_input_bf16(stream, tape.batch, tape.time, C, 1, ffn_grads,
-                               ffn_mixes, d_ln2, state_grad.ffn_shift_grad);
+                               ffn_mixes, d_ln2, state_grad.ffn_shift_grad,
+                               tape.offsets);
   add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln2,
-                          state_grad.final_ffn_shift_grad);
+                          state_grad.final_ffn_shift_grad, tape.offsets);
   layer_norm_backward_input_bf16(stream, rows, C, tape.x_after_att,
                                  w.ln2_weight, d_ln2, temp0, kLnEps);
   add_bf16(stream, grad_out, temp0, grad_x_after, R);
@@ -324,7 +326,8 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
                                  kGnEps);
 
   // Exact WKV reverse recurrence. The only persistent result is ds_initial.
-  wkv_backward_input(stream, IoType::BF16, {tape.batch, tape.time, w.heads, kN},
+  wkv_backward_input(stream, IoType::BF16,
+                     {tape.batch, tape.time, w.heads, kN, tape.offsets},
                      tape.r, tape.raw_w, tape.wkv_k, tape.v, tape.neg_kk,
                      tape.kka, d_wkv_y, state_grad.final_state_grad, tape.wkv,
                      state_grad.initial_state_grad, wkv_dr, d_w, d_wkv_k, d_v,
@@ -400,9 +403,10 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
     require_pointer(tmix_weights[i], "time-mix weight");
   }
   time_mix_backward_input_bf16(stream, tape.batch, tape.time, C, 6, tmix_grads,
-                               tmix_weights, d_ln1, state_grad.att_shift_grad);
+                               tmix_weights, d_ln1, state_grad.att_shift_grad,
+                               tape.offsets);
   add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln1,
-                          state_grad.final_att_shift_grad);
+                          state_grad.final_att_shift_grad, tape.offsets);
   layer_norm_backward_input_bf16(stream, rows, C, tape.x, w.ln1_weight, d_ln1,
                                  temp1, kLnEps);
   add_bf16(stream, grad_x_after, temp1, grad_in, R);

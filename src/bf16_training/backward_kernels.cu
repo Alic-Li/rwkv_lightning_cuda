@@ -109,29 +109,35 @@ __device__ __forceinline__ const bf16 *select_ptr(SixPointers p, int i) {
   }
 }
 
-__global__ void time_mix_backward_kernel(int B, int T, int C, int branches,
-                                         SixPointers grads, SixPointers mixes,
+__global__ void time_mix_backward_kernel(int B, int T, int C,
+                                         const int *__restrict__ offsets,
+                                         int branches, SixPointers grads,
+                                         SixPointers mixes,
                                          bf16 *__restrict__ dx) {
   const long long idx =
       static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const long long elements = static_cast<long long>(B) * T * C;
+  const long long elements = static_cast<long long>(offsets ? 1 : B) * T * C;
   if (idx >= elements)
     return;
   const int c = static_cast<int>(idx % C);
-  const int t = static_cast<int>((idx / C) % T);
+  const bool last = lane_row(offsets, B, T, idx / C).last;
   float value = 0.0f;
   for (int branch = 0; branch < branches; ++branch) {
     const bf16 *grad = select_ptr(grads, branch);
     const float mix = to_float(select_ptr(mixes, branch)[c]);
     value += to_float(grad[idx]) * (1.0f - mix);
-    if (t + 1 < T)
+    if (!last)
       value += to_float(grad[idx + C]) * mix;
   }
   dx[idx] = to_bf16(value);
 }
 
-__global__ void shift_backward_kernel(int B, int T, int C, int branches,
-                                      SixPointers grads, SixPointers mixes,
+// An empty packed lane gets zero: callers only leave lanes empty while their
+// terminal shift adjoint is still zero.
+__global__ void shift_backward_kernel(int B, int T, int C,
+                                      const int *__restrict__ offsets,
+                                      int branches, SixPointers grads,
+                                      SixPointers mixes,
                                       bf16 *__restrict__ d_shift) {
   const long long idx =
       static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -140,7 +146,12 @@ __global__ void shift_backward_kernel(int B, int T, int C, int branches,
     return;
   const int c = static_cast<int>(idx % C);
   const int batch = static_cast<int>(idx / C);
-  const long long first = static_cast<long long>(batch) * T * C + c;
+  if (offsets && offsets[batch + 1] == offsets[batch]) {
+    d_shift[idx] = to_bf16(0.0f);
+    return;
+  }
+  const long long first =
+      (offsets ? offsets[batch] : static_cast<long long>(batch) * T) * C + c;
   float value = 0.0f;
   for (int branch = 0; branch < branches; ++branch) {
     value += to_float(select_ptr(grads, branch)[first]) *
@@ -151,11 +162,14 @@ __global__ void shift_backward_kernel(int B, int T, int C, int branches,
 
 enum class ElementOp { ReluSquare, Sigmoid, Tanh, Add, AddInplace };
 
-__global__ void last_shift_kernel(int T, int C, int count, bf16 *dx,
-                                  const bf16 *shift) {
+__global__ void last_shift_kernel(int T, int C, int count, const int *offsets,
+                                  bf16 *dx, const bf16 *shift) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < count) {
-    const long long j = (static_cast<long long>(i / C) * T + T - 1) * C + i % C;
+  const int b = i / C;
+  if (i < count && (!offsets || offsets[b + 1] > offsets[b])) {
+    const long long end =
+        offsets ? offsets[b + 1] : static_cast<long long>(b) * T + T;
+    const long long j = (end - 1) * C + i % C;
     dx[j] = to_bf16(to_float(dx[j]) + to_float(shift[i]));
   }
 }
@@ -220,10 +234,11 @@ void linear_orig_backward_input_bf16(cudaStream_t stream, int rows,
 }
 
 void add_last_shift_gradient(cudaStream_t stream, int batch, int time,
-                             int channels, bf16 *dx, const bf16 *dshift) {
+                             int channels, bf16 *dx, const bf16 *dshift,
+                             const int *offsets) {
   if (dshift)
     last_shift_kernel<<<blocks_for(batch * channels), kThreads, 0, stream>>>(
-        time, channels, batch * channels, dx, dshift);
+        time, channels, batch * channels, offsets, dx, dshift);
 }
 
 void linear_runtime_backward_input_bf16(cudaStream_t stream, int rows,
@@ -266,7 +281,7 @@ void time_mix_backward_input_bf16(cudaStream_t stream, int batch, int time,
                                   int channels, int branches,
                                   const bf16 *const *branch_grads,
                                   const bf16 *const *frozen_mixes, bf16 *dx,
-                                  bf16 *d_shift) {
+                                  bf16 *d_shift, const int *offsets) {
   if (batch <= 0 || time <= 0 || channels <= 0 || branches <= 0 ||
       branches > 6 || !branch_grads || !frozen_mixes || !dx) {
     throw std::invalid_argument("invalid time-mix backward arguments");
@@ -274,14 +289,14 @@ void time_mix_backward_input_bf16(cudaStream_t stream, int batch, int time,
   const SixPointers grads = pack(branch_grads, branches);
   const SixPointers mixes = pack(frozen_mixes, branches);
   const std::size_t elements =
-      static_cast<std::size_t>(batch) * time * channels;
+      static_cast<std::size_t>(offsets ? 1 : batch) * time * channels;
   time_mix_backward_kernel<<<blocks_for(elements), kThreads, 0, stream>>>(
-      batch, time, channels, branches, grads, mixes, dx);
+      batch, time, channels, offsets, branches, grads, mixes, dx);
   if (d_shift) {
     const std::size_t shift_elements =
         static_cast<std::size_t>(batch) * channels;
     shift_backward_kernel<<<blocks_for(shift_elements), kThreads, 0, stream>>>(
-        batch, time, channels, branches, grads, mixes, d_shift);
+        batch, time, channels, offsets, branches, grads, mixes, d_shift);
   }
 }
 

@@ -35,7 +35,8 @@ __device__ __forceinline__ float effective_w(float raw) {
 
 template <typename IO>
 __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
-    int T, int H, const float *__restrict__ initial_state,
+    int T, int H, const int *__restrict__ offsets,
+    const float *__restrict__ initial_state,
     const IO *__restrict__ r_ptr, const IO *__restrict__ w_ptr,
     const IO *__restrict__ k_ptr, const IO *__restrict__ v_ptr,
     const IO *__restrict__ a_ptr, const IO *__restrict__ b_ptr,
@@ -53,10 +54,12 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
   }
 
   __shared__ float r[kN], w[kN], k[kN], a[kN], b[kN];
-  for (int t = 0; t < T; ++t) {
-    const long long token =
-        (static_cast<long long>(batch) * T + t) * H * kN + head * kN;
-    const long long tape_base = (bh * T + t) * kN * kN;
+  // Packed lanes own rows [offsets[b], offsets[b + 1]); dense lanes own T.
+  const int begin = offsets ? offsets[batch] : batch * T;
+  const int end = offsets ? offsets[batch + 1] : begin + T;
+  for (int t = begin; t < end; ++t) {
+    const long long token = (static_cast<long long>(t) * H + head) * kN;
+    const long long tape_base = token * kN;
 #pragma unroll
     for (int key = 0; key < kN; ++key) {
       if (state_before)
@@ -91,7 +94,8 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
 
 template <typename IO>
 __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
-    int T, int H, const IO *__restrict__ r_ptr, const IO *__restrict__ w_ptr,
+    int T, int H, const int *__restrict__ offsets,
+    const IO *__restrict__ r_ptr, const IO *__restrict__ w_ptr,
     const IO *__restrict__ k_ptr, const IO *__restrict__ v_ptr,
     const IO *__restrict__ a_ptr, const IO *__restrict__ b_ptr,
     const IO *__restrict__ dy_ptr, const float *__restrict__ ds_final,
@@ -113,10 +117,11 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
   __shared__ float sa[kN], dsa[kN];
   __shared__ float dnew[kN * kN];
 
-  for (int t = T - 1; t >= 0; --t) {
-    const long long token =
-        (static_cast<long long>(batch) * T + t) * H * kN + head * kN;
-    const long long tape_base = (bh * T + t) * kN * kN;
+  const int begin = offsets ? offsets[batch] : batch * T;
+  const int end = offsets ? offsets[batch + 1] : begin + T;
+  for (int t = end - 1; t >= begin; --t) {
+    const long long token = (static_cast<long long>(t) * H + head) * kN;
+    const long long tape_base = token * kN;
     __syncthreads();
     r[value] = as_float(r_ptr[token + value]);
     const float raw_w = as_float(w_ptr[token + value]);
@@ -193,7 +198,7 @@ void launch_forward(hipStream_t stream, const WkvShape &s, const float *s0,
                     const void *a, const void *b, void *y, float *sT,
                     WkvTapeView tape) {
   exact_forward_kernel<IO><<<dim3(s.heads, s.batch), kN, 0, stream>>>(
-      s.time, s.heads, s0, static_cast<const IO *>(r),
+      s.time, s.heads, s.offsets, s0, static_cast<const IO *>(r),
       static_cast<const IO *>(w), static_cast<const IO *>(k),
       static_cast<const IO *>(v), static_cast<const IO *>(a),
       static_cast<const IO *>(b), static_cast<IO *>(y), sT, tape.state_before);
@@ -206,7 +211,8 @@ void launch_backward(hipStream_t stream, const WkvShape &s, const void *r,
                      WkvTapeView tape, float *ds0, void *dr, void *dw, void *dk,
                      void *dv, void *da, void *db) {
   exact_backward_kernel<IO><<<dim3(s.heads, s.batch), kN, 0, stream>>>(
-      s.time, s.heads, static_cast<const IO *>(r), static_cast<const IO *>(w),
+      s.time, s.heads, s.offsets, static_cast<const IO *>(r),
+      static_cast<const IO *>(w),
       static_cast<const IO *>(k), static_cast<const IO *>(v),
       static_cast<const IO *>(a), static_cast<const IO *>(b),
       static_cast<const IO *>(dy), dsT, tape.state_before, ds0,

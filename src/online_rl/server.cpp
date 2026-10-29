@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <set>
 #include <sstream>
@@ -90,7 +91,7 @@ struct Options {
   std::string gemm_mode = "bf16";
   std::vector<std::string> stop = {"</tool_call>", "</answer>", "\n\nUser:"};
   int port = 8848, chunk = 64, ctx = 4096, batch = 32, cache = 16, versions = 2,
-      rank = 16, max_tokens = 1024, cache_memory_mb = 4096;
+      rank = 16, max_tokens = 1024, cache_memory_mb = 4096, micro_bsz = 1;
   float alpha = 16;
   bool rank_set = false, alpha_set = false, targets_set = false;
 };
@@ -109,6 +110,8 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
              "  --host 127.0.0.1 --port "
           << o.port
           << " --chunk 64 --ctx 4096 --max-batch 32\n"
+             "  --micro-bsz 1 (train samples packed per pass without padding;\n"
+             "    learner activation memory scales with micro-bsz * chunk)\n"
              "  --cache-capacity 16 --keep-versions 2 --output online-rl-output\n"
              "  learning_rate is required in every POST /v1/train request\n"
              "  --cache-memory-mb 4096 (global CPU snapshot pool MiB; 0 disables)\n"
@@ -181,6 +184,8 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
       o.ctx = integer();
     else if (key == "--max-batch")
       o.batch = integer();
+    else if (key == "--micro-bsz")
+      o.micro_bsz = integer();
     else if (key == "--cache-capacity")
       o.cache = integer();
     else if (key == "--cache-memory-mb")
@@ -201,13 +206,14 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
   }
   if (o.model.empty() || o.port < 1 || o.port > 65535 || o.chunk < 1 ||
       o.ctx < 2 || o.chunk > o.ctx || o.chunk > 65535 || o.ctx > 1048576 ||
-      o.batch < 1 || o.batch > 1024 || o.cache < 0 || o.versions < 1 ||
+      o.batch < 1 || o.batch > 1024 || o.micro_bsz < 1 ||
+      int64_t(o.chunk) * o.micro_bsz > 65535 || o.cache < 0 || o.versions < 1 ||
       o.cache_memory_mb < 0 || o.cache_memory_mb > 1048576 ||
       o.versions > 32 || o.rank < 1 || o.rank > 1024 ||
       (o.gemm_mode != "bf16" && o.gemm_mode != "strict") ||
       o.max_tokens < 1 || o.max_tokens > 1048576)
     throw std::invalid_argument(
-        "invalid model/port/chunk/ctx/batch/cache/cache-memory-mb/versions/rank/gemm-mode/max-tokens");
+        "invalid model/port/chunk/ctx/batch/micro-bsz/cache/cache-memory-mb/versions/rank/gemm-mode/max-tokens");
   if (!o.alpha_set)
     o.alpha = float(o.rank);
   if (nora && o.alpha_set &&
@@ -634,7 +640,8 @@ public:
       config["alpha"] = o_.alpha;
       config["targets"] = o_.targets;
       trainer_ = std::make_unique<rwkv_bf16_miss::Trainer>(
-          learner_, o_.rank, o_.alpha, o_.targets, o_.chunk, config,
+          learner_, o_.rank, o_.alpha, o_.targets, o_.chunk * o_.micro_bsz,
+          config,
           stream_.value);
       if (package)
         trainer_->load_adapter(*package);
@@ -674,8 +681,8 @@ public:
         }
       }
     }
-    learner_exec_ =
-        std::make_unique<Executor>(learner_, o_.chunk, stream_.value);
+    learner_exec_ = std::make_unique<Executor>(learner_, o_.chunk,
+                                               stream_.value, o_.micro_bsz);
     auto actor_view = learner_;
     for (auto &b : actor_view.blocks)
       for (auto &linear : b.miss) {
@@ -709,7 +716,12 @@ public:
     r["wkv_io_dtype"] = "bfloat16";
     r["wkv_state_dtype"] = "float32";
     r["gemm_mode"] = o_.gemm_mode;
+#ifdef RWKV_USE_HIP
     r["gemm_tile_rows"] = 32;
+#else
+    // One pinned cuBLASLt kernel per shape, chosen for 64-row GEMMs.
+    r["gemm_pinned_rows"] = 64;
+#endif
     r["backbone_loads"] = 1;
     r["step"] = Json::UInt64(step_);
     r["policy_version"] = policies_.back()->version;
@@ -743,6 +755,7 @@ public:
     r["ctx"] = o_.ctx;
     r["vocab_size"] = learner_.vocab;
     r["max_batch"] = o_.batch;
+    r["micro_bsz"] = o_.micro_bsz;
     r["default_max_tokens"] = o_.max_tokens;
     r["default_stop"] = Json::Value(Json::arrayValue);
     for (const auto &stop : o_.stop)
@@ -1042,14 +1055,47 @@ public:
       else
         gpu_check(cudaMemsetAsync(gradient_.p, 0, gradient_.n * sizeof(float),
                                   stream_.value), "clear state gradient");
-      for (const auto &s : batch) {
-        loss += learner_exec_->backward(learner_, s.tokens, s.weights,
-                                        initial_.p, kept, s.temperature);
-        if (!miss_) {
-          reduce_state_gradient_f32(
-              stream_.value, 1, learner_.layers * learner_.heads, 64,
-              learner_exec_->state_gradient(), gradient_.p, true);
+      // One CE temperature per packed pass: group equal temperatures, keeping
+      // request order within each group.
+      std::vector<size_t> order(batch.size());
+      std::iota(order.begin(), order.end(), size_t(0));
+      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return batch[a].temperature < batch[b].temperature;
+      });
+      const size_t lanes = size_t(learner_exec_->lanes());
+      for (size_t first = 0; first < order.size();) {
+        const float temperature = batch[order[first]].temperature;
+        size_t last = first;
+        while (last < order.size() && last - first < lanes &&
+               batch[order[last]].temperature == temperature)
+          ++last;
+        if (lanes == 1) {
+          const auto &s = batch[order[first]];
+          loss += learner_exec_->backward(learner_, s.tokens, s.weights,
+                                          initial_.p, kept, temperature);
+        } else {
+          std::vector<std::vector<int>> tokens;
+          std::vector<std::vector<float>> weights;
+          for (size_t i = first; i < last; ++i) {
+            tokens.push_back(batch[order[i]].tokens);
+            weights.push_back(batch[order[i]].weights);
+          }
+          loss += learner_exec_->backward_packed(learner_, tokens, weights,
+                                                 initial_.p, kept, temperature);
         }
+        // Add samples in request order, one lane at a time, so packing
+        // reproduces per-sample accumulation bit for bit.
+        if (!miss_) {
+          const size_t lane = size_t(learner_.heads) * 4096;
+          for (size_t b = 0; b < last - first; ++b)
+            for (int l = 0; l < learner_.layers; ++l)
+              reduce_state_gradient_f32(
+                  stream_.value, 1, learner_.heads, 64,
+                  learner_exec_->lane_state_gradients() +
+                      (size_t(l) * lanes + b) * lane,
+                  gradient_.p + size_t(l) * lane, true);
+        }
+        first = last;
       }
       if (!std::isfinite(loss))
         throw std::runtime_error(

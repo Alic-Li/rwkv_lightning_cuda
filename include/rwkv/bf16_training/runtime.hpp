@@ -48,6 +48,30 @@ __host__ __device__ inline bf16 to_bf16(float x) {
 }
 #endif
 namespace rwkv_bf16_training {
+// Token position within a lane. Dense layouts pass offsets=nullptr and T rows
+// per lane. Packed layouts pass device offsets[lanes + 1]: lane b owns rows
+// [offsets[b], offsets[b + 1]) and may be empty; a valid row never maps to an
+// empty lane.
+struct LaneRow {
+  int lane;
+  bool first, last;
+};
+__host__ __device__ inline LaneRow lane_row(const int *offsets, int lanes,
+                                            int T, long long row) {
+  if (!offsets) {
+    const int t = static_cast<int>(row % T);
+    return {static_cast<int>(row / T), t == 0, t == T - 1};
+  }
+  int lo = 0, hi = lanes;
+  while (hi - lo > 1) {
+    const int mid = (lo + hi) / 2;
+    if (offsets[mid] <= row)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  return {lo, offsets[lo] == row, offsets[lo + 1] == row + 1};
+}
 inline void gpu_check(cudaError_t e, const char *what) {
   if (e != cudaSuccess)
     throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));

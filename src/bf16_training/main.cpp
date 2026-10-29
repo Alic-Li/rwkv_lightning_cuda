@@ -4,6 +4,7 @@
 #endif
 #include "rwkv/bf16_training/model.hpp"
 #include "rwkv/bf16_training/executor.hpp"
+#include "rwkv/bf16_training/ops.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
 #include "rwkv/bf16_training/training.hpp"
 
@@ -47,11 +48,13 @@ struct Options {
   std::string output;
   std::string vocab = RWKV_STATE_TUNE_DEFAULT_VOCAB;
   std::string optimizer = "adam";
+  std::string gemm_mode = "bf16";
   bool chunk_load = false;
   int ctx = 128;
   int chunk = 64;
   int epochs = 1;
   int batch_size = 1;
+  int micro_bsz = 1;
   std::uint64_t max_steps = 0;
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
   float lr = 1.0e-3f;
@@ -99,8 +102,10 @@ struct Options {
       << "  --chunk N             recompute chunk length (default "
          "64)\n"
       << "  --epochs N            dataset passes (default 1)\n"
-      << "  --batch-size N        samples per update, accumulated sequentially "
-         "(default 1)\n"
+      << "  --batch-size N        samples per update (default 1)\n"
+      << "  --micro-bsz N         samples run together, packed without padding "
+         "(default 1;\n"
+      << "                        activation memory scales with N * chunk)\n"
       << "  --max-steps N         stop after N optimizer updates\n"
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
       << "  --optimizer adam      adapter optimizer\n"
@@ -111,6 +116,10 @@ struct Options {
       << "  --lr FLOAT            initial learning rate (default 1.0)\n"
       << "  --lr-final FLOAT      final learning rate (default 0.01)\n"
 #endif
+      << "  --gemm-mode MODE      bf16 (default): one pinned GEMM kernel per shape,\n"
+         "                        so rows (and --micro-bsz packing) never change\n"
+         "                        results; strict: same with pedantic FP32;\n"
+         "                        auto: cuBLAS picks per call (previous default)\n"
       << "  --warmup-steps N      linear warmup updates (default 10)\n"
       << "  --save-every N        periodic checkpoint interval (default 0)\n"
       << "  --seed N              deterministic run seed (default 1234)\n"
@@ -204,10 +213,14 @@ Options parse(int argc, char **argv) {
       out.epochs = integer<int>(value(i, argc, argv), "epochs");
     else if (arg == "--batch-size" || arg == "--batch")
       out.batch_size = integer<int>(value(i, argc, argv), "batch-size");
+    else if (arg == "--micro-bsz")
+      out.micro_bsz = integer<int>(value(i, argc, argv), "micro-bsz");
     else if (arg == "--max-steps")
       out.max_steps = integer<std::uint64_t>(value(i, argc, argv), "max-steps");
     else if (arg == "--optimizer")
       out.optimizer = value(i, argc, argv);
+    else if (arg == "--gemm-mode")
+      out.gemm_mode = value(i, argc, argv);
     else if (arg == "--lr")
       out.lr = real(value(i, argc, argv), "lr");
     else if (arg == "--lr-final")
@@ -225,11 +238,19 @@ Options parse(int argc, char **argv) {
   }
   if (out.optimizer != "adam" && out.optimizer != "muon")
     usage(argv[0], "optimizer must be adam or muon");
+  if (out.gemm_mode != "bf16" && out.gemm_mode != "strict" &&
+      out.gemm_mode != "auto")
+    usage(argv[0], "gemm-mode must be bf16, strict or auto");
   if (out.model.empty() || out.data.empty() || out.output.empty())
     usage(argv[0], "--model, --data and --output are required");
   if (out.ctx <= 0 || out.chunk <= 0 || out.epochs <= 0 ||
-      out.batch_size <= 0 || out.lr <= 0 || out.lr_final <= 0)
-    usage(argv[0], "ctx/chunk/epochs/lr values must be positive");
+      out.batch_size <= 0 || out.micro_bsz <= 0 || out.lr <= 0 ||
+      out.lr_final <= 0)
+    usage(argv[0], "ctx/chunk/epochs/batch/lr values must be positive");
+  out.micro_bsz = std::min(out.micro_bsz, out.batch_size);
+  if (static_cast<long long>(std::min(out.ctx, out.chunk)) * out.micro_bsz >
+      65535)
+    usage(argv[0], "micro-bsz * chunk must not exceed 65535 rows");
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
   if (out.rank < 1 || out.rank > 1024 || out.optimizer != "adam")
     usage(argv[0], "adapter tuning requires rank 1..1024 and Adam");
@@ -288,6 +309,11 @@ std::string checkpoint_name(const std::filesystem::path &directory,
 int main(int argc, char **argv) {
   try {
     const Options options = parse(argc, argv);
+    // Thread-local policy: all training GEMMs run on this thread. Kernels are
+    // chosen for wide prefill-like GEMMs (no decode to keep fast) at a fixed
+    // row count, so --chunk and --micro-bsz never change which kernel runs.
+    rwkv_bf16_training::set_consistent_forward(
+        options.gemm_mode != "auto", options.gemm_mode == "bf16", 256);
     const int max_time = std::min(options.ctx, options.chunk);
     const std::size_t dataset_rows =
         rwkv7_state_tuning::count_jsonl_rows(options.data);
@@ -346,8 +372,10 @@ int main(int argc, char **argv) {
     config["method"] = "nora";
     config["initialization"] = "nora_init";
 #endif
+    // Adapter latent tapes hold one packed micro-batch chunk.
     rwkv_bf16_miss::Trainer miss(frozen, options.rank, options.alpha,
-                                 options.targets, max_time, config,
+                                 options.targets,
+                                 max_time * options.micro_bsz, config,
                                  stream.value);
 #endif
     const std::size_t state_count = static_cast<std::size_t>(L) * state_lane;
@@ -365,11 +393,15 @@ int main(int argc, char **argv) {
 #else
     if (!options.state.empty()) time_state = model.load_state(options.state);
 #endif
-    rwkv_bf16_training::Executor executor(frozen, max_time, stream.value);
+    rwkv_bf16_training::Executor executor(frozen, max_time, stream.value,
+                                          options.micro_bsz);
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
     miss.bind_tapes(executor.tapes());
 #endif
     std::cout << "Optimizer: " << options.optimizer << '\n'
+              << "GEMM mode: " << options.gemm_mode << '\n'
+              << "Micro-bsz: " << options.micro_bsz
+              << " packed lanes (no padding)\n"
               << "WKV tape: shared across layers (recompute)\n";
     std::filesystem::create_directories(options.output);
 
@@ -449,28 +481,52 @@ int main(int argc, char **argv) {
         std::fill(accumulated.begin(), accumulated.end(), 0.0f);
 #endif
         float batch_loss = 0.0f;
-        for (const auto &sample : batch) {
-          std::vector<float> weights(sample.train.begin(), sample.train.end());
-          batch_loss += executor.backward(frozen, sample.tokens, weights,
-                                           time_state.p, batch_tokens);
+        for (std::size_t first = 0; first < batch.size();
+             first += options.micro_bsz) {
+          const std::size_t last = std::min(
+              batch.size(), first + static_cast<std::size_t>(options.micro_bsz));
+          if (options.micro_bsz == 1) {
+            const auto &sample = batch[first];
+            std::vector<float> weights(sample.train.begin(), sample.train.end());
+            batch_loss += executor.backward(frozen, sample.tokens, weights,
+                                             time_state.p, batch_tokens);
+          } else {
+            std::vector<std::vector<int>> tokens;
+            std::vector<std::vector<float>> weights;
+            for (std::size_t i = first; i < last; ++i) {
+              tokens.push_back(batch[i].tokens);
+              weights.emplace_back(batch[i].train.begin(), batch[i].train.end());
+            }
+            batch_loss += executor.backward_packed(frozen, tokens, weights,
+                                                    time_state.p, batch_tokens);
+          }
 #if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
-          check(cudaMemcpyAsync(host_gradient.data(), executor.state_gradient(),
-                                state_count * sizeof(float),
+          // Per-sample gradients [L,lanes,H,K,V] are added in sample order,
+          // exactly like single-sample steps, so --micro-bsz changes no bits.
+          const std::size_t lanes = executor.lanes();
+          host_gradient.resize(state_count * lanes);
+          check(cudaMemcpyAsync(host_gradient.data(),
+                                executor.lane_state_gradients(),
+                                host_gradient.size() * sizeof(float),
                                 cudaMemcpyDeviceToHost, stream.value),
                 "validate initial state gradient");
           check(cudaStreamSynchronize(stream.value), "read state gradient");
-          for (std::size_t i = 0; i < state_count; ++i) {
-            if (!std::isfinite(host_gradient[i]))
-              throw std::runtime_error("nonfinite dState at layer " +
-                                       std::to_string(i / state_lane) +
-                                       "; optimizer not executed");
-            accumulated[i] += host_gradient[i];
-            if (!std::isfinite(accumulated[i]) ||
-                std::abs(accumulated[i]) >
-                    std::sqrt(std::numeric_limits<float>::max()))
-              throw std::runtime_error(
-                  "batch gradient overflow before optimizer");
-          }
+          for (std::size_t b = 0; b < last - first; ++b)
+            for (std::size_t i = 0; i < state_count; ++i) {
+              const float g =
+                  host_gradient[(i / state_lane * lanes + b) * state_lane +
+                                i % state_lane];
+              if (!std::isfinite(g))
+                throw std::runtime_error("nonfinite dState at layer " +
+                                         std::to_string(i / state_lane) +
+                                         "; optimizer not executed");
+              accumulated[i] += g;
+              if (!std::isfinite(accumulated[i]) ||
+                  std::abs(accumulated[i]) >
+                      std::sqrt(std::numeric_limits<float>::max()))
+                throw std::runtime_error(
+                    "batch gradient overflow before optimizer");
+            }
 #endif
         }
 #if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)

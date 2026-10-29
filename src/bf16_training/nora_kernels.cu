@@ -13,13 +13,16 @@ void validate(int rows, const rwkv_bf16_miss::Linear &w) {
 void checked() {
   rwkv_bf16_training::gpu_check(cudaGetLastError(), "NoRA kernel");
 }
-__global__ void replay_mix(int time, int C, int rows, const bf16 *x,
+__global__ void replay_mix(int lanes, int time, int C, int rows,
+                           const int *offsets, const bf16 *x,
                            const bf16 *shift, const bf16 *mix, bf16 *y) {
   size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= size_t(rows) * C)
     return;
-  int c = i % C, t = (i / C) % time, b = i / (size_t(time) * C);
-  float v = to_float(x[i]), p = to_float(t ? x[i - C] : shift[b * C + c]);
+  int c = i % C;
+  auto at = rwkv_bf16_training::lane_row(offsets, lanes, time, i / C);
+  float v = to_float(x[i]),
+        p = to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
   y[i] = to_bf16(v + (p - v) * to_float(mix[c]));
 }
 } // namespace
@@ -60,11 +63,11 @@ void backward_target(cudaStream_t stream,
                      const bf16 *g, bf16 *dx) {
   const auto &a = w.miss[target];
   if (!a.a) {
-    rwkv_bf16_miss::backward(stream, t.batch * t.time, a,
+    rwkv_bf16_miss::backward(stream, rwkv_bf16_training::tape_rows(t), a,
                              t.miss_reduced[target], g, dx);
     return;
   }
-  int rows = t.batch * t.time, C = w.channels;
+  int rows = rwkv_bf16_training::tape_rows(t), C = w.channels;
   bf16 *x = t.nora_input;
   if (!t.nora_ds || (a.gradient_a && !x))
     throw std::invalid_argument("missing NoRA replay scratch");
@@ -74,7 +77,7 @@ void backward_target(cudaStream_t stream,
       rwkv7_relu_square_launch(stream, t.ffn_hid, x, size_t(rows) * w.ffn);
     else if (target == 3)
       rwkv7_tmix_lnx_rkvres_xg_launch(
-          stream, t.batch, t.time, C, w.heads, t.wkv_y, t.r, t.wkv_k, t.v,
+          stream, 1, rows, C, w.heads, t.wkv_y, t.r, t.wkv_k, t.v,
           w.r_k, w.att_group_norm_weight, w.att_group_norm_bias, t.att_gate, x);
     else {
       const bf16 *mix = target == 0   ? w.mix_r
@@ -85,7 +88,8 @@ void backward_target(cudaStream_t stream,
       if (!shift)
         throw std::invalid_argument("missing NoRA incoming shift");
       replay_mix<<<(size_t(rows) * C + 255) / 256, 256, 0, stream>>>(
-          t.time, C, rows, target == 4 ? t.ln2 : t.ln1, shift, mix, x);
+          t.batch, t.time, C, rows, t.offsets, target == 4 ? t.ln2 : t.ln1,
+          shift, mix, x);
     }
   }
   backward(stream, rows, a, x, t.miss_reduced[target], g, dx, t.nora_ds);
