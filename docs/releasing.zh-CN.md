@@ -67,7 +67,7 @@ CI 根据 `bun.lock` 安装前端依赖，执行 lint/测试，并在编译启�
 
 解压整个目录，进入后运行 `rwkv_launcher`（Windows 为 `rwkv_launcher.exe`）。
 启动器默认使用附带词表。Linux 库通过相对于可执行文件位置的 RPATH 解析。
-使用状态微调或 MiSS 微调 CLI 时传入 `--vocab ./rwkv_vocab_v20230424.txt`，因为编译时的默认值
+使用 State、MiSS 或 NoRA 微调 CLI 时传入 `--vocab ./rwkv_vocab_v20230424.txt`，因为编译时的默认值
 指向构建机器的源码目录。
 
 目标机器需要与安装包 CUDA 版本（12.9 或 13.2）及 GPU 兼容的 NVIDIA 驱动。
@@ -99,7 +99,7 @@ C++ 程序在 CMake 配置时读取 `VERSION`；Go 启动器和路由器在打�
 ## CI 验证范围
 
 两个平台均运行路由器测试和 Go vet，编译全部 C++/CUDA 目标（包括 GPU 测试），并运行
-七组纯 CPU CTest：分词器、PTH 文件、量化文件、预填充准入、状态微调 API、上传 State 存储和前缀缓存索引。
+八组纯 CPU CTest：分词器、PTH 文件、量化文件、预填充准入、状态微调 API、上传 State 存储、前缀缓存索引和 checkpoint 配置。
 若运行时依赖无法解析，打包失败；还会执行移动后各 C++ CLI 的 `--help` 进行冒烟检查，
 并检查每个打包的可执行文件的 `--version` 与 `-v` 输出恰好为 `<程序名> <版本号>`。
 
@@ -138,4 +138,4 @@ Windows 使用 MSVC 开发者 shell。先在启动器目录执行
 运行 `./rwkv_router -config router.config.toml`（Windows 使用 `./rwkv_router.exe`）。
 CI 使用 `CGO_ENABLED=0` 编译 router，并在打包前运行 `--help` 验证。
 
-两个在线 RL Server 同样参与依赖打包及迁移后的 `--help` 检查。启动命令、Python 闭环和断线恢复见 [在线 RL 指南](online-rl.zh-CN.md)。解压后运行时应显式传入 `--vocab ./rwkv_vocab_v20230424.txt`。
+三个在线 RL Server 同样参与依赖打包及迁移后的 `--help` 检查。启动命令、Python 闭环和断线恢复见 [在线 RL 指南](online-rl.zh-CN.md)。解压后运行时应显式传入 `--vocab ./rwkv_vocab_v20230424.txt`。

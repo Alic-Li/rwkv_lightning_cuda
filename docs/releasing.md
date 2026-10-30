@@ -76,7 +76,7 @@ and runtime DLLs sit beside them. Models and the optional router are not include
 Extract the whole directory, change into it, and run `rwkv_launcher` (Windows:
 `rwkv_launcher.exe`). The launcher uses the included vocabulary by default.
 Linux libraries are resolved using the executables' origin-relative RPATH.
-Pass `--vocab ./rwkv_vocab_v20230424.txt` when using the state-tuning or MiSS-tuning CLI
+Pass `--vocab ./rwkv_vocab_v20230424.txt` when using the state, MiSS, or NoRA tuning CLI
 (its compiled default points to the build machine's source tree).
 
 The target machine needs an NVIDIA driver compatible with the CUDA version of the
@@ -111,8 +111,8 @@ with a plain `go build`.
 ## What CI verifies
 
 Both platforms run router tests and Go vet, compile all C++/CUDA targets (including
-GPU tests), and run seven CPU-only CTest suites: tokenizer, PTH archive, quantized
-archive, prefill admission, state-tuning API, uploaded-state store, and prefix-cache index. Packaging fails on unresolved
+GPU tests), and run eight CPU-only CTest suites: tokenizer, PTH archive, quantized
+archive, prefill admission, state-tuning API, uploaded-state store, prefix-cache index, and checkpoint configuration. Packaging fails on unresolved
 runtime dependencies and runs each relocated C++ CLI's `--help` as a smoke check,
 then checks that every packaged executable's `--version` and `-v` print exactly
 `<program> <version>`.
@@ -162,4 +162,4 @@ listen address and backends, then run `./rwkv_router -config router.config.toml`
 (use `./rwkv_router.exe` on Windows). CI builds the router with `CGO_ENABLED=0`
 and smoke-tests `--help` before archiving the bundle.
 
-Both online RL servers participate in dependency packaging and relocated `--help` checks. See the [online RL guide](online-rl.md) for startup, the Python loop, and recovery. Pass `--vocab ./rwkv_vocab_v20230424.txt` when running them from an extracted archive.
+All three online RL servers participate in dependency packaging and relocated `--help` checks. See the [online RL guide](online-rl.md) for startup, the Python loop, and recovery. Pass `--vocab ./rwkv_vocab_v20230424.txt` when running them from an extracted archive.
