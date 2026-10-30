@@ -130,14 +130,17 @@ remains active.
 
 Forward saves each layer's chunk initial WKV state and skips per-token WKV
 state recording. Immediately before each block backward, its WKV recurrence
-is replayed from the saved state into one shared tape. Linear layers and FFN
-are not replayed by this option. All layers execute sequentially on the same
-stream; chunk boundary gradients remain connected.
+is replayed from the saved state into one shared tape, which keeps one state
+checkpoint per 16 rows; the WKV backward recomputes the rows in between with
+the forward's arithmetic, so gradients are bitwise those of a full tape.
+Linear layers and FFN are not replayed by this option. All layers execute
+sequentially on the same stream; chunk boundary gradients remain connected.
 
 For L layers, H heads and T=min(ctx,chunk), WKV tape-related storage changes
-from `4*L*H*T*64*64` bytes to `4*H*64*64*(T+L+1)` bytes (shared tape,
-per-layer initial states, and shared final-state scratch). This trades an
-additional WKV forward recurrence per backward block for lower memory.
+from `4*L*H*T*64*64` bytes to `4*H*64*64*(ceil(T/16)+16+L+1)` bytes (shared
+checkpoint tape with its 16-state backward scratch, per-layer initial states,
+and shared final-state scratch). This trades an additional WKV forward
+recurrence per backward block for lower memory.
 Other activations, weights, and GPU chunk-boundary checkpoints are unchanged;
 very small chunks or a single layer may not benefit.
 

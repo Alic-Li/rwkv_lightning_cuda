@@ -10,6 +10,8 @@ namespace rwkv7_state_tuning {
 namespace {
 
 constexpr int kN = 64;
+constexpr int kPad = kN + 1;
+constexpr int kCheckpointInterval = kWkvCheckpointInterval;
 constexpr float kWScale = -0.6065306597126334f; // -exp(-0.5)
 
 template <typename T> __device__ __forceinline__ float as_float(T value);
@@ -33,6 +35,26 @@ __device__ __forceinline__ float effective_w(float raw) {
   return expf(kWScale * sigmoid);
 }
 
+// One state element of the recurrence. Forward, backward recompute and the
+// backward's updated row all use this expression so the compiler contracts
+// it identically everywhere.
+__device__ __forceinline__ float next_state(float s, float w, float sa,
+                                            float b, float k, float v) {
+  return s * w + sa * b + k * v;
+}
+
+// Checkpoint slot of the state before packed row t of lane `batch`. Lanes
+// own ascending row ranges, so t / kInterval + batch never collides.
+__device__ __forceinline__ long long checkpoint_slot(int t, int batch) {
+  return t / kCheckpointInterval + batch;
+}
+
+// One row's raw inputs for this thread's channel. The forward loads the next
+// row's while it computes the current one.
+template <typename IO> struct RowInputs {
+  IO r, w, k, v, a, b;
+};
+
 template <typename IO>
 __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
     int T, int H, const int *__restrict__ offsets,
@@ -41,7 +63,7 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
     const IO *__restrict__ k_ptr, const IO *__restrict__ v_ptr,
     const IO *__restrict__ a_ptr, const IO *__restrict__ b_ptr,
     IO *__restrict__ y_ptr, float *__restrict__ final_state,
-    float *__restrict__ state_before) {
+    float *__restrict__ checkpoints) {
   const int batch = blockIdx.y;
   const int head = blockIdx.x;
   const int value = threadIdx.x;
@@ -57,31 +79,43 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
   // Packed lanes own rows [offsets[b], offsets[b + 1]); dense lanes own T.
   const int begin = offsets ? offsets[batch] : batch * T;
   const int end = offsets ? offsets[batch + 1] : begin + T;
+  const auto load_row = [&](int t) {
+    const long long i = (static_cast<long long>(t) * H + head) * kN + value;
+    return RowInputs<IO>{r_ptr[i], w_ptr[i], k_ptr[i],
+                         v_ptr[i], a_ptr[i], b_ptr[i]};
+  };
+  RowInputs<IO> next{};
+  if (begin < end)
+    next = load_row(begin);
   for (int t = begin; t < end; ++t) {
     const long long token = (static_cast<long long>(t) * H + head) * kN;
-    const long long tape_base = token * kN;
+    const RowInputs<IO> row = next;
+    if (t + 1 < end)
+      next = load_row(t + 1);
+    if (checkpoints && (t - begin) % kCheckpointInterval == 0) {
+      const long long slot =
+          (checkpoint_slot(t, batch) * H + head) * kN * kN;
 #pragma unroll
-    for (int key = 0; key < kN; ++key) {
-      if (state_before)
-        state_before[tape_base + key * kN + value] = state[key];
+      for (int key = 0; key < kN; ++key)
+        checkpoints[slot + key * kN + value] = state[key];
     }
     __syncthreads();
-    r[value] = as_float(r_ptr[token + value]);
-    w[value] = effective_w(as_float(w_ptr[token + value]));
-    k[value] = as_float(k_ptr[token + value]);
-    a[value] = as_float(a_ptr[token + value]);
-    b[value] = as_float(b_ptr[token + value]);
+    r[value] = as_float(row.r);
+    w[value] = effective_w(as_float(row.w));
+    k[value] = as_float(row.k);
+    a[value] = as_float(row.a);
+    b[value] = as_float(row.b);
     __syncthreads();
 
     float sa = 0.0f;
 #pragma unroll
     for (int key = 0; key < kN; ++key)
       sa += state[key] * a[key];
-    const float vv = as_float(v_ptr[token + value]);
+    const float vv = as_float(row.v);
     float yy = 0.0f;
 #pragma unroll
     for (int key = 0; key < kN; ++key) {
-      state[key] = state[key] * w[key] + sa * b[key] + k[key] * vv;
+      state[key] = next_state(state[key], w[key], sa, b[key], k[key], vv);
       yy += state[key] * r[key];
     }
     y_ptr[token + value] = from_float<IO>(yy);
@@ -92,6 +126,14 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
   }
 }
 
+// The backward walks each checkpoint interval twice: first it replays the
+// forward recurrence from the checkpoint (same arithmetic, so bitwise the
+// states the forward saw) into a per-block scratch that stays in L2, then it
+// consumes those states in reverse. Both passes touch the scratch with
+// coalesced [K][V] accesses, and each thread reads back only the column it
+// wrote; the reverse pass transposes through shared memory for the K-row
+// reductions. The replay also keeps every row's sa, which is the same
+// reduction the reverse pass would otherwise repeat.
 template <typename IO>
 __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
     int T, int H, const int *__restrict__ offsets,
@@ -99,9 +141,10 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
     const IO *__restrict__ k_ptr, const IO *__restrict__ v_ptr,
     const IO *__restrict__ a_ptr, const IO *__restrict__ b_ptr,
     const IO *__restrict__ dy_ptr, const float *__restrict__ ds_final,
-    const float *__restrict__ state_before, float *__restrict__ ds_initial,
-    IO *__restrict__ dr_ptr, IO *__restrict__ dw_ptr, IO *__restrict__ dk_ptr,
-    IO *__restrict__ dv_ptr, IO *__restrict__ da_ptr, IO *__restrict__ db_ptr) {
+    const float *__restrict__ checkpoints, float *__restrict__ scratch,
+    float *__restrict__ ds_initial, IO *__restrict__ dr_ptr,
+    IO *__restrict__ dw_ptr, IO *__restrict__ dk_ptr, IO *__restrict__ dv_ptr,
+    IO *__restrict__ da_ptr, IO *__restrict__ db_ptr) {
   const int batch = blockIdx.y;
   const int head = blockIdx.x;
   const int value = threadIdx.x;
@@ -114,76 +157,123 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
   }
 
   __shared__ float r[kN], w[kN], w_sig[kN], k[kN], v[kN], a[kN], b[kN], dy[kN];
-  __shared__ float sa[kN], dsa[kN];
-  __shared__ float dnew[kN * kN];
+  __shared__ float dsa[kN];
+  // sa of every row in the interval, saved by the replay.
+  __shared__ float sa_history[kCheckpointInterval * kN];
+  // [K][V], padded so row and column walks are both conflict-free.
+  __shared__ float dnew[kN * kPad];
+  __shared__ float previous[kN * kPad];
+  float *history = scratch + bh * kCheckpointInterval * kN * kN;
 
   const int begin = offsets ? offsets[batch] : batch * T;
   const int end = offsets ? offsets[batch + 1] : begin + T;
-  for (int t = end - 1; t >= begin; --t) {
-    const long long token = (static_cast<long long>(t) * H + head) * kN;
-    const long long tape_base = token * kN;
-    __syncthreads();
-    r[value] = as_float(r_ptr[token + value]);
-    const float raw_w = as_float(w_ptr[token + value]);
-    w_sig[value] = 1.0f / (1.0f + expf(-raw_w));
-    w[value] = expf(kWScale * w_sig[value]);
-    k[value] = as_float(k_ptr[token + value]);
-    v[value] = as_float(v_ptr[token + value]);
-    a[value] = as_float(a_ptr[token + value]);
-    b[value] = as_float(b_ptr[token + value]);
-    dy[value] = as_float(dy_ptr[token + value]);
-    __syncthreads(); // a[] is read across both warps below.
-    float local_sa = 0.0f;
+  const int last = end > begin
+                       ? begin + (end - begin - 1) / kCheckpointInterval *
+                                     kCheckpointInterval
+                       : begin - kCheckpointInterval;
+  for (int first = last; first >= begin; first -= kCheckpointInterval) {
+    const int stop = min(first + kCheckpointInterval, end);
+    {
+      float state[kN];
+      const long long slot =
+          (checkpoint_slot(first, batch) * H + head) * kN * kN;
 #pragma unroll
-    for (int key = 0; key < kN; ++key) {
-      local_sa += state_before[tape_base + key * kN + value] * a[key];
+      for (int key = 0; key < kN; ++key)
+        state[key] = checkpoints[slot + key * kN + value];
+      for (int t = first; t < stop; ++t) {
+        float *before = history + (t - first) * kN * kN;
+#pragma unroll
+        for (int key = 0; key < kN; ++key)
+          before[key * kN + value] = state[key];
+        const long long token = (static_cast<long long>(t) * H + head) * kN;
+        __syncthreads();
+        w[value] = effective_w(as_float(w_ptr[token + value]));
+        k[value] = as_float(k_ptr[token + value]);
+        a[value] = as_float(a_ptr[token + value]);
+        b[value] = as_float(b_ptr[token + value]);
+        __syncthreads();
+        float state_sa = 0.0f;
+#pragma unroll
+        for (int key = 0; key < kN; ++key)
+          state_sa += state[key] * a[key];
+        sa_history[(t - first) * kN + value] = state_sa;
+        if (t + 1 == stop)
+          break;
+        const float vv = as_float(v_ptr[token + value]);
+#pragma unroll
+        for (int key = 0; key < kN; ++key)
+          state[key] =
+              next_state(state[key], w[key], state_sa, b[key], k[key], vv);
+      }
     }
-    sa[value] = local_sa;
-    __syncthreads();
 
-    float local_dsa = 0.0f;
+    for (int t = stop - 1; t >= first; --t) {
+      const long long token = (static_cast<long long>(t) * H + head) * kN;
+      const float *before = history + (t - first) * kN * kN;
+      float column[kN];
 #pragma unroll
-    for (int key = 0; key < kN; ++key) {
-      const float d = dstate[key] + r[key] * dy[value];
-      dnew[key * kN + value] = d;
-      local_dsa += d * b[key];
-    }
-    dsa[value] = local_dsa;
-    __syncthreads();
+      for (int key = 0; key < kN; ++key)
+        column[key] = before[key * kN + value];
+      const float *sa = sa_history + (t - first) * kN;
+      __syncthreads();
+#pragma unroll
+      for (int key = 0; key < kN; ++key)
+        previous[key * kPad + value] = column[key];
+      r[value] = as_float(r_ptr[token + value]);
+      const float raw_w = as_float(w_ptr[token + value]);
+      w_sig[value] = 1.0f / (1.0f + expf(-raw_w));
+      w[value] = expf(kWScale * w_sig[value]);
+      k[value] = as_float(k_ptr[token + value]);
+      v[value] = as_float(v_ptr[token + value]);
+      a[value] = as_float(a_ptr[token + value]);
+      b[value] = as_float(b_ptr[token + value]);
+      dy[value] = as_float(dy_ptr[token + value]);
+      __syncthreads(); // r[] and b[] are read across both warps below.
 
-    // A thread represents one channel. The same index is a K row for the
-    // row reductions and a V column for the column reductions.
-    float dr = 0.0f;
-    float dw_eff = 0.0f;
-    float dk = 0.0f;
-    float db = 0.0f;
-    float da = 0.0f;
-    float dv = 0.0f;
+      float local_dsa = 0.0f;
 #pragma unroll
-    for (int q = 0; q < kN; ++q) {
-      const float previous_row = state_before[tape_base + value * kN + q];
-      const float updated_row =
-          previous_row * w[value] + sa[q] * b[value] + k[value] * v[q];
-      const float row_grad = dnew[value * kN + q];
-      dr += updated_row * dy[q];
-      dw_eff += row_grad * previous_row;
-      dk += row_grad * v[q];
-      db += row_grad * sa[q];
-      da += previous_row * dsa[q];
-      dv += dnew[q * kN + value] * k[q];
-    }
-    const float sig = w_sig[value];
-    dr_ptr[token + value] = from_float<IO>(dr);
-    dw_ptr[token + value] =
-        from_float<IO>(kWScale * dw_eff * w[value] * sig * (1.0f - sig));
-    dk_ptr[token + value] = from_float<IO>(dk);
-    dv_ptr[token + value] = from_float<IO>(dv);
-    da_ptr[token + value] = from_float<IO>(da);
-    db_ptr[token + value] = from_float<IO>(db);
+      for (int key = 0; key < kN; ++key) {
+        const float d = dstate[key] + r[key] * dy[value];
+        dnew[key * kPad + value] = d;
+        local_dsa += d * b[key];
+      }
+      dsa[value] = local_dsa;
+      __syncthreads(); // dsa, dnew and previous are read transposed.
+
+      // A thread represents one channel. The same index is a K row for the
+      // row reductions and a V column for the column reductions.
+      float dr = 0.0f;
+      float dw_eff = 0.0f;
+      float dk = 0.0f;
+      float db = 0.0f;
+      float da = 0.0f;
+      float dv = 0.0f;
+#pragma unroll
+      for (int q = 0; q < kN; ++q) {
+        const float previous_row = previous[value * kPad + q];
+        const float updated_row =
+            next_state(previous_row, w[value], sa[q], b[value], k[value], v[q]);
+        const float row_grad = dnew[value * kPad + q];
+        dr += updated_row * dy[q];
+        dw_eff += row_grad * previous_row;
+        dk += row_grad * v[q];
+        db += row_grad * sa[q];
+        da += previous_row * dsa[q];
+        dv += dnew[q * kPad + value] * k[q];
+      }
+      const float sig = w_sig[value];
+      dr_ptr[token + value] = from_float<IO>(dr);
+      dw_ptr[token + value] =
+          from_float<IO>(kWScale * dw_eff * w[value] * sig * (1.0f - sig));
+      dk_ptr[token + value] = from_float<IO>(dk);
+      dv_ptr[token + value] = from_float<IO>(dv);
+      da_ptr[token + value] = from_float<IO>(da);
+      db_ptr[token + value] = from_float<IO>(db);
 
 #pragma unroll
-    for (int key = 0; key < kN; ++key) {
-      dstate[key] = dnew[key * kN + value] * w[key] + a[key] * dsa[value];
+      for (int key = 0; key < kN; ++key) {
+        dstate[key] = dnew[key * kPad + value] * w[key] + a[key] * dsa[value];
+      }
     }
   }
 #pragma unroll
@@ -201,7 +291,7 @@ void launch_forward(hipStream_t stream, const WkvShape &s, const float *s0,
       s.time, s.heads, s.offsets, s0, static_cast<const IO *>(r),
       static_cast<const IO *>(w), static_cast<const IO *>(k),
       static_cast<const IO *>(v), static_cast<const IO *>(a),
-      static_cast<const IO *>(b), static_cast<IO *>(y), sT, tape.state_before);
+      static_cast<const IO *>(b), static_cast<IO *>(y), sT, tape.data);
 }
 
 template <typename IO>
@@ -215,14 +305,15 @@ void launch_backward(hipStream_t stream, const WkvShape &s, const void *r,
       static_cast<const IO *>(w),
       static_cast<const IO *>(k), static_cast<const IO *>(v),
       static_cast<const IO *>(a), static_cast<const IO *>(b),
-      static_cast<const IO *>(dy), dsT, tape.state_before, ds0,
+      static_cast<const IO *>(dy), dsT, tape.data,
+      tape.data + wkv_checkpoint_elements(s), ds0,
       static_cast<IO *>(dr), static_cast<IO *>(dw), static_cast<IO *>(dk),
       static_cast<IO *>(dv), static_cast<IO *>(da), static_cast<IO *>(db));
 }
 
 void validate(const WkvShape &shape, WkvTapeView tape) {
   const std::size_t required = wkv_tape_elements(shape);
-  if (!tape.state_before || tape.state_before_elements < required) {
+  if (!tape.data || tape.elements < required) {
     throw std::invalid_argument("state-tuning WKV tape is null or too small");
   }
 }
@@ -233,7 +324,7 @@ void wkv_forward(hipStream_t stream, IoType io_type, const WkvShape &shape,
                  const float *initial_state, const void *r, const void *w,
                  const void *k, const void *v, const void *a, const void *b,
                  void *y, float *final_state, WkvTapeView tape) {
-  if (tape.state_before || tape.state_before_elements)
+  if (tape.data || tape.elements)
     validate(shape, tape);
   else
     (void)wkv_tape_elements(shape); // Validate shape even without recording.

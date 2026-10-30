@@ -20,13 +20,19 @@ struct WkvShape {
   const int *offsets = nullptr;
 };
 
-// Exact short-context tape: FP32 [rows,H,K,V]. A later checkpoint/recompute
-// implementation can change the storage policy without changing the API.
+// Exact checkpoint tape, FP32. The forward records the state before every
+// kWkvCheckpointInterval-th row of each lane, [slots,H,K,V]; the backward
+// replays the rows in between with the forward's arithmetic, so gradients
+// match a full per-row tape bitwise. A trailing [B,H,interval,K,V] region is
+// the backward's replay scratch.
+constexpr int kWkvCheckpointInterval = 16;
+
 struct WkvTapeView {
-  float *state_before = nullptr;
-  std::size_t state_before_elements = 0;
+  float *data = nullptr;
+  std::size_t elements = 0;
 };
 
+std::size_t wkv_checkpoint_elements(const WkvShape &shape);
 std::size_t wkv_tape_elements(const WkvShape &shape);
 
 // r/w/k/v/a/b/y are [B,T,H,N] (packed: [rows,H,N]). w is the raw clamp-w input including w0.
