@@ -25,7 +25,7 @@ state tuning, a multi-backend Go router, and a Go desktop launcher with a Web UI
 - **MiSS adapters&peft** — train one compact `D` matrix per target linear, then load adapters per request without modifying shared model weights.
 - **Batteries included** — weighted least-inflight load-balancing router and a desktop launcher with Web UI.
 
-Both training binaries use the independent [BF16 training backbone](src/bf16_training/README.md), with streamed base loading, native state passing and BF16 exports. Inference keeps its existing FP16/quantized paths.
+Both training binaries use the independent [BF16 training backbone](src/training/README.md), with streamed base loading, native state passing and BF16 exports. Inference keeps its existing FP16/quantized paths.
 
 [NoRA-init tuning](src/nora/README.md) adds `rwkv_nora_tune` and `rwkv_nora_tune_server`, with random column-normalized A, trainable A/B, fixed `alpha/rank=1`, and dynamic adapter loading in the inference engine.
 

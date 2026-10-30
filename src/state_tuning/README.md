@@ -3,14 +3,14 @@
 English | [简体中文](README.zh-CN.md)
 
 The active `rwkv_state_tune` and `rwkv_miss_tune` binaries now use the independent
-[native BF16 training backbone](../bf16_training/README.md). It keeps chunk/state
+[native BF16 training backbone](../training/README.md). It keeps chunk/state
 passing and microbatch accumulation, streams base tensors into BF16, and exports
 BF16 state/adapter files. WKV directly reuses the standard operator in `cuda/`.
 
 This directory retains the shared JSONL dataset reader and state-tuning usage
 notes. The legacy FP16 training sidecar and its inference-backend bridge have
 been removed. Neither training CLI links the inference core. MiSS training is
-implemented in `src/bf16_training/`; FP16 MiSS remains an inference format.
+implemented across `src/training/`, `src/model/bf16/`, and `src/backend/bf16/`; FP16 MiSS remains an inference format.
 
 The runtime state ABI is [H,K,V]. PyTorch state files use [H,V,K], so loading
 and checkpoint serialization transpose the last two dimensions. The inference

@@ -3,7 +3,7 @@
 [English](README.md) | 简体中文
 
 `rwkv_state_tune` 和 `rwkv_miss_tune` 使用独立的
-[BF16 训练 backbone](../bf16_training/README.md)，不链接推理核心。
+[BF16 训练 backbone](../training/README.md)，不链接推理核心。
 本目录只保留共享 JSONL 数据读取器和状态微调使用说明。
 旧 FP16 训练 sidecar 及其推理 backend 桥接接口已移除。
 MiSS 的 FP16 表示仍用于在线推理，训练使用 BF16；主参数与优化器张量使用 FP32。

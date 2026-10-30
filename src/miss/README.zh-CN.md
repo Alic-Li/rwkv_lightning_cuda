@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-训练使用独立的 [BF16 backbone](../bf16_training/README.md)。BF16 基模保持冻结，只有 `D[out, rank]` 接收参数梯度。本实现采用
+训练使用独立的 [BF16 backbone](../training/README.md)。BF16 基模保持冻结，只有 `D[out, rank]` 接收参数梯度。本实现采用
 [论文](https://arxiv.org/pdf/2409.15371) 和 [参考项目](https://github.com/Joluck/MiSS)
 中的高效 MiSS 形式，不存储或训练 A。
 

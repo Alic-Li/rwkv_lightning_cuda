@@ -35,7 +35,7 @@ inference kernels still require architecture-specific validation beyond gfx1100.
   --chunk-load --ctx 64 --chunk 32 --max-steps 2 --save-every 1
 ```
 
-Both training CLIs use the independent [BF16 backbone](../src/bf16_training/README.md).
+Both training CLIs use the independent [BF16 backbone](../src/training/README.md).
 Weight loading always streams through bounded staging buffers. `--chunk` controls
 activation recomputation and carries recurrent gradients across boundaries.
 State exports contain BF16 tensors; master parameters and optimizer state are FP32.

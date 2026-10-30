@@ -25,7 +25,7 @@ The final partial block is implicitly zero padded, including when rank > K.
 `Y = base_linear(X) + scale * S @ D.T`, with `scale = alpha / rank`.
 Ranks 1–1024 and up to 65535 rows per invocation are supported.
 
-Training uses the independent [BF16 backbone](../bf16_training/README.md).
+Training uses the independent [BF16 backbone](../training/README.md).
 D is BF16 for forward and dX; master D, accumulated dD and Adam moments are
 FP32. Reduction and projection accumulate in FP32. dD accumulates over every
 chunk and sample before one Adam update; no base dW is allocated or computed.

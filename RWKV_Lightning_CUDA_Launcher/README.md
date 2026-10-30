@@ -108,7 +108,7 @@ Vite 将 `/api` 和 `/v1` 转发到 `127.0.0.1:10721`，并把请求的 `Origin`
 
 ## 与当前原生代码的兼容说明
 
-事实来源为仓库 `README.md`、`rwkv_lightning_api_doc.md`、`src/server/rwkv_api_service.cpp`、`src/app/rwkv_fast_server.cpp`、`src/bf16_training/main.cpp` 和 `dataset.cpp`。
+事实来源为仓库 `README.md`、`rwkv_lightning_api_doc.md`、`src/server/rwkv_api_service.cpp`、`src/app/rwkv_fast_server.cpp`、`src/app/rwkv_tune.cpp` 和 `dataset.cpp`。
 
 ### Chat 初始化 state 与思考
 

@@ -31,7 +31,7 @@ HIP 实现包括 `rwkv7_statepassing_clampw.hip`、`backward_kernels.hip`、
   --chunk-load --ctx 64 --chunk 32 --max-steps 2 --save-every 1
 ```
 
-两个训练 CLI 均使用独立的 [BF16 backbone](../src/bf16_training/README.md)。
+两个训练 CLI 均使用独立的 [BF16 backbone](../src/training/README.md)。
 权重加载始终通过有界暂存缓冲区流式进行；`--chunk` 控制激活重算并跨边界传递循环梯度。
 状态导出为 BF16，主参数与优化器状态为 FP32。
 

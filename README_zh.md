@@ -16,7 +16,7 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 会话状态缓存、W8A16/W4A16 量化推理、state tuning、MiSS adapter、负载均衡
 路由器以及带 Web UI 的桌面启动器。
 
-两个训练二进制已切换到独立的 [BF16 训练 backbone](src/bf16_training/README.md)：基模逐层流式加载，直接复用原有 BF16 state-passing 算子，最终 state/adapter 导出为 BF16；推理仍使用原有 FP16/量化路线。
+两个训练二进制已切换到独立的 [BF16 训练 backbone](src/training/README.md)：基模逐层流式加载，直接复用原有 BF16 state-passing 算子，最终 state/adapter 导出为 BF16；推理仍使用原有 FP16/量化路线。
 
 新增 [NoRA-init tuning](src/nora/README.md)：`rwkv_nora_tune`、`rwkv_nora_tune_server`。使用随机 A 沿 rank 维按列归一化初始化，A/B 均可训练，固定 `alpha/rank=1`，支持推理引擎动态加载。
 

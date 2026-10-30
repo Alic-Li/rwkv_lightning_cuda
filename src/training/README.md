@@ -1,7 +1,10 @@
 # Native BF16 training backbone
 
-`rwkv_state_tune`, `rwkv_miss_tune`, and `rwkv_nora_tune` build from this directory and link
-`rwkv_bf16_training`, independently of `rwkv7_fast_backend_core`. The existing
+`rwkv_state_tune`, `rwkv_miss_tune`, and `rwkv_nora_tune` share the entry point
+[`src/app/rwkv_tune.cpp`](../app/rwkv_tune.cpp) and link `rwkv_bf16_training`
+(`rwkv::training`), independently of `rwkv7_fast_backend_core`.
+This directory owns training orchestration and the training library build;
+see [the source layout](../README.md) for model, kernel and I/O ownership. The existing
 FP16 inference backend remains unchanged apart from accepting BF16 adapter
 files. The legacy FP16 training sidecar has been removed. The layer forward/reverse
 implementations preserve its execution order; the linear, normalization, mixing and activation primitives

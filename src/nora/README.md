@@ -20,7 +20,7 @@ for dA are reconstructed from the existing chunk tape and saved incoming shifts.
 One input/latent-adjoint workspace is shared across layers, avoiding an extra
 full activation per layer and projection. No dense base dW or delta-W is created.
 
-Training kernels live in `src/bf16_training/nora_kernels.cu`; FP16 inference
+Training kernels live in `src/nora/training_kernels.cu`; FP16 inference
 kernels live in `src/nora/kernels.cu`. The tiled product primitive is shared in
 `include/rwkv/runtime/nora_gemm.cuh`. Adapter views, serialization, the trainer,
 and request/cache lifecycle reuse the MiSS infrastructure; a non-null A selects

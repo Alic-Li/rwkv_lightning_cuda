@@ -1,4 +1,4 @@
-#include "../state_tuning/dataset.hpp"
+#include "dataset.hpp"
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
 #include "rwkv/bf16_training/trainer.hpp"
 #endif
