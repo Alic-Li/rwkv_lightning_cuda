@@ -331,7 +331,7 @@ loss = - sum(mask[t] * advantage[t] * log softmax(logits[t-1]/temperature)[token
 
 正 Advantage 增大动作概率，负 Advantage 减小动作概率。分母不使用有符号权重之和。
 复用原 CE Kernel，加入逐行 signed weight 和 temperature 的链式导数；没有 PPO clipping、KL 项或重要性修正。
-GRPO 的组内 Reward 归一化在 Python 中完成。服务每次执行一次 Adam 更新，跨请求保持 FP32 master、梯度和 Adam m/v。
+GRPO / Dr.GRPO 的组内 Reward 归一化在 Python 中完成（见客户端 `--algorithm`）。服务每次执行一次 Adam 更新，跨请求保持 FP32 master、梯度和 Adam m/v。
 
 返回 `loss`、`grad_norm`（FP32 梯度的 L2）、本次实际使用的 `learning_rate`、`step`、`trained_tokens`、`total_tokens`、`seconds`、`updated` 和 `publish_required`。
 全零 Advantage 返回 `updated:false`，不推进 Adam。全零 Loss Mask 返回 400。
@@ -404,6 +404,18 @@ uv run --with tqdm python tools/online_rl.py \
 `--judge your_module:reward` 替换；函数接收 `(generated_token_ids, reference_token_ids)`，返回标量奖励。
 组内 Reward 无方差时 Advantage 全零，会跳过更新。
 
+`--algorithm` 选择组内 Reward 转 Advantage 的方式，默认 `grpo`：
+
+| 取值 | Advantage | 等效 Loss 分母 |
+|---|---|---|
+| `grpo` | `(r - mean) / std` | 本批可训练 Token 数 `N` |
+| `dr_grpo` | `(r - mean) · N / (G · max_tokens · turns)` | 常数 `G · max_tokens · turns` |
+
+`dr_grpo` 按 [Dr. GRPO](https://arxiv.org/abs/2503.20783) 去掉 std 归一化和与长度相关的归一化。
+服务端始终除以本批可训练 Token 数 `N`，因此客户端把每个 Advantage 乘以 `N / budget`，
+净分母变为常数 `budget = group-size × max-tokens × 该行轮数`。只改客户端，`/v1/train` 接口不变。
+由于没有 1/std 且分母不小于 `N`，梯度通常明显小于 `grpo`，需要相应调大 `--lr`。指标中记录 `algorithm`。
+
 数据集中的工具结果作为离线观察回放；示例不执行模型生成的工具调用。真实 Agent RL 应由 Python 环境执行动作并提供新的观察和 Judge。
 
 ### 真实工具环境的多轮示例
@@ -446,6 +458,10 @@ rewards = [judge(e) for e in episodes]
 mean = sum(rewards) / len(rewards)
 std = (sum((r - mean) ** 2 for r in rewards) / len(rewards)) ** 0.5 or 1.0
 samples = [{"turns": e["turns"], "advantages": (r - mean) / std} for e, r in zip(episodes, rewards)]
+# Dr.GRPO：不除 std，并把服务端的 1/N 换成常数 1/budget
+# n = sum(sum(t["loss_mask"]) for e in episodes for t in e["turns"])
+# budget = group_size * 1024 * max_turns
+# samples = [{"turns": e["turns"], "advantages": (r - mean) * n / budget} for e, r in zip(episodes, rewards)]
 lr = learning_rate_for_step(health["step"] + 1)  # 由客户端的调度函数决定本次 Adam 更新的 LR
 train = call("/v1/train", {"policy_version": version, "temperature": 1.0,
                          "learning_rate": lr, "samples": samples})

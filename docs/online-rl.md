@@ -197,6 +197,21 @@ and may inject synthetic advantages; use it only for plumbing tests. Progress an
 append-only JSONL metrics report reward mean/std, loss, gradient norm, learning rate,
 step, throughput, and cache reuse. Full histories over server `ctx` are skipped.
 
+`--algorithm` selects how group rewards become advantages (default `grpo`):
+
+| Value | Advantage | Effective loss divisor |
+|---|---|---|
+| `grpo` | `(r - mean) / std` | trained tokens in the batch |
+| `dr_grpo` | `(r - mean) · N / (G · max_tokens · turns)` | constant `G · max_tokens · turns` |
+
+`dr_grpo` follows [Dr. GRPO](https://arxiv.org/abs/2503.20783): no std
+normalization and no length-dependent normalization. The server always divides
+by the batch's trained-token count `N`, so the client multiplies each advantage
+by `N / budget`; the net divisor is the constant `budget = group-size ×
+max-tokens × turns of the row`. Only the client changes; the `/v1/train` API is
+the same. Gradients are typically much smaller than under `grpo` (no 1/std and a
+divisor ≥ N), so retune `--lr` upward. Metrics record `algorithm`.
+
 ## API and policy lifecycle
 
 All POST bodies are JSON. Use the opaque `policy_version` returned by the server.
@@ -259,6 +274,7 @@ retired. `/v1/logprobs` scores `sequences` under any live policy with the same
 forward and reductions as training (`len(tokens)-1` values each), which lets a client
 fold a KL penalty against the reference into per-token advantages. The loss is signed-advantage CE normalized
 by the number of selected predictable tokens, without PPO clipping or a KL term.
+Group normalization (GRPO or Dr. GRPO) is done by the client; see `--algorithm`.
 Masked observations still carry gradients across chunks and turns. Training never
 uses inference prefix snapshots. Collect rollouts, judge, train once, publish,
 then collect fresh rollouts. A second update before publication is rejected (409).
