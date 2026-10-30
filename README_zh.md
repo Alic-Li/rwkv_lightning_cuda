@@ -20,7 +20,7 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 
 新增 [NoRA-init tuning](src/nora/README.md)：`rwkv_nora_tune`、`rwkv_nora_tune_server`。使用随机 A 沿 rank 维按列归一化初始化，A/B 均可训练，固定 `alpha/rank=1`，支持推理引擎动态加载。
 
-新增两个常驻 [在线 RL Server](docs/online-rl.zh-CN.md)：`rwkv_miss_tune_server`、`rwkv_state_tune_server`，推训共享 BF16 Backbone，支持批量 Rollout、Signed Advantage 训练和策略版本发布。
+新增三个常驻 [在线 RL Server](docs/online-rl.zh-CN.md)：`rwkv_miss_tune_server`、`rwkv_state_tune_server`、`rwkv_nora_tune_server`（MiSS / State / NoRA 三种模式，客户端支持 GRPO 与 Dr.GRPO），推训共享 BF16 Backbone，支持批量 Rollout、Signed Advantage 训练和策略版本发布。
 
 ## 主要功能
 

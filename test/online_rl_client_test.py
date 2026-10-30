@@ -92,5 +92,27 @@ class RolloutTest(unittest.TestCase):
                 online_rl.parse_stops(value)
 
 
+class AdvantageTest(unittest.TestCase):
+    def test_grpo_divides_by_group_std(self):
+        self.assertEqual(online_rl.group_advantages([1.0, 0.0, 1.0, 0.0], "grpo"),
+                         [1.0, -1.0, 1.0, -1.0])
+        self.assertEqual(online_rl.group_advantages([0.5, 0.5], "grpo"), [0.0, 0.0])
+
+    def test_dr_grpo_centers_and_uses_constant_divisor(self):
+        rewards = [1.0, 0.0, 0.5, 0.5]
+        advantages = online_rl.group_advantages(rewards, "dr_grpo", trained_tokens=30,
+                                                token_budget=120)
+        self.assertEqual(advantages, [0.125, -0.125, 0.0, 0.0])
+        # Server loss = -sum(A * logprob) / trained_tokens; with the scale the
+        # effective divisor is the constant budget, independent of lengths.
+        logprob_sums = [-2.0, -6.0, -1.0, -1.0]
+        server = -sum(a * lp for a, lp in zip(advantages, logprob_sums)) / 30
+        mean = sum(rewards) / len(rewards)
+        expected = -sum((r - mean) * lp for r, lp in zip(rewards, logprob_sums)) / 120
+        self.assertAlmostEqual(server, expected)
+        with self.assertRaises(ValueError):
+            online_rl.group_advantages(rewards, "ppo")
+
+
 if __name__ == "__main__":
     unittest.main()

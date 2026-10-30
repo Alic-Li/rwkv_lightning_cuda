@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal rollout -> Python judge -> signed GRPO -> publish HTTP client.
+"""Minimal rollout -> Python judge -> signed GRPO/Dr.GRPO -> publish HTTP client.
 Only tqdm is required. Example: uv run --with tqdm tools/online_rl.py --help
 """
 import argparse
@@ -55,6 +55,23 @@ def parse_stops(value):
     if not valid:
         raise argparse.ArgumentTypeError("--stop requires up to 16 nonempty strings, each at most 256 UTF-8 bytes")
     return stops
+
+
+def group_advantages(rewards, algorithm, *, trained_tokens=0, token_budget=1):
+    """Scalar advantage per sample for one group.
+
+    grpo:    (r - mean) / std.
+    dr_grpo: r - mean, scaled by trained_tokens / token_budget so the server's
+             division by the batch token count becomes a constant divisor
+             (Dr. GRPO, arXiv:2503.20783).
+    """
+    mean, std = statistics.mean(rewards), statistics.pstdev(rewards)
+    if algorithm == "grpo":
+        return [(r - mean) / max(std, 1e-8) for r in rewards]
+    if algorithm == "dr_grpo":
+        scale = trained_tokens / token_budget
+        return [(r - mean) * scale for r in rewards]
+    raise ValueError(f"unknown algorithm {algorithm!r}")
 
 
 def collect_rollouts(api, rounds, *, group_size, version, max_tokens, ctx,
@@ -144,6 +161,9 @@ def main():
     p.add_argument("--stop", type=parse_stops,
                    help='JSON array of stop strings; default: server strings; [] explicitly disables stops')
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--algorithm", choices=("grpo", "dr_grpo"), default="grpo",
+                   help="grpo: (r-mean)/std; dr_grpo: r-mean with loss divided by "
+                        "group-size * max-tokens * turns instead of trained tokens")
     p.add_argument("--lr", type=float, required=True,
                    help="learning rate sent in every train request; custom loops may schedule it per step")
     p.add_argument("--seed", type=int, default=1234)
@@ -219,10 +239,16 @@ def main():
             cached, prefilled, generated = rollout["cached"], rollout["prefilled"], rollout["generated"]
             rollout_seconds = rollout["seconds"]
             mean, std = statistics.mean(rewards), statistics.pstdev(rewards)
-            advantages = [(r - mean) / max(std, 1e-8) for r in rewards]
+            # The first token is always prompt, so masked tokens equal the
+            # server's trained_tokens.
+            masked = sum(sum(t["loss_mask"]) for sample in turns for t in sample)
+            budget = args.group_size * args.max_new_tokens * len(rounds)
+            advantages = group_advantages(rewards, args.algorithm,
+                                          trained_tokens=masked, token_budget=budget)
             synthetic = args.smoke and std < 1e-8
             if synthetic:
-                advantages = [1.0 if i % 2 == 0 else -1.0 for i in range(args.group_size)]
+                scale = masked / budget if args.algorithm == "dr_grpo" else 1.0
+                advantages = [scale if i % 2 == 0 else -scale for i in range(args.group_size)]
             train = api.call("/v1/train", {
                 "policy_version": version, "temperature": args.temperature,
                 "learning_rate": args.lr,
@@ -237,7 +263,7 @@ def main():
                 updates += 1
             elapsed = time.monotonic() - started
             rollout_loss = -sum(a * lp for a, lp in zip(advantages, rollout["logprob_sums"])) / train["trained_tokens"]
-            report = dict(row=line_number, reward=mean, reward_std=std, loss=train["loss"],
+            report = dict(row=line_number, algorithm=args.algorithm, reward=mean, reward_std=std, loss=train["loss"],
                           rollout_loss=rollout_loss, loss_abs_error=abs(train["loss"] - rollout_loss),
                           grad_norm=train["grad_norm"], learning_rate=train["learning_rate"],
                           step=train["step"], updated=train["updated"],
