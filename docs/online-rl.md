@@ -1,14 +1,21 @@
 # Persistent BF16 online RL servers
 
-`rwkv_nora_tune_server` supports the same API, trains both NoRA A/B factors, and defaults to port 8850. See [NoRA-init](../src/nora/README.md).
-
 English | [简体中文 / full API examples](online-rl.zh-CN.md)
 
-`rwkv_miss_tune_server` trains MiSS D parameters with a fixed initial state.
-`rwkv_state_tune_server` trains the initial time_state with a fixed adapter.
-Both accept a cold-start adapter and state, retain Adam in memory, and share one
+Online RL supports three modes, one server each, all with the same HTTP API:
+
+| Mode | Server | Trains | Frozen | Default port |
+|---|---|---|---|---|
+| MiSS | `rwkv_miss_tune_server` | MiSS `D` | initial state | 8848 |
+| State | `rwkv_state_tune_server` | initial `time_state` | adapter (MiSS or NoRA) | 8849 |
+| NoRA | `rwkv_nora_tune_server` | NoRA A/B factors | initial state | 8850 |
+
+All three accept a cold-start adapter and state, retain Adam in memory, and share one
 BF16 backbone between actor snapshots and the learner within each process.
-Running both processes loads two backbones. Choose one for each training run.
+`/health` reports `mode` as `miss`, `state` or `nora`. NoRA uses NoRA-init (random
+column-normalized A, zero B) and requires `alpha/rank = 1`; see
+[NoRA-init](../src/nora/README.md). Each process loads its own backbone. Choose one
+for each training run.
 The original inference server and training CLIs remain separate.
 
 ## Build or use a release
@@ -17,10 +24,10 @@ From the source checkout, with the project's CUDA and Drogon dependencies instal
 
 ```bash
 cmake -S . -B build -DRWKV7_STATE_TUNING=ON
-cmake --build build --parallel 2 --target rwkv_miss_tune_server rwkv_state_tune_server
+cmake --build build --parallel 2 --target rwkv_miss_tune_server rwkv_state_tune_server rwkv_nora_tune_server
 ```
 
-GitHub Actions builds and packages both servers on Linux and Windows with CUDA
+GitHub Actions builds and packages all three servers on Linux and Windows with CUDA
 12.9 and 13.2. Extract the entire release directory, including runtime libraries,
 `rwkv_vocab_v20230424.txt`, `tools/online_rl.py`, and `docs/`. The examples below
 run from that directory. For a source build, use `./build/<binary>` and
@@ -55,18 +62,32 @@ State (Linux shell):
   --output ./online-rl-output/state
 ```
 
+NoRA (Linux shell; without `--adapter` it starts from NoRA-init, rank must equal alpha):
+
+```bash
+./rwkv_nora_tune_server \
+  --model /path/to/model.pth --state /path/to/state.pth \
+  --vocab ./rwkv_vocab_v20230424.txt \
+  --rank 16 --alpha 16 --targets all \
+  --host 127.0.0.1 --port 8850 \
+  --chunk 64 --ctx 4096 --max-batch 8 \
+  --cache-capacity 8 --keep-versions 2 \
+  --output ./online-rl-output/nora
+```
+
 Windows PowerShell (single-line commands avoid shell-specific continuations):
 
 ```powershell
 .\rwkv_miss_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8848 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\miss
 .\rwkv_state_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8849 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\state
+.\rwkv_nora_tune_server.exe --model C:\models\model.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --rank 16 --alpha 16 --targets all --host 127.0.0.1 --port 8850 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\nora
 ```
 
 Run only the command for your chosen mode. Omit `--adapter` to initialize MiSS D
-at zero (or use no adapter in State mode); omit `--state` for zero initial state.
+at zero, NoRA with NoRA-init (or use no adapter in State mode); omit `--state` for zero initial state.
 Cold adapters supply rank/alpha/targets and must match the base model.
 `--help` lists all startup flags without loading a model.
-Neither server accepts startup `--lr` anymore. Every `POST /v1/train` request
+No server accepts startup `--lr` anymore. Every `POST /v1/train` request
 must supply `learning_rate`; the server has no default or sticky learning rate.
 
 `--ctx` limits complete history; oversized requests are rejected, never silently
@@ -156,7 +177,7 @@ uv run --with tqdm python tools/online_rl.py \
   --save --metrics ./miss-online-metrics.jsonl
 ```
 
-For State use port `8849`, client `--lr 0.01`, and a separate metrics file.
+For State use port `8849`, client `--lr 0.01`, and a separate metrics file; for NoRA use port `8850`.
 The example client's `--lr` is required and is sent in every train request;
 custom loops can schedule that field independently for each optimizer step.
 Python needs only `tqdm`;
@@ -288,10 +309,10 @@ contains `state.pth`, `adapter.pth` when applicable, and `policy.json`. Restarti
 resets Adam and the server step counter. Omit adapter if none was exported.
 
 Publishing with `"checkpoint": true` (implies `save`) also writes `training/`: for
-MiSS the `rwkv_miss_tune` checkpoint (FP32 master, gradient, Adam m/v, initial state,
+MiSS/NoRA the `rwkv_miss_tune`/`rwkv_nora_tune` checkpoint (FP32 master, gradient, Adam m/v, initial state,
 step); for State the FP32 state, Adam m/v and step. Restart with `--resume <directory>`
 to continue with the same optimizer state and step; adapter and state default to the
-files in that directory. MiSS resume checks rank, alpha, targets and the backbone.
+files in that directory. MiSS/NoRA resume checks rank, alpha, targets and the backbone.
 
 External sampling: `/v1/train` checks only `policy_version`, so tokens sampled by
 `rwkv_lighting_cuda` with the exported adapter (registered per step through
@@ -319,6 +340,6 @@ Updating the server executable requires restarting the process.
 
 CI validates compilation, CPU tests, bundled dependencies and relocated `--help`.
 Hosted runners have no GPU; GPU training is not exercised there. Local HTTP tests
-in `test/online_rl_http_test.py` cover both modes; `--check-idle-timeout` adds a
+in `test/online_rl_http_test.py` cover all three modes; `--check-idle-timeout` adds a
 75-second silent-connection check per mode. See the
 [GPU validation record](online-rl-validation.zh-CN.md).

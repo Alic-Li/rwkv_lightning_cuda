@@ -1,11 +1,17 @@
 # 常驻 BF16 在线 RL Server
 
-`rwkv_nora_tune_server` 复用相同 API，训练 NoRA 的 A/B 两组参数，默认端口 8850。详见 [NoRA-init](../src/nora/README.md)。
-
 [English](online-rl.md) | 简体中文
 
-`rwkv_miss_tune_server` 更新 MiSS `D`；`rwkv_state_tune_server` 更新初始 `time_state`。
-两个 Server 均支持 `--adapter`、`--state` 同时冷启动。State 模式下 Adapter 冻结；MiSS 模式下初始 State 冻结。
+在线 RL 支持三种模式，各对应一个 Server，共用同一套 HTTP API：
+
+| 模式 | Server | 训练参数 | 冻结 | 默认端口 |
+|---|---|---|---|---|
+| MiSS | `rwkv_miss_tune_server` | MiSS `D` | 初始 State | 8848 |
+| State | `rwkv_state_tune_server` | 初始 `time_state` | Adapter（MiSS 或 NoRA） | 8849 |
+| NoRA | `rwkv_nora_tune_server` | NoRA 的 A/B 两组参数 | 初始 State | 8850 |
+
+三个 Server 均支持 `--adapter`、`--state` 同时冷启动。`/health` 的 `mode` 分别为 `miss`、`state`、`nora`。
+NoRA 使用 NoRA-init（随机按列归一化 A、零 B），要求 `alpha/rank = 1`，详见 [NoRA-init](../src/nora/README.md)。
 原来的 `rwkv_miss_tune`、`rwkv_state_tune` 和 `rwkv_lighting_cuda` 入口保留。
 
 ## 构建与启动
@@ -14,7 +20,7 @@
 
 ```bash
 cmake -S . -B build -DRWKV7_STATE_TUNING=ON
-cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server
+cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server rwkv_nora_tune_server
 ```
 
 启动 MiSS 服务：
@@ -43,8 +49,21 @@ cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server
   --output ./online-rl-output/state
 ```
 
+训练 NoRA 时，不指定 `--adapter` 就按 NoRA-init 冷启动（rank 与 alpha 须相等）；也可用 `--adapter` 加载已有 NoRA Adapter：
+
+```bash
+./build/rwkv_nora_tune_server \
+  --model /path/to/model.pth \
+  --state /path/to/state.pth \
+  --vocab ./assets/rwkv_vocab_v20230424.txt \
+  --rank 16 --alpha 16 --targets all \
+  --host 127.0.0.1 --port 8850 --chunk 64 --ctx 4096 \
+  --max-batch 8 --cache-capacity 8 --keep-versions 2 \
+  --output ./online-rl-output/nora
+```
+
 以上命令在源码仓库根目录执行。GitHub Actions 的 Linux/Windows CUDA 12.9、13.2
-安装包均包含两个 Server、运行库、词表、`tools/online_rl.py` 和在线 RL 文档。
+安装包均包含三个 Server、运行库、词表、`tools/online_rl.py` 和在线 RL 文档。
 解压后进入 `rwkv_lighting_cuda/` 目录，将命令中的 `./build/二进制` 改为 `./二进制`，
 并将词表改为 `--vocab ./rwkv_vocab_v20230424.txt`；默认词表路径指向构建机器，不能用于发布包。
 模型、冷启动 Adapter/State 和数据集需要自行提供，示例中的绝对路径应替换为本机路径。
@@ -54,21 +73,22 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 ```powershell
 .\rwkv_miss_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8848 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\miss
 .\rwkv_state_tune_server.exe --model C:\models\model.pth --adapter C:\models\adapter.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --host 127.0.0.1 --port 8849 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\state
+.\rwkv_nora_tune_server.exe --model C:\models\model.pth --state C:\models\state.pth --vocab .\rwkv_vocab_v20230424.txt --rank 16 --alpha 16 --targets all --host 127.0.0.1 --port 8850 --chunk 64 --ctx 4096 --max-batch 8 --output .\online-rl-output\nora
 ```
 
 选择一种模式启动即可；`--help` 无需加载模型，可检查可执行文件及依赖是否可用。
 等待日志出现 `ready`，在另一个终端运行 Python 闭环，关闭客户端不会关闭后端。
 
-不指定 Adapter 时 MiSS 从零 `D` 开始；不指定 State 时使用零初始 State。
+不指定 Adapter 时 MiSS 从零 `D` 开始，NoRA 按 NoRA-init 初始化；不指定 State 时使用零初始 State。
 冷 Adapter 自动提供 rank、alpha、targets，并校验基模 fingerprint 和维度。
-两个 Server 均不再接受启动参数 `--lr`，每次 `POST /v1/train` 必须显式传入 `learning_rate`。
+三个 Server 均不再接受启动参数 `--lr`，每次 `POST /v1/train` 必须显式传入 `learning_rate`。
 学习率由客户端逐步控制，服务端不提供默认值，也不沿用上一次请求的学习率。
-每个 Server 进程仅加载一份 Backbone；同时启动两个进程会各自加载一份。
+每个 Server 进程仅加载一份 Backbone；同时启动多个进程会各自加载一份。
 
 | 参数 | 默认值与含义 |
 |---|---|
 | `--host` | `127.0.0.1` |
-| `--port` | MiSS `8848`，State `8849` |
+| `--port` | MiSS `8848`，State `8849`，NoRA `8850` |
 | `--chunk` | `64`；计算与反向重算块长，不截断梯度 |
 | `--ctx` | `4096`；完整历史 Token 上限，超长请求直接拒绝；对显存的影响见下文 |
 | `--max-tokens` | `1024`；每轮生成的防复读硬上限，命中停止串会提前结束；请求可以覆盖 |
@@ -353,16 +373,16 @@ Backbone 指针始终共享。显式指定旧版本的请求仍使用其旧权�
 版本切换不会重建 Learner 或清空 Adam。
 
 `save:true` 输出 `state.pth`、有 Adapter 时的 `adapter.pth`、`policy.json`。
-State 和 Adapter 按现有格式导出 BF16，可由原推理服务或两个新 Server 冷启动加载；用它们冷启动会从新 Adam 状态和 step=0 开始。
+State 和 Adapter 按现有格式导出 BF16，可由原推理服务或在线 RL Server 冷启动加载；用它们冷启动会从新 Adam 状态和 step=0 开始。
 
 `checkpoint:true`（隐含 `save:true`）额外写入 `training/` 子目录，即完整训练检查点：
 
-- MiSS：沿用 `rwkv_miss_tune` 的检查点格式（FP32 master、梯度、Adam m/v、初始 State 和 step）；
+- MiSS / NoRA：沿用 `rwkv_miss_tune` / `rwkv_nora_tune` 的检查点格式（FP32 master、梯度、Adam m/v、初始 State 和 step）；
 - State：FP32 可训练 State、Adam m/v 和 step。
 
 返回值中的 `checkpoint` 是该子目录。重启时传 `--resume <目录>`：未显式指定时，`adapter.pth`/`state.pth` 也从该目录读取；
 恢复后 `/health` 的 `step` 和 `published_step` 都等于检查点 step，Adam 的偏差校正从该 step 继续。
-MiSS 恢复时会校验 rank、alpha、targets 和 Backbone fingerprint 与检查点一致。
+MiSS / NoRA 恢复时会校验 rank、alpha、targets 和 Backbone fingerprint 与检查点一致。
 7.2B r16 的 MiSS 检查点约为 Adapter 参数量 × 16 字节（约 0.3 GB），State 检查点约为 3 个 State 大小（约 100 MB），建议隔几步再存一次。
 
 输入错误返回 400；版本过期/发布 step 不符返回 409；工作队列满返回 503；执行错误返回 500。
@@ -397,7 +417,7 @@ uv run --with tqdm python tools/online_rl.py \
 超限轨迹保留已生成 Token 及其 logprob，结束本条轨迹，不再追加后续观察；奖励仍交给 Judge 计算。
 指标记录 `finish_reasons`、`matched_stops`、`truncated_samples`、`truncation_reasons` 和 `completed_turns`。
 进度条的 `trunc` 显示本批截断样本数。首个 Prompt 已占满 `ctx` 的数据行会跳过。
-换成 `:8849`、设置客户端 `--lr 0.01` 并使用独立指标文件可测 State。
+换成 `:8849`、设置客户端 `--lr 0.01` 并使用独立指标文件可测 State；换成 `:8850` 可测 NoRA。
 示例客户端的 `--lr` 必填，它在每个训练请求中发送 `learning_rate`；自定义循环可逐步改变此值。
 进度条与 JSONL 指标包含 Reward 均值/标准差、Loss、梯度范数、实际学习率、更新步数、吞吐和缓存命中率。
 默认 Judge 是生成 Token 与参考答案的 unigram F1，仅供演示。实际任务可用
@@ -513,7 +533,7 @@ curl -X POST http://127.0.0.1:8848/v1/publish \
 
 ## 实现与测试
 
-Actions 会编译两个 Server、打包依赖并在打包目录执行 `--help`；也运行纯 CPU 前缀索引测试。
+Actions 会编译三个 Server、打包依赖并在打包目录执行 `--help`；也运行纯 CPU 前缀索引测试。
 托管 Runner 没有 GPU，不运行真实 Rollout/训练；GPU 闭环需另行验证。
 
 HTTP 验收脚本可加 `--check-idle-timeout`，对每种 Server 检查同一条连接静默 75 秒后

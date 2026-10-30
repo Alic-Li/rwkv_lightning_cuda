@@ -29,7 +29,7 @@ Both training binaries use the independent [BF16 training backbone](src/bf16_tra
 
 [NoRA-init tuning](src/nora/README.md) adds `rwkv_nora_tune` and `rwkv_nora_tune_server`, with random column-normalized A, trainable A/B, fixed `alpha/rank=1`, and dynamic adapter loading in the inference engine.
 
-The standalone `rwkv_miss_tune_server` and `rwkv_state_tune_server` add persistent BF16 online RL: batch rollouts, signed-advantage train steps, versioned actor snapshots, and shared prefix caching. See the [online RL guide](docs/online-rl.md).
+The standalone `rwkv_miss_tune_server`, `rwkv_state_tune_server` and `rwkv_nora_tune_server` add persistent BF16 online RL (MiSS, State and NoRA modes, GRPO or Dr.GRPO advantages): batch rollouts, signed-advantage train steps, versioned actor snapshots, and shared prefix caching. See the [online RL guide](docs/online-rl.md).
 
 ## Quick Start
 
