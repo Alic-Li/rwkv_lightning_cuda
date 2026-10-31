@@ -1,4 +1,7 @@
 #include "dataset.hpp"
+#ifdef RWKV_NCCL_DP
+#include "nccl_dp.hpp"
+#endif
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
 #include "rwkv/bf16_training/trainer.hpp"
 #endif
@@ -15,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -29,6 +33,19 @@ namespace {
 
 using rwkv_bf16_training::DeviceBuffer;
 
+constexpr const char *program_name =
+#ifdef RWKV_NORA_TUNE
+    "rwkv_nora_tune"
+#elif defined(RWKV_MISS_TUNE)
+    "rwkv_miss_tune"
+#else
+    "rwkv_state_tune"
+#endif
+#ifdef RWKV_NCCL_DP
+    "_dp"
+#endif
+    ;
+
 // Target i of a sample predicts tokens[i + 1]; train[i + 1] says whether it
 // contributes to the loss. Untrained prefixes still run forward and backward
 // because the tuned initial state receives its gradient through them.
@@ -38,6 +55,10 @@ struct Sample {
 };
 
 struct Options {
+#ifdef RWKV_NCCL_DP
+  std::string devices = "0";
+  bool dp_profile = false;
+#endif
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
   std::string state, resume, targets = "all";
   int rank = 16;
@@ -92,6 +113,14 @@ struct Options {
   std::cerr
       << "Usage: " << program << " --model MODEL.pth --data TRAIN.jsonl "
       << "--output DIR [options]\n"
+#ifdef RWKV_NCCL_DP
+      << "  --devices 0,1,...     NCCL GPU indices (default 0); batch-size is "
+         "global,\n"
+         "                        micro-bsz is per GPU; one process per "
+         "device\n"
+      << "  --dp-profile         report each rank's work, compute/reduce time "
+         "and memory\n"
+#endif
       << "  --wkv_tape            accepted for compatibility; tape replay is "
          "always enabled\n"
       << "  --chunk-load          accepted for compatibility; BF16 loading "
@@ -116,10 +145,13 @@ struct Options {
       << "  --lr FLOAT            initial learning rate (default 1.0)\n"
       << "  --lr-final FLOAT      final learning rate (default 0.01)\n"
 #endif
-      << "  --gemm-mode MODE      bf16 (default): one pinned GEMM kernel per shape,\n"
-         "                        so rows (and --micro-bsz packing) never change\n"
+      << "  --gemm-mode MODE      bf16 (default): one pinned GEMM kernel per "
+         "shape,\n"
+         "                        so rows (and --micro-bsz packing) never "
+         "change\n"
          "                        results; strict: same with pedantic FP32;\n"
-         "                        auto: cuBLAS picks per call (previous default)\n"
+         "                        auto: cuBLAS picks per call (previous "
+         "default)\n"
       << "  --warmup-steps N      linear warmup updates (default 10)\n"
       << "  --save-every N        periodic checkpoint interval (default 0)\n"
       << "  --seed N              deterministic run seed (default 1234)\n"
@@ -172,19 +204,17 @@ Options parse(int argc, char **argv) {
     if (arg == "--help" || arg == "-h")
       usage(argv[0]);
     else if (rwkv::is_version_flag(arg))
-#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
-#ifdef RWKV_NORA_TUNE
-      std::exit(rwkv::print_version("rwkv_nora_tune"));
-#else
-      std::exit(rwkv::print_version("rwkv_miss_tune"));
-#endif
-#else
-      std::exit(rwkv::print_version("rwkv_state_tune"));
-#endif
+      std::exit(rwkv::print_version(program_name));
     else if (arg == "--wkv_tape")
       continue; // Compatibility flag: shared WKV tape is always enabled.
     else if (arg == "--chunk-load")
       out.chunk_load = true;
+#ifdef RWKV_NCCL_DP
+    else if (arg == "--devices")
+      out.devices = value(i, argc, argv);
+    else if (arg == "--dp-profile")
+      out.dp_profile = true;
+#endif
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
     else if (arg == "--state")
       out.state = value(i, argc, argv);
@@ -309,6 +339,22 @@ std::string checkpoint_name(const std::filesystem::path &directory,
 int main(int argc, char **argv) {
   try {
     const Options options = parse(argc, argv);
+#ifdef RWKV_NCCL_DP
+    const int launch_status = rwkv_dp::launch(options.devices);
+    if (launch_status >= 0)
+      return launch_status;
+    rwkv_dp::Group dp;
+    const bool primary = rwkv_dp::rank() == 0;
+    // Avoid reserving excessive lanes for small global batches. Ranks may own
+    // different sample counts and accumulate as many micro-batches as needed.
+    const int micro_bsz =
+        std::min(options.micro_bsz,
+                 int((size_t(options.batch_size) + rwkv_dp::size() - 1) /
+                     rwkv_dp::size()));
+#else
+    const bool primary = true;
+    const int micro_bsz = options.micro_bsz;
+#endif
     // Thread-local policy: all training GEMMs run on this thread. Kernels are
     // chosen for wide prefill-like GEMMs (no decode to keep fast) at a fixed
     // row count, so --chunk and --micro-bsz never change which kernel runs.
@@ -368,14 +414,19 @@ int main(int argc, char **argv) {
     config["planned_steps"] = Json::UInt64(planned);
     config["seed"] = Json::UInt64(options.seed);
     config["training_dtype"] = "bfloat16";
+#ifdef RWKV_NCCL_DP
+    config["dp_world_size"] = rwkv_dp::size();
+    config["dp_micro_bsz"] = micro_bsz;
+    config["dp_partition"] = "packed_cost_v1";
+    config["gemm_mode"] = options.gemm_mode;
+#endif
 #ifdef RWKV_NORA_TUNE
     config["method"] = "nora";
     config["initialization"] = "nora_init";
 #endif
     // Adapter latent tapes hold one packed micro-batch chunk.
     rwkv_bf16_miss::Trainer miss(frozen, options.rank, options.alpha,
-                                 options.targets,
-                                 max_time * options.micro_bsz, config,
+                                 options.targets, max_time * micro_bsz, config,
                                  stream.value);
 #endif
     const std::size_t state_count = static_cast<std::size_t>(L) * state_lane;
@@ -394,21 +445,24 @@ int main(int argc, char **argv) {
     if (!options.state.empty()) time_state = model.load_state(options.state);
 #endif
     rwkv_bf16_training::Executor executor(frozen, max_time, stream.value,
-                                          options.micro_bsz);
+                                          micro_bsz);
+#ifdef RWKV_NCCL_DP
+    executor.reserve_sequence(options.ctx);
+#endif
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
     miss.bind_tapes(executor.tapes());
 #endif
-    std::cout << "Optimizer: " << options.optimizer << '\n'
-              << "GEMM mode: " << options.gemm_mode << '\n'
-              << "Micro-bsz: " << options.micro_bsz
-              << " packed lanes (no padding)\n"
-              << "WKV tape: shared across layers (recompute)\n";
-    std::filesystem::create_directories(options.output);
+    if (primary)
+      std::cout << "Optimizer: " << options.optimizer << '\n'
+                << "GEMM mode: " << options.gemm_mode << '\n'
+                << "Micro-bsz: " << micro_bsz << " packed lanes (no padding)\n"
+                << "WKV tape: shared across layers (recompute)\n";
+    if (primary)
+      std::filesystem::create_directories(options.output);
 
     std::uint64_t global_step = 0;
     std::size_t skipped = 0;
     bool stop = false;
-    const auto started = std::chrono::steady_clock::now();
     std::uint64_t processed_tokens = 0;
 #if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
     std::vector<float> host_gradient(state_count), accumulated(state_count);
@@ -422,6 +476,17 @@ int main(int argc, char **argv) {
     if (options.max_steps && global_step >= options.max_steps)
       stop = true;
 #endif
+#ifdef RWKV_NCCL_DP
+    dp.barrier(stream.value);
+    size_t free_bytes = 0, total_bytes = 0;
+    check(cudaMemGetInfo(&free_bytes, &total_bytes), "DP memory report");
+    std::fprintf(
+        stderr,
+        "DP rank=%d reserved workspace; GPU used=%zu MiB, free=%zu MiB\n",
+        rwkv_dp::rank(), (total_bytes - free_bytes) / (1024 * 1024),
+        free_bytes / (1024 * 1024));
+#endif
+    const auto started = std::chrono::steady_clock::now();
     for (int epoch = resume_epoch; epoch <= options.epochs && !stop; ++epoch) {
       rwkv7_state_tuning::JsonlTextReader dataset(options.data);
       std::uint64_t data_row = 0;
@@ -477,15 +542,45 @@ int main(int argc, char **argv) {
         }
         if (batch.empty())
           break;
+        const size_t global_batch_size = batch.size();
+#ifdef RWKV_NCCL_DP
+        std::vector<size_t> lengths;
+        for (const auto &sample : batch)
+          lengths.push_back(sample.tokens.size() - 1);
+        const auto owners =
+            rwkv_dp::assign(lengths, rwkv_dp::size(), micro_bsz);
+        std::vector<Sample> local;
+        for (size_t i = 0; i < batch.size(); ++i)
+          if (owners[i] == rwkv_dp::rank())
+            local.push_back(std::move(batch[i]));
+        std::stable_sort(local.begin(), local.end(),
+                         [](const Sample &a, const Sample &b) {
+                           return a.tokens.size() > b.tokens.size();
+                         });
+        batch = std::move(local);
+        size_t local_positions = 0;
+        for (const auto &sample : batch)
+          local_positions += sample.tokens.size() - 1;
+        const auto compute_started = std::chrono::steady_clock::now();
+        // Empty ranks in the last partial batch still reduce a zero gradient.
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
+        miss.zero_gradient();
+#endif
+#endif
 #if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
+#ifdef RWKV_NCCL_DP
+        check(cudaMemsetAsync(state_gradient.p, 0, state_count * sizeof(float),
+                              stream.value),
+              "zero DP state gradient");
+#else
         std::fill(accumulated.begin(), accumulated.end(), 0.0f);
 #endif
+#endif
         float batch_loss = 0.0f;
-        for (std::size_t first = 0; first < batch.size();
-             first += options.micro_bsz) {
+        for (std::size_t first = 0; first < batch.size(); first += micro_bsz) {
           const std::size_t last = std::min(
-              batch.size(), first + static_cast<std::size_t>(options.micro_bsz));
-          if (options.micro_bsz == 1) {
+              batch.size(), first + static_cast<std::size_t>(micro_bsz));
+          if (micro_bsz == 1) {
             const auto &sample = batch[first];
             std::vector<float> weights(sample.train.begin(), sample.train.end());
             batch_loss += executor.backward(frozen, sample.tokens, weights,
@@ -501,6 +596,16 @@ int main(int argc, char **argv) {
                                                     time_state.p, batch_tokens);
           }
 #if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
+#ifdef RWKV_NCCL_DP
+          // Accumulate on-device in sample order; avoid copying every lane's
+          // state adjoint to the CPU between micro-batches.
+          for (int l = 0; l < L; ++l)
+            rwkv_bf16_training::reduce_state_gradient_f32(
+                stream.value, int(last - first), H, N,
+                executor.lane_state_gradients() +
+                    size_t(l) * executor.lanes() * state_lane,
+                state_gradient.p + size_t(l) * state_lane, true);
+#else
           // Per-sample gradients [L,lanes,H,K,V] are added in sample order,
           // exactly like single-sample steps, so --micro-bsz changes no bits.
           const std::size_t lanes = executor.lanes();
@@ -528,8 +633,10 @@ int main(int argc, char **argv) {
                     "batch gradient overflow before optimizer");
             }
 #endif
+#endif
         }
-#if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
+#if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE) &&                    \
+    !defined(RWKV_NCCL_DP)
         check(cudaMemcpyAsync(state_gradient.p, accumulated.data(),
                               state_count * sizeof(float),
                               cudaMemcpyHostToDevice, stream.value),
@@ -537,6 +644,44 @@ int main(int argc, char **argv) {
 #endif
         const std::uint64_t next_step = global_step + 1;
         const float lr = learning_rate(options, next_step, planned);
+#ifdef RWKV_NCCL_DP
+        check(cudaStreamSynchronize(stream.value), "DP local gradient ready");
+        const auto reduce_started = std::chrono::steady_clock::now();
+        // Backward already divides by GLOBAL trained tokens. Sum, never
+        // average again by world size (also correct for unequal/empty ranks).
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
+        dp.sum(miss.gradient_data(), miss.gradient_size(), stream.value);
+#else
+        dp.sum(state_gradient.p, state_count, stream.value);
+        check(cudaMemcpyAsync(accumulated.data(), state_gradient.p,
+                              state_count * sizeof(float),
+                              cudaMemcpyDeviceToHost, stream.value),
+              "DP validate reduced state gradient");
+        check(cudaStreamSynchronize(stream.value), "DP state reduction");
+        for (float g : accumulated)
+          if (!std::isfinite(g) || std::abs(g) > 1e18f)
+            throw std::runtime_error(
+                "nonfinite/overflow global state gradient");
+#endif
+        batch_loss = dp.sum_loss(batch_loss, stream.value);
+        if (!std::isfinite(batch_loss))
+          throw std::runtime_error(
+              "nonfinite global loss; optimizer not executed");
+        if (options.dp_profile) {
+          const auto reduced = std::chrono::steady_clock::now();
+          check(cudaMemGetInfo(&free_bytes, &total_bytes), "DP profile memory");
+          std::fprintf(
+              stderr,
+              "DP step=%llu rank=%d samples=%zu tokens=%zu compute_s=%.3f "
+              "reduce_wait_s=%.3f used_MiB=%zu\n",
+              static_cast<unsigned long long>(next_step), rwkv_dp::rank(),
+              batch.size(), local_positions,
+              std::chrono::duration<double>(reduce_started - compute_started)
+                  .count(),
+              std::chrono::duration<double>(reduced - reduce_started).count(),
+              (total_bytes - free_bytes) / (1024 * 1024));
+        }
+#endif
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
         miss.update(lr, next_step);
 #else
@@ -563,32 +708,39 @@ int main(int argc, char **argv) {
         const double fraction =
             std::min(1.0, static_cast<double>(global_step) / planned);
         const int filled = static_cast<int>(fraction * 24);
-        std::cout << '\r' << '[' << std::string(filled, '=')
-                  << std::string(24 - filled, ' ') << "] " << global_step << '/'
-                  << planned << " epoch=" << epoch << '/' << options.epochs
-                  << " loss=" << std::fixed << std::setprecision(4)
-                  << batch_loss << " batch=" << batch.size()
-                  << " tokens=" << batch_positions
-                  << " trained=" << batch_tokens
-                  << " lr=" << std::setprecision(6) << lr
-                  << " tok/s=" << std::setprecision(1)
-                  << processed_tokens / elapsed
-                  << " ETA=" << std::setprecision(0)
-                  << elapsed / global_step * (planned - global_step) << "s   "
-                  << std::flush;
+        if (primary)
+          std::cout << '\r' << '[' << std::string(filled, '=')
+                    << std::string(24 - filled, ' ') << "] " << global_step
+                    << '/' << planned << " epoch=" << epoch << '/'
+                    << options.epochs << " loss=" << std::fixed
+                    << std::setprecision(4) << batch_loss
+                    << " batch=" << global_batch_size
+                    << " tokens=" << batch_positions
+                    << " trained=" << batch_tokens
+                    << " lr=" << std::setprecision(6) << lr
+                    << " tok/s=" << std::setprecision(1)
+                    << processed_tokens / elapsed
+                    << " ETA=" << std::setprecision(0)
+                    << elapsed / global_step * (planned - global_step) << "s   "
+                    << std::flush;
         if (options.save_every && global_step % options.save_every == 0) {
+          if (primary) {
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
-          const auto path = (std::filesystem::path(options.output) /
-                             ("checkpoint-" + std::to_string(global_step)))
-                                .string();
-          miss.checkpoint(path, global_step, epoch, data_row, time_state.p,
-                          state_count);
+            const auto path = (std::filesystem::path(options.output) /
+                               ("checkpoint-" + std::to_string(global_step)))
+                                  .string();
+            miss.checkpoint(path, global_step, epoch, data_row, time_state.p,
+                            state_count);
 #else
-          const auto path = checkpoint_name(options.output, global_step);
-          rwkv_bf16_training::save_state_checkpoint_pth(path, stream.value, L,
-                                                        H, N, time_state.p);
+            const auto path = checkpoint_name(options.output, global_step);
+            rwkv_bf16_training::save_state_checkpoint_pth(path, stream.value, L,
+                                                          H, N, time_state.p);
 #endif
-          std::cout << "\nsaved: " << path << '\n';
+            std::cout << "\nsaved: " << path << '\n';
+          }
+#ifdef RWKV_NCCL_DP
+          dp.barrier(stream.value);
+#endif
         }
         if (options.max_steps && global_step >= options.max_steps) {
           stop = true;
@@ -596,32 +748,30 @@ int main(int argc, char **argv) {
         }
       }
     }
-    std::cout << '\n';
+    if (primary) {
+      std::cout << '\n';
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
-    const std::string final_path =
-        (std::filesystem::path(options.output) / "adapter-final.pth").string();
-    miss.export_adapter(final_path);
+      const std::string final_path =
+          (std::filesystem::path(options.output) / "adapter-final.pth")
+              .string();
+      miss.export_adapter(final_path);
 #else
-    const std::string final_path =
-        (std::filesystem::path(options.output) / "state-final.pth").string();
-    rwkv_bf16_training::save_state_checkpoint_pth(final_path, stream.value, L,
-                                                  H, N, time_state.p);
+      const std::string final_path =
+          (std::filesystem::path(options.output) / "state-final.pth").string();
+      rwkv_bf16_training::save_state_checkpoint_pth(final_path, stream.value, L,
+                                                    H, N, time_state.p);
 #endif
-    std::cout << "saved: " << std::filesystem::absolute(final_path).string()
-              << '\n';
-    std::cout << "complete: steps=" << global_step
-              << " skipped_short_samples=" << skipped
-              << " seed=" << options.seed << '\n';
+      std::cout << "saved: " << std::filesystem::absolute(final_path).string()
+                << '\n';
+      std::cout << "complete: steps=" << global_step
+                << " skipped_short_samples=" << skipped
+                << " seed=" << options.seed << '\n';
+    }
+#ifdef RWKV_NCCL_DP
+    dp.barrier(stream.value);
+#endif
   } catch (const std::exception &error) {
-    std::cerr <<
-#ifdef RWKV_NORA_TUNE
-        "\nrwkv_nora_tune: "
-#elif defined(RWKV_MISS_TUNE)
-        "\nrwkv_miss_tune: "
-#else
-        "\nrwkv_state_tune: "
-#endif
-              << error.what() << '\n';
+    std::cerr << '\n' << program_name << ": " << error.what() << '\n';
     return 1;
   }
   return 0;

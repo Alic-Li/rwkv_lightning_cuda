@@ -28,6 +28,9 @@ public:
   // per-sample backward() accumulation bit for bit.
   const float *lane_state_gradients() const;
   int lanes() const;
+  // Reserve the maximum sequence's boundary checkpoints once. Backward keeps
+  // this high-water allocation, including across shorter micro-batches.
+  void reserve_sequence(int tokens);
   void reset(const float *initial);
   // Last computes only the final token's output head; None advances states
   // without an output head. last_logits() is unavailable after None.

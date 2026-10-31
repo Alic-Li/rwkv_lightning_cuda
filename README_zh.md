@@ -32,6 +32,20 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 - 多后端路由和带 Web UI 的桌面启动器。
 
 ## 快速开始
+对于 Ubuntu 24.04 LTS，使用以下命令安装依赖：
+```bash
+sudo apt install -y libpq-dev libmariadb-dev libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev libsqlite3-dev libbrotli-dev libhiredis-dev libyaml-cpp-dev libnccl2 libnccl-dev
+```
+然后安装Drogon
+```bash
+git clone --branch v1.9.14 --recurse-submodules \
+  https://github.com/drogonframework/drogon.git \
+  drogon-1.9.14-git
+mkdir build
+cd build
+cmake ..
+make -j && sudo make install
+```
 
 ```bash
 cmake -S . -B ./build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120"

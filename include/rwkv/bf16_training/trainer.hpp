@@ -11,6 +11,9 @@ public:
   void bind_tapes(std::vector<rwkv_bf16_training::BlockTapeView> &);
   double update(float lr, std::uint64_t step);
   void zero_gradient();
+  // Contiguous FP32 trainable gradients, reduced before optimizer execution.
+  float *gradient_data() { return gradient_.p; }
+  std::size_t gradient_size() const { return gradient_.n; }
   // Load validated package into the existing FP32 master/BF16 forward weights.
   // Cold starts intentionally zero Adam moments; resume() restores optimizer state.
   void load_adapter(const rwkv7_miss::Package &);
