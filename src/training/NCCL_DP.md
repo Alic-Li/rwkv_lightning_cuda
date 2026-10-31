@@ -37,7 +37,8 @@ cd /home/no22/rwkv_lightning_cuda
   --targets all --ctx 16384 --chunk 512 --wkv_tape \
   --batch-size 32 --micro-bsz 6 --devices 0,1,2,3 \
   --warmup-steps 10 --save-every 186 \
-  --rank 16 --alpha 16 --lr 0.00002 --lr-final 0.000002
+  --rank 16 --alpha 16 --lr 0.00002 --lr-final 0.000002 \
+  --gemm-mode bf16
 ```
 
 原命令没有 `--epochs 2`，因此仍使用默认 **1 epoch**；输出目录名中的 `e2` 不会改变训练轮数。如需两轮训练，显式添加 `--epochs 2`。

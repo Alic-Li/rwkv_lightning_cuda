@@ -21,7 +21,13 @@ p.add_argument('--devices', default='0,1,2,3')
 p.add_argument('--host')
 p.add_argument('--remote-work', type=pathlib.Path)
 p.add_argument('--ssh-socket')
+p.add_argument('--width', type=int, default=64,
+               help='fixture width; use 256 to exercise optimized NoRA projections')
+p.add_argument('--rank', type=int, default=8,
+               help='adapter rank; use 16 to exercise specialized NoRA kernels')
 a = p.parse_args()
+if a.width < 64 or a.width % 64 or a.rank < 1:
+    p.error('--width must be a positive multiple of 64; --rank must be positive')
 if a.work.exists():
     p.error('--work must be a fresh directory (protect existing checkpoints)')
 a.work.mkdir(parents=True)
@@ -42,7 +48,7 @@ def execute(cmd, timeout=180, expect=0):
 
 torch.manual_seed(1234)
 # Two layers exercise v_first cross-layer gradients; nonzero mixes exercise shifts.
-C, F, V, R, L = 64, 128, 256, 16, 2
+C, F, V, R, L = a.width, a.width * 2, 256, 16, 2
 w = {}
 def put(n, shape, kind='random'):
     w[n] = (torch.ones(shape) if kind == 'one' else torch.zeros(shape) if kind == 'zero'
@@ -60,7 +66,7 @@ for l in range(L):
     for n in ['w','a','g']+(['v'] if l else []):
         put(b+'att.'+n+'1',(C,R));put(b+'att.'+n+'2',(R,C))
     for n in ['w0','a0']+(['v0'] if l else []): put(b+'att.'+n,(C,),'zero')
-    put(b+'att.k_k',(C,),'one');put(b+'att.k_a',(C,),'one');put(b+'att.r_k',(1,64))
+    put(b+'att.k_k',(C,),'one');put(b+'att.k_a',(C,),'one');put(b+'att.r_k',(C//64,64))
     put(b+'att.ln_x.weight',(C,),'one');put(b+'att.ln_x.bias',(C,),'zero')
     w[b+'ffn.x_k']=torch.full((C,),.5,dtype=torch.bfloat16)
     put(b+'ffn.key.weight',(F,C));put(b+'ffn.value.weight',(C,F))
@@ -87,7 +93,7 @@ def run(mode, name, devices=None, steps=2, resume=None, extra=(), expect=0):
            '--ctx', '48', '--chunk', '8', '--batch-size', '7', '--micro-bsz', '2',
            '--epochs', '2', '--lr', '.003', '--lr-final', '.003',
            '--warmup-steps', '0', '--max-steps', str(steps), '--save-every', '1']
-    if mode != 'state': cmd += ['--rank', '8']
+    if mode != 'state': cmd += ['--rank', str(a.rank)]
     if devices: cmd += ['--devices', devices]
     if resume: cmd += ['--resume', remote/resume]
     output = execute([*cmd, *extra], expect=expect)

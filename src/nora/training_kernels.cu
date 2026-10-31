@@ -1,6 +1,7 @@
 #include "rwkv/bf16_training/nora.hpp"
 #include "rwkv/bf16_training/ops.hpp"
 #include "rwkv/runtime/nora_gemm.cuh"
+#include "training_gemm.cuh"
 #include <cmath>
 #include <stdexcept>
 namespace rwkv_bf16_nora {
@@ -33,8 +34,8 @@ void forward(cudaStream_t stream, int rows, const rwkv_bf16_miss::Linear &w,
     throw std::invalid_argument("null NoRA forward input");
   using namespace rwkv_nora_detail;
   if (s) {
-    gemm<false, true, false>(stream, rows, w.rank, w.in, x, w.a, s);
-    gemm<false, true, true>(stream, rows, w.out, w.rank, s, w.d, y, w.scale);
+    detail::projection<true>(stream, rows, w.rank, w.in, x, w.a, s);
+    detail::expansion<true>(stream, rows, w.out, w.rank, s, w.d, y, w.scale);
   } else {
     fused<<<dim3((w.out + 255) / 256, rows), 256, w.rank * sizeof(float),
             stream>>>(w.in, w.out, w.rank, w.scale, w.a, w.d, x, y);
@@ -51,10 +52,10 @@ void backward(cudaStream_t stream, int rows, const rwkv_bf16_miss::Linear &w,
   if (w.gradient)
     gemm<true, false, true>(stream, w.out, w.rank, rows, g, s, w.gradient,
                             w.scale);
-  gemm<false, false, false>(stream, rows, w.rank, w.out, g, w.d, ds, w.scale);
+  detail::projection<false>(stream, rows, w.rank, w.out, g, w.d, ds, w.scale);
   if (w.gradient_a)
     gemm<true, false, true>(stream, w.rank, w.in, rows, ds, x, w.gradient_a);
-  gemm<false, false, true>(stream, rows, w.in, w.rank, ds, w.a, dx);
+  detail::expansion<false>(stream, rows, w.in, w.rank, ds, w.a, dx);
   checked();
 }
 void backward_target(cudaStream_t stream,
