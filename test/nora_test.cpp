@@ -129,6 +129,7 @@ int main() {
       return 77;
     numerical(1, 67, 35, 1);
     numerical(17, 67, 35, 16);
+    numerical(17, 257, 259, 16); // optimized projections, including partial tiles
     numerical(33, 19, 37, 32);
     numerical(3, 7, 5, 1024);
     std::cout << "NoRA forward/dA/dB/dX and FP16 inference passed\n";

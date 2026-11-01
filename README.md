@@ -33,6 +33,20 @@ The standalone `rwkv_miss_tune_server`, `rwkv_state_tune_server` and `rwkv_nora_
 
 ## Quick Start
 
+For Ubuntu 24.04 LTS，Use the following command to install the dependencies:
+```bash
+sudo apt install -y libpq-dev libmariadb-dev libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev libsqlite3-dev libbrotli-dev libhiredis-dev libyaml-cpp-dev libnccl2 libnccl-dev
+```
+Than install Drogon
+```bash
+git clone --branch v1.9.14 --recurse-submodules \
+  https://github.com/drogonframework/drogon.git \
+  drogon-1.9.14-git
+mkdir build
+cd build
+cmake ..
+make -j && sudo make install
+```
 ```bash
 cmake -S . -B ./build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120"
 cmake --build ./build -j --config Release --target bundle_all

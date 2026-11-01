@@ -81,3 +81,13 @@ and FP16/W8A16/W4A16 serving. CUDA is exercised locally; HIP execution requires
 an AMD GPU and must not be inferred from CUDA results.
 
 NoRA-init shares the trainer and chunk executor. See [NoRA](../nora/README.md) for random A initialization, both-factor gradients, checkpoint layout and launch examples.
+
+## NCCL data parallel
+
+Linux/CUDA builds with NCCL also provide `rwkv_state_tune_dp`,
+`rwkv_miss_tune_dp`, and `rwkv_nora_tune_dp`. `--devices 0,1,2,3` launches one
+process per GPU; `--batch-size` remains global and `--micro-bsz` is per GPU.
+Gradients are summed after normalization by the global trained-token count.
+Boundary checkpoints are reserved once and reused to stabilize VRAM usage.
+See [NCCL DP](NCCL_DP.md) for build options, launch examples, checkpoint
+semantics, profiling, and the multi-GPU acceptance test.

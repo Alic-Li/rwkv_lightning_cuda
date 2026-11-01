@@ -83,7 +83,7 @@ void check(Model &model, const std::string &method, double tolerance) {
       config["initialization"] = "nora_init";
     }
     trainer = std::make_unique<rwkv_bf16_miss::Trainer>(
-        view, 8, 8, "all", chunk * lanes, config, nullptr);
+        view, 16, 16, "all", chunk * lanes, config, nullptr);
   }
   Executor single(view, chunk, nullptr), packed(view, chunk, nullptr, lanes);
   const size_t states = size_t(view.layers) * view.heads * 4096;

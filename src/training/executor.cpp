@@ -189,6 +189,16 @@ struct Executor::Impl {
     gpu_check(cudaMemcpyAsync(to, from, n, cudaMemcpyDeviceToDevice, stream),
               "copy boundary");
   }
+  void reserve_checkpoints(int count) {
+    if (checkpoints.size() < size_t(count)) {
+      checkpoints.resize(count);
+      shift_checkpoints.resize(count);
+    }
+    for (int j = 0; j < count; ++j) {
+      checkpoints[j].resize(states, "WKV boundary checkpoint");
+      shift_checkpoints[j].resize(shift_count, "shift boundary checkpoint");
+    }
+  }
   void zero(void *to, size_t n) {
     gpu_check(cudaMemsetAsync(to, 0, n, stream), "clear adjoint");
   }
@@ -303,6 +313,11 @@ std::vector<float> Executor::last_logits() const {
     result[i] = to_float(bits[i]);
   return result;
 }
+void Executor::reserve_sequence(int tokens) {
+  if (tokens < 1)
+    throw std::invalid_argument("reserve_sequence needs positive tokens");
+  impl_->reserve_checkpoints(1 + (tokens - 1) / impl_->chunk);
+}
 float Executor::backward(const FrozenModelView &m,
                          const std::vector<int> &tokens,
                          const std::vector<float> &weights,
@@ -328,12 +343,9 @@ float Executor::backward(const FrozenModelView &m,
     return 0;
   }
   const int chunks = 1 + (length - 1) / w.chunk;
-  w.checkpoints.resize(chunks);
-  w.shift_checkpoints.resize(chunks);
+  w.reserve_checkpoints(chunks);
   reset(initial);
   for (int j = 0; j < chunks; ++j) {
-    w.checkpoints[j].resize(w.states, "WKV boundary checkpoint");
-    w.shift_checkpoints[j].resize(w.shift_count, "shift boundary checkpoint");
     w.copy(w.checkpoints[j].p, w.carried.p, w.states * 4);
     w.copy(w.shift_checkpoints[j].p, w.shifts.p, w.shift_count * 2);
     if (j + 1 < chunks)
@@ -453,14 +465,11 @@ float Executor::backward_packed(const FrozenModelView &m,
       offsets.push_back(offsets.back() + T);
     }
   };
-  w.checkpoints.resize(steps);
-  w.shift_checkpoints.resize(steps);
+  w.reserve_checkpoints(steps);
   reset(initial);
   std::vector<int> offsets, inputs, targets;
   std::vector<float> row_weights;
   for (int j = 0; j < steps; ++j) {
-    w.checkpoints[j].resize(w.states, "WKV boundary checkpoint");
-    w.shift_checkpoints[j].resize(w.shift_count, "shift boundary checkpoint");
     w.copy(w.checkpoints[j].p, w.carried.p, w.states * 4);
     w.copy(w.shift_checkpoints[j].p, w.shifts.p, w.shift_count * 2);
     if (j + 1 < steps) {
