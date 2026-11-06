@@ -36,7 +36,7 @@ state 数据库存放在同一目录（同样是当前工作目录）。部署�
 ## Windows 运行
 
 ```powershell
-cd .\build\bundle\rwkv_lighting_cuda
+cd .\build\bundle
 $env:PATH = "$PWD\lib;$env:PATH"
 .\rwkv_lighting_cuda.exe `
   --model-path C:\models\model.pth `

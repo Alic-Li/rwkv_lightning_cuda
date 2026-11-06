@@ -27,8 +27,9 @@ function(rwkv_configure_runtime_bundle target_name)
   add_custom_target(bundle_${target_name}
     COMMAND ${CMAKE_COMMAND}
       -DINPUT_FILE=$<TARGET_FILE:${target_name}>
-      -DOUTPUT_DIR=${PROJECT_BINARY_DIR}/bundle/${target_name}
-      -DLIB_OUTPUT_DIR=${PROJECT_BINARY_DIR}/bundle/${target_name}/lib
+      -DOUTPUT_DIR=${PROJECT_BINARY_DIR}/bundle
+      -DLIB_OUTPUT_DIR=${PROJECT_BINARY_DIR}/bundle/lib
+      -DLOCK_FILE=${PROJECT_BINARY_DIR}/CMakeFiles/rwkv-bundle.lock
       -DASSET_FILES=${rwkv_asset_files}
       -DCOPY_BINARY=ON
       -P ${PROJECT_SOURCE_DIR}/cmake/packaging/CopyRuntimeDependencies.cmake

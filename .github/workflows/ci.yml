@@ -175,6 +175,19 @@ jobs:
           sub-packages: '["nvcc","cudart-dev","cccl","profiler-api"]'
           non-cuda-sub-packages: '["libcublas-dev","libcurand-dev"]'
           log-file-suffix: ${{ matrix.os }}-${{ matrix.cuda }}.txt
+      - name: Install NCCL (Linux multi-GPU training)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # The toolkit step has added NVIDIA's apt repository. Match its CUDA
+          # major so CUDA 12/13 jobs do not pull in the other runtime family.
+          cuda_major="${CUDA_VERSION%%.*}"
+          nccl_version="$(apt-cache madison libnccl-dev | awk -v suffix="+cuda${cuda_major}." 'index($3, suffix) && !found { print $3; found=1 }')"
+          if [ -z "$nccl_version" ]; then
+            echo "No NCCL development package for CUDA $cuda_major" >&2
+            exit 1
+          fi
+          sudo apt-get install -y --no-install-recommends "libnccl2=$nccl_version" "libnccl-dev=$nccl_version"
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Check out pinned vcpkg

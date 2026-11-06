@@ -34,10 +34,10 @@ PR 只编译 SM 86，以缩小评审构建。主分支和手动构建编译 SM 7
 
 ## 安装包内容与使用
 
-每个压缩包包含一个 `rwkv_lighting_cuda/` 目录，暂存于 `build/bundle/rwkv_lighting_cuda/`：
+每个压缩包包含一个 `bundle/` 目录，暂存于 `build/bundle/`：
 
 ```text
-rwkv_lighting_cuda/
+bundle/
 ├── dist/
 │   ├── assets/
 │   └── index.html
@@ -53,6 +53,9 @@ rwkv_lighting_cuda/
 ├── rwkv_quantize
 ├── rwkv_state_tune
 ├── rwkv_state_tune_server
+├── rwkv_state_tune_dp    # Linux only / 仅 Linux
+├── rwkv_miss_tune_dp     # Linux only / 仅 Linux
+├── rwkv_nora_tune_dp     # Linux only / 仅 Linux
 ├── tools/online_rl.py
 ├── docs/online-rl.md
 ├── docs/online-rl.zh-CN.md
@@ -62,8 +65,10 @@ rwkv_lighting_cuda/
 
 CI 根据 `bun.lock` 安装前端依赖，执行 lint/测试，并在编译启动器之前重新构建 `dist/`。
 同一份前端既嵌入 Go 可执行文件，也复制到压缩包中。资源哈希和库名称随构建及 CUDA 版本
-变化，不硬编码。Windows 可执行文件使用 `.exe`，运行时 DLL 放在其旁边。
-包中不包含模型和可选路由器。
+变化，不硬编码。Windows 可执行文件使用 `.exe`，运行时 DLL 与可执行文件放在同一目录。
+Linux CI 安装 NCCL 并强制构建、打包
+三个 `*_tune_dp` 多卡程序；Windows 关闭 NCCL 多卡构建。
+包中不包含模型。
 
 解压整个目录，进入后运行 `rwkv_launcher`（Windows 为 `rwkv_launcher.exe`）。
 启动器默认使用附带词表。Linux 库通过相对于可执行文件位置的 RPATH 解析。

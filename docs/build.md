@@ -26,20 +26,20 @@ cmake --build ./build -j --config Release
 cmake --build ./build -j --config Release --target bundle_all
 ```
 
-`bundle_all` assembles every available runtime target below `build/bundle/`. Server and state-tuning bundles include `rwkv_vocab_v20230424.txt`; shared runtime libraries are placed in each bundle's `lib/` directory. Individual `bundle_<target>` targets remain available.
+`bundle_all` assembles every available runtime target below `build/bundle/`. Executables and `rwkv_vocab_v20230424.txt` sit directly in that directory; all executables share a single `build/bundle/lib/` directory for runtime libraries. Individual `bundle_<target>` targets remain available.
 
 ## CUDA W8A16 / W4A16 quantization
 
-The build produces `build/bundle/rwkv_quantize/rwkv_quantize`, a standalone converter for BF16 RWKV
+The build produces `build/bundle/rwkv_quantize`, a standalone converter for BF16 RWKV
 checkpoints. It writes a streaming `.rwkvq` file containing either per-output-channel
 INT8 weights or grouped INT4 weights with FP16 scales; embeddings, layer norms,
 LoRA factors, and other non-linear tensors remain BF16.
 
 ```bash
-./build/bundle/rwkv_quantize/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
+./build/bundle/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
 
 # W4 with one FP16 scale for each 128-weight group (recommended default)
-./build/bundle/rwkv_quantize/rwkv_quantize \
+./build/bundle/rwkv_quantize \
   --format w4a16 --group-size 128 \
   /path/to/model.pth /path/to/model.w4a16.rwkvq
 ```

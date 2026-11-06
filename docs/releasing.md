@@ -40,11 +40,11 @@ HIP/ROCm and ARM builds are not included in this workflow.
 
 ## Package contents and use
 
-Each archive contains a single `rwkv_lighting_cuda/` directory, staged at
-`build/bundle/rwkv_lighting_cuda/`:
+Each archive contains a single `bundle/` directory, staged at
+`build/bundle/`:
 
 ```text
-rwkv_lighting_cuda/
+bundle/
 ├── dist/
 │   ├── assets/
 │   └── index.html
@@ -60,6 +60,9 @@ rwkv_lighting_cuda/
 ├── rwkv_quantize
 ├── rwkv_state_tune
 ├── rwkv_state_tune_server
+├── rwkv_state_tune_dp    # Linux only
+├── rwkv_miss_tune_dp     # Linux only
+├── rwkv_nora_tune_dp     # Linux only
 ├── tools/online_rl.py
 ├── docs/online-rl.md
 ├── docs/online-rl.zh-CN.md
@@ -71,7 +74,8 @@ CI installs frontend dependencies from `bun.lock`, runs lint/tests, and rebuilds
 `dist/` before compiling the launcher. The same frontend is embedded in the Go
 executable and copied into the archive. Asset hashes and library names vary with
 the build and CUDA version; they are not hardcoded. Windows executables use `.exe`
-and runtime DLLs sit beside them. Models and the optional router are not included.
+and runtime DLLs sit beside them. Linux CI installs NCCL and requires all three
+`*_tune_dp` CLIs; Windows disables NCCL DP. Models are not included.
 
 Extract the whole directory, change into it, and run `rwkv_launcher` (Windows:
 `rwkv_launcher.exe`). The launcher uses the included vocabulary by default.

@@ -19,10 +19,25 @@ get_filename_component(INPUT_FILE "${INPUT_FILE}" ABSOLUTE)
 get_filename_component(OUTPUT_DIR "${OUTPUT_DIR}" ABSOLUTE)
 get_filename_component(LIB_OUTPUT_DIR "${LIB_OUTPUT_DIR}" ABSOLUTE)
 
+# Bundle targets share binaries, assets and libraries. Serialize copies when
+# bundle_all is built in parallel; keep the lock outside the shipped directory.
+if(DEFINED LOCK_FILE AND NOT LOCK_FILE STREQUAL "")
+  file(LOCK "${LOCK_FILE}" GUARD PROCESS)
+endif()
+
 file(MAKE_DIRECTORY "${OUTPUT_DIR}")
 file(MAKE_DIRECTORY "${LIB_OUTPUT_DIR}")
 
 if(COPY_BINARY)
+  # Migrate the previous bundle/<target>/<binary> + lib layout in place.
+  get_filename_component(binary_name "${INPUT_FILE}" NAME)
+  get_filename_component(target_name "${INPUT_FILE}" NAME_WE)
+  set(legacy_dir "${OUTPUT_DIR}/${target_name}")
+  if(IS_DIRECTORY "${legacy_dir}" AND
+     EXISTS "${legacy_dir}/${binary_name}" AND
+     IS_DIRECTORY "${legacy_dir}/lib")
+    file(REMOVE_RECURSE "${legacy_dir}")
+  endif()
   file(COPY "${INPUT_FILE}" DESTINATION "${OUTPUT_DIR}")
 endif()
 

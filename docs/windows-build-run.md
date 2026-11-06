@@ -68,7 +68,7 @@ For a wider binary package, replace `86` with a list such as:
 The backend executable is generated at:
 
 ```text
-build_win10_sm86\bundle\rwkv_lighting_cuda\rwkv_lighting_cuda.exe
+build_win10_sm86\bundle\rwkv_lighting_cuda.exe
 ```
 
 ## Build the web launcher
@@ -84,7 +84,7 @@ bun run build
 $env:CGO_ENABLED = "0"
 
 go build -trimpath -ldflags="-s -w" `
-  -o ..\build_win10_sm86\bundle\rwkv_lighting_cuda\rwkv_launcher.exe `
+  -o ..\build_win10_sm86\bundle\rwkv_launcher.exe `
   .
 ```
 
@@ -95,13 +95,13 @@ The launcher starts an HTTP control page on `http://127.0.0.1:10721`. On Windows
 The CMake bundle target copies the backend executable, vocabulary, and detected runtime DLLs into:
 
 ```text
-build_win10_sm86\bundle\rwkv_lighting_cuda
+build_win10_sm86\bundle
 ```
 
 If the CUDA runtime DLLs were not discovered automatically on a particular machine, copy them into the bundle manually:
 
 ```powershell
-$bundle = "D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda"
+$bundle = "D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle"
 $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"
 
 Copy-Item "$cudaBin\cudart64_12.dll" -Destination "$bundle\lib" -Force
@@ -112,7 +112,7 @@ Copy-Item "$cudaBin\cublasLt64_12.dll" -Destination "$bundle\lib" -Force
 The expected runtime bundle layout is:
 
 ```text
-rwkv_lighting_cuda
+bundle
 |-- lib
 |   |-- brotlicommon.dll
 |   |-- brotlidec.dll
@@ -143,7 +143,7 @@ If CMake copied Windows system DLLs into `lib`, they can be removed from the bun
 The launcher is the recommended way to run the backend on Windows because it prepares the child process environment:
 
 ```powershell
-cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda
+cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle
 .\rwkv_launcher.exe
 ```
 
@@ -160,7 +160,7 @@ Use the UI to select the model, vocab, port, password, and WKV mode.
 When starting `rwkv_lighting_cuda.exe` directly, prepend the bundle `lib` directory to `PATH` first:
 
 ```powershell
-cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda
+cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle
 
 $env:PATH = "$PWD\lib;$env:PATH"
 

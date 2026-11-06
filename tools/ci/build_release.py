@@ -24,7 +24,9 @@ BINARIES = (
     "rwkv_lighting_cuda", "rwkv_quantize", "rwkv_state_tune", "rwkv_miss_tune",
     "rwkv_miss_tune_server", "rwkv_state_tune_server",
     "rwkv_nora_tune", "rwkv_nora_tune_server",
-)
+) + (() if WINDOWS else (
+    "rwkv_state_tune_dp", "rwkv_miss_tune_dp", "rwkv_nora_tune_dp",
+))
 
 GO_BINARIES = ("rwkv_launcher", "rwkv_router")
 
@@ -59,7 +61,7 @@ def main():
     version = package_version()
     cuda_tag = "cuda" + ".".join(os.environ.get("CUDA_VERSION", "12.9.0").split(".")[:2])
     name = f"rwkv-lightning-{version}-{'windows' if WINDOWS else 'linux'}-x64-{cuda_tag}"
-    bundle = BUILD / "bundle" / "rwkv_lighting_cuda"
+    bundle = BUILD / "bundle"
     if bundle.exists():
         shutil.rmtree(bundle)
     bundle.mkdir(parents=True)
@@ -77,6 +79,7 @@ def main():
         f"-DVCPKG_MANIFEST_DIR={ROOT / 'tools/ci'}",
         f"-DVCPKG_TARGET_TRIPLET={TRIPLET}",
         "-DRWKV7_FAST_BUILD_TESTS=ON", "-DRWKV7_STATE_TUNING=ON",
+        f"-DRWKV_NCCL_DP={'OFF' if WINDOWS else 'ON'}",
     ]
     if WINDOWS:
         # CUDA compiler probes otherwise use Debug (/Zi), whose shared PDB
@@ -99,7 +102,7 @@ def main():
     run("ctest", "--test-dir", BUILD, "-C", "Release", "--output-on-failure",
         "--no-tests=error", "-R", expression, env=test_env)
 
-    # Put Windows DLLs beside all executables so direct invocation also works.
+    # Windows loads DLLs beside the executables; Linux shares a lib directory.
     lib_dir = bundle if WINDOWS else bundle / "lib"
     for binary in BINARIES:
         run("cmake", f"-DINPUT_FILE={BUILD / (binary + SUFFIX)}",
@@ -114,14 +117,14 @@ def main():
         if not crt_files:
             raise RuntimeError(f"MSVC runtime not found under {redist}")
         for dll in crt_files:
-            shutil.copy2(dll, bundle / dll.name)
+            shutil.copy2(dll, lib_dir / dll.name)
         # copy_runtime_deps resolves the DLLs the executables actually import;
         # these globs are a safety net covering the CUDA 12 (bin) and CUDA 13
         # (bin/x64) toolkit layouts.
         for sub in dependency_dirs[1:]:
             for pattern in ("cudart*.dll", "cublas*.dll"):
                 for dll in sorted(sub.glob(pattern)):
-                    shutil.copy2(dll, bundle / dll.name)
+                    shutil.copy2(dll, lib_dir / dll.name)
     # The launcher is a multi-file package now: build by package path. The
     # NVML metrics path (linux, cgo dlopen of libnvidia-ml) needs CGO on
     # Linux; Windows keeps CGO off (no NVML path there yet). The version

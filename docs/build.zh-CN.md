@@ -28,22 +28,22 @@ cmake --build ./build -j --config Release
 cmake --build ./build -j --config Release --target bundle_all
 ```
 
-`bundle_all` 会在 `build/bundle/` 下组装所有可用的运行时目标。Server 与 state-tuning
-bundle 自带 `rwkv_vocab_v20230424.txt`；共享运行时库放在各 bundle 的 `lib/` 目录下。
+`bundle_all` 会在 `build/bundle/` 下组装所有可用的运行时目标。所有可执行文件与 `rwkv_vocab_v20230424.txt` 直接放在该目录，
+运行时依赖统一放在 `build/bundle/lib/`，由全部程序共用。
 单独的 `bundle_<target>` 目标依然可用。
 
 ## CUDA W8A16 / W4A16 量化
 
-构建会产出 `build/bundle/rwkv_quantize/rwkv_quantize`，这是一个独立的转换器，用于
+构建会产出 `build/bundle/rwkv_quantize`，这是一个独立的转换器，用于
 BF16 RWKV checkpoint。它输出流式 `.rwkvq` 文件：权重可以是按输出通道的 INT8，也可以
 是分组 INT4 加 FP16 scale；embedding、layer norm、LoRA 因子及其他非线性张量保持
 BF16。
 
 ```bash
-./build/bundle/rwkv_quantize/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
+./build/bundle/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
 
 # W4，每 128 个权重共享一个 FP16 scale（推荐默认值）
-./build/bundle/rwkv_quantize/rwkv_quantize \
+./build/bundle/rwkv_quantize \
   --format w4a16 --group-size 128 \
   /path/to/model.pth /path/to/model.w4a16.rwkvq
 ```

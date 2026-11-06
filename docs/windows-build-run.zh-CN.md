@@ -70,7 +70,7 @@ cmake --build .\build_win10_sm86 --config Release -j --target bundle_rwkv_lighti
 后端可执行文件生成在：
 
 ```text
-build_win10_sm86\bundle\rwkv_lighting_cuda\rwkv_lighting_cuda.exe
+build_win10_sm86\bundle\rwkv_lighting_cuda.exe
 ```
 
 ## 构建 Web 启动器
@@ -86,7 +86,7 @@ bun run build
 $env:CGO_ENABLED = "0"
 
 go build -trimpath -ldflags="-s -w" `
-  -o ..\build_win10_sm86\bundle\rwkv_lighting_cuda\rwkv_launcher.exe `
+  -o ..\build_win10_sm86\bundle\rwkv_launcher.exe `
   .
 ```
 
@@ -98,13 +98,13 @@ go build -trimpath -ldflags="-s -w" `
 CMake 的打包目标将后端可执行文件、词表和检测到的运行时 DLL 复制到：
 
 ```text
-build_win10_sm86\bundle\rwkv_lighting_cuda
+build_win10_sm86\bundle
 ```
 
 如果某台机器未能自动找到 CUDA 运行时 DLL，请手动复制到安装包中：
 
 ```powershell
-$bundle = "D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda"
+$bundle = "D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle"
 $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"
 
 Copy-Item "$cudaBin\cudart64_12.dll" -Destination "$bundle\lib" -Force
@@ -115,7 +115,7 @@ Copy-Item "$cudaBin\cublasLt64_12.dll" -Destination "$bundle\lib" -Force
 预期的运行时目录结构：
 
 ```text
-rwkv_lighting_cuda
+bundle
 |-- lib
 |   |-- brotlicommon.dll
 |   |-- brotlidec.dll
@@ -147,7 +147,7 @@ rwkv_lighting_cuda
 Windows 下建议使用启动器运行后端，因为它会准备子进程环境：
 
 ```powershell
-cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda
+cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle
 .\rwkv_launcher.exe
 ```
 
@@ -164,7 +164,7 @@ http://127.0.0.1:10721
 直接启动 `rwkv_lighting_cuda.exe` 时，先将包内 `lib` 目录加入 `PATH` 开头：
 
 ```powershell
-cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle\rwkv_lighting_cuda
+cd D:\repo\rwkv_lightning_cuda\build_win10_sm86\bundle
 
 $env:PATH = "$PWD\lib;$env:PATH"
 

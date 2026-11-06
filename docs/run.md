@@ -39,7 +39,7 @@ you intentionally want to listen on all IPv4 interfaces.
 ## Run on Windows
 
 ```powershell
-cd .\build\bundle\rwkv_lighting_cuda
+cd .\build\bundle
 $env:PATH = "$PWD\lib;$env:PATH"
 .\rwkv_lighting_cuda.exe `
   --model-path C:\models\model.pth `

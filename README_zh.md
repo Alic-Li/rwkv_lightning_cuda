@@ -51,7 +51,7 @@ make -j && sudo make install
 cmake -S . -B ./build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="75;80;86;87;89;90;100;120"
 cmake --build ./build -j --config Release --target bundle_all
 
-./build/bundle/rwkv_lighting_cuda/rwkv_lighting_cuda \
+./build/bundle/rwkv_lighting_cuda \
   --model-path /path/to/model.pth \
   --vocab-path ./assets/rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 \
