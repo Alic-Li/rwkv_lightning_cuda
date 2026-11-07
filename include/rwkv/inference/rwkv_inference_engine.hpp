@@ -148,7 +148,7 @@ class InferenceEngine {
       std::vector<std::vector<int64_t>>& prompt_ids,
       std::vector<size_t>& sorted_to_original,
       GenerationState& state, DeviceLogits& logits,
-      const std::string& state_id, const std::string& adapter_id,
+      const std::string& state_id,
       GenerationStats& stats) const;
 
   std::shared_ptr<IModelBackend> model_;

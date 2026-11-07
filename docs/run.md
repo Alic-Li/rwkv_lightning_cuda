@@ -109,7 +109,7 @@ per optimizer update. Checkpoints contain only state tensors and can be uploaded
 existing inference backend. See `../src/state_tuning/README.md` for the masked
 `segments` format and implementation details.
 
-## MiSS adapter tuning and serving
+## MiSS adapter tuning
 
 The same build also provides `rwkv_miss_tune`. It freezes the base model and
 trains only MiSS `D[out,rank]` matrices for the selected attention and FFN
@@ -128,10 +128,6 @@ periodic resumable checkpoints, and a separate inference export:
   --save-every 100 --wkv_tape
 ```
 
-Register or upload `miss_output/adapter-final.pth` (or a checkpoint's
-`training.pth`) through `POST /v1/adapters`, then add
-`adapter_id` and optional `adapter_version` or `adapter_scale` to a generation
-request. Registration validates the package in CPU RAM; its complete weights
-are uploaded to GPU once on the first request. See the
-[MiSS guide](../src/miss/README.md) for checkpoint/resume, package identity,
-cache budgets, profiling, and validation.
+The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Adapter checkout and weight merging are not implemented.
+
+See the [MiSS guide](../src/miss/README.md) for training, checkpoint/resume and validation.

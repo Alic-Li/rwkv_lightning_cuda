@@ -60,8 +60,6 @@ set_tests_properties(rwkv_w4a16_model_test PROPERTIES SKIP_RETURN_CODE 77)
 
 rwkv_add_unit_test(rwkv_miss_test ${CMAKE_CURRENT_SOURCE_DIR}/miss_test.cpp)
 set_tests_properties(rwkv_miss_test PROPERTIES SKIP_RETURN_CODE 77)
-rwkv_add_unit_test(rwkv_miss_model_test ${CMAKE_CURRENT_SOURCE_DIR}/miss_model_test.cpp)
-set_tests_properties(rwkv_miss_model_test PROPERTIES SKIP_RETURN_CODE 77)
 
 if(RWKV7_STATE_TUNING)
   add_executable(rwkv_bf16_training_test bf16_training_test.cpp)

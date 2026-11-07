@@ -74,7 +74,6 @@ void register_chat_routes(
                       create_request_state(engine, state_id));
                   auto logits_ptr = std::make_shared<DeviceLogits>();
                   const auto prefill_begin = std::chrono::steady_clock::now();
-                  bind_adapter(*state_ptr, options.adapter);
                   const int prefill_tokens = engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
                   const auto prefill_end = std::chrono::steady_clock::now();
                   record_prefill_metrics(active, prefill_tokens, prefill_begin, prefill_end);
@@ -104,8 +103,6 @@ void register_chat_routes(
                     paused.generated_tokens = active->generated_tokens.load();
                     paused.chunk_size = chunk_size;
                     paused.options = options;
-                    state_ptr->adapter_gpu.reset();
-                    rwkv7_miss::adapter_cache().trim();
                     paused.state = state_ptr;
                     paused.logits = logits_ptr;
                     StateCacheManager::instance().put_state(paused.id, *state_ptr);
@@ -148,7 +145,6 @@ void register_chat_routes(
         std::string completion;
 
         const auto prefill_begin = std::chrono::steady_clock::now();
-        bind_adapter(*state_ptr, options.adapter);
         const int prefill_tokens =
             engine.prefill_prompt(prompt, *state_ptr, *logits_ptr);
         const auto prefill_end = std::chrono::steady_clock::now();
@@ -180,8 +176,6 @@ void register_chat_routes(
           paused.generated_tokens = active->generated_tokens.load();
           paused.chunk_size = parse_chunk_size(*json, 2);
           paused.options = options;
-          state_ptr->adapter_gpu.reset();
-          rwkv7_miss::adapter_cache().trim();
           paused.state = state_ptr;
           paused.logits = logits_ptr;
           StateCacheManager::instance().put_state(paused.id, *state_ptr);

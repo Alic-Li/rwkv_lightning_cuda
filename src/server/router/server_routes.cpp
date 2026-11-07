@@ -141,7 +141,6 @@ void register_server_routes(
         }
         try {
           options = parse_options(*json, options);
-          bind_adapter(*paused->state, options.adapter);
           if ((*json).isMember("stop") || (*json).isMember("stop_tokens"))
             paused->state->text_stop_tail.clear();
         } catch (const std::exception &e) {
@@ -149,9 +148,6 @@ void register_server_routes(
           cb(json_response(make_error(e.what()), k400BadRequest));
           return;
         }
-        paused->state->request_started = std::chrono::steady_clock::now();
-        paused->state->adapter_cold = false;
-        paused->state->adapter_h2d_ms = 0;
         const int chunk_size = parse_chunk_size(*json, paused->chunk_size);
         const std::string model = (*json).get("model", paused->model).asString();
 
@@ -208,8 +204,6 @@ void register_server_routes(
                   paused_again.chunk_size = chunk_size;
                   paused_again.options = options;
                   paused_again.options.max_tokens += saved_generated_tokens;
-                  state_ptr->adapter_gpu.reset();
-                  rwkv7_miss::adapter_cache().trim();
                   paused_again.state = state_ptr;
                   paused_again.logits = logits_ptr;
                   StateCacheManager::instance().put_state(paused_again.id, *state_ptr);

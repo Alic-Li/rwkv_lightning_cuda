@@ -1,4 +1,4 @@
-# NoRA-init tuning and dynamic inference
+# NoRA-init tuning and kernels
 
 This implements the **random NoRA-init** variant of
 [Normalized Low-Rank Adaptation](https://arxiv.org/abs/2608.31036)
@@ -22,8 +22,8 @@ full activation per layer and projection. No dense base dW or delta-W is created
 
 Training kernels live in `src/nora/training_kernels.cu`; FP16 inference
 kernels live in `src/nora/kernels.cu`. The tiled product primitive is shared in
-`include/rwkv/runtime/nora_gemm.cuh`. Adapter views, serialization, the trainer,
-and request/cache lifecycle reuse the MiSS infrastructure; a non-null A selects
+`include/rwkv/runtime/nora_gemm.cuh`. Adapter views, serialization and the trainer
+reuse the MiSS infrastructure; a non-null A selects
 NoRA. Kernels use FP32 accumulation, not Tensor Core products. Large-model
 throughput has not been benchmarked. HIP shares these sources but has not been
 built or validated on AMD hardware.
@@ -65,25 +65,7 @@ uses `method=nora`, `layout=low_rank_ba`, `initialization=nora_init`, rank, alph
 scale, base fingerprint and content digest. A/B shapes and native bytes are both
 validated and hashed. No initialization is reapplied when loading trained A.
 
-An exported PTH or a standalone `checkpoint-N/training.pth` can be registered
-or uploaded using the existing inference API:
-
-```bash
-curl http://127.0.0.1:8848/v1/adapters \
-  -H 'Content-Type: application/json' \
-  -d '{"adapter_id":"nora-r16","path":"/absolute/path/adapter-final.pth"}'
-```
-
-Then pass `adapter_id` (and optionally `adapter_version`) in generation requests.
-`adapter_scale` remains the explicit inference override supported by MiSS;
-training and the package's default scale are always 1. The loader automatically
-selects NoRA for FP16, W8A16 and W4A16 bases. Quantized bases require the matching
-source provenance sidecar, as with MiSS.
-
-RAM/GPU/staging budgets account for **both** factors. GPU admission uploads a
-single contiguous allocation; cache hits reuse it during prefill/decode.
-Versions, scales and base identity isolate session states. MiSS and NoRA packages
-can coexist in the same registry. See [the adapter API](../../docs/http-api.md).
+The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Adapter checkout and weight merging are not implemented.
 
 ## Online tuning server
 
@@ -107,7 +89,6 @@ rate. The state tuning server can also use a frozen NoRA adapter.
 ```bash
 ctest --test-dir build --output-on-failure
 python tools/check_nora.py --build build --work /tmp/nora-acceptance
-python tools/check_miss_http.py --method nora --build build --work /tmp/nora-acceptance
 python test/online_rl_http_test.py --modes nora --build build \
   --model /tmp/nora-acceptance/tiny.pth --vocab /tmp/nora-acceptance/vocab.txt \
   --adapter /tmp/nora-acceptance/learn/adapter-final.pth --work /tmp/nora-online-acceptance
@@ -117,10 +98,9 @@ Use an environment with PyTorch for the independent oracle. Tests cover tiled
 and scratch-free forward, dA/dB/dX against a double-precision reference, rank 1
 and rank larger than input, random unit-column initialization, first-step zero dA,
 second-step nonzero dA, two-layer autograd across all six targets, chunking,
-batch accumulation, bitwise resume, loss decrease, dynamic quantized inference,
-concurrent versions, cache eviction/reload, checkpoint uploads and HTTP lifecycle.
+batch accumulation, bitwise resume, loss decrease and the training HTTP lifecycle.
 
 On RTX PRO 6000 Blackwell, the two-layer test loss fell from 5.2132 to 2.5217
-in 16 updates. Full-model autograd, exact resume, all three inference formats,
+in 16 updates. Full-model autograd, exact resume,
 and online rollout/train/publish/cache/restore checks passed. The supplied 7.2B
 training command has not been launched as part of these tests.

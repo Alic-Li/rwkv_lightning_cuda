@@ -1,5 +1,7 @@
 # RWKV Lightning CUDA Router
 
+Adapter forwarding described below applies only to legacy workers. The current native inference server has removed request adapters and their HTTP management endpoints. State APIs remain supported.
+
 English | [简体中文](README.zh-CN.md)
 
 An HTTP reverse proxy that balances RWKV inference servers by in-flight batch size

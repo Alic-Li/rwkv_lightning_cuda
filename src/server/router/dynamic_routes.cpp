@@ -44,7 +44,6 @@ void register_dynamic_routes(
     app.registerHandler(path, options_handler, {Options});
   }
   register_uploaded_state_routes(app, password);
-  register_adapter_routes(app, password);
 
   app.registerHandler("/v1/models", [&models, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
     Json::Value body = Json::objectValue;

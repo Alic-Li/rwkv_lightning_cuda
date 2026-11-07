@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 namespace rwkv7_miss {
+std::string new_runtime_identity();
 std::string fingerprint_file(const std::string &);
 // Quantized model sidecar binds the runtime archive digest to its source PTH.
 std::string source_fingerprint(const std::string &);

@@ -48,6 +48,10 @@ std::vector<std::uint16_t> copy_half_bits(const rwkv7_fast_v4::DeviceBuffer<half
 
 void expect_state_eq(const rwkv7_server::GenerationState& state, const rwkv7_server::GenerationState& expected) {
   TEST_EQ(state.batch_size, expected.batch_size);
+  TEST_EQ(state.effective_key, expected.effective_key);
+  TEST_EQ(state.initial_state_identity, expected.initial_state_identity);
+  TEST_EQ(state.advanced, expected.advanced);
+  TEST_EQ(state.wkv32, expected.wkv32);
   TEST_EQ(copy_half_bits(state.shift, "copy state shift"), copy_half_bits(expected.shift, "copy expected shift"));
   TEST_EQ(copy_half_bits(state.wkv_state, "copy state wkv"), copy_half_bits(expected.wkv_state, "copy expected wkv"));
   TEST_EQ(rwkv_test::copy_device_buffer(state.elapsed, "copy state elapsed"),
@@ -77,6 +81,15 @@ int main() {
     auto state2 = make_state(1, {6.0f}, {7.0f, 8.0f}, {9});
     auto state3 = make_state(1, {10.0f, 11.0f}, {12.0f}, {13});
 
+    state1.initial_state_identity = "uploaded-state-digest";
+    state1.effective_key = rwkv7_server::effective_model_key("model-runtime", state1.initial_state_identity, false);
+    state1.advanced = true;
+    TEST_EQ(state1.effective_key.size(), size_t(64));
+    TEST_CHECK(state1.effective_key != rwkv7_server::effective_model_key("other-model", state1.initial_state_identity, false));
+    TEST_CHECK(state1.effective_key != rwkv7_server::effective_model_key("model-runtime", "other-state", false));
+    TEST_CHECK(state1.effective_key != rwkv7_server::effective_model_key("model-runtime", state1.initial_state_identity, true));
+    TEST_CHECK(rwkv7_server::effective_model_key("a:b", "c", false) !=
+               rwkv7_server::effective_model_key("a", "b:c", false));
     manager.put_state("session-1", state1);
     auto loaded1 = manager.get_state("session-1");
     TEST_CHECK(loaded1.has_value());

@@ -24,49 +24,6 @@
 namespace rwkv7_server {
 namespace {
 
-// One JSON record per adapter request. TTFT includes admission/H2D/prefill;
-// TPOT measures sample-to-sample wall time. VRAM is sampled device usage,
-// including other processes, not an allocator-level per-request peak.
-struct AdapterMetrics {
-  GenerationState &state;
-  int tokens = 0;
-  std::chrono::steady_clock::time_point first{}, last{};
-  explicit AdapterMetrics(GenerationState &s) : state(s) {}
-  void token() {
-    if (!state.adapter)
-      return;
-    last = std::chrono::steady_clock::now();
-    if (!tokens)
-      first = last;
-    ++tokens;
-  }
-  ~AdapterMetrics() {
-    if (!state.adapter || !tokens)
-      return;
-    Json::Value m;
-    m["event"] = "miss_request_metrics";
-    m["adapter_version"] = state.adapter->package->version;
-    m["gpu_cache"] = state.adapter_cold ? "cold" : "hot";
-    m["h2d_ms"] = state.adapter_h2d_ms;
-    m["ttft_ms"] =
-        std::chrono::duration<double, std::milli>(first - state.request_started)
-            .count();
-    m["tpot_ms"] =
-        tokens > 1
-            ? std::chrono::duration<double, std::milli>(last - first).count() /
-                  (tokens - 1)
-            : 0;
-    m["sample_steps"] = tokens;
-    m["observed_device_vram_peak_bytes"] =
-        Json::UInt64(state.observed_device_vram_peak);
-    Json::StreamWriterBuilder w;
-    w["indentation"] = "";
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    std::clog << Json::writeString(w, m) << '\n';
-  }
-};
-
 void mark_interrupted(InferenceEngine::GenerationStats& stats) {
   stats.stopped = true;
   for (auto& reason : stats.finish_reasons) {
@@ -104,10 +61,7 @@ ThinkPromptConfig think_prompt_config(ThinkType think_type) {
 }  // namespace
 
 struct HostPromptState {
-  // CPU RAM State Cache，Not save to adapter_gpu。
-  std::shared_ptr<const rwkv7_miss::AdapterHandle> adapter;
   std::string effective_key;
-  std::string adapter_identity;
   std::string initial_state_identity;
   bool advanced = false;
   bool wkv32 = false;
@@ -151,9 +105,7 @@ HostPromptState download_prompt_state(const GenerationState& gpu) {
     throw std::runtime_error("prompt cache snapshot requires a single-row state");
   }
   HostPromptState host;
-  host.adapter = gpu.adapter;
   host.effective_key = gpu.effective_key;
-  host.adapter_identity = gpu.adapter_identity;
   host.initial_state_identity = gpu.initial_state_identity;
   host.advanced = gpu.advanced;
   host.wkv32 = gpu.wkv32;
@@ -171,10 +123,7 @@ void upload_prompt_state(const HostPromptState& host, GenerationState& gpu) {
   if (gpu.batch_size != 1 || gpu.wkv32 != host.wkv32) {
     throw std::runtime_error("prompt cache staging state shape/precision mismatch");
   }
-  gpu.adapter_gpu.reset();
-  gpu.adapter = host.adapter;
   gpu.effective_key = host.effective_key;
-  gpu.adapter_identity = host.adapter_identity;
   gpu.initial_state_identity = host.initial_state_identity;
   gpu.advanced = host.advanced;
   upload_prompt_buffer(host.shift, gpu.shift);
@@ -201,20 +150,19 @@ void InferenceEngine::prefill_cached(
     std::vector<std::vector<int64_t>>& prompt_ids,
     std::vector<size_t>& sorted_to_original,
     GenerationState& state, DeviceLogits& logits,
-    const std::string& state_id, const std::string& adapter_id,
+    const std::string& state_id,
     GenerationStats& stats) const {
   if (state.advanced) {
     throw std::runtime_error("prompt cache requires an initial request state");
   }
   const auto initial_identity = state.initial_state_identity;
-  const auto adapter_identity = state.adapter_identity;
   auto& cache = *prompt_cache_;
   const size_t count = prompt_ids.size();
   std::vector<std::shared_ptr<PromptCache::Entry>> hits(count);
   std::vector<size_t> offsets(count, 0), order(count);
   // Length-prefixed fields avoid ambiguous namespace concatenations.
   std::string identity;
-  for (const auto &part : {state_id, adapter_id, initial_identity, adapter_identity,
+  for (const auto &part : {state_id, initial_identity,
                            std::string(state.wkv32 ? "fp32" : "fp16")})
     identity += std::to_string(part.size()) + ":" + part;
   for (size_t i = 0; i < count; ++i) {
@@ -292,7 +240,6 @@ struct InferenceEngine::Scheduler {
     GenerateOptions options;
     std::unique_ptr<TextStopMatcher> text_stops;
     ControlCallback should_stop;
-    std::unique_ptr<AdapterMetrics> metrics;
     int chunk_size;
     bool notify_text_stop = false;
     GenerationStats stats;
@@ -320,7 +267,6 @@ struct InferenceEngine::Scheduler {
     DeviceLogits logits;
     SamplerPenaltyState sampler;
     std::vector<GenerateOptions> options;
-    std::string adapter;
     bool wkv32 = false;
   };
 
@@ -385,7 +331,6 @@ struct InferenceEngine::Scheduler {
     req->options = options;
     req->text_stops = std::make_unique<TextStopMatcher>(options.stop.value_or(std::vector<std::string>{}));
     req->should_stop = should_stop;
-    req->metrics = std::make_unique<AdapterMetrics>(state);
     req->chunk_size = chunk_size;
     req->notify_text_stop = bool(on_row_stop);
     req->remaining = logits.rows;
@@ -457,17 +402,9 @@ struct InferenceEngine::Scheduler {
     auto& dst = *row.request->state;
     const auto key = dst.effective_key;
     const auto initial = dst.initial_state_identity;
-    const auto identity = dst.adapter_identity;
-    const auto adapter = dst.adapter;
     pack(group.state, slot, dst, row.index);
     dst.effective_key = key;
     dst.initial_state_identity = initial;
-    dst.adapter_identity = identity;
-    dst.adapter = adapter;
-    // Preserve backend diagnostics for adapter metrics.
-    dst.adapter_gpu = group.state.adapter_gpu;
-    dst.observed_device_vram_peak = std::max(dst.observed_device_vram_peak,
-                                            group.state.observed_device_vram_peak);
     model->copy_logits_slice(group.logits, slot, *row.request->logits, row.index, 1);
     if (dst.batch_size == 1) dst.text_stop_tail = row.stop_tail;
   }
@@ -481,7 +418,6 @@ struct InferenceEngine::Scheduler {
         (req.notify_text_stop || req.stats.matched_stops[row.index].empty()))
       event(row, {}, true);
     if (--req.remaining == 0) {
-      req.metrics.reset();
       req.stats.decode_seconds = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - req.start).count();
       std::lock_guard<std::mutex> lock(req.mutex);
@@ -590,9 +526,6 @@ struct InferenceEngine::Scheduler {
       steps.push_back(row->step);
     }
     const auto tokens = sample_rows(group.logits, group.sampler, group.options, steps);
-    std::unordered_set<Request*> sampled;
-    for (const auto& row : group.rows)
-      if (sampled.insert(row->request.get()).second) row->request->metrics->token();
     for (size_t i = 0; i < group.rows.size(); ++i) {
       auto& row = *group.rows[i];
       auto& req = *row.request;
@@ -659,14 +592,13 @@ struct InferenceEngine::Scheduler {
       if (occupied >= size_t(max_rows) || backpressured(*req)) { ++it; continue; }
       Group* target = nullptr;
       for (auto& group : groups) {
-        if (group->adapter == req->state->adapter_identity && group->wkv32 == req->state->wkv32) {
+        if (group->wkv32 == req->state->wkv32) {
           target = group.get(); break;
         }
       }
       if (!target) {
         groups.push_back(std::make_unique<Group>());
         target = groups.back().get();
-        target->adapter = req->state->adapter_identity;
         target->wkv32 = req->state->wkv32;
       }
       target->incoming.push_back(row);
@@ -884,7 +816,6 @@ std::string InferenceEngine::generate_one(
     int chunk_size,
     const ControlCallback& should_stop,
     GenerationStats* out_stats) const {
-  bind_adapter(state, options.adapter);
   GenerationStats stats;
   stats.finish_reasons = {"length"};
   stats.matched_stops.resize(1);
@@ -967,7 +898,6 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
     const StatsCallback& on_prefill_complete,
     const std::optional<std::string>& prompt_cache_state_id,
     const StatsCallback& on_row_stop) const {
-  bind_adapter(state, options.adapter);
   GenerationStats stats;
   if (prompts.empty()) {
     return stats;
@@ -989,7 +919,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
   const auto prefill_begin = std::chrono::steady_clock::now();
   if (prompt_cache_state_id && prompt_cache_->capacity > 0) {
     prefill_cached(sorted_prompt_ids, sorted_to_original, state, logits,
-                   *prompt_cache_state_id, options.adapter_id, stats);
+                   *prompt_cache_state_id, stats);
   } else {
     prefill_batch_chunked(sorted_prompt_ids, state, logits);
   }
@@ -1051,7 +981,6 @@ InferenceEngine::GenerationStats InferenceEngine::generate_from_logits_stream(
     int chunk_size,
     const StreamCallback& emit,
     const ControlCallback& should_stop) const {
-  bind_adapter(state, options.adapter);
   if (state.batch_size != 1 || logits.rows != 1) {
     throw std::runtime_error("logit continuation only supports single prompt batch");
   }

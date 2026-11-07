@@ -40,8 +40,7 @@ class StateCacheManager {
   StateCacheManager& operator=(const StateCacheManager&) = delete;
 
   struct HostState {
-    std::shared_ptr<const rwkv7_miss::AdapterHandle> adapter;
-    std::string effective_key, adapter_identity,
+    std::string effective_key,
         initial_state_identity = "zero";
     bool advanced = false;
     int batch_size = 0;

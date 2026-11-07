@@ -39,7 +39,6 @@ void register_legacy_routes(
     app.registerHandler(path, handle_options, {Options});
   }
   register_uploaded_state_routes(app, password);
-  register_adapter_routes(app, password);
 
   register_server_routes(app, engine, password, admission);
   register_token_routes(app, engine, password);

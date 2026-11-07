@@ -30,21 +30,17 @@ AUTH_HEADER=()
 BASE_URL=http://127.0.0.1:8000 PASSWORD=rwkv7_7.2b ./test/api_endpoints_test.sh
 ```
 
-## 状态与适配器端点速查
+## 状态端点速查
 
 | 对象 | 方法 | 路径 | 用途 |
 |---|---|---|---|
 | 初始 state 文件 | `POST` | `/v1/state/upload` | 上传单个 `.pth` 文件 |
 | 初始 state 文件 | `GET` / `POST` | `/v1/state/list` | 列出已上传文件 |
 | 初始 state 文件 | `DELETE` / `POST` | `/v1/state/delete` | 按 `state_id` 删除文件 |
-| MiSS 适配器 | `POST` | `/v1/adapters` | 按服务端目录注册推理包 |
-| MiSS 适配器 | `GET` | `/v1/adapters` | 列出版本和缓存指标 |
-| MiSS 适配器 | `DELETE` | `/v1/adapters` | 删除全部或指定版本的注册 |
 | 会话缓存 | `POST` | `/state/status` | 列出生成期间保存的会话 |
 | 会话缓存 | `POST` | `/state/delete` | 按 `session_id` 删除会话 |
 
 - [初始状态文件：上传、列表与删除](#初始状态文件上传列表与删除)
-- [MiSS 适配器：注册、列表与删除](#miss-适配器注册列表与删除)
 - [有状态补全与会话缓存](#有状态补全)
 
 ## 服务状态
@@ -162,103 +158,7 @@ curl -sS "${AUTH_HEADER[@]}" -X DELETE \
 此接口管理上传的初始状态文件；生成期间缓存的 `session_id` 会话由
 [`/state/status` 和 `/state/delete`](#有状态补全) 管理。
 
-## MiSS 适配器：注册、列表与删除
-
-### 注册：`POST /v1/adapters`
-
-同一个接口支持 JSON 注册服务端 PTH 路径，以及 multipart 直接上传本地 PTH。
-可使用 `adapter-final.pth` 或新 checkpoint 中的 `training.pth`。
-`path` 是服务端路径，建议使用绝对路径；原来的双文件推理目录也兼容。
-
-```bash
-curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
-  -H "Content-Type: application/json" \
-  --data '{"adapter_id":"task-a","path":"/absolute/path/miss_output/checkpoint-100/training.pth"}'
-
-curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
-  -F 'adapter_id=task-a' -F 'file=@miss_output/adapter-final.pth'
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `adapter_id` | string | 是 | 非空的适配器名称，后续生成、删除时使用 |
-| `path` | string | JSON 注册时必填 | 服务端 PTH 路径或旧推理包目录；multipart 使用 `file` |
-
-新 PTH 内嵌元数据，单独上传即可。旧训练 checkpoint 需要同目录的 `checkpoint.json`；
-远程上传旧文件时再添加 `-F 'metadata=@miss_output/checkpoint-100/checkpoint.json'`。
-临时上传文件在注册后删除，RAM 只缓存声明精度的 BF16/FP16 D，不保留梯度和优化器张量。BF16 D 在 GPU miss 时于 pinned staging 中转换一次，供 FP16 推理使用。
-启用密码时，multipart 请求使用 Bearer header 鉴权；上传文件受 HTTP 请求体大小限制。
-
-成功返回 `{"adapter_id":"task-a","version":"<内容的 SHA-256 版本>"}`。同一 ID 可以注册多个内容版本，
-最近注册的版本作为默认版本。注册会校验格式、形状、元数据和内容哈希并缓存到 CPU RAM，
-此时不上传 GPU；无效包或 RAM 预算不足等错误返回 HTTP 400。
-生成时还会检查推理包中的基模指纹是否与实际加载的模型匹配，不匹配则拒绝使用。
-
-### 列表：`GET /v1/adapters`
-
-```bash
-curl -sS "${AUTH_HEADER[@]}" "http://127.0.0.1:8000/v1/adapters"
-```
-
-响应的 `data` 数组按注册版本列出 `id`、`version` 和 `manifest`；空列表为 `[]`。
-响应顶层还包含以下进程级缓存指标：
-
-| 字段 | 含义 |
-|---|---|
-| `ram_hits` | CPU RAM 缓存命中次数 |
-| `gpu_hits`、`gpu_misses` | GPU 缓存命中、未命中次数 |
-| `uploads` | 向 GPU 上传适配器的次数 |
-| `h2d_ms` | 从主机向 GPU 传输的累计时间，单位毫秒 |
-| `ram_bytes`、`gpu_bytes` | 适配器在 RAM、GPU 中的驻留字节数 |
-| `gpu_peak_bytes` | 适配器 GPU 驻留字节数峰值 |
-
-### 在生成请求中使用
-
-所有生成接口都接受 `adapter_id`，以及可选的 `adapter_version` 和 `adapter_scale`。
-省略版本时，请求准入会绑定当时最新的注册版本；`adapter_scale` 是绝对有效缩放值，
-省略时使用推理包清单中的 scale。一个请求或批次绑定一个不可变适配器句柄。
-
-```bash
-curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  --data '{
-    "model":"api-test",
-    "messages":[{"role":"user","content":"你好，请介绍一下自己。"}],
-    "adapter_id":"task-a",
-    "adapter_scale":1.0,
-    "stream":false,
-    "max_tokens":64
-  }'
-```
-
-需要固定版本时，在 JSON 中加入 `"adapter_version":"<注册响应中的 version>"`。
-第一次生成会把该版本完整上传 GPU，后续预填充（prefill）和逐词元解码（decode）
-复用同一份显存，不会逐层或逐 token 传输。有状态会话按基模运行实例、适配器内容版本、
-有效缩放值、初始 state 和 WKV 精度隔离，不兼容的缓存 state 会被拒绝。
-
-### 删除：`DELETE /v1/adapters`
-
-删除该 ID 的所有注册版本：
-
-```bash
-curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/adapters" \
-  -H "Content-Type: application/json" \
-  --data '{"adapter_id":"task-a"}'
-```
-
-只删除一个版本时，额外传入 `adapter_version`：
-
-```bash
-curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/adapters" \
-  -H "Content-Type: application/json" \
-  --data '{"adapter_id":"task-a","adapter_version":"<注册响应中的 version>"}'
-```
-
-返回 `{"deleted":true}`；ID 或版本不存在时同样返回成功。删除只移除注册，
-不会删除磁盘上的推理包。已经取得句柄的请求可继续执行，新请求不能再查到已删除版本。
-若删除的是最新版本，默认版本回退到其余版本中最近注册的一个。
-
-推理包格式、缓存预算、暂停和恢复行为详见 [MiSS 中文文档](../src/miss/README.zh-CN.md)。
+原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留，本阶段不实现 Adapter Checkout 或权重融合。
 
 ## 聊天补全
 

@@ -93,7 +93,7 @@ void reference(const std::string &path) {
   for (size_t i = 0; i < y.size(); ++i)
     near(__half2float(y[i]), h.at("Y").values[i], .002);
 }
-void cache() {
+void package_roundtrip() {
   auto dir = rwkv_test::unique_temp_path("miss_cache");
   Json::Value m;
   m["rank"] = 4;
@@ -103,79 +103,15 @@ void cache() {
   std::vector<HostTensor> ts{{0, 0, 8, 8, 4, 0}, {1, 5, 16, 8, 4, 32}};
   std::vector<uint16_t> d(64, 0x3000);
   save_package(dir.string(), m, ts, d);
-  AdapterCache too_small(64, 128, 128);
-  bool ram_denied = false;
-  try {
-    too_small.register_adapter("large", dir.string());
-  } catch (const std::runtime_error &) {
-    ram_denied = true;
-  }
-  TEST_CHECK(ram_denied);
-  TEST_EQ(too_small.stats().ram_bytes, 0);
-  AdapterCache staging_small(4096, 128, 64);
-  staging_small.register_adapter("large", dir.string());
-  auto staging_handle = staging_small.resolve("large");
-  bool staging_denied = false;
-  try {
-    staging_small.acquire(*staging_handle);
-  } catch (const std::runtime_error &) {
-    staging_denied = true;
-  }
-  TEST_CHECK(staging_denied);
-  TEST_EQ(staging_small.stats().uploads, 0);
-  AdapterCache c(4096, 128, 128);
-  auto v = c.register_adapter("one", dir.string());
-  TEST_EQ(c.stats().uploads, 0);
-  auto h = c.resolve("one");
-  std::vector<std::future<std::shared_ptr<const GpuLease>>> jobs;
-  for (int i = 0; i < 8; ++i)
-    jobs.push_back(
-        std::async(std::launch::async, [&] { return c.acquire(*h); }));
-  auto lease = jobs[0].get();
-  for (size_t i = 1; i < jobs.size(); ++i)
-    TEST_CHECK(jobs[i].get().get() == lease.get());
-  TEST_EQ(c.stats().uploads, 1);
-  TEST_EQ(lease->blocks.size(), 2);
-  auto dir2 = dir.string() + "-two";
-  d[0] = 0x3400;
-  save_package(dir2, m, ts, d);
-  c.register_adapter("two", dir2);
-  auto h2 = c.resolve("two");
+  auto package = load_package(dir.string());
+  TEST_EQ(package->data, d);
+  TEST_EQ(package->tensors.size(), ts.size());
+  TEST_EQ(package->version, content_version(package->manifest, d));
   bool denied = false;
-  try {
-    c.acquire(*h2);
-  } catch (const std::runtime_error &) {
-    denied = true;
-  }
+  try { load_package(dir.string(), 64); }
+  catch (const std::runtime_error&) { denied = true; }
   TEST_CHECK(denied);
-  lease.reset();
-  auto lease2 = c.acquire(*h2);
-  TEST_EQ(c.stats().evictions, 1);
-  lease2.reset();
-  c.trim();
-  TEST_EQ(c.stats().gpu_bytes, 0);
-  auto resumed = c.acquire(*h);
-  TEST_EQ(c.stats().uploads, 3);
-  rwkv7_server::GenerationState state;
-  rwkv7_server::bind_adapter(state, h);
-  state.advanced = true;
-  bool mismatch = false;
-  try {
-    rwkv7_server::bind_adapter(state, h2);
-  } catch (...) {
-    mismatch = true;
-  }
-  TEST_CHECK(mismatch);
-  c.register_adapter("one", dir2);
-  TEST_EQ(c.resolve("one")->package->version, h2->package->version);
-  c.erase("one", h2->package->version);
-  TEST_EQ(c.resolve("one")->package->version, h->package->version);
-  c.erase("one");
-  TEST_CHECK(c.acquire(*h).get() == resumed.get());
-  TEST_CHECK(effective_model_key("base", h.get(), "zero", false) !=
-             effective_model_key("base", h2.get(), "zero", false));
   std::filesystem::remove_all(dir);
-  std::filesystem::remove_all(dir2);
 }
 } // namespace
 int main(int argc, char **argv) {
@@ -188,10 +124,10 @@ int main(int argc, char **argv) {
                                                       {65, 257, 513, 17},
                                                       {5, 7, 9, 16}})
       numerical(shape[0], shape[1], shape[2], shape[3]);
-    cache();
+    package_roundtrip();
     if (argc > 1)
       reference(argv[1]);
-    std::cout << "MiSS numerical/cache tests passed\n";
+    std::cout << "MiSS numerical/package tests passed\n";
     return 0;
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

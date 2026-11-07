@@ -22,14 +22,16 @@ state tuning, a multi-backend Go router, and a Go desktop launcher with a Web UI
 - **Session state cache** — reuse conversation states across L1 VRAM, L2 RAM, and SQLite persistence; uploaded `.pth` states work with every generation endpoint.
 - **Quantization** — W4A16/W8A16 `.rwkvq` checkpoints with packed INT4/INT8 weights on device.
 - **State tuning** — train `time_state` blocks standalone from JSONL data without touching linear weights.
-- **MiSS adapters&peft** — train one compact `D` matrix per target linear, then load adapters per request without modifying shared model weights.
+- **MiSS adapters&peft** — train one compact `D` matrix per target linear, export compact adapter packages for the standalone training tools.
 - **Batteries included** — weighted least-inflight load-balancing router and a desktop launcher with Web UI.
 
 Both training binaries use the independent [BF16 training backbone](src/training/README.md), with streamed base loading, native state passing and BF16 exports. Inference keeps its existing FP16/quantized paths.
 
-[NoRA-init tuning](src/nora/README.md) adds `rwkv_nora_tune` and `rwkv_nora_tune_server`, with random column-normalized A, trainable A/B, fixed `alpha/rank=1`, and dynamic adapter loading in the inference engine.
+[NoRA-init tuning](src/nora/README.md) adds `rwkv_nora_tune` and `rwkv_nora_tune_server`, with random column-normalized A, trainable A/B, fixed `alpha/rank=1`, and standalone adapter training.
 
 The standalone `rwkv_miss_tune_server`, `rwkv_state_tune_server` and `rwkv_nora_tune_server` add persistent BF16 online RL (MiSS, State and NoRA modes, GRPO or Dr.GRPO advantages): batch rollouts, signed-advantage train steps, versioned actor snapshots, and shared prefix caching. See the [online RL guide](docs/online-rl.md).
+
+The native inference server uses the currently loaded weights and supports dynamic State. Request adapters and Adapter HTTP management have been removed; weight merging is not implemented.
 
 ## Quick Start
 
@@ -75,7 +77,7 @@ are described in the [build guide](docs/build.md).
 | [Run](docs/run.md) | Server flags, Windows runtime, dynamic model loading, standalone state tuning |
 | [HTTP API](docs/http-api.md) | curl examples for every endpoint; complete reference in [rwkv_lightning_api_doc.md](rwkv_lightning_api_doc.md) |
 | [Launcher integration (Chinese)](RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md) | Client / Agent, control APIs, authentication and multi-backend integration |
-| [MiSS adapters&peft](src/miss/README.md) | Frozen-base adapter training, checkpoint/resume, export, dynamic serving, caches, and validation |
+| [MiSS adapters&peft](src/miss/README.md) | Frozen-base adapter training, checkpoint/resume, export and validation |
 | [State tuning](src/state_tuning/README.md) | Standalone `time_state` training and checkpoint format |
 | [Router](RWKV_Lightning_CUDA_router/README.md) | Multi-backend load-balancing reverse proxy with session affinity and state fan-out |
 | [Releasing](docs/releasing.md) | CI packaging matrix and how to publish a versioned release |
@@ -102,4 +104,4 @@ The root `CMakeLists.txt` only selects the GPU backend and composes these module
 
 ## Continuous batching
 
-The server merges concurrent requests into one persistent GPU decode scheduler, with independent row sampling and MiSS adapter groups. `--decode-batch-size` caps active decode rows (default 64); `--chunk-size` controls interleaved prefill chunks. See the [scheduler notes](docs/continuous-batching.zh-CN.md) and [`tools/bench_continuous_http.py`](tools/bench_continuous_http.py) for configuration and benchmarking.
+The server merges concurrent requests into one persistent GPU decode scheduler, with independent row sampling and per-request State. `--decode-batch-size` caps active decode rows (default 64); `--chunk-size` controls interleaved prefill chunks. See the [scheduler notes](docs/continuous-batching.zh-CN.md) and [`tools/bench_continuous_http.py`](tools/bench_continuous_http.py) for configuration and benchmarking.

@@ -1,5 +1,7 @@
 # RWKV Lightning CUDA 路由器
 
+下文的 Adapter 转发接口仅适用于旧版后端；当前原生推理 Server 已移除请求级 Adapter 与 HTTP 管理接口。State API 继续支持。
+
 [English](README.md) | 简体中文
 
 这是一个 HTTP 反向代理，按正在处理的批大小而非请求数，对 RWKV 推理服务器进行负载均衡。

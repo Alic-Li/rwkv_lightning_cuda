@@ -626,9 +626,6 @@ Authorization: Bearer your-password
 | `POST` | `/v1/state/upload` | 上传初始 state 文件 | 否 |
 | `GET` / `POST` | `/v1/state/list` | 列出已上传 state | 否 |
 | `DELETE` / `POST` | `/v1/state/delete` | 删除已上传 state | 否 |
-| `POST` | `/v1/adapters` | 注册 MiSS 推理 adapter 到 CPU RAM | 否 |
-| `GET` | `/v1/adapters` | 列出 adapter、版本与缓存指标 | 否 |
-| `DELETE` | `/v1/adapters` | 删除 adapter 注册 | 否 |
 | `POST` | `/v1/chat/completions` | OpenAI 风格单请求聊天补全 | 是 |
 | `POST` | `/v1/batch/completions` | 多 prompt 批量补全 | 是 |
 | `POST` | `/translate/v1/batch-translate` | 批量翻译 | 否 |
@@ -641,7 +638,7 @@ Authorization: Bearer your-password
 | `POST` | `/v1/server/resume` | 恢复可续推的聊天流 | 固定为 SSE |
 
 > 动态加载模式当前注册 `/v1/models`、`/v1/model/load`、`/v1/tokens/count`、
-> `/v1/chat/completions`、`/v1/batch/completions`、`/v1/server/status`、`/v1/adapters`，
+> `/v1/chat/completions`、`/v1/batch/completions`、`/v1/server/status`，
 > 以及 `/v1/state/upload`、`/v1/state/list`、`/v1/state/delete`。其余路由仅在单模型模式提供。
 
 ### 4. 通用生成参数
@@ -664,17 +661,14 @@ Authorization: Bearer your-password
 | `stream` | boolean | `false` | 是否使用 SSE。 |
 | `chunk_size` | integer | 因路由而异 | 流式输出累计多少 token 后发送一次；小于 `1` 时按 `1` 处理。 |
 | `force_reasoning` | boolean | `false` | 启用内部 reasoning token mask。聊天接口使用 think 字段时会覆盖此值。 |
-| `adapter_id` | string | 无 | 绑定已注册的 MiSS adapter；一个请求或 batch 只能绑定一个 adapter。 |
-| `adapter_version` | string | 最新注册版本 | 可选的内容版本；请求准入时固定，不会在生成中途切换。 |
-| `adapter_scale` | number | manifest scale | 可选的绝对有效 scale 覆盖值。 |
 | `password` | string | 无 | 可选的 JSON 鉴权凭据。 |
 
 `chunk_size` 是输出刷新粒度，不是 prefill 分块。prefill 分块由进程启动参数
 `--chunk-size` 全局控制，默认 `128`。
 
-初始 state 文件的上传、列表和删除，以及 MiSS 适配器的注册、版本选择、列表、删除、
-鉴权和生成示例，统一维护在 [HTTP API 中文文档](docs/http-api.zh-CN.md#状态与适配器端点速查)。
-MiSS 推理包格式与缓存预算见 [MiSS 中文文档](src/miss/README.zh-CN.md)。
+原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留，本阶段不实现 Adapter Checkout 或权重融合。
+
+初始 State API 详见 [HTTP API 中文文档](docs/http-api.zh-CN.md#状态端点速查)。
 
 #### 请求字符串停止（`stop`）
 

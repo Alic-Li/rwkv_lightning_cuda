@@ -147,22 +147,6 @@ losses=[float(x) for x in re.findall(r'loss=([0-9.]+)',log)]
 assert losses[-1]<losses[0],losses
 print(a.method+' acceptance passed; loss',losses[0],'->',losses[-1])
 
-# Dynamic runtime must reuse the same adapter semantics for all base formats.
-for fmt in ['fp16','w8a16','w4a16']:
-    model=a.work/'tiny.pth'
-    if fmt!='fp16':
-        model=a.work/('tiny.'+fmt)
-        with (a.work/('quant-'+fmt+'.log')).open('w') as log:
-            subprocess.run([a.build/'rwkv_quantize','--format',fmt,a.work/'tiny.pth',model],check=True,stdout=log)
-    output=a.work/('logits-'+fmt+'.pth')
-    with (a.work/('runtime-'+fmt+'.log')).open('w') as log:
-        subprocess.run([a.build/'test/rwkv_miss_model_test',model,a.work/'learn/adapter-final.pth',output],check=True,stdout=log)
-    if fmt=='fp16':
-        adapter=torch.load(a.work/'learn/adapter-final.pth',weights_only=True)
-        adapter={k:v.float() for k,v in adapter.items()}
-        ref=forward(w,adapter,torch.tensor([98,99,100,98,99,100,98,99,100]),8)
-        actual=torch.load(output,weights_only=True)['logits']
-        torch.testing.assert_close(actual,ref[[5,8]],atol=.005,rtol=.003)
 # Initial states remain frozen and use the PTH [H,V,K] -> runtime [H,K,V] ABI.
 initial={f'blocks.{i}.att.time_state':torch.randn(1,64,64)*.001 for i in range(L)}
 torch.save(initial,a.work/'initial.pth')
@@ -170,7 +154,7 @@ run('initial-state',7,1,extra=['--state',str(a.work/'initial.pth')])
 state_checkpoint=torch.load(a.work/'initial-state/checkpoint-1/training.pth',weights_only=True)
 expected_state=torch.cat([initial[k].transpose(-1,-2).reshape(-1) for k in sorted(initial)])
 torch.testing.assert_close(state_checkpoint['initial_state'],expected_state,atol=0,rtol=0)
-print('Dynamic FP16/W8A16/W4A16 model acceptance passed')
+print('Frozen initial-state training acceptance passed')
 
 # Loader conversion must be bitwise identical to an explicitly converted BF16
 # archive. No whole-model FP32 host copy is made by the native loader.

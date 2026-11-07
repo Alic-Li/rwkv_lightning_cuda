@@ -1,6 +1,7 @@
 #include "rwkv/server/rwkv_state_cache.hpp"
 
 #include <algorithm>
+#include <json/json.h>
 #include <ctime>
 #include <stdexcept>
 
@@ -142,9 +143,7 @@ void StateCacheManager::init_db() {
 
 StateCacheManager::HostState StateCacheManager::copy_to_host(const GenerationState& state) const {
   HostState host;
-  host.adapter = state.adapter;
   host.effective_key = state.effective_key;
-  host.adapter_identity = state.adapter_identity;
   host.initial_state_identity = state.initial_state_identity;
   host.advanced = state.advanced;
   host.batch_size = state.batch_size;
@@ -170,9 +169,7 @@ StateCacheManager::HostState StateCacheManager::copy_to_host(const GenerationSta
 
 GenerationState StateCacheManager::copy_to_device(const HostState& state) const {
   GenerationState device;
-  device.adapter = state.adapter;
   device.effective_key = state.effective_key;
-  device.adapter_identity = state.adapter_identity;
   device.initial_state_identity = state.initial_state_identity;
   device.advanced = state.advanced;
   device.batch_size = state.batch_size;
@@ -198,9 +195,7 @@ GenerationState StateCacheManager::copy_to_device(const HostState& state) const 
 
 std::shared_ptr<GenerationState> StateCacheManager::clone_device_state(const GenerationState& state) const {
   auto clone = std::make_shared<GenerationState>();
-  clone->adapter = state.adapter;
   clone->effective_key = state.effective_key;
-  clone->adapter_identity = state.adapter_identity;
   clone->initial_state_identity = state.initial_state_identity;
   clone->advanced = state.advanced;
   clone->batch_size = state.batch_size;
@@ -315,7 +310,6 @@ void StateCacheManager::persist_state_locked(const std::string& session_id, cons
   sqlite3_bind_double(stmt, 7, static_cast<double>(time(nullptr)));
   Json::Value meta;
   meta["effective"] = state.effective_key;
-  meta["adapter"] = state.adapter_identity;
   meta["initial"] = state.initial_state_identity;
   meta["advanced"] = state.advanced;
   Json::StreamWriterBuilder writer;
@@ -349,7 +343,6 @@ std::optional<StateCacheManager::HostState> StateCacheManager::load_state_locked
         throw std::runtime_error("invalid state identity");
       }
       state.effective_key = meta["effective"].asString();
-      state.adapter_identity = meta["adapter"].asString();
       state.initial_state_identity = meta["initial"].asString();
       state.advanced = meta["advanced"].asBool();
     }

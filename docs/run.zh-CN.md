@@ -99,7 +99,7 @@ curl -sS -X POST "http://127.0.0.1:8000/v1/model/load" \
 state 张量，可直接上传到现有推理后端使用。掩码 `segments`
 格式和实现细节见 [状态微调文档](../src/state_tuning/README.zh-CN.md)。
 
-## MiSS adapter 训练与推理
+## MiSS adapter 训练
 
 同一个构建还会生成 `rwkv_miss_tune`。它冻结基模，只训练所选 attention 和 FFN
 Linear 对应的 MiSS `D[out,rank]`，支持分块 state passing、梯度累积、可续训的周期
@@ -117,9 +117,6 @@ checkpoint，以及与训练 checkpoint 分离的推理导出：
   --save-every 100 --wkv_tape
 ```
 
-通过 `POST /v1/adapters` 上传或注册 `miss_output/adapter-final.pth`
-（也可使用 checkpoint 的 `training.pth`），然后在生成请求中传入
-`adapter_id`，并按需指定 `adapter_version` 或 `adapter_scale`。注册阶段只在 CPU
-RAM 中校验和缓存；第一次请求时才把整个 adapter 一次性上传到 GPU。checkpoint
-续训、推理包身份、缓存预算、性能分析和验收说明见
-[MiSS 文档](../src/miss/README.zh-CN.md)。
+原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留，本阶段不实现 Adapter Checkout 或权重融合。
+
+训练、续训和验收说明见 [MiSS 文档](../src/miss/README.zh-CN.md)。

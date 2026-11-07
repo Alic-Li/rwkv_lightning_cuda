@@ -1,5 +1,7 @@
 # Launcher 控制面 API 与多后端形态
 
+下文的 Adapter 转发接口仅适用于旧版后端；当前原生推理 Server 已移除请求级 Adapter 与 HTTP 管理接口。State API 继续支持。
+
 本文是 Launcher 控制面当前实现的接口参考。首次接入先读 [前端与第三方联调指南](integration-guide.md)；工程准备见 [前端开发指南](frontend-development.md)。原生推理 API 见 [完整参考](../../rwkv_lightning_api_doc.md) 与 [示例](../../docs/http-api.zh-CN.md)。
 
 Runtime / Tuning / Quantization 请求体集中定义在 `request_types.go`，路由在 `api.go`。§1–§6 介绍架构与兼容，§7–§8 给出请求字段、返回值与边界；旧设计草案不作为接口契约。

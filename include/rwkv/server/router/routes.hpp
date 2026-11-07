@@ -18,8 +18,6 @@ void register_legacy_routes(
 void register_dynamic_routes(
     drogon::HttpAppFramework& app, ModelRouter& models,
     const std::optional<std::string>& password);
-void register_adapter_routes(
-    drogon::HttpAppFramework& app, const std::optional<std::string>& password);
 void register_uploaded_state_routes(
     drogon::HttpAppFramework& app, const std::optional<std::string>& password);
 

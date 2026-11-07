@@ -303,11 +303,7 @@ turn = {"tokens": out["tokens"], "loss_mask": [1] * len(out["tokens"]),
 - 训练是纯 on-policy REINFORCE，没有重要性采样修正。推理服务使用不同的前向 Kernel（以及可能的量化、稀疏 cmix），
   logprob 与本服务不逐位一致，采样分布有小偏差，相当于轻微 off-policy。偏差是否可接受取决于任务，服务端无法保证；
   可以用 `/v1/logprobs` 对外部轨迹打分，与推理服务返回的 logprob 比较来监控。
-- 每步需要 `publish` 时 `save:true`（或 `checkpoint:true`），再把导出的 `adapter.pth` 注册到推理服务：
-  `POST /v1/adapters`，同机可传 `{"adapter_id":"rl","path":".../adapter.pth"}`，跨机可用 multipart 上传文件。
-  同一 `adapter_id` 每次注册得到新的内容版本，无需重启推理服务；生成时用 `adapter_version` 固定版本，旧版本可 `DELETE`。
-  目前没有不经磁盘直接推送权重的接口。State 模式训练的 State 不走这条路径。
-- 采样请求本身已经合批，通常应优先用本服务采样，省掉导出、注册和数值偏差。
+- Adapter 策略使用在线训练 Server 采样；原生推理 Server 已移除动态 Adapter。导出的 State 仍可通过 State 上传 API 使用。
 
 ### RL train step
 
@@ -376,7 +372,7 @@ Backbone 指针始终共享。显式指定旧版本的请求仍使用其旧权�
 版本切换不会重建 Learner 或清空 Adam。
 
 `save:true` 输出 `state.pth`、有 Adapter 时的 `adapter.pth`、`policy.json`。
-State 和 Adapter 按现有格式导出 BF16，可由原推理服务或在线 RL Server 冷启动加载；用它们冷启动会从新 Adam 状态和 step=0 开始。
+State 和 Adapter 按现有格式导出 BF16，State 可由原推理服务加载，Adapter/State 可由在线 RL Server 冷启动加载；用它们冷启动会从新 Adam 状态和 step=0 开始。
 
 `checkpoint:true`（隐含 `save:true`）额外写入 `training/` 子目录，即完整训练检查点：
 

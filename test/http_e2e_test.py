@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live HTTP E2E tests. Uses only Python's standard library.
 
-python test/http_e2e_test.py --state ./latest-state.pth --adapter ./adapter-final.pth
+python test/http_e2e_test.py --state ./rwkv-state-agentic.pth
 The server must already be running. Only resources created by this run are removed.
 Raw HTTP responses and report.json are saved in --output (default: build/http-e2e-<id>).
 """
@@ -24,7 +24,7 @@ class Suite:
         self.prefix = 'http-e2e-' + uuid.uuid4().hex[:12]
         self.output = Path(args.output or 'build/' + self.prefix)
         self.output.mkdir(parents=True, exist_ok=True)
-        self.results, self.sessions, self.states, self.adapters = [], [], [], []
+        self.results, self.sessions, self.states = [], [], []
         self.lock = threading.Lock()
         self.counter = 0
         self.initial_active = set()
@@ -186,6 +186,9 @@ class Suite:
                 if action == 'pause':
                     status = self.call('/v1/server/status')
                     assert any(e['id'] == rid for e in status['paused_requests']), status
+                    # A rejected legacy adapter override must leave the paused State resumable.
+                    for key, value in [('adapter_id', 'old'), ('adapter_version', 'v1'), ('adapter_scale', 1.0)]:
+                        self.call('/v1/server/resume', {'request_id':rid, key:value}, expected=400)
                     self.completion('/v1/server/resume', {'request_id':rid, 'max_tokens':8, 'chunk_size':1}, stream=True)
                     assert not any(e['id'] == rid for e in self.call('/v1/server/status')['paused_requests'])
                     self.call('/state/delete', {'session_id': rid}, expected=(200,404))
@@ -197,10 +200,9 @@ class Suite:
         self.check('server status and initial snapshot', self.initial_status)
         self.check('model list', lambda: require(self.call('/v1/models')['data']))
         self.check('CORS response headers', lambda: self.cors())
-        paths=['/v1/models','/v1/chat/completions','/v1/batch/completions','/v1/tokens/count','/translate/v1/batch-translate','/state/chat/completions','/state/status','/state/delete','/v1/server/status','/v1/server/stop','/v1/server/pause','/v1/server/resume','/v1/state/upload','/v1/state/list','/v1/state/delete','/v1/adapters']
+        paths=['/v1/models','/v1/chat/completions','/v1/batch/completions','/v1/tokens/count','/translate/v1/batch-translate','/state/chat/completions','/state/status','/state/delete','/v1/server/status','/v1/server/stop','/v1/server/pause','/v1/server/resume','/v1/state/upload','/v1/state/list','/v1/state/delete']
         for path in paths:
             self.check('OPTIONS ' + path, lambda p=path: self.call(p, method='OPTIONS', expected=(200,204)))
-        self.check('adapter browser CORS preflight', self.adapter_preflight)
         for body in [{'text':'你好，RWKV!'}, {'messages':[{'role':'user','content':[{'type':'text','text':'你好'}]}]}, {'contents':['hello','world']}]:
             self.check('token count ' + next(iter(body)), lambda b=body: require(self.call('/v1/tokens/count', b)['tokens'] > 0))
         self.matrix('base', {})
@@ -219,7 +221,7 @@ class Suite:
             sid = result['state_id']; self.states.append(sid)
             assert result['size_bytes'] == Path(self.args.state).stat().st_size, result
             assert result['layers'] > 0 and result['heads'] > 0 and result['head_size'] == 64, result
-        self.check('upload latest-state.pth', upload_state)
+        self.check('upload initial state PTH', upload_state)
         if sid:
             for method in ['GET','POST']:
                 self.check('state list ' + method, lambda m=method: require(any(e['state_id']==sid for e in self.call('/v1/state/list', {} if m=='POST' else None)['data'])))
@@ -228,57 +230,18 @@ class Suite:
             self.check('state header batch SSE', lambda: self.header_stream(sid))
             self.check('state body/header identical', lambda: require(self.call('/v1/chat/completions',self.chat|{'state_id':sid},headers={'X-RWKV-State-Id':sid})['choices']))
             self.check('translation loaded state', lambda: require(len(self.call('/translate/v1/batch-translate',{'source_lang':'English','target_lang':'Chinese','text_list':['Hi'],'state_id':sid})['translations'])==1))
-        aid = self.prefix + '-adapter'; version = None
-        def register_adapter():
-            nonlocal version
-            result = self.call('/v1/adapters', {'adapter_id':aid,'path':str(Path(self.args.adapter).resolve())})
-            version = result['version']; self.adapters.append(aid)
-            assert len(version)==64,result
-        self.check('register adapter-final.pth by path', register_adapter)
-        if version:
-            self.check('adapter listed with manifest', lambda: require(any(e['id']==aid and e['version']==version and e['manifest']['method']=='miss' for e in self.call('/v1/adapters')['data'])))
-            self.matrix('adapter', {'adapter_id':aid,'adapter_version':version})
-            self.check('adapter scale override', lambda: self.completion('/v1/chat/completions',self.chat|{'adapter_id':aid,'adapter_scale':0.5}))
-            if sid:
-                self.matrix('state-and-adapter', {'state_id':sid,'adapter_id':aid})
-            self.check('adapter cache GPU and RAM hits', lambda: self.adapter_metrics())
-            self.check('adapter pause/resume', lambda: self.controlled('adapter','pause',{'adapter_id':aid}))
-        upload_aid = self.prefix + '-multipart'
-        def upload_adapter():
-            data,headers=self.multipart({'adapter_id':upload_aid},[('file',Path(self.args.adapter).name,Path(self.args.adapter).read_bytes())])
-            result=self.call('/v1/adapters',raw=data,headers=headers); self.adapters.append(upload_aid)
-            assert result['adapter_id']==upload_aid and len(result['version'])==64,result
-        self.check('multipart adapter upload',upload_adapter)
-        if upload_aid in self.adapters:
-            self.check('multipart adapter inference SSE',lambda: self.completion('/v1/chat/completions',self.chat|{'adapter_id':upload_aid},stream=True))
         self.negative_cases()
         self.check('stream stop by request_id',lambda: self.controlled('base','stop',{}))
         self.check('stream pause and resume by request_id',lambda: self.controlled('base','pause',{}))
-        if sid and version:
-            self.check('state+adapter pause/resume',lambda: self.controlled('combined','pause',{'state_id':sid,'adapter_id':aid}))
+        if sid:
+            self.check('loaded-state pause/resume',lambda: self.controlled('loaded-state','pause',{'state_id':sid}))
         self.check('concurrent generation requests',self.concurrent)
-        if sid and version:
-            self.check('continuous mixed state/adapter/scale requests',
-                       lambda: self.concurrent_mixed(sid, aid))
+        if sid:
+            self.check('continuous mixed initial-state requests',
+                       lambda: self.concurrent_mixed(sid))
         self.check('session header lifecycle',self.session_header)
         for path,body in [('/v1/chat/completions',self.chat),('/v1/batch/completions',self.batch),('/state/chat/completions',self.options|{'session_id':self.session('connection-close'),'contents':['User: Hello.\n\nAssistant:']})]:
             self.check('SSE Connection: close '+path,lambda p=path,b=body:self.connection_close(p,b))
-
-    def adapter_preflight(self):
-        origin = 'http://localhost:5173'
-        for method in ('GET', 'POST', 'DELETE'):
-            self.call('/v1/adapters', method='OPTIONS', expected=(200, 204), headers={
-                'Origin': origin,
-                'Access-Control-Request-Method': method,
-                'Access-Control-Request-Headers': 'content-type,authorization',
-            })
-            record = json.loads((self.output / f'{self.counter:04d}-http.json').read_text())
-            headers = {k.lower(): v for k, v in record['headers'].items()}
-            assert headers['access-control-allow-origin'] in ('*', origin), headers
-            methods = {v.strip().upper() for v in headers['access-control-allow-methods'].split(',')}
-            assert method in methods, headers
-            allowed = {v.strip().lower() for v in headers['access-control-allow-headers'].split(',')}
-            assert {'content-type', 'authorization'} <= allowed, headers
 
     def cors(self):
         self.call('/v1/server/status')
@@ -291,11 +254,6 @@ class Suite:
         last=self.call('/v1/server/status')['last_request']
         assert last['endpoint']=='batch.completions' and last['prefill_progress']==1,last
         assert last['prefill_speed']>0 and last['decode_speed']>0,last
-
-    def adapter_metrics(self):
-        r=self.call('/v1/adapters')
-        assert r['ram_hits']>0 and r['gpu_hits']>0 and r['gpu_misses']>0,r
-        assert r['gpu_peak_bytes']>0 and r['ram_bytes']>0,r
 
     def batch_text_stops(self):
         path = '/v1/batch/completions'
@@ -381,8 +339,15 @@ class Suite:
         data,headers=self.multipart({},[])
         self.check('empty state upload',lambda:self.call('/v1/state/upload',raw=data,headers=headers,expected=400))
         data,headers=self.multipart({},[('file','bad.pth',b'invalid pth')])
-        self.check('adapter upload missing adapter_id',lambda:self.call('/v1/adapters',raw=data,headers=headers,expected=400))
-        self.check('adapter nonexistent path',lambda:self.call('/v1/adapters',{'adapter_id':self.prefix+'-bad','path':'/nonexistent/e2e-adapter.pth'},expected=400))
+        self.check('removed adapter multipart upload',lambda:self.call('/v1/adapters',raw=data,headers=headers,expected=404))
+        for method in ['GET', 'POST', 'DELETE']:
+            self.check('removed adapter route '+method,lambda m=method:self.call('/v1/adapters',method=m,expected=404))
+        for key, value in [('adapter_id', ''), ('adapter_id', 'old'), ('adapter_version', 'v1'), ('adapter_scale', 1.0)]:
+            for path, body in [('/v1/chat/completions', self.chat), ('/v1/batch/completions', self.batch),
+                               ('/state/chat/completions', self.options | {'session_id': self.session('removed-'+key), 'contents':['hello']}),
+                               ('/translate/v1/batch-translate', {'target_lang':'Chinese', 'text_list':['hello']})]:
+                self.check('removed field '+key+' '+path,lambda p=path,b=body,k=key,v=value:require(
+                    'no longer supported' in str(self.call(p,b|{k:v},expected=400))))
         for action,key in [('stop','stopped'),('pause','paused')]:
             self.check(action+' unknown request',lambda a=action,k=key:require(self.call('/v1/server/'+a,{'request_id':self.prefix+'-missing'})[k] is False))
 
@@ -391,7 +356,7 @@ class Suite:
             futures=[pool.submit(self.completion,'/v1/chat/completions',self.chat|{'messages':[{'role':'user','content':f'Count starting at {i}.'}]},1,bool(i%2)) for i in range(4)]
             for f in futures: f.result(timeout=self.args.timeout)
 
-    def concurrent_mixed(self, state_id, adapter_id):
+    def concurrent_mixed(self, state_id):
         barrier = threading.Barrier(8)
         def run(i):
             body = self.chat | dict(max_tokens=16, temperature=0.5+i*0.1,
@@ -399,8 +364,6 @@ class Suite:
                                     alpha_decay=0.9+i*0.01)
             if i & 1:
                 body['state_id'] = state_id
-            if i & 2:
-                body.update(adapter_id=adapter_id, adapter_scale=0.5 if i & 4 else 1.0)
             barrier.wait()
             return self.completion('/v1/chat/completions', body, 1, bool(i & 4))
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -422,9 +385,6 @@ class Suite:
         for sid in self.states:
             self.check('cleanup uploaded state '+sid,lambda s=sid:require(self.call('/v1/state/delete?'+urllib.parse.urlencode({'state_id':s}),method='DELETE')['deleted']))
             self.check('deleted state absent',lambda s=sid:require(not any(e['state_id']==s for e in self.call('/v1/state/list')['data'])))
-        for aid in self.adapters:
-            self.check('cleanup adapter '+aid,lambda a=aid:require(self.call('/v1/adapters',{'adapter_id':a},method='DELETE')['deleted']))
-        self.check('test adapters absent',lambda:require(not any(e['id'].startswith(self.prefix) for e in self.call('/v1/adapters')['data'])))
         self.check('final server has no newly leaked active or paused requests',lambda:self.final_status())
 
     def initial_status(self):
@@ -454,12 +414,11 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url',default=os.environ.get('BASE_URL','http://127.0.0.1:8000'))
     parser.add_argument('--password',default=os.environ.get('PASSWORD',''))
-    parser.add_argument('--state',default='./latest-state.pth')
-    parser.add_argument('--adapter',default='./adapter-final.pth')
+    parser.add_argument('--state',default='./rwkv-state-agentic.pth')
     parser.add_argument('--timeout',type=float,default=120)
     parser.add_argument('--output')
     args=parser.parse_args()
-    for name in [args.state,args.adapter]:
+    for name in [args.state]:
         if not Path(name).is_file(): parser.error('file does not exist: '+name)
     suite=Suite(args)
     try: suite.run()
