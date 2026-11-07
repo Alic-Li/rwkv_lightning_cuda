@@ -13,6 +13,8 @@ import torch
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', required=True)
+parser.add_argument('--threads', type=int, default=2,
+                    help='Merger thread count; use 1 for builds without OpenMP')
 args, rest = parser.parse_known_args()
 BINARY = str(Path(args.binary).resolve())
 NAMES = ['att.receptance.weight', 'att.key.weight', 'att.value.weight',
@@ -83,7 +85,7 @@ class MergeTest(unittest.TestCase):
     def run_merge(self, base, adapter, method, *extra, ok=True):
         output = self.root/'merged.pth'
         result = subprocess.run([BINARY, '--model', str(base), '--adapter', str(adapter),
-                                 '--method', method, '--output', str(output), '--threads', '2', *extra],
+                                 '--method', method, '--output', str(output), '--threads', str(args.threads), *extra],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode == 0, ok, result.stdout+result.stderr)
         if not ok:

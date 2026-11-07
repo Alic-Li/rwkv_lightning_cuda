@@ -446,7 +446,10 @@ void merge(std::vector<uint8_t> &storage, const TensorRecord &weight,
       for (int k = 0; k < t.rank; ++k) {
         const float b = t.b[size_t(row) * t.rank + k];
         const float *a = t.a.data() + size_t(k) * t.in;
+        // SIMD requires OpenMP 4.0; MSVC's default /openmp supports 2.0.
+#if defined(_OPENMP) && _OPENMP >= 201307
 #pragma omp simd
+#endif
         for (int col = 0; col < t.in; ++col)
           delta[col] += b * a[col];
       }
