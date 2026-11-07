@@ -29,6 +29,20 @@ BINARIES = (
 ))
 
 GO_BINARIES = ("rwkv_launcher", "rwkv_router")
+PEFT_BINARY = "rwkv_peft_weight_merge"
+
+
+def peft_merge_enabled():
+    value = os.environ.get("RWKV_BUILD_PEFT_MERGE", "ON").strip().lower()
+    if value in ("on", "true", "1"):
+        return True
+    if value in ("off", "false", "0"):
+        return False
+    raise ValueError("RWKV_BUILD_PEFT_MERGE must be ON/OFF, true/false or 1/0")
+
+
+def release_binaries(include_peft):
+    return BINARIES + ((PEFT_BINARY,) if include_peft else ())
 
 
 def run(*args, cwd=ROOT, env=None):
@@ -53,6 +67,8 @@ def package_version():
 
 
 def main():
+    include_peft = peft_merge_enabled()
+    binaries = release_binaries(include_peft)
     if platform.system() not in ("Windows", "Linux"):
         raise SystemExit("CUDA release builds require Linux or Windows")
     if platform.machine().lower() not in ("x86_64", "amd64"):
@@ -79,6 +95,8 @@ def main():
         f"-DVCPKG_MANIFEST_DIR={ROOT / 'tools/ci'}",
         f"-DVCPKG_TARGET_TRIPLET={TRIPLET}",
         "-DRWKV7_FAST_BUILD_TESTS=ON", "-DRWKV7_STATE_TUNING=ON",
+        f"-DRWKV_BUILD_PEFT_MERGE={'ON' if include_peft else 'OFF'}",
+        "-DRWKV_PEFT_MERGE_ONLY=OFF",
         f"-DRWKV_NCCL_DP={'OFF' if WINDOWS else 'ON'}",
     ]
     if WINDOWS:
@@ -104,7 +122,7 @@ def main():
 
     # Windows loads DLLs beside the executables; Linux shares a lib directory.
     lib_dir = bundle if WINDOWS else bundle / "lib"
-    for binary in BINARIES:
+    for binary in binaries:
         run("cmake", f"-DINPUT_FILE={BUILD / (binary + SUFFIX)}",
             f"-DOUTPUT_DIR={bundle}", f"-DLIB_OUTPUT_DIR={lib_dir}",
             "-DCOPY_BINARY=ON", "-DSTRICT_RUNTIME_DEPS=ON",
@@ -157,12 +175,14 @@ def main():
     (bundle / "docs").mkdir(exist_ok=True)
     for guide in ("online-rl.md", "online-rl.zh-CN.md", "online-rl-validation.zh-CN.md"):
         shutil.copy2(ROOT / "docs" / guide, bundle / "docs")
+    if include_peft:
+        shutil.copy2(ROOT / "docs/peft-weight-merge.zh-CN.md", bundle / "docs")
     # Check relocated CLIs with a clean library path, without loading a model.
     smoke_env = os.environ.copy()
     smoke_env.pop("LD_LIBRARY_PATH", None)
     if WINDOWS:
         smoke_env["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
-    for binary in (*BINARIES, "rwkv_router"):
+    for binary in (*binaries, "rwkv_router"):
         run(bundle / (binary + SUFFIX), "--help", cwd=bundle, env=smoke_env)
     # Every shipped binary answers -v/--version with exactly "<name> <version>".
     # The C++ binaries take the version from VERSION at configure time; the Go
@@ -170,7 +190,7 @@ def main():
     file_version = (ROOT / "VERSION").read_text().strip()
     go_version = (package_version().removeprefix("v")
                   if os.environ.get("RWKV_RELEASE_VERSION") else "dev")
-    for binary in (*BINARIES, "rwkv_launcher", "rwkv_router"):
+    for binary in (*binaries, "rwkv_launcher", "rwkv_router"):
         expected = f"{binary} {go_version if binary in GO_BINARIES else file_version}"
         for flag in ("--version", "-v"):
             check_version(bundle / (binary + SUFFIX), flag, expected, bundle, smoke_env)

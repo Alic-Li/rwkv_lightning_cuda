@@ -5,6 +5,7 @@
     {"name": "drogon", "default-features": false},
     "sqlite3",
     "jsoncpp",
-    "openssl"
+    "openssl",
+    "zlib"
   ]
 }

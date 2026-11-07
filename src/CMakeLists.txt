@@ -1,5 +1,10 @@
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+if(RWKV_BUILD_PEFT_MERGE)
+  rwkv_add_peft_merge()
+  rwkv_configure_runtime_bundle(rwkv_peft_weight_merge)
+endif()
+
 set(RWKV_CORE_HOST_SOURCES
   io/pth_archive.cpp
   io/pth_tensor.cpp

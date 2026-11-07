@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.24)
 
+option(RWKV_PEFT_MERGE_ONLY "Build only the CPU MiSS/NoRA weight merger (no GPU SDK)" OFF)
+option(RWKV_BUILD_PEFT_MERGE "Build the CPU MiSS/NoRA weight merger in the full project" ON)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/RwkvPeftMerge.cmake)
+if(RWKV_PEFT_MERGE_ONLY)
+  project(rwkv_peft_weight_merge LANGUAGES CXX)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/RwkvVersion.cmake)
+  rwkv_add_peft_merge()
+  return()
+endif()
+
 set(RWKV_GPU_BACKEND "CUDA" CACHE STRING "GPU backend (CUDA or HIP)")
 set_property(CACHE RWKV_GPU_BACKEND PROPERTY STRINGS CUDA HIP)
 string(TOUPPER "${RWKV_GPU_BACKEND}" RWKV_GPU_BACKEND)

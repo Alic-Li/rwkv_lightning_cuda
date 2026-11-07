@@ -29,6 +29,8 @@ Both training binaries use the independent [BF16 training backbone](src/training
 
 [NoRA-init tuning](src/nora/README.md) adds `rwkv_nora_tune` and `rwkv_nora_tune_server`, with random column-normalized A, trainable A/B, fixed `alpha/rank=1`, and standalone adapter training.
 
+The [CPU weight merger](docs/peft-weight-merge.zh-CN.md), `rwkv_peft_weight_merge --method miss|nora`, merges an Adapter into its base checkpoint and writes a standalone inference `.pth`. It can be built without a GPU SDK.
+
 The standalone `rwkv_miss_tune_server`, `rwkv_state_tune_server` and `rwkv_nora_tune_server` add persistent BF16 online RL (MiSS, State and NoRA modes, GRPO or Dr.GRPO advantages): batch rollouts, signed-advantage train steps, versioned actor snapshots, and shared prefix caching. See the [online RL guide](docs/online-rl.md).
 
 The native inference server uses the currently loaded weights and supports dynamic State. Request adapters and Adapter HTTP management have been removed; weight merging is not implemented.

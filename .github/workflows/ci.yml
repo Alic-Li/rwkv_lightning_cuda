@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      build_peft_merge:
+        description: Build and package the CPU MiSS/NoRA weight merger
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -71,6 +76,7 @@ jobs:
     env:
       CUDA_VERSION: ${{ matrix.cuda }}
       RWKV_RELEASE_VERSION: ${{ needs.version.outputs.tag }}
+      RWKV_BUILD_PEFT_MERGE: ${{ github.event_name != 'workflow_dispatch' || inputs.build_peft_merge }}
       # PRs compile one architecture; release/manual builds cover the full set.
       CUDA_ARCHITECTURES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;87;89;90;100;120' }}
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite'
@@ -211,9 +217,10 @@ jobs:
           restore-keys: |
             vcpkg-${{ matrix.os }}-2025.06.13-${{ hashFiles('tools/ci/vcpkg.json') }}-
             vcpkg-${{ matrix.os }}-2025.06.13-${{ hashFiles('tools/ci/vcpkg.json') }}
-      # Includes all three online RL servers, runtime dependencies, guides and client;
+      # Includes the optional CPU PEFT merger, all three online RL servers,
+      # runtime dependencies, guides and client;
       # relocated --help checks run without a GPU or model on hosted runners.
-      - name: Build, test and package CLIs and online RL servers
+      - name: Build, test and package CLIs, PEFT merger and online RL servers
         run: python tools/ci/build_release.py
       - name: Save C++ dependencies
         if: >-
