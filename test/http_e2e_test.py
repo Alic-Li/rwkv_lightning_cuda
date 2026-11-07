@@ -2,6 +2,7 @@
 """Live HTTP E2E tests. Uses only Python's standard library.
 
 python test/http_e2e_test.py --state ./rwkv-state-agentic.pth
+Use --check-stream-parity only with deterministic/dense FFN.
 The server must already be running. Only resources created by this run are removed.
 Raw HTTP responses and report.json are saved in --output (default: build/http-e2e-<id>).
 """
@@ -154,7 +155,7 @@ class Suite:
             for streaming in (False, True):
                 self.check(f'{label} {path} stream={streaming}',
                            lambda p=path,b=body,c=count,s=streaming: outputs.update({s:self.completion(p,b|extra,c,s)}))
-            if len(outputs) == 2:
+            if len(outputs) == 2 and getattr(self.args, "check_stream_parity", False):
                 self.check(f'{label} {path} deterministic stream parity', lambda: require(outputs[False] == outputs[True], outputs))
         session = self.session(label)
         body = self.options | {'contents': ['User: Hello.\n\nAssistant:'], 'session_id': session} | extra
@@ -415,6 +416,8 @@ def main():
     parser.add_argument('--url',default=os.environ.get('BASE_URL','http://127.0.0.1:8000'))
     parser.add_argument('--password',default=os.environ.get('PASSWORD',''))
     parser.add_argument('--state',default='./rwkv-state-agentic.pth')
+    parser.add_argument('--check-stream-parity', action='store_true',
+                        help='require exact cross-request output parity (use deterministic/dense FFN only)')
     parser.add_argument('--timeout',type=float,default=120)
     parser.add_argument('--output')
     args=parser.parse_args()

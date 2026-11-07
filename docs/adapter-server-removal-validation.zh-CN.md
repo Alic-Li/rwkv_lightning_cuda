@@ -96,3 +96,50 @@ BASE_URL=http://127.0.0.1:8060 python test/state_nonstream_stop_test.py
 
 每次运行使用新的输出目录；已知 `Connection: close` 用例会留下注册记录，因此不同测试套件
 应使用干净服务。验收结束已关闭本次启动的所有临时推理与训练服务。
+
+## Router / Launcher 同步清理验收（2026-11-07）
+
+Router 已移除 Adapter 广播上传、版本发现/固定、副本就绪表、调度条件和
+`adapter_upload_*` 配置。旧管理路径直接返回 404，旧请求字段返回 400，均不转发给后端。
+State 广播、UUID、失败重试、就绪判断、Session 亲和和 HTTP 行为保留。
+
+Launcher 已移除 Adapter 管理界面、选择控件、API 客户端、生成设置、翻译请求注入及文案。
+本地与后端前缀的 Adapter 管理路径返回 404。设置存储升级到 v4，清除旧 Adapter 字段，
+保留所选 State、采样参数、语言与用户主题；Chat 只序列化支持的生成参数。
+State 上传、节点文件导入、管理界面与训练能力继续保留。本次没有修改 GPU 权重或 Kernel
+路径，也没有实现 Checkout、Merge、权重副本或新的 GPU 缓冲区。
+
+使用同一个正式 7.2B 模型启动两个独立原生进程（8060 / 8061，chunk/decode batch 均为
+512），Router 监听 18080，Launcher 监听 18081，经后端前缀访问 Router。
+上传文件为 `rwkv-state-agentic.pth`，Session 数据库单独存放，未覆盖用户数据库。
+两个进程各自正常加载模型仅用于验证 State 广播，不是产品新增常驻权重副本。
+
+| 检查 | 结果 | 报告（位于 `build/router-launcher-removal-validation/`） |
+|---|---|---|
+| Router `go test -race ./...`、`go vet ./...` | 通过 | `router-go.log` |
+| Launcher `go test -race .`、`go vet .` | 通过；可选 tiny GPU fixture 测试未启用 | `launcher-go.log` |
+| 前端 Bun 测试 | 87/87，492 个断言 | `frontend-test.log` |
+| 前端 TypeScript/Vite 构建与 ESLint | 通过 | `frontend-build.log`、`frontend-lint.log` |
+| Launcher → Router → 两个正式模型进程 | 38/38，含直接核验共 61 个 HTTP 请求 | `chain-e2e/report.json` |
+| 正式模型原生 HTTP 全量功能测试 | 133 通过、4 个已知失败 | `native-functional-e2e/report.json` |
+| Launcher HTTP 控制面启动 MiSS / State 训练 | 两种模式各一步成功，loss 有限，最终 PTH 已导出 | `training-report.json` |
+
+链路测试覆盖 Base/State 的 Chat/Batch 非流式与 SSE、State Header、重复推理、混合并发、
+State 在每个独立进程中的一致可见性、Session 亲和、缓存续推、删除与不存在 State 拒绝，
+以及旧 Adapter 管理接口/请求参数拒绝。每个原生进程均未新增泄漏请求。
+回归入口为 `test/router_launcher_e2e_test.py`：
+
+```bash
+python test/router_launcher_e2e_test.py \
+  --url http://127.0.0.1:18081/api/v1/backends/formal-router \
+  --router http://127.0.0.1:18080 \
+  --worker http://127.0.0.1:8060 --worker http://127.0.0.1:8061 \
+  --state ./rwkv-state-agentic.pth
+```
+
+原生测试的 4 个失败与前述基线相同：三个 `Connection: close` 空 SSE，及对应的最终请求
+清理断言。首次运行还触发一次稀疏 FFN 的跨请求文本精确匹配失败（原始结果
+`native-e2e/report.json`：136 通过、5 失败）。现将 `http_e2e_test.py` 的精确流式/非流式
+文本比较改为显式 `--check-stream-parity`，仅用于确定性/普通 FFN 验证；默认仍完整检查
+响应结构、流结束、State、Session、并发与控制 API。最终功能测试未启用这四项文本精确
+比较，未跳过上述 SSE 失败。

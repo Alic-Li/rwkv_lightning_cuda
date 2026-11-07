@@ -1,5 +1,5 @@
 // Package broadcast implements the bounded, replayable HTTP fan-out used by
-// resource synchronization. It knows nothing about State or adapter identities.
+// resource synchronization. It knows nothing about resource identities.
 package broadcast
 
 import (

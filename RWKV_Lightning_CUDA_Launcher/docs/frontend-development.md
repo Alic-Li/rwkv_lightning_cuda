@@ -54,7 +54,7 @@ src/
   pages/                Nodes / Chat / Translate / Runtime / Training / Quantization / Settings
   components/
     ui/                 shadcn 风格基础组件（button/input/select/card/dialog/popover/field/…）
-    chat/               Chat 页专用组件：气泡、代码块、输入区、会话选择、生成参数面板、state / adapter 管理
+    chat/               Chat 页专用组件：气泡、代码块、输入区、会话选择、生成参数面板、State 管理
     training/           训练页组件：任务栏（Start / Stop）、参数卡片、进度与曲线卡片
     *.tsx               通用控件：页头与远端路径字段（common）、日志查看器、节点状态与 GPU 绘制、选卡控件、指标曲线、添加 / 编辑后端与目录对话框
   lib/

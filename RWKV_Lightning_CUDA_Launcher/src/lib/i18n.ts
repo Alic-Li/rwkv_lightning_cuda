@@ -245,7 +245,6 @@ const zh = {
   "chat.stop": "停止生成",
   "chat.generation": "生成参数",
   "chat.state": "State",
-  "chat.adapter": "MiSS adapter",
   "chat.thinkType": "think_type",
   "chat.thinkFast": "fast",
   "chat.thinkThink": "think",
@@ -277,7 +276,6 @@ const zh = {
   "chat.conversations": "会话",
   "chat.newConversation": "新会话",
   "chat.stateNone": "不使用",
-  "chat.adapterNone": "不使用",
   "chat.manage": "管理",
   "chat.unavailable": "不可用",
   "chat.parameters": "生成参数",
@@ -294,7 +292,6 @@ const zh = {
   "chat.thinkOffHint": "预填完整的 <think></think，跳过思考（fast）",
   "chat.thinkOnHint": "只预填 <think 并强制模型展开思考（free）",
   "chat.manageStates": "管理 state…",
-  "chat.manageAdapters": "管理 adapter…",
   "chat.loadingStates": "读取 state 列表…",
   "chat.stateUnavailable": "该节点不支持 /v1/state/list",
   "chat.thinking": "思考中",
@@ -334,21 +331,6 @@ const zh = {
   "file.choose": "选择文件",
   "file.dropHint": "也可以把文件拖到这里",
 
-  "adapter.title": "MiSS adapter 管理",
-  "adapter.description":
-    "按 adapter_id + version 注册；推理时通过 adapter_id / adapter_version / adapter_scale 选择。",
-  "adapter.id": "adapter_id",
-  "adapter.version": "version",
-  "adapter.rank": "rank",
-  "adapter.scale": "scale",
-  "adapter.registerPath": "从节点路径注册",
-  "adapter.uploadPth": "上传 .pth",
-  "adapter.uploadJson": "上传 checkpoint.json（可选）",
-  "adapter.empty": "该节点还没有注册 adapter。",
-  "adapter.ram": "RAM",
-  "adapter.gpu": "GPU",
-  "adapter.uploads": "上传次数",
-  "adapter.deleteConfirm": "删除 adapter「{id} · {version}」？",
 
   "translate.title": "并行翻译",
   "translate.subtitle":
@@ -547,8 +529,6 @@ const zh = {
   "toast.statesRefreshed": "state 列表已刷新",
   "toast.stateUploaded": "已上传 state {name}",
   "toast.stateDeleted": "已删除 state {name}",
-  "toast.adapterRegistered": "已注册 adapter {id} · {version}",
-  "toast.adapterDeleted": "已删除 adapter {id}",
   "toast.unsupported": "该节点不支持此能力",
 
   "node.pollTimeout": "节点响应超时（超过 6 秒），可能正忙；稍后自动重试。",
@@ -558,7 +538,6 @@ const zh = {
   "error.noStream": "推理服务没有返回流",
   "error.noLogStream": "日志流没有响应体",
   "error.invalidSSE": "SSE 事件格式无效",
-  "error.adapterScale": "adapter scale 必须是有限数值",
   "error.batchSize": "batch 大小必须是 1 到 128 之间的整数",
   "error.storageFull": "浏览器存储已满或不可用。",
 } as const;
@@ -803,7 +782,6 @@ const en: Record<MessageKey, string> = {
   "chat.stop": "Stop generating",
   "chat.generation": "Generation",
   "chat.state": "State",
-  "chat.adapter": "MiSS adapter",
   "chat.thinkType": "think_type",
   "chat.thinkFast": "fast",
   "chat.thinkThink": "think",
@@ -837,7 +815,6 @@ const en: Record<MessageKey, string> = {
   "chat.conversations": "Conversations",
   "chat.newConversation": "New conversation",
   "chat.stateNone": "None",
-  "chat.adapterNone": "None",
   "chat.manage": "Manage",
   "chat.unavailable": "Unavailable",
   "chat.parameters": "Generation",
@@ -854,7 +831,6 @@ const en: Record<MessageKey, string> = {
   "chat.thinkOffHint": "Prefill a closed <think></think to skip thinking (fast)",
   "chat.thinkOnHint": "Prefill a half-open <think and force the model to think (free)",
   "chat.manageStates": "Manage states…",
-  "chat.manageAdapters": "Manage adapters…",
   "chat.loadingStates": "Reading state list…",
   "chat.stateUnavailable": "This node does not support /v1/state/list",
   "chat.thinking": "Thinking",
@@ -895,21 +871,6 @@ const en: Record<MessageKey, string> = {
   "file.choose": "Choose file",
   "file.dropHint": "or drop a file here",
 
-  "adapter.title": "MiSS adapter manager",
-  "adapter.description":
-    "Registered per adapter_id + version; inference selects one via adapter_id / adapter_version / adapter_scale.",
-  "adapter.id": "adapter_id",
-  "adapter.version": "version",
-  "adapter.rank": "rank",
-  "adapter.scale": "scale",
-  "adapter.registerPath": "Register from a node path",
-  "adapter.uploadPth": "Upload .pth",
-  "adapter.uploadJson": "Upload checkpoint.json (optional)",
-  "adapter.empty": "No adapter registered on this node.",
-  "adapter.ram": "RAM",
-  "adapter.gpu": "GPU",
-  "adapter.uploads": "uploads",
-  "adapter.deleteConfirm": "Delete adapter “{id} · {version}”?",
 
   "translate.title": "Parallel Translate",
   "translate.subtitle":
@@ -1117,8 +1078,6 @@ const en: Record<MessageKey, string> = {
   "toast.statesRefreshed": "State list refreshed",
   "toast.stateUploaded": "Uploaded state {name}",
   "toast.stateDeleted": "Deleted state {name}",
-  "toast.adapterRegistered": "Registered adapter {id} · {version}",
-  "toast.adapterDeleted": "Deleted adapter {id}",
   "toast.unsupported": "This node does not support that capability",
 
   "node.pollTimeout":
@@ -1129,7 +1088,6 @@ const en: Record<MessageKey, string> = {
   "error.noStream": "The inference service returned no stream",
   "error.noLogStream": "The log stream has no response body",
   "error.invalidSSE": "Invalid SSE event",
-  "error.adapterScale": "Adapter scale must be finite",
   "error.batchSize": "Batch size must be an integer from 1 to 128",
   "error.storageFull": "Browser storage is full or unavailable.",
 };

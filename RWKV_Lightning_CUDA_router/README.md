@@ -1,12 +1,11 @@
 # RWKV Lightning CUDA Router
 
-Adapter forwarding described below applies only to legacy workers. The current native inference server has removed request adapters and their HTTP management endpoints. State APIs remain supported.
+Dynamic Adapter management and routing have been removed. `/v1/adapters` returns 404; requests containing `adapter_id`, `adapter_version`, or `adapter_scale` return 400. Remove old `adapter_upload_*` configuration keys. State APIs remain supported.
 
 English | [简体中文](README.zh-CN.md)
 
 An HTTP reverse proxy that balances RWKV inference servers by in-flight batch size
-instead of request count. Inference and SSE pass through; State and adapter
-management use a shared replication pipeline.
+instead of request count. Inference and SSE pass through; State management uses a replication pipeline.
 
 ## Run
 
@@ -31,19 +30,18 @@ internal/
     app.go, config.go            # Startup and configuration
     scheduler.go, proxy.go       # Scheduling, affinity, inference forwarding
     resource_sync.go             # Shared acknowledgments, errors, discovery
-    state_*.go, adapter_*.go     # Resource identities and replica tracking
+    state_*.go                  # State identities and replica tracking
     diagnostics.go              # Routing diagnostics
 cmd/rwkv-batch-loadtest/         # Standalone load-test command
 ```
 
-Both resources follow one pipeline: validate and guard the ID, broadcast to every
+State operations follow one pipeline: validate and guard the ID, broadcast to every
 worker, retry only failed uploads, wait for all results, validate identities, publish
 readiness, then respond. Readiness is committed before the acknowledgment reaches
-the client. State retains its shared UUID; adapters retain IDs and content versions.
-Existing resource-specific retry configuration keys remain supported.
+the client. State retains its shared UUID and existing retry configuration.
 
 - Upload, list, delete, and discovery share the HTTP broadcast module. Only uploads
-  retry. Lists/deletes also use the corresponding `*_upload_attempt_timeout_seconds`
+  retry. Lists/deletes also use the corresponding `state_upload_attempt_timeout_seconds`
   deadline (120 seconds by default); a shorter global timeout takes precedence.
   Discovery is bounded to five seconds and preserves auth headers and JSON `password`.
 - Concurrent mutations of the same ID return 409; inference for that ID is blocked
@@ -59,7 +57,7 @@ Existing resource-specific retry configuration keys remain supported.
   mutate resource registration.
 
 Run `go test -race ./...` and `go vet ./...` here. Tests cover the shared engine,
-the same failure contract for both resources, and real HTTP sockets connecting the
+the State failure contract, and real HTTP sockets connecting the
 router to three independent simulated workers for uploads, lists, and concurrent
 inference. These require no model/GPU and do not verify a deployed production cluster.
 
@@ -129,76 +127,23 @@ Deletion blocks new uses of that State, uncertain deletion stays blocked, and
 uniform validation/auth rejection restores previous readiness. Stale lists cannot
 undo upload/delete mutations.
 
-## Adapter replication
-
-`POST /v1/adapters` (multipart upload or JSON path registration), `GET /v1/adapters`,
-and `DELETE /v1/adapters` fan out to every configured worker, including workers in
-connection cooldown. Registration succeeds only when all workers accept the same
-`adapter_id` and content `version`. JSON `path` registration requires that path to
-be readable on every worker. Prefer multipart for separate machines: the router
-forwards the same PTH and optional legacy `checkpoint.json` bytes to each worker.
-
-```bash
-curl -sS http://127.0.0.1:8080/v1/adapters \
-  -F 'adapter_id=miss-r16-lr3e-5' \
-  -F 'file=@./rwkv7-g1k-7b-r16-lr3e-5-e2-miss.pth'
-```
-
-Add an `Authorization: Bearer ...` header when needed. Use the ID in generation
-requests, preferably with the returned `version` as `adapter_version`. If omitted,
-the router pins the request to its confirmed current content version instead of
-relying on potentially different per-worker latest registrations. `adapter_scale`,
-text `stop`, and SSE stop metadata are preserved.
-
-- Uploads default to three attempts per failed worker, with a 120-second attempt
-  deadline, bounded exponential backoff, jitter, and `Retry-After` support.
-  `adapter_upload_*` configures this independently of State uploads. Only transport,
-  response-read, timeout, and HTTP 408/429/500/502/503/504 failures retry, with the
-  same ID/body; successful workers and deterministic 4xx responses do not retry.
-- Partial failure returns HTTP 502 JSON with `adapter_id`, the confirmed `version`,
-  `ready_backends`, and `failed_backends`. Successful replicas remain available;
-  inference only uses healthy workers confirmed to hold the requested version.
-  State and adapter requirements must both be satisfied on the selected worker.
-  With no eligible worker, inference returns 503 without dropping either resource.
-  Inference itself is never replayed automatically.
-- New inference for an ID is blocked during its upload/delete. Concurrent mutations
-  of the same ID return 409. Deletion broadcasts to all workers and uncertain
-  results keep the deleted ID/version disabled. Deterministic rejection by all
-  workers, such as unauthorized requests, restores previous readiness.
-- Lists compare `(id, version, manifest)` across all workers, ignoring order and
-  worker-local cache statistics. Differences return 502 instead of a random
-  worker's list. On success, statistics belong to the first worker, not the cluster
-  total. Stale lists cannot overwrite upload/delete results.
-- After restart or an unknown adapter request, a five-second bounded list probe
-  rebuilds readiness. Existing runtime lists do not expose latest-registration
-  order. A sole discovered version can be selected automatically; with multiple
-  versions for an ID, provide `adapter_version` or re-register through the router.
-
-Replication is not a distributed transaction and does not retry forever after
-returning an error. Re-upload with the same ID to synchronize again, then check the
-router list. An outer Cloudflare 502/timeout can still occur after an upload has
-actually completed; use the cluster-wide router list to confirm the result.
-States must likewise be uploaded through `/v1/state/*`. Files previously uploaded
-to just one worker by an older router are not automatically copied to other hosts.
-
 ## Diagnosing lists that fail after a successful upload
 
 A timeout, 401/502, HTML error page, or invalid JSON list no longer erases confirmed
-State or adapter registrations. A valid list confirming absence or a different identity,
-or a runtime `uploaded state not found` / `unknown adapter id/version` response,
+State registrations. A valid list confirming absence or a different identity,
+or a runtime `uploaded state not found` response,
 revokes the corresponding replica's readiness. Transport
 failures still trigger connection cooldown; they do not establish deletion.
 The list endpoint continues to report actual upstream failures and differences.
 
 Logs identify each worker's upload attempts, status, elapsed time, and confirmed
-ID/version. List diagnostics include the worker and parsing/status failure. For
+State ID. List diagnostics include the worker and parsing/status failure. For
 inconsistent lists, `failed_backends[].error` names the reference worker and the
-missing, extra, or manifest-mismatched ID/version pairs. Upload contents and
-credentials are not logged. `route_unavailable` records per-worker health, adapter
-and State readiness, and mutation state.
+missing, extra, or metadata-mismatched State entries. Upload contents and
+credentials are not logged. `route_unavailable` records per-worker health, State readiness, and mutation state.
 
 Generation responses include `X-RWKV-Backend`, the router-selected worker name;
-`route_selected` logs the session ID and adapter version. Requests with the same
+`route_selected` logs the session ID and State ID. Requests with the same
 `session_id` or `X-RWKV-Session-Id` remain on that worker, including concurrent
 requests, while it is healthy and holds the required resources. Failure or missing
 resources can move the session. Identical messages alone do not establish affinity.

@@ -17,22 +17,16 @@ type backend struct {
 }
 
 type scheduler struct {
-	mu           sync.Mutex
-	backends     []*backend
-	next         uint64
-	sessions     map[string]*backend
-	cooldown     time.Duration
-	states       map[string]*statePlacement
-	stateEpoch   uint64
-	adapters     map[string]*adapterPlacement
-	adapterEpoch uint64
+	mu         sync.Mutex
+	backends   []*backend
+	next       uint64
+	sessions   map[string]*backend
+	cooldown   time.Duration
+	states     map[string]*statePlacement
+	stateEpoch uint64
 }
 
 func (s *scheduler) acquire(bsz int64, session, stateID string) (*backend, func(), error) {
-	return s.acquireWithAdapter(bsz, session, stateID, "", "")
-}
-
-func (s *scheduler) acquireWithAdapter(bsz int64, session, stateID, adapterID, adapterVersion string) (*backend, func(), error) {
 	if bsz < 1 {
 		bsz = 1
 	}
@@ -40,7 +34,7 @@ func (s *scheduler) acquireWithAdapter(bsz int64, session, stateID, adapterID, a
 	defer s.mu.Unlock()
 	now := time.Now()
 	if session != "" {
-		if b := s.sessions[session]; b != nil && !now.Before(b.unhealthy) && s.stateReadyLocked(stateID, b) && s.adapterReadyLocked(adapterID, adapterVersion, b) {
+		if b := s.sessions[session]; b != nil && !now.Before(b.unhealthy) && s.stateReadyLocked(stateID, b) {
 			b.inflight += bsz
 			return b, s.releaseFunc(b, bsz), nil
 		}
@@ -49,7 +43,7 @@ func (s *scheduler) acquireWithAdapter(bsz int64, session, stateID, adapterID, a
 	best := math.Inf(1)
 	for offset := 0; offset < len(s.backends); offset++ {
 		b := s.backends[(int(s.next)+offset)%len(s.backends)]
-		if now.Before(b.unhealthy) || !s.stateReadyLocked(stateID, b) || !s.adapterReadyLocked(adapterID, adapterVersion, b) {
+		if now.Before(b.unhealthy) || !s.stateReadyLocked(stateID, b) {
 			continue
 		}
 		load := float64(b.inflight) / b.weight
@@ -58,9 +52,6 @@ func (s *scheduler) acquireWithAdapter(bsz int64, session, stateID, adapterID, a
 		}
 	}
 	if chosen == nil {
-		if adapterID != "" {
-			return nil, nil, errors.New("no healthy upstream backend has the requested adapter/version and State ready; specify adapter_version when multiple versions are registered")
-		}
 		if stateID == "" {
 			return nil, nil, errors.New("all upstream backends are temporarily unavailable")
 		}

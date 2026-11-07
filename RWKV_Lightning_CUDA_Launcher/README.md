@@ -8,7 +8,7 @@ Go Launcher + React / TypeScript 静态 WebUI，使用 Vite 构建、Tailwind CS
 - [控制面 API 参考](docs/control-plane-api.md)：完整路由、请求体、返回值与兼容约定。
 - [前端开发指南](docs/frontend-development.md)：工程结构、Tailwind 接入、多后端架构、Bun 与测试。
 - [未决事项](docs/open-items.md)：已知但未修的问题、需要先做决定的兼容性取舍、尚未实机验收的范围。
-- [原生推理 API](../rwkv_lightning_api_doc.md)：C++ server 的生成、模型、state、adapter 接口。
+- [原生推理 API](../rwkv_lightning_api_doc.md)：C++ server 的生成、模型与 State 接口。
 
 前端框架是 React，样式为 Tailwind CSS 4（CSS-first `@theme` 令牌 + shadcn 风格自建组件 + Radix primitives），不使用 HeroUI；Bun 用于依赖管理、脚本执行和测试。
 
@@ -94,7 +94,7 @@ Vite 将 `/api` 和 `/v1` 转发到 `127.0.0.1:10721`，并把请求的 `Origin`
 - **Runtime**：输入真实模型和词表路径，可浏览远端白名单目录，宿主机对话框仅在节点宣告 `host_dialog` 时出现。Start 使用当前表单；Restart 使用实际运行配置。配置修改在下次 Stop → Start 后生效。
 - 选卡是三态字符串：缺省沿用 Agent `--card` / 继承环境、空串显式不注入、显式值如 `0,1`；Runtime / 训练 / 量化共用同一控件。
 - 动态加载时，模型路径必须为目录。启动服务后，在模型列表中选择并 Load，再开始 Chat / Translate。Ready 表示 HTTP 服务已就绪，模型是否加载另行判断。
-- **Chat**：真实 SSE 增量输出，支持 Markdown、代码高亮、表格、Stop、重新生成、HTML 预览。思考开关为「自动 / 关 / 开」三档。右侧生成参数面板调整 temperature / top_p / top_k / max_tokens 与重复惩罚，并选择 State 与 MiSS adapter。会话按 backend ID 隔离；停止或网络中断保留部分输出。
+- **Chat**：真实 SSE 增量输出，支持 Markdown、代码高亮、表格、Stop、重新生成、HTML 预览。思考开关为「自动 / 关 / 开」三档。右侧生成参数面板调整 temperature / top_p / top_k / max_tokens 与重复惩罚，并选择 State。会话按 backend ID 隔离；停止或网络中断保留部分输出。
 - **并行翻译**：按非空行生成原始续写任务，直接调用 `/v1/batch/completions`，每批 1–128 行非流式执行并按 `choices[].index` 合并。任务栏放语言、batch 与开始 / 停止，不能开始时直接写明原因；译文逐行显示状态（等待 / 进行中 / 完成 / 失败），失败行显示错误原因，可重试失败行、继续被停止的剩余行。结果记录所属节点，切换节点不会串结果。
 - 语言名允许自定义，未知值回退默认。复制 / TXT / Markdown 导出已完成的行。
 - **State / MiSS 训练**：通过真实 CLI 训练，JSONL 每行必须恰好为一个字符串 `text` 字段，或一个 `segments` 数组（每项恰好为字符串 `text` 和布尔 `train`，只对 `train:true` 片段计算 loss）；「校验数据集」在 Go 宿主机执行，拒绝额外/重复字段。参数分组并提供「推荐 / 低显存 / 试跑」预设。进度卡显示真实 step / epoch / loss / LR / tokens/s / ETA、可切换并平滑的 loss / lr / tok/s 曲线和实际保存的 checkpoint 路径；进程输出在日志抽屉里查看。
@@ -171,7 +171,7 @@ Launcher WebUI 默认训练参数（启动时会完整传给 CLI）：
 
 State tuning 使用 `.pth` 基础模型，最终张量结构由原生加载器验证。State checkpoint 只有 FP32 state tensors，不含 optimizer，State 模式不提供续训恢复。日志中的 epoch 值为 CLI 原值。
 
-### MiSS 训练与推理
+### MiSS 训练
 
 在 **State / MiSS Training** 页面将 Method 切换为 **MiSS adapter**，Launcher 会启动同目录的 `rwkv_miss_tune`。
 提供 rank、alpha、六类 Linear targets、初始 state、checkpoint 续训目录，以及原有 ctx/chunk、梯度累积 batch、学习率和 WKV tape 设置。
@@ -179,14 +179,8 @@ State tuning 使用 `.pth` 基础模型，最终张量结构由原生加载器�
 恢复时选择 `checkpoint-N` 目录，保持原模型、数据与训练配置，并选择新的输出目录。
 周期保存仍为 `checkpoint-N/{checkpoint.json,training.pth}`；结束生成单个 `adapter-final.pth`。
 
-在 Chat 右侧生成参数面板的 **MiSS adapter**「管理」中：
-
-- 选择最终 PTH 或新 checkpoint 的 `training.pth` 后立即上传并用于新请求；adapter ID 可选，留空时使用去掉 `.pth` 的文件名。旧 checkpoint 可先附带 `checkpoint.json`。
-- 也可填写服务器已有文件的绝对路径注册。
-- 注册只缓存 D 到服务器 RAM；首次调用才装入 GPU。
-- 选择具体内容版本，并按需覆盖 scale；留空使用默认值，0 保留为显式零。
-- 所选 adapter 是全局生成设置：Chat 和并行翻译的新请求都携带 `adapter_id/adapter_version/adapter_scale`；运行中的请求不受切换影响。
-- 可刷新列表、删除指定版本和查看 RAM/GPU 驻留量及 H2D 次数。服务器重启后需重新注册。
+推理端已移除动态 Adapter 管理和按请求选择；训练产物仍正常导出与续训。
+State 上传、按请求选择及缓存继续支持。
 
 管理本地 runtime 时，Go 自动透传其鉴权信息；远程节点使用添加 / 编辑后端时填写的 Agent token，由本机 Client 注入，浏览器不保存。
 

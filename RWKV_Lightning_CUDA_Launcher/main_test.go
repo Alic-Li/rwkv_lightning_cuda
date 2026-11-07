@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -228,7 +227,7 @@ func TestNativeMissLifecycle(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(30 * time.Second)
 		for time.Now().Before(deadline) {
-			s := call("GET", "/api/tuning/status", nil)
+			s := call("GET", "/api/v1/jobs/tuning", nil)
 			if s["running"] == false {
 				if s["status"] != "completed" {
 					t.Fatal(s)
@@ -240,18 +239,18 @@ func TestNativeMissLifecycle(t *testing.T) {
 		t.Fatal("native training timed out")
 	}
 	cfg := tuneRequest{Method: "miss", Model: filepath.Join(fixture, "tiny.pth"), Data: filepath.Join(fixture, "train.jsonl"), Vocab: filepath.Join(fixture, "vocab.txt"), Output: filepath.Join(t.TempDir(), "first"), Ctx: 30, Chunk: 7, Epochs: 4, BatchSize: 2, MaxSteps: 1, LR: .003, LRFinal: .003, SaveEvery: 1, Seed: 1234, Rank: 8, Alpha: 8, Targets: "all", Optimizer: "adam", WKVTape: true}
-	if call("GET", "/api/tuning/status", nil)["miss_available"] != true {
+	if call("GET", "/api/v1/jobs/tuning", nil)["miss_available"] != true {
 		t.Fatal("missing trainer detection")
 	}
-	call("POST", "/api/tuning/start", cfg)
+	call("POST", "/api/v1/jobs/tuning", cfg)
 	wait()
 	cfg.Resume = filepath.Join(cfg.Output, "checkpoint-1")
 	cfg.Output = filepath.Join(t.TempDir(), "resumed")
 	cfg.MaxSteps = 2
-	call("POST", "/api/tuning/start", cfg)
+	call("POST", "/api/v1/jobs/tuning", cfg)
 	wait()
 	final := filepath.Join(cfg.Output, "adapter-final.pth")
-	if call("GET", "/api/tuning/status", nil)["checkpoint"] != final {
+	if call("GET", "/api/v1/jobs/tuning", nil)["checkpoint"] != final {
 		t.Fatal("missing final export path")
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -260,7 +259,7 @@ func TestNativeMissLifecycle(t *testing.T) {
 	}
 	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
 	listener.Close()
-	call("POST", "/api/start", startRequest{ModelPath: cfg.Model, VocabPath: cfg.Vocab, Port: port, Password: "miss-test-password", ChunkSize: 32, UseWKV32: true, StateDBPath: filepath.Join(t.TempDir(), "state.db")})
+	call("POST", "/api/v1/runtime/start", startRequest{ModelPath: cfg.Model, VocabPath: cfg.Vocab, Port: port, Password: "miss-test-password", ChunkSize: 32, UseWKV32: true, StateDBPath: filepath.Join(t.TempDir(), "state.db")})
 	deadline := time.Now().Add(30 * time.Second)
 	for l.status()["status"] != "ready" {
 		if time.Now().After(deadline) {
@@ -268,41 +267,17 @@ func TestNativeMissLifecycle(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	var payload bytes.Buffer
-	writer := multipart.NewWriter(&payload)
-	writer.WriteField("adapter_id", "test")
-	part, _ := writer.CreateFormFile("file", "training.pth")
-	file, err := os.Open(filepath.Join(cfg.Output, "checkpoint-2", "training.pth"))
-	if err != nil {
-		t.Fatal(err)
+	for _, method := range []string{"GET", "POST", "DELETE"} {
+		w := httptest.NewRecorder()
+		l.handler().ServeHTTP(w, httptest.NewRequest(method, "http://127.0.0.1:10721/v1/adapters", nil))
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("retired endpoint: %d", w.Code)
+		}
 	}
-	_, err = io.Copy(part, file)
-	file.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer.Close()
-	r := httptest.NewRequest("POST", "http://127.0.0.1:10721/v1/adapters", &payload)
-	r.Header.Set("Content-Type", writer.FormDataContentType())
-	w := httptest.NewRecorder()
-	l.handler().ServeHTTP(w, r)
-	if w.Code != 200 {
-		t.Fatal(w.Code, w.Body.String())
-	}
-	stats := call("GET", "/v1/adapters", nil)
-	if stats["uploads"] != float64(0) {
-		t.Fatal(stats)
-	}
-	var registration map[string]string
-	json.Unmarshal(w.Body.Bytes(), &registration)
-	body := map[string]any{"contents": []string{"abcabc"}, "adapter_id": "test", "adapter_version": registration["version"], "adapter_scale": 1, "max_tokens": 1, "temperature": 1, "top_k": 1, "stop_tokens": []int{}, "stream": false}
-	call("POST", "/v1/chat/completions", body)
-	call("POST", "/v1/chat/completions", body)
-	if call("GET", "/v1/adapters", nil)["uploads"] != float64(1) {
-		t.Fatal("repeated adapter H2D")
-	}
-	call("DELETE", "/v1/adapters", map[string]string{"adapter_id": "test", "adapter_version": registration["version"]})
-	call("POST", "/api/stop", map[string]any{})
+	body := map[string]any{"contents": []string{"abcabc"}, "max_tokens": 1, "temperature": 1, "top_k": 1, "stop_tokens": []int{}, "stream": false}
+	call("POST", "/v1/batch/completions", body)
+	call("POST", "/v1/batch/completions", body)
+	call("POST", "/api/v1/runtime/stop", map[string]any{})
 }
 func TestProcessLogsAndProgress(t *testing.T) {
 	t.Setenv("RWKV_TEST_CHILD", "logs")

@@ -23,7 +23,7 @@ export function FileDrop({
   accept: string;
   label: string;
   hint?: string;
-  /** Selected file, when the caller keeps one (adapter metadata does). */
+  /** Selected file, when the caller keeps one. */
   file?: File;
   disabled?: boolean;
   onFile: (file: File | undefined) => void;

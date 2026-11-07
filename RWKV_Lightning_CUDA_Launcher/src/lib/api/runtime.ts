@@ -36,8 +36,7 @@ export const runtimeApi = {
 
   /**
    * Hand a .pth that already sits on the node to the runtime's multipart
-   * upload. The native API registers an *adapter* from a server-side path but
-   * has no path form for a state, so the Agent does that hop
+   * upload. The native API has no path form for a State, so the Agent does that hop
    * (`state_import` capability).
    */
   importState: (backendId: string, path: string) =>

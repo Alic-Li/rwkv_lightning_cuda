@@ -28,9 +28,6 @@ export const storage = {
 };
 
 export interface GenerationSettings {
-  adapter_id?: string;
-  adapter_version?: string;
-  adapter_scale?: string;
   temperature: number;
   top_p: number;
   top_k: number;
@@ -57,9 +54,6 @@ export const THINK_TYPES = [
 ] as const;
 
 export const defaultGeneration: GenerationSettings = {
-  adapter_id: "",
-  adapter_version: "",
-  adapter_scale: "",
   temperature: 1,
   top_p: 0.3,
   top_k: 20,
@@ -71,6 +65,20 @@ export const defaultGeneration: GenerationSettings = {
   think_type: "fast",
   state_id: "",
 };
+
+/** Discard retired/unknown fields from persisted generation settings. */
+export function normalizeGeneration(
+  value?: Partial<GenerationSettings>,
+): GenerationSettings {
+  const result = { ...defaultGeneration };
+  for (const key of Object.keys(
+    defaultGeneration,
+  ) as (keyof GenerationSettings)[]) {
+    if (value?.[key] !== undefined)
+      Object.assign(result, { [key]: value[key] });
+  }
+  return result;
+}
 
 export interface SettingsValues {
   theme: ThemeMode;
@@ -113,29 +121,49 @@ export const useSettings = create(
   persist<SettingsState>(
     (set) => ({
       ...defaults,
-      set: (patch) => set(patch),
+      set: (patch) =>
+        set({
+          ...patch,
+          ...(patch.generation
+            ? { generation: normalizeGeneration(patch.generation) }
+            : {}),
+        }),
       setGeneration: (patch) =>
-        set((s) => ({ generation: { ...s.generation, ...patch } })),
+        set((s) => ({
+          generation: normalizeGeneration({ ...s.generation, ...patch }),
+        })),
       reset: () => set({ ...defaults }),
     }),
     {
       name: "rwkv-settings-v2",
-      version: 3,
+      version: 4,
       storage: createJSONStorage(() => storage),
+      merge: (persisted, current) => {
+        const saved = persisted as Partial<SettingsValues> | undefined;
+        return {
+          ...current,
+          ...saved,
+          generation: normalizeGeneration(saved?.generation),
+        };
+      },
       migrate: (persisted, version) => {
-        if (version >= 3) return persisted as SettingsState;
         // v1 nested everything under `values` and kept a per-install baseURL.
         const legacy =
           version >= 2
-            ? (persisted as Partial<SettingsValues> | undefined) ?? {}
+            ? ((persisted as Partial<SettingsValues> | undefined) ?? {})
             : ((persisted as PersistedV1 | undefined)?.values ?? {});
         return {
           ...defaults,
           ...legacy,
           // Dark used to be the hard-coded default rather than a choice, so a
           // stored "dark" carries no intent: switch those installs to system.
-          theme: legacy.theme === "light" ? "light" : "system",
-          generation: { ...defaultGeneration, ...legacy.generation },
+          theme:
+            version >= 3
+              ? (legacy.theme ?? defaults.theme)
+              : legacy.theme === "light"
+                ? "light"
+                : "system",
+          generation: normalizeGeneration(legacy.generation),
         } as SettingsState;
       },
     },

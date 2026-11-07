@@ -1,6 +1,6 @@
 # Launcher 控制面 API 与多后端形态
 
-下文的 Adapter 转发接口仅适用于旧版后端；当前原生推理 Server 已移除请求级 Adapter 与 HTTP 管理接口。State API 继续支持。
+Launcher 不再提供动态 Adapter 管理和选择；直接或经后端前缀访问 `/v1/adapters` 返回 404。State API 与训练保持支持。
 
 本文是 Launcher 控制面当前实现的接口参考。首次接入先读 [前端与第三方联调指南](integration-guide.md)；工程准备见 [前端开发指南](frontend-development.md)。原生推理 API 见 [完整参考](../../rwkv_lightning_api_doc.md) 与 [示例](../../docs/http-api.zh-CN.md)。
 
@@ -319,8 +319,7 @@ body：`{ "model": "<动态模式模型 ID，可省略>", "visible_devices": "<�
 
 #### `POST /api/v1/runtime/state/import`
 
-body：`{ "path": "<节点上的 .pth 绝对路径>" }`。原生 API 能从服务端路径注册 **adapter**
-（`POST /v1/adapters {adapter_id, path}`），但 **state 只有 multipart 上传**，没有路径形式。
+body：`{ "path": "<节点上的 .pth 绝对路径>" }`。原生 API 的 **State 只有 multipart 上传**，没有路径形式。
 于是这一跳由 Agent 补：按 §5.5 白名单解析路径（越界 403 且不回显路径）→ 校验是普通文件、
 非空、`.pth`、不超过原生 512 MiB 上限 → 以流式 multipart POST 到本机推理服务
 `/v1/state/upload`（multipart 用 Bearer 头鉴权，不读 JSON `password`）→ **原样转发**推理服务的

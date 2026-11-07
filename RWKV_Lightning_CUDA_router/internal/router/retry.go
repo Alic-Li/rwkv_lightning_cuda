@@ -22,18 +22,5 @@ func configuredUploadPolicy(c config) (uploadRetryPolicy, error) {
 	return p, nil
 }
 
-func configuredAdapterUploadPolicy(c config) (uploadRetryPolicy, error) {
-	p, err := configuredUploadPolicy(config{
-		StateUploadMaxAttempts:           c.AdapterUploadMaxAttempts,
-		StateUploadAttemptTimeoutSeconds: c.AdapterUploadAttemptTimeoutSeconds,
-		StateUploadRetryBaseMS:           c.AdapterUploadRetryBaseMS,
-		StateUploadRetryMaxMS:            c.AdapterUploadRetryMaxMS,
-	})
-	if err != nil {
-		return p, errors.New("invalid adapter upload retry configuration")
-	}
-	return p, nil
-}
-
 func retryableResourceResponse(r resourceResponse) bool { return broadcast.Retryable(r.status, r.err) }
 func retryAfter(h http.Header) time.Duration            { return broadcast.RetryAfter(h) }
