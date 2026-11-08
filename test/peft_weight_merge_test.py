@@ -90,6 +90,10 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(result.returncode == 0, ok, result.stdout+result.stderr)
         if not ok:
             self.assertFalse(output.exists())
+        else:
+            self.assertEqual(output.read_bytes()[-22:-18], b'PK\x05\x06')
+            with zipfile.ZipFile(output) as z:
+                self.assertEqual(z.comment, b'')
         self.assertFalse(list(self.root.glob('*.merge-*')))
         return output
 

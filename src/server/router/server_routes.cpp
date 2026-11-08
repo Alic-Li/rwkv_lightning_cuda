@@ -159,12 +159,22 @@ void register_server_routes(
             request_id,
             request_id);
         active->generated_tokens.store(paused->generated_tokens);
+        auto finish_guard = RequestRegistry::instance().scoped_finish(active);
 
         auto state_ptr = paused->state;
         auto logits_ptr = paused->logits;
         const auto saved_generated_tokens = paused->generated_tokens;
-        cb(make_sse_response([&engine, admission, active, state_ptr, logits_ptr, options, chunk_size, request_id, model,
+        auto paused_holder = std::make_shared<std::optional<RequestRegistry::PausedRequest>>(std::move(*paused));
+        auto restore_guard = std::shared_ptr<void>(nullptr, [paused_holder](void*) {
+          if (paused_holder->has_value()) {
+            RequestRegistry::instance().put_paused(std::move(**paused_holder));
+          }
+        });
+        cb(make_sse_response([&engine, admission, active, finish_guard, paused_holder, restore_guard,
+                              state_ptr, logits_ptr, options, chunk_size, request_id, model,
                               saved_generated_tokens](ResponseStreamPtr stream) {
+          (void)restore_guard;
+          paused_holder->reset();
           start_streaming_task(
               std::move(stream),
               request_id,
@@ -211,7 +221,8 @@ void register_server_routes(
                 }
                 return stats;
               },
-              [active]() {
+              [active, finish_guard]() {
+                (void)finish_guard;
                 RequestRegistry::instance().finish(active);
               });
         }));

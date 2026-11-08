@@ -136,7 +136,7 @@ Training checkpoints carry embedded metadata. The package loader and export form
 The loader checks format, shapes, duplicate targets, finite values and content hash.
 Training validates the source base fingerprint.
 
-The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Adapter checkout and weight merging are not implemented.
+The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Online adapter checkout and online weight merging are not implemented in the server; use `rwkv_peft_weight_merge` for offline weight merging.
 
 ## Profiling
 

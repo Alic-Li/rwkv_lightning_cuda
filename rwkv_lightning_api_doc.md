@@ -666,7 +666,7 @@ Authorization: Bearer your-password
 `chunk_size` 是输出刷新粒度，不是 prefill 分块。prefill 分块由进程启动参数
 `--chunk-size` 全局控制，默认 `128`。
 
-原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留，本阶段不实现 Adapter Checkout 或权重融合。
+原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留；服务端不支持在线 Adapter Checkout 或在线权重融合，离线权重融合请使用 [`rwkv_peft_weight_merge`](docs/peft-weight-merge.zh-CN.md)。
 
 初始 State API 详见 [HTTP API 中文文档](docs/http-api.zh-CN.md#状态端点速查)。
 

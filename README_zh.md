@@ -33,7 +33,7 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 - 冻结基模训练 MiSS adapter，支持 checkpoint 续训和导出。
 - 多后端路由和带 Web UI 的桌面启动器。
 
-原生推理 Server 使用当前模型权重，保留动态 State；不支持请求级 Adapter、Adapter HTTP 管理或权重融合。
+原生推理 Server 使用当前模型权重，保留动态 State；不支持请求级 Adapter、Adapter HTTP 管理或服务端在线权重融合（离线合并请使用 `rwkv_peft_weight_merge`）。
 
 ## 快速开始
 对于 Ubuntu 24.04 LTS，使用以下命令安装依赖：

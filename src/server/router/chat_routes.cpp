@@ -52,9 +52,10 @@ void register_chat_routes(
             model,
             options.max_tokens,
             prompt_tokens);
+        auto finish_guard = RequestRegistry::instance().scoped_finish(active);
 
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, admission, prompt, state_id, options, active, model,
+          cb(make_sse_response([&engine, admission, prompt, state_id, options, active, finish_guard, model,
                                 chunk_size = parse_chunk_size(*json, 2)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
@@ -110,7 +111,8 @@ void register_chat_routes(
                   }
                   return stats;
                 },
-                [active]() {
+                [active, finish_guard]() {
+                  (void)finish_guard;
                   RequestRegistry::instance().finish(active);
                 });
           }));

@@ -170,7 +170,6 @@ class ModelBackend final : public IModelBackend {
   const std::string& model_path() const override;
   const std::string& model_name() const override;
   std::string runtime_identity() const override;
-  const std::string &base_fingerprint() const;
 
  private:
   struct Impl;

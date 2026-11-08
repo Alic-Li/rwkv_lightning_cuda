@@ -1613,14 +1613,9 @@ struct ModelBackend::Impl {
         model_name(basename_without_extension(model_path)),
         use_wkv32(use_wkv32_), chunk_load(chunk_load_),
         cmix_sparse(std::move(cmix_sparse_)),
-        weights(load_backend_weights(model_path, chunk_load)) {
-    fingerprint = llm_infer::is_quantized_archive(model_path)
-                      ? rwkv7_miss::source_fingerprint(model_path)
-                      : rwkv7_miss::fingerprint_file(model_path);
-  }
+        weights(load_backend_weights(model_path, chunk_load)) {}
 
   const std::string runtime_identity = rwkv7_miss::new_runtime_identity();
-  std::string fingerprint;
   std::string model_path;
   std::string model_name;
   bool use_wkv32 = false;
@@ -1962,10 +1957,6 @@ int ModelBackend::vocab_size() const {
 
 const std::string& ModelBackend::model_path() const {
   return impl_->model_path;
-}
-
-const std::string &ModelBackend::base_fingerprint() const {
-  return impl_->fingerprint;
 }
 
 std::string ModelBackend::runtime_identity() const {

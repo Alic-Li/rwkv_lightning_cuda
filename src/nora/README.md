@@ -65,7 +65,7 @@ uses `method=nora`, `layout=low_rank_ba`, `initialization=nora_init`, rank, alph
 scale, base fingerprint and content digest. A/B shapes and native bytes are both
 validated and hashed. No initialization is reapplied when loading trained A.
 
-The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Adapter checkout and weight merging are not implemented.
+The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Online adapter checkout and online weight merging are not implemented in the server; use `rwkv_peft_weight_merge` for offline weight merging.
 
 ## Online tuning server
 

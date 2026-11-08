@@ -71,9 +71,10 @@ void register_session_routes(
             options.max_tokens,
             prompt_tokens,
             session_id);
+        auto finish_guard = RequestRegistry::instance().scoped_finish(active);
         if ((*json).get("stream", false).asBool()) {
           cb(make_sse_response([&engine, admission, session_id, state_id, prompts, options,
-                                active, model, chunk_size = parse_chunk_size(*json, 8)](
+                                active, finish_guard, model, chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
                 std::move(stream),
@@ -111,7 +112,8 @@ void register_session_routes(
                   StateCacheManager::instance().put_state(session_id, *state_ptr);
                   return stats;
                 },
-                [active]() {
+                [active, finish_guard]() {
+                  (void)finish_guard;
                   RequestRegistry::instance().finish(active);
                 });
           }));

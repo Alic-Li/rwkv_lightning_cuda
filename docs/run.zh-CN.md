@@ -117,6 +117,6 @@ checkpoint，以及与训练 checkpoint 分离的推理导出：
   --save-every 100 --wkv_tape
 ```
 
-原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留，本阶段不实现 Adapter Checkout 或权重融合。
+原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留；服务端不支持在线 Adapter Checkout 或在线权重融合，离线权重融合请使用 [`rwkv_peft_weight_merge`](peft-weight-merge.zh-CN.md)。
 
 训练、续训和验收说明见 [MiSS 文档](../src/miss/README.zh-CN.md)。

@@ -136,7 +136,7 @@ curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/state/delete" \
 When `--password` is enabled, use an `Authorization: Bearer ...` header for the
 multipart upload request.
 
-The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Adapter checkout and weight merging are not implemented.
+The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Online adapter checkout and online weight merging are not implemented in the server; use `rwkv_peft_weight_merge` for offline weight merging.
 
 ## Chat completions
 

@@ -118,7 +118,7 @@ Adam 动量、初始状态、优化器步数、调度总步数、数据集轮次
 加载器检查格式、形状、重复目标、有限值和内容哈希，
 训练时校验来源基模指纹。
 
-原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留，本阶段不实现 Adapter Checkout 或权重融合。
+原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留；服务端不支持在线 Adapter Checkout 或在线权重融合，离线权重融合请使用 [`rwkv_peft_weight_merge`](../../docs/peft-weight-merge.zh-CN.md)。
 
 ## 性能分析
 

@@ -705,13 +705,15 @@ int main(int argc, char **argv) {
         const double elapsed = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - started)
                                    .count();
+        const std::uint64_t display_steps =
+            options.max_steps ? std::min(planned, options.max_steps) : planned;
         const double fraction =
-            std::min(1.0, static_cast<double>(global_step) / planned);
+            std::min(1.0, static_cast<double>(global_step) / display_steps);
         const int filled = static_cast<int>(fraction * 24);
         if (primary)
           std::cout << '\r' << '[' << std::string(filled, '=')
                     << std::string(24 - filled, ' ') << "] " << global_step
-                    << '/' << planned << " epoch=" << epoch << '/'
+                    << '/' << display_steps << " epoch=" << epoch << '/'
                     << options.epochs << " loss=" << std::fixed
                     << std::setprecision(4) << batch_loss
                     << " batch=" << global_batch_size
@@ -721,8 +723,11 @@ int main(int argc, char **argv) {
                     << " tok/s=" << std::setprecision(1)
                     << processed_tokens / elapsed
                     << " ETA=" << std::setprecision(0)
-                    << elapsed / global_step * (planned - global_step) << "s   "
-                    << std::flush;
+                    << elapsed / global_step *
+                           (display_steps > global_step
+                                ? display_steps - global_step
+                                : 0)
+                    << "s   " << std::flush;
         if (options.save_every && global_step % options.save_every == 0) {
           if (primary) {
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)

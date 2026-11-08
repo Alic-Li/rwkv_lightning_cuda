@@ -1,7 +1,5 @@
 # HTTP API 示例
 
-适配器接口及生成请求中的适配器字段也支持 [NoRA-init 包](../src/nora/README.md)，根据 manifest 自动选择算法，缓存预算包含 A、B 两组参数。
-
 [English](http-api.md) | 简体中文 | [返回 README](../README_zh.md)
 
 本页介绍原生推理服务；Launcher 的 Client/Agent 控制、鉴权和后端转发请看[联调指南](../RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md)。
@@ -158,7 +156,7 @@ curl -sS "${AUTH_HEADER[@]}" -X DELETE \
 此接口管理上传的初始状态文件；生成期间缓存的 `session_id` 会话由
 [`/state/status` 和 `/state/delete`](#有状态补全) 管理。
 
-原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留，本阶段不实现 Adapter Checkout 或权重融合。
+原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留；服务端不支持在线 Adapter Checkout 或在线权重融合，离线权重融合请使用 [`rwkv_peft_weight_merge`](peft-weight-merge.zh-CN.md)。
 
 ## 聊天补全
 

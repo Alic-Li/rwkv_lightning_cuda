@@ -55,8 +55,9 @@ void register_batch_routes(
             model,
             options.max_tokens,
             prompt_tokens);
+        auto finish_guard = RequestRegistry::instance().scoped_finish(active);
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, admission, active, prompts, state_id, options, model, metrics_requested,
+          cb(make_sse_response([&engine, admission, active, finish_guard, prompts, state_id, options, model, metrics_requested,
                                 chunk_size = parse_chunk_size(*json, 8)](
                                    ResponseStreamPtr stream) {
             auto matched_stops = std::make_shared<std::vector<std::string>>(prompts.size());
@@ -106,7 +107,8 @@ void register_batch_routes(
                   }
                   return stats;
                 },
-                [active]() {
+                [active, finish_guard]() {
+                  (void)finish_guard;
                   RequestRegistry::instance().finish(active);
                 }, matched_stops);
           }));

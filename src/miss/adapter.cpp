@@ -318,9 +318,10 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
           for (auto bits : native) {
             const float x = bf16_storage ? llm_infer::bf16_bits_to_float(bits)
                                          : llm_infer::f16_bits_to_float(bits);
-            if (!std::isfinite(x) || std::abs(x) > 65504.0f)
-              throw std::runtime_error("adapter cannot be represented by the "
-                                       "FP16 inference runtime");
+            if (!std::isfinite(x) || (!bf16_storage && std::abs(x) > 65504.0f))
+              throw std::runtime_error(bf16_storage
+                                           ? "nonfinite BF16 adapter weight"
+                                           : "adapter weight overflows FP16");
           }
           p->data.insert(p->data.end(), native.begin(), native.end());
         });

@@ -138,6 +138,14 @@ class RequestRegistry {
     }
   }
 
+  std::shared_ptr<void> scoped_finish(const std::shared_ptr<ActiveRequest>& active) {
+    return std::shared_ptr<void>(nullptr, [this, active](void*) {
+      if (active) {
+        this->finish(active);
+      }
+    });
+  }
+
   void put_paused(PausedRequest paused) {
     std::lock_guard<std::mutex> lock(mutex_);
     paused_[paused.id] = std::move(paused);

@@ -329,7 +329,6 @@ public:
     integer(1, 4);
     integer(0x06054b50, 4);
     integer(0, 4);
-    integer(0, 4);
     integer(0xffffffff, 4);
     integer(0xffffffff, 4);
     integer(0xffffffff, 4);
@@ -340,16 +339,22 @@ public:
 struct Staging {
   fs::path dir;
   explicit Staging(const fs::path &output) {
+    const auto parent = output.parent_path();
+    require(parent.empty() || fs::is_directory(parent),
+            "output parent directory does not exist: " + parent.string());
     std::random_device random;
+    std::error_code last_error;
     for (int i = 0; i < 100; ++i) {
       auto candidate = output;
       candidate += ".merge-" + std::to_string(random());
-      if (fs::create_directory(candidate)) {
+      if (fs::create_directory(candidate, last_error)) {
         dir = candidate;
         return;
       }
     }
-    throw std::runtime_error("cannot reserve output staging directory");
+    throw std::runtime_error(
+        "cannot reserve output staging directory" +
+        (last_error ? ": " + last_error.message() : ""));
   }
   ~Staging() {
     std::error_code error;
@@ -513,8 +518,13 @@ int main(int argc, char **argv) {
     require(method == "miss" || method == "nora",
             "--method must be miss or nora");
     if (args.count("--threads")) {
-      size_t end;
-      int n = std::stoi(args.at("--threads"), &end);
+      size_t end = 0;
+      int n = 0;
+      try {
+        n = std::stoi(args.at("--threads"), &end);
+      } catch (const std::exception &) {
+        throw std::runtime_error("invalid --threads");
+      }
       require(end == args.at("--threads").size() && n > 0 && n <= 1024,
               "invalid --threads");
 #ifdef _OPENMP
@@ -530,8 +540,12 @@ int main(int argc, char **argv) {
     auto adapter = load_adapter(args.at("--adapter"), method);
     float scale = adapter.scale;
     if (args.count("--scale")) {
-      size_t end;
-      scale = std::stof(args.at("--scale"), &end);
+      size_t end = 0;
+      try {
+        scale = std::stof(args.at("--scale"), &end);
+      } catch (const std::exception &) {
+        throw std::runtime_error("invalid --scale");
+      }
       require(end == args.at("--scale").size() && std::isfinite(scale),
               "invalid --scale");
     }

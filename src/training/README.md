@@ -5,8 +5,8 @@
 (`rwkv::training`), independently of `rwkv7_fast_backend_core`.
 This directory owns training orchestration and the training library build;
 see [the source layout](../README.md) for model, kernel and I/O ownership. The existing
-FP16 inference backend remains unchanged apart from accepting BF16 adapter
-files. The legacy FP16 training sidecar has been removed. The layer forward/reverse
+FP16 inference backend remains unchanged and serves base or offline-merged
+checkpoints directly, while accepting BF16 state files. The legacy FP16 training sidecar has been removed. The layer forward/reverse
 implementations preserve its execution order; the linear, normalization, mixing and activation primitives
 implement the same RWKV ordering with BF16 inputs and outputs.
 
@@ -64,11 +64,11 @@ and initial state remain FP32 for exact resume. The configuration identifies
 `training_dtype=bfloat16`. FP16-backbone checkpoints are rejected for BF16 exact
 resume instead of silently changing the numerical model.
 
-The existing server accepts BF16 state exports, BF16 MiSS exports and MiSS
-`training.pth` files. Adapter RAM storage and content hashes retain the declared
-BF16 bytes. At a GPU cache miss, the FP16 inference runtime converts D in pinned
-staging once, then uploads the whole adapter; hot decode performs no repeated
-conversion or upload. This conversion is an inference-only boundary.
+The inference server accepts BF16 state exports directly. Standalone training
+and online RL tools (`rwkv_miss_tune_server`, `rwkv_nora_tune_server`,
+`rwkv_state_tune_server`) load BF16 MiSS/NoRA exports and `training.pth` files;
+for deployment in the FP16/quantized inference server, merge the trained adapter
+into the base checkpoint offline with `rwkv_peft_weight_merge`.
 
 ## Validation
 
@@ -76,8 +76,8 @@ conversion or upload. This conversion is an inference-only boundary.
 BF16 normalization backward, and tiny softmax gradients at a 262144-token batch
 normalizer without loss scaling. `tools/check_miss.py` checks BF16 full-model
 PyTorch gradients, all six targets, shared tapes, chunk/accumulation consistency,
-loss decrease, exact BF16 checkpoint resume/export, streamed source conversion,
-and FP16/W8A16/W4A16 serving. CUDA is exercised locally; HIP execution requires
+loss decrease, exact BF16 checkpoint resume/export, and streamed source
+conversion. CUDA is exercised locally; HIP execution requires
 an AMD GPU and must not be inferred from CUDA results.
 
 NoRA-init shares the trainer and chunk executor. See [NoRA](../nora/README.md) for random A initialization, both-factor gradients, checkpoint layout and launch examples.
