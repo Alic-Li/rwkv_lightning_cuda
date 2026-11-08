@@ -48,7 +48,9 @@ def run(args, assignment, prompt_suffix=''):
     with concurrent.futures.ThreadPoolExecutor(len(assignment)) as pool:
         results = list(pool.map(lambda p: one(*p), enumerate(assignment)))
     wall = time.monotonic() - t0
-    tokens = sum(r[4].get('completion_tokens', args.max_tokens) for r in results)
+    # stop_tokens=[] makes every row decode exactly max_tokens; usage counts
+    # re-tokenized text, which undercounts repetitive adapter outputs.
+    tokens = args.max_tokens * len(results)
     return wall, tokens, results
 
 
