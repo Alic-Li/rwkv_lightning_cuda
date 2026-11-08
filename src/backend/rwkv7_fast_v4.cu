@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -529,6 +530,14 @@ struct BackendProfile {
 
 struct ForwardResources {
   HalfArena arena;
+  DeviceBuffer<float> adapter_latent;
+  DeviceBuffer<rwkv7_miss::Linear> uniform_table;
+  std::vector<std::uint8_t> uniform_present;
+  int uniform_max_rank = 0;
+  const rwkv7_miss::GpuLease* uniform_lease = nullptr;
+  const half* uniform_data = nullptr;
+  float uniform_scale = 0.0f;
+  std::string uniform_version;
   DeviceBuffer<unsigned char> lt_workspace;
   cudaStream_t stream = nullptr;
 
@@ -1882,6 +1891,97 @@ void configure_w8a16_tuning(
             << " sparse_max_rows=" << weights.cmix_sparse_max_rows << "\n";
 }
 
+void validate_adapter_dims(const rwkv7_miss::AdapterHandle& adapter, const ModelDims& dims) {
+  for (const auto& t : adapter.package->tensors)
+    if (t.layer < 0 || t.layer >= dims.layers || t.target < 0 ||
+        t.target >= rwkv7_miss::TargetCount ||
+        t.in != (t.target == rwkv7_miss::FfnValue ? dims.ffn : dims.channels) ||
+        t.out != (t.target == rwkv7_miss::FfnKey ? dims.ffn : dims.channels))
+      throw std::runtime_error("MiSS target incompatible with base model dimensions");
+}
+
+// [layer][target][slot] table of (lease, scale) slots plus which layer/target
+// pairs any slot covers (absent pairs launch nothing).
+void build_adapter_table(const std::vector<std::pair<const rwkv7_miss::GpuLease*, float>>& keys,
+                         const ModelDims& dims, std::vector<rwkv7_miss::Linear>& table,
+                         std::vector<std::uint8_t>& present, int& max_rank) {
+  const int slots = static_cast<int>(keys.size());
+  const std::size_t per_slot = static_cast<std::size_t>(dims.layers) * rwkv7_miss::TargetCount;
+  table.assign(per_slot * static_cast<std::size_t>(slots), rwkv7_miss::Linear{});
+  present.assign(per_slot, 0);
+  max_rank = 0;
+  for (int slot = 0; slot < slots; ++slot) {
+    const auto& blocks = keys[static_cast<std::size_t>(slot)].first->blocks;
+    for (int layer = 0; layer < dims.layers && layer < static_cast<int>(blocks.size()); ++layer) {
+      for (int target = 0; target < rwkv7_miss::TargetCount; ++target) {
+        auto linear = blocks[static_cast<std::size_t>(layer)][static_cast<std::size_t>(target)];
+        if (!linear.d) continue;
+        linear.scale = keys[static_cast<std::size_t>(slot)].second;
+        const std::size_t index = static_cast<std::size_t>(layer) * rwkv7_miss::TargetCount + target;
+        table[index * slots + slot] = linear;
+        present[index] = 1;
+        max_rank = std::max(max_rank, linear.rank);
+      }
+    }
+  }
+}
+
+// Rebuild the device mirror of a packed batch's adapters. Slots deduplicate
+// (lease, scale) pairs; the table is [layer][target][slot] so each layer and
+// target passes one contiguous slice to a single forward_rows launch.
+void refresh_row_adapters(RowAdapters& rows, int batch, const ModelDims& dims, cudaStream_t stream) {
+  if (!rows.dirty) return;
+  if (static_cast<int>(rows.leases.size()) != batch || rows.scales.size() != rows.leases.size())
+    throw std::runtime_error("packed adapter rows do not match decode batch");
+  std::vector<int> row_slot(static_cast<std::size_t>(batch), -1);
+  std::vector<std::pair<const rwkv7_miss::GpuLease*, float>> keys;
+  for (int r = 0; r < batch; ++r) {
+    const auto* lease = rows.leases[static_cast<std::size_t>(r)].get();
+    const float scale = rows.scales[static_cast<std::size_t>(r)];
+    if (!lease || scale == 0.0f) continue;
+    const std::pair<const rwkv7_miss::GpuLease*, float> key{lease, scale};
+    auto it = std::find(keys.begin(), keys.end(), key);
+    if (it == keys.end()) it = keys.insert(keys.end(), key);
+    row_slot[static_cast<std::size_t>(r)] = static_cast<int>(it - keys.begin());
+  }
+  const int slots = static_cast<int>(keys.size());
+  std::vector<rwkv7_miss::Linear> table;
+  build_adapter_table(keys, dims, table, rows.present, rows.max_rank);
+  rows.slots = slots;
+  if (slots > 0) {
+    rows.row_slot.resize(static_cast<std::size_t>(batch), "packed adapter row slots");
+    rows.table.resize(table.size(), "packed adapter table");
+    check_cuda(cudaMemcpyAsync(rows.row_slot.p, row_slot.data(), row_slot.size() * sizeof(int),
+                               cudaMemcpyHostToDevice, stream), "upload packed adapter row slots");
+    check_cuda(cudaMemcpyAsync(rows.table.p, table.data(), table.size() * sizeof(rwkv7_miss::Linear),
+                               cudaMemcpyHostToDevice, stream), "upload packed adapter table");
+    // Host vectors die at return; pageable copies are staged, but make the
+    // ordering explicit since this runs only on batch membership changes.
+    check_cuda(cudaStreamSynchronize(stream), "sync packed adapter table");
+  }
+  rows.dirty = false;
+}
+
+// Single-adapter forwards (prefill) use the same kernels with every row on
+// slot 0. The device table is cached in the workspace and keyed by the lease
+// identity, never by an owning pointer, so it does not pin GPU residency.
+void refresh_uniform_table(ForwardResources& res, const rwkv7_miss::GpuLease& lease, float scale,
+                           const ModelDims& dims, cudaStream_t stream) {
+  if (res.uniform_lease == &lease && res.uniform_data == lease.data.p &&
+      res.uniform_scale == scale && res.uniform_version == lease.version)
+    return;
+  std::vector<rwkv7_miss::Linear> table;
+  build_adapter_table({{&lease, scale}}, dims, table, res.uniform_present, res.uniform_max_rank);
+  res.uniform_table.resize(table.size(), "uniform adapter table");
+  check_cuda(cudaMemcpyAsync(res.uniform_table.p, table.data(), table.size() * sizeof(rwkv7_miss::Linear),
+                             cudaMemcpyHostToDevice, stream), "upload uniform adapter table");
+  check_cuda(cudaStreamSynchronize(stream), "sync uniform adapter table");
+  res.uniform_lease = &lease;
+  res.uniform_data = lease.data.p;
+  res.uniform_scale = scale;
+  res.uniform_version = lease.version;
+}
+
 void run_backend_forward(
     const CudaWeights& weights,
     const std::vector<std::vector<int64_t>>& token_batches,
@@ -1890,6 +1990,15 @@ void run_backend_forward(
     GenerationState& state,
     DeviceLogits& out) {
   const auto& dims = weights.dims;
+  // Normal callers prepared the lease on their request thread; this fallback
+  // keeps direct backend users working.
+  if (state.adapter && !state.adapter_gpu) {
+    validate_adapter_dims(*state.adapter, dims);
+    state.adapter_gpu = rwkv7_miss::adapter_cache().acquire(
+        *state.adapter, &state.adapter_cold);
+    if (state.adapter_cold)
+      state.adapter_h2d_ms = state.adapter_gpu->h2d_ms;
+  }
   const int B = static_cast<int>(token_batches.size());
   if (B <= 0) {
     throw std::runtime_error("token_batches must not be empty");
@@ -1956,6 +2065,17 @@ void run_backend_forward(
     }
   }
 
+  // Packed decode batches carry per-row adapters; single requests (prefill,
+  // direct decode) carry one adapter for every row.
+  RowAdapters* row_adapters =
+      T == 1 && state.row_adapters ? state.row_adapters.get() : nullptr;
+  if (row_adapters) refresh_row_adapters(*row_adapters, B, dims, stream);
+  const bool packed_adapters = row_adapters && row_adapters->slots > 0;
+  const rwkv7_miss::GpuLease* uniform_adapter =
+      row_adapters || !state.adapter ? nullptr : state.adapter_gpu.get();
+  if (uniform_adapter && state.adapter->scale == 0.0f) uniform_adapter = nullptr;
+  if (uniform_adapter)
+    refresh_uniform_table(*resources, *uniform_adapter, state.adapter->scale, dims, stream);
   const std::size_t row_elems = static_cast<std::size_t>(rows) * C;
   half* x0 = arena.take(row_elems, "x0");
   half* x1 = arena.take(row_elems, "x1");
@@ -2009,6 +2129,33 @@ void run_backend_forward(
 
   for (int layer = 0; layer < dims.layers; ++layer) {
     const LayerWeights& w = weights.layers[layer];
+    // relu2_input: `input` is the FFN pre-activation (sparse value kernels
+    // square it internally), so the adapter must apply relu(x)^2 itself.
+    const auto miss_add = [&](int target, const half *input, half *output, bool relu2_input = false) {
+      const std::size_t index = static_cast<std::size_t>(layer) * rwkv7_miss::TargetCount + target;
+      const int* row_slot = nullptr;
+      const rwkv7_miss::Linear* table = nullptr;
+      int max_rank = 0;
+      if (packed_adapters) {
+        if (!row_adapters->present[index]) return;
+        row_slot = row_adapters->row_slot.p;
+        table = row_adapters->table.p + index * row_adapters->slots;
+        max_rank = row_adapters->max_rank;
+      } else if (uniform_adapter) {
+        if (!resources->uniform_present[index]) return;
+        table = resources->uniform_table.p + index;  // one slot, all rows
+        max_rank = resources->uniform_max_rank;
+      } else {
+        return;
+      }
+      const int in = target == rwkv7_miss::FfnValue ? F : C;
+      const int out_features = target == rwkv7_miss::FfnKey ? F : C;
+      resources->adapter_latent.resize(rwkv7_miss::forward_rows_scratch(rows, in, max_rank),
+                                       "adapter latent");
+      rwkv7_miss::forward_rows(stream, rows, in, out_features, max_rank, row_slot, table,
+                               input, output, resources->adapter_latent.p, relu2_input);
+    };
+
     const int Rw = static_cast<int>(w.att_w1_t->shape[0]);
     const int Ra = static_cast<int>(w.att_a1_t->shape[0]);
     const int Rg = static_cast<int>(w.att_g1_t->shape[0]);
@@ -2055,12 +2202,15 @@ void run_backend_forward(
 
     const int profile_att_receptance = profiler.begin(stream, "att_receptance");
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xr, w.att_receptance_w, lt_workspace.p, lt_workspace.n, r);
+    miss_add(0, xr, r);
     profiler.end(stream, profile_att_receptance);
     const int profile_att_key = profiler.begin(stream, "att_key");
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xk, w.att_key_w, lt_workspace.p, lt_workspace.n, k);
+    miss_add(1, xk, k);
     profiler.end(stream, profile_att_key);
     const int profile_att_value = profiler.begin(stream, "att_value");
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xv, w.att_value_w, lt_workspace.p, lt_workspace.n, v_base);
+    miss_add(2, xv, v_base);
     profiler.end(stream, profile_att_value);
     half* v_use = v_base;
     bool v_done = false;
@@ -2134,6 +2284,7 @@ void run_backend_forward(
     profiler.end(stream, profile_att_post);
     const int profile_att_output = profiler.begin(stream, "att_output");
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, w.att_output_w, lt_workspace.p, lt_workspace.n, att_out);
+    miss_add(3, y2, att_out);
     profiler.end(stream, profile_att_output);
     const int profile_ffn_mix = profiler.begin(stream, "ffn_mix");
     if (T == 1) {
@@ -2148,6 +2299,7 @@ void run_backend_forward(
 
     const int profile_ffn_key = profiler.begin(stream, "ffn_key");
     linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, F, mixed, w.ffn_key_w, lt_workspace.p, lt_workspace.n, hid);
+    miss_add(4, mixed, hid);
     profiler.end(stream, profile_ffn_key);
     if (weights.cmix_stats.enabled && T == 1) {
       rwkv7_cmix_stats_relu2_launch(
@@ -2208,6 +2360,8 @@ void run_backend_forward(
         rwkv7_v3a_linear_f16_launch(stream, rows, F, C, hid, hp(w.ffn_value_w), cmix_out);
       }
     }
+    // Dense mode squared `hid` in place above; sparse modes left it raw.
+    miss_add(5, hid, cmix_out, cmix_mode != CmixMode::Dense);
     profiler.end(stream, profile_ffn_value);
 
     if (layer + 1 < dims.layers) {
@@ -2286,6 +2440,15 @@ struct ModelBackend::Impl {
         tune_cache_directory(std::move(tune_cache_directory_)),
         weights(load_backend_weights(model_path, chunk_load)) {
     configure_w8a16_tuning(weights, model_path, tune_cache, tune_cache_directory, retune);
+    check_cuda(cudaGetDevice(&device), "query backend device");
+    // Hash the base model off the request path so the first adapter request
+    // does not wait for it; failures surface again on first adapter use.
+    fingerprint_job = std::async(std::launch::async, [this] {
+      try {
+        fingerprint();
+      } catch (...) {
+      }
+    });
   }
 
   ~Impl() {
@@ -2336,6 +2499,19 @@ struct ModelBackend::Impl {
     std::cout << "cmix_stats_end\n";
   }
 
+  // Base digest is only needed to bind adapters; hashing a multi-GiB model at
+  // startup would delay every server, so compute it on first adapter use.
+  const std::string& fingerprint() const {
+    std::call_once(fingerprint_once, [this] {
+      fingerprint_value = llm_infer::is_quantized_archive(model_path)
+                              ? rwkv7_miss::source_fingerprint(model_path)
+                              : rwkv7_miss::fingerprint_file(model_path);
+    });
+    return fingerprint_value;
+  }
+  mutable std::once_flag fingerprint_once;
+  int device = 0;
+  mutable std::string fingerprint_value;
   const std::string runtime_identity = rwkv7_miss::new_runtime_identity();
   std::string model_path;
   std::string model_name;
@@ -2346,6 +2522,8 @@ struct ModelBackend::Impl {
   bool retune = false;
   std::string tune_cache_directory;
   CudaWeights weights;
+  // Last member: destroyed first, joining the hash before its inputs go.
+  std::future<void> fingerprint_job;
 };
 
 ModelBackend::ModelBackend(std::string model_path, bool use_wkv32, bool chunk_load, std::string cmix_sparse,
@@ -2476,18 +2654,37 @@ GenerationState ModelBackend::load_state_from_pth(const std::string& path, int b
   return state;
 }
 
+void ModelBackend::prepare_adapter(GenerationState& state) const {
+  if (!state.adapter) {
+    state.adapter_gpu.reset();
+    return;
+  }
+  if (state.adapter_gpu) return;
+  validate_adapter_dims(*state.adapter, impl_->weights.dims);
+  if (state.adapter->package->base != impl_->fingerprint())
+    throw std::runtime_error("adapter base fingerprint mismatch");
+  check_cuda(cudaSetDevice(impl_->device), "select adapter device");
+  state.adapter_gpu = rwkv7_miss::adapter_cache().acquire(*state.adapter, &state.adapter_cold);
+  if (state.adapter_cold) state.adapter_h2d_ms = state.adapter_gpu->h2d_ms;
+}
+
 void ModelBackend::forward_prefill(
     const std::vector<std::vector<int64_t>>& token_batches,
     GenerationState& state,
     DeviceLogits& logits) const {
-  const auto key = effective_model_key(
-      impl_->runtime_identity,
+  if (state.request_started == std::chrono::steady_clock::time_point{})
+    state.request_started = std::chrono::steady_clock::now();
+  const auto key = rwkv7_miss::effective_model_key(
+      impl_->runtime_identity, state.adapter.get(),
       state.initial_state_identity, state.wkv32);
   if (state.advanced && state.effective_key != key)
     throw std::runtime_error(
-        "incompatible model/initial-state cache identity");
+        "incompatible model/adapter/initial-state cache identity");
+  if (state.adapter && !state.adapter_gpu) prepare_adapter(state);
   state.effective_key = key;
   state.advanced = true;
+  state.adapter_identity =
+      state.adapter ? state.adapter->identity : std::string{};
   run_backend_forward(impl_->weights, token_batches, impl_->use_wkv32, impl_->cmix_sparse, state, logits);
 }
 
@@ -2500,14 +2697,19 @@ void ModelBackend::forward_decode(
   for (int64_t token : token_batch) {
     batch.push_back({token});
   }
-  const auto key = effective_model_key(
-      impl_->runtime_identity,
+  if (state.request_started == std::chrono::steady_clock::time_point{})
+    state.request_started = std::chrono::steady_clock::now();
+  const auto key = rwkv7_miss::effective_model_key(
+      impl_->runtime_identity, state.adapter.get(),
       state.initial_state_identity, state.wkv32);
   if (state.advanced && state.effective_key != key)
     throw std::runtime_error(
-        "incompatible model/initial-state cache identity");
+        "incompatible model/adapter/initial-state cache identity");
+  if (state.adapter && !state.adapter_gpu) prepare_adapter(state);
   state.effective_key = key;
   state.advanced = true;
+  state.adapter_identity =
+      state.adapter ? state.adapter->identity : std::string{};
   run_backend_forward(impl_->weights, batch, impl_->use_wkv32, impl_->cmix_sparse, state, logits);
 }
 
@@ -2530,9 +2732,17 @@ void ModelBackend::copy_state_slice(
     throw std::runtime_error("state slice range exceeds batch size");
   }
 
-  if (dst.advanced && src.effective_key != dst.effective_key)
-    throw std::runtime_error("cannot copy incompatible model/initial-state");
+  if (dst.advanced && (src.effective_key != dst.effective_key ||
+                       src.adapter_identity != dst.adapter_identity))
+    throw std::runtime_error("cannot copy incompatible adapter state");
+  // Host-staged states (prompt/session cache) carry no GPU lease; keep the
+  // destination's lease for the same adapter so the decode loop never has to
+  // re-acquire it on the scheduler thread.
+  if (src.adapter_gpu || src.adapter_identity != dst.adapter_identity)
+    dst.adapter_gpu = src.adapter_gpu;
+  dst.adapter = src.adapter;
   dst.effective_key = src.effective_key;
+  dst.adapter_identity = src.adapter_identity;
   dst.initial_state_identity = src.initial_state_identity;
   dst.advanced = src.advanced;
   const auto& dims = impl_->weights.dims;

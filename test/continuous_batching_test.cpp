@@ -11,10 +11,10 @@
 using namespace rwkv7_server;
 namespace {
 // A recurrent backend with real GPU buffers. Output and next state depend on
-// every input token, the initial state, not a global step.
+// every input token, the initial state and the bound adapter, not a global step.
 class Backend final : public IModelBackend {
  public:
-  struct Call { bool prefill; int rows; std::thread::id thread; };
+  struct Call { bool prefill; int rows; std::string adapter; std::thread::id thread; };
   mutable std::vector<Call> calls;
   mutable std::atomic<int> decode_steps{0};
   mutable std::atomic<bool> fail_next{false};
@@ -42,12 +42,14 @@ class Backend final : public IModelBackend {
   }
   void forward(const std::vector<std::vector<int64_t>>& tokens,
                GenerationState& s, DeviceLogits& out, bool prefill) const {
-    if (s.advanced) TEST_EQ(s.effective_key, s.initial_state_identity);
-    calls.push_back({prefill, int(tokens.size()), std::this_thread::get_id()});
+    const std::string identity = s.adapter ? s.adapter->identity : "";
+    TEST_EQ(s.adapter_identity, identity);
+    if (s.advanced) TEST_EQ(s.effective_key, identity + s.initial_state_identity);
+    calls.push_back({prefill, int(tokens.size()), identity, std::this_thread::get_id()});
     auto values = rwkv_test::copy_device_buffer(s.elapsed, "read state");
     std::vector<float> logits(tokens.size() * vocab_size(), -100.0f);
     for (size_t i = 0; i < tokens.size(); ++i) {
-      for (auto t : tokens[i]) values[i] = (values[i] * 17 + int(t)) % 23;
+      for (auto t : tokens[i]) values[i] = (values[i] * 17 + int(t) + (s.adapter ? 3 : 0)) % 23;
       logits[i * vocab_size() + 98 + values[i]] = 10.0f;
       logits[i * vocab_size() + 98 + (values[i] + 1) % 23] = 9.0f;
     }
@@ -55,7 +57,7 @@ class Backend final : public IModelBackend {
     out.rows = int(tokens.size()); out.vocab_size = vocab_size();
     rwkv_test::copy_host_to_device(logits, out.values, "logits", "logits");
     s.advanced = true;
-    s.effective_key = s.initial_state_identity;
+    s.effective_key = identity + s.initial_state_identity;
   }
   void copy_state_slice(const GenerationState& src, int from, GenerationState& dst,
                         int to, int n) const override {
@@ -63,6 +65,7 @@ class Backend final : public IModelBackend {
     if (dst.advanced) TEST_EQ(src.effective_key, dst.effective_key);
     rwkv7_fast_v4::check_cuda(cudaMemcpy(dst.elapsed.p + to, src.elapsed.p + from,
         n * sizeof(int), cudaMemcpyDeviceToDevice), "copy state");
+    dst.adapter = src.adapter; dst.adapter_identity = src.adapter_identity;
     dst.effective_key = src.effective_key; dst.initial_state_identity = src.initial_state_identity;
     dst.advanced = src.advanced;
   }
@@ -87,6 +90,9 @@ int main() {
     TEST_EQ(tokenizer->load(rwkv_test::vocab_path().string()), kTokenizerSuccess);
     auto backend = std::make_shared<Backend>();
     InferenceEngine engine(backend, tokenizer, "continuous", 2, 0, 4);
+    auto package = std::make_shared<rwkv7_miss::Package>();
+    package->version = "test-adapter";
+    const auto adapter = std::make_shared<rwkv7_miss::AdapterHandle>(package, 1.0f);
     auto run = [&](int id, const InferenceEngine::ControlCallback& stop = InferenceEngine::ControlCallback{}) {
       GenerateOptions o;
       o.max_tokens = id == 0 ? 50 : 5 + id;
@@ -94,6 +100,7 @@ int main() {
       o.alpha_presence = id % 3 == 0 ? 20 : 0;
       o.alpha_frequency = id % 2 ? 3 : 0;
       o.alpha_decay = 0.8 + id * 0.01;
+      if (id % 2) o.adapter = adapter;
       auto state = backend->create_state(1);
       state.initial_state_identity = "initial-" + std::to_string(id);
       const std::string identity = state.initial_state_identity;
@@ -104,7 +111,8 @@ int main() {
           [&](int index, const std::string& text) { TEST_EQ(index, 0); result.text += text; return true; }, stop);
       result.state = rwkv_test::copy_device_buffer(state.elapsed, "final state")[0];
       TEST_EQ(state.initial_state_identity, identity);
-      TEST_EQ(state.effective_key, identity);
+      TEST_EQ(state.adapter_identity, o.adapter ? o.adapter->identity : "");
+      TEST_EQ(state.effective_key, state.adapter_identity + identity);
       return result;
     };
     std::vector<Result> expected;

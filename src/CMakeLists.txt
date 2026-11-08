@@ -92,6 +92,7 @@ if(Drogon_FOUND)
   add_executable(rwkv_lighting_cuda
     app/rwkv_fast_server.cpp
     server/rwkv_api_service.cpp
+    server/router/adapter_routes.cpp
     server/router/batch_routes.cpp
     server/router/chat_routes.cpp
     server/router/dynamic_routes.cpp

@@ -314,7 +314,11 @@ step); for State the FP32 state, Adam m/v and step. Restart with `--resume <dire
 to continue with the same optimizer state and step; adapter and state default to the
 files in that directory. MiSS/NoRA resume checks rank, alpha, targets and the backbone.
 
-Use the training server for adapter-policy rollouts. The native inference server no longer accepts dynamic adapters. Exported State files remain usable through its State upload API.
+External sampling: `/v1/train` checks only `policy_version`, so tokens sampled by
+`rwkv_lighting_cuda` with the exported adapter (registered per step through
+`POST /v1/adapters`, by path or multipart upload) are accepted. Its kernels are not
+bit-identical to this server, and training applies no importance correction, so such
+batches are slightly off-policy; compare with `/v1/logprobs` if you rely on it.
 
 The server disables Drogon's default 60-second idle connection timeout for long GPU
 jobs. The client's `--timeout` defaults to 3600 seconds. If a request disconnects,

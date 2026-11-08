@@ -9,15 +9,12 @@
 #include <string>
 #include <vector>
 
+#include "rwkv/runtime/rwkv_adapter.hpp"
 #include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 
 #include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
 
 namespace rwkv7_server {
-
-// Stable-width namespace used by persisted State and Session cache keys.
-std::string effective_model_key(const std::string& runtime,
-                                const std::string& initial_state, bool fp32);
 
 struct PrefillCapacity {
   std::size_t free_vram_bytes = 0;
@@ -38,6 +35,8 @@ enum class ThinkType {
 };
 
 struct GenerateOptions {
+  std::string adapter_id;
+  std::shared_ptr<const rwkv7_miss::AdapterHandle> adapter;
   int max_tokens = 8192;
   std::vector<int64_t> stop_tokens{0, 261, 24281};
   // Presence selects text matching, including an explicitly empty list.
@@ -52,18 +51,42 @@ struct GenerateOptions {
   int force_reasoning_token_offset = 0;
 };
 
+// Adapter selection for a packed continuous-decode batch. Rows are independent
+// requests, so each row names its own GPU lease (null = base weights) and the
+// backend applies every adapter in one pass over the shared base forward.
+struct RowAdapters {
+  std::vector<std::shared_ptr<const rwkv7_miss::GpuLease>> leases;
+  std::vector<float> scales;
+  // Set whenever leases/scales change; the backend then refreshes its device
+  // mirror (row -> slot map and per-layer/target slot table) once.
+  bool dirty = true;
+  int slots = 0;
+  int max_rank = 0;
+  std::vector<std::uint8_t> present;  // [layer * TargetCount + target]
+  rwkv7_fast_v4::DeviceBuffer<int> row_slot;
+  rwkv7_fast_v4::DeviceBuffer<rwkv7_miss::Linear> table;
+};
+
 struct GenerationState {
+  std::shared_ptr<const rwkv7_miss::AdapterHandle> adapter;
+  std::shared_ptr<const rwkv7_miss::GpuLease> adapter_gpu;
   std::string effective_key;
+  std::string adapter_identity;
   std::string initial_state_identity = "zero";
   bool advanced = false;
   // Bounded decoded suffix retained across pause/resume of logit generation.
   std::string text_stop_tail;
+  bool adapter_cold = false;
+  double adapter_h2d_ms = 0;
+  std::chrono::steady_clock::time_point request_started{};
   int batch_size = 0;
   bool wkv32 = false;
   rwkv7_fast_v4::DeviceBuffer<half> shift;
   rwkv7_fast_v4::DeviceBuffer<half> wkv_state;
   rwkv7_fast_v4::DeviceBuffer<float> wkv_state32;
   rwkv7_fast_v4::DeviceBuffer<int> elapsed;
+  // Packed decode groups only; when set it replaces `adapter` in forward.
+  std::shared_ptr<RowAdapters> row_adapters;
 
   GenerationState() = default;
   GenerationState(const GenerationState&) = delete;
@@ -71,6 +94,18 @@ struct GenerationState {
   GenerationState(GenerationState&&) noexcept = default;
   GenerationState& operator=(GenerationState&&) noexcept = default;
 };
+
+inline void
+bind_adapter(GenerationState &state,
+             const std::shared_ptr<const rwkv7_miss::AdapterHandle> &adapter) {
+  const auto id = adapter ? adapter->identity : std::string{};
+  if (state.advanced && state.adapter_identity != id)
+    throw std::runtime_error("state belongs to another adapter/version/scale");
+  if (state.adapter_identity != id)
+    state.adapter_gpu.reset();
+  state.adapter = adapter;
+  state.adapter_identity = id;
+}
 
 struct DeviceLogits {
   int rows = 0;
@@ -97,6 +132,10 @@ class IModelBackend {
   virtual GenerationState load_state_from_pth(const std::string&, int batch_size) const {
     throw std::runtime_error("PTH state loading is not supported by this backend");
   }
+  // Validate the bound adapter against this model and make it GPU resident.
+  // Callers run this on the request thread so a cold H2D upload, cudaMalloc
+  // or base-model hashing never stalls the shared decode loop.
+  virtual void prepare_adapter(GenerationState&) const {}
   virtual void forward_prefill(
       const std::vector<std::vector<int64_t>>& token_batches,
       GenerationState& state,
@@ -144,6 +183,7 @@ class ModelBackend final : public IModelBackend {
 
   GenerationState create_state(int batch_size) const override;
   GenerationState load_state_from_pth(const std::string& path, int batch_size) const override;
+  void prepare_adapter(GenerationState& state) const override;
   void forward_prefill(
       const std::vector<std::vector<int64_t>>& token_batches,
       GenerationState& state,
