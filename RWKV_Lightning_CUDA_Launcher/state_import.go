@@ -2,7 +2,9 @@ package main
 
 // Importing a node-local state file (§ state).
 //
-// The native runtime accepts State files only through a multipart upload — there is no path form of /v1/state/upload. Without this
+// The native runtime registers an adapter from a server-side path
+// (`POST /v1/adapters {adapter_id, path}`) but a *state* only through a
+// multipart upload — there is no path form of /v1/state/upload. Without this
 // endpoint the console could only send state files that happen to sit on the
 // machine running the browser, which on a remote GPU box is the wrong
 // machine: the .pth produced by a tuning run lives next to the trainer.

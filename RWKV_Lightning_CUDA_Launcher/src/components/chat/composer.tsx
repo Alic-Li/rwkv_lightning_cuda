@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowUp, Brain, Layers, Square } from "lucide-react";
+import { ArrowUp, Brain, Layers, Puzzle, Square } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { useChat } from "@/stores/chat";
@@ -147,8 +147,8 @@ export function Composer({
 
         <div className="flex items-center gap-1.5 px-2.5 pb-2.5">
           {/* Thinking is a per-message decision, so its switch lives where the
-              message is written. State is chosen in the panel
-              and appears here while it is in effect. */}
+              message is written. State and adapter are chosen in the panel;
+              they appear here only while they are in effect. */}
           <ThinkSwitch
             value={generation.think_type}
             onChange={(think_type) => setGeneration({ think_type })}
@@ -156,6 +156,9 @@ export function Composer({
           <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
             {generation.state_id && (
               <Chip icon={<Layers />}>{generation.state_id}</Chip>
+            )}
+            {generation.adapter_id && (
+              <Chip icon={<Puzzle />}>{generation.adapter_id}</Chip>
             )}
           </div>
           {streaming ? (

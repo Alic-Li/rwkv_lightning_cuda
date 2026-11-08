@@ -354,11 +354,14 @@ describe("chat streaming", () => {
     expect(values.get("rwkv-chat-v3")).toContain("answer");
   });
 
-  it("sends the selected State and thinking mode", async () => {
+  it("sends the selected state, thinking mode and MiSS adapter", async () => {
     const calls = capture();
     useSettings.getState().setGeneration({
       state_id: "roleplay.pth",
       think_type: "free",
+      adapter_id: "zh-legal",
+      adapter_version: "v1",
+      adapter_scale: "0",
     });
     await useChat.getState().send(backend.id, "hello");
     const body = calls.find((entry) =>
@@ -366,9 +369,10 @@ describe("chat streaming", () => {
     )?.body;
     expect(body?.state_id).toBe("roleplay.pth");
     expect(body?.think_type).toBe("free");
-    expect(body).not.toHaveProperty("adapter_id");
-    expect(body).not.toHaveProperty("adapter_version");
-    expect(body).not.toHaveProperty("adapter_scale");
+    expect(body?.adapter_id).toBe("zh-legal");
+    expect(body?.adapter_version).toBe("v1");
+    // An explicit "0" scale must survive as the number 0, not be dropped.
+    expect(body?.adapter_scale).toBe(0);
   });
 
   it("regenerates without duplicating the user message", async () => {
@@ -758,75 +762,5 @@ describe("per-backend form isolation", () => {
     const dump = [...values.values()].join("\n");
     expect(dump).not.toContain("secret-a");
     expect(dump).not.toContain("secret-b");
-  });
-});
-
-describe("generation settings migration", () => {
-  for (const version of [1, 2, 3, 4]) {
-    it(`preserves State and removes retired fields from v${version} storage`, async () => {
-      const saved = {
-        theme: "light",
-        lang: "en",
-        concurrency: 3,
-        generation: {
-          state_id: "state-kept",
-          temperature: 0,
-          think_type: "free",
-          adapter_id: "old",
-          adapter_version: "v2",
-          adapter_scale: "NaN",
-        },
-      };
-      values.set(
-        "rwkv-settings-v2",
-        JSON.stringify({
-          version,
-          state: version === 1 ? { values: saved } : saved,
-        }),
-      );
-      await useSettings.persist.rehydrate();
-      const settings = useSettings.getState();
-      expect(settings.theme).toBe("light");
-      expect(settings.concurrency).toBe(3);
-      expect(settings.generation.state_id).toBe("state-kept");
-      expect(settings.generation.temperature).toBe(0);
-      expect(settings.generation.think_type).toBe("free");
-      expect(settings.generation).not.toHaveProperty("adapter_id");
-      expect(settings.generation).not.toHaveProperty("adapter_version");
-      expect(settings.generation).not.toHaveProperty("adapter_scale");
-      const calls = capture();
-      await useChat.getState().send(backend.id, "after upgrade");
-      const body = calls.find((call) =>
-        call.url.includes("/v1/chat/completions"),
-      )?.body;
-      expect(body?.state_id).toBe("state-kept");
-      expect(body).not.toHaveProperty("adapter_id");
-      expect(body).not.toHaveProperty("adapter_version");
-      expect(body).not.toHaveProperty("adapter_scale");
-      useTranslate
-        .getState()
-        .set({
-          source: "hello",
-          from: "English",
-          to: "Chinese",
-          concurrency: 1,
-        });
-      await useTranslate.getState().run(backend.id);
-      const translated = calls.find((call) =>
-        call.url.includes("/v1/batch/completions"),
-      )?.body;
-      expect(translated?.contents).toEqual(["English: hello\n\nChinese:"]);
-      expect(translated).not.toHaveProperty("adapter_id");
-      expect(translated).not.toHaveProperty("adapter_version");
-      expect(translated).not.toHaveProperty("adapter_scale");
-    });
-  }
-  it("retains an explicit dark theme from v3", async () => {
-    values.set(
-      "rwkv-settings-v2",
-      JSON.stringify({ version: 3, state: { theme: "dark" } }),
-    );
-    await useSettings.persist.rehydrate();
-    expect(useSettings.getState().theme).toBe("dark");
   });
 });

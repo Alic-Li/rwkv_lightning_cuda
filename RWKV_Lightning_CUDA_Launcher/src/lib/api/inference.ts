@@ -1,7 +1,12 @@
 import { tNow } from "@/lib/i18n";
 import { nodeRequest, nodeStream } from "./http";
 import { readSSE, type StreamEvent } from "./sse";
-import type { ModelListResponse, UploadedState } from "./types";
+import type {
+  AdapterEntry,
+  AdapterListResponse,
+  ModelListResponse,
+  UploadedState,
+} from "./types";
 
 export interface BatchCompletion {
   choices: {
@@ -64,4 +69,37 @@ export const inferenceApi = {
       "/v1/state/delete",
       { body: { state_id: stateId } },
     ),
+
+  listAdapters: (backendId: string, signal?: AbortSignal) =>
+    nodeRequest<AdapterListResponse>(backendId, "/v1/adapters", { signal }),
+
+  registerAdapter: (backendId: string, adapterId: string, path: string) =>
+    nodeRequest<{ adapter_id: string; version: string }>(
+      backendId,
+      "/v1/adapters",
+      { body: { adapter_id: adapterId, path } },
+    ),
+
+  uploadAdapter: (
+    backendId: string,
+    adapterId: string,
+    file: File,
+    metadata?: File,
+  ) => {
+    const body = new FormData();
+    body.append("adapter_id", adapterId);
+    body.append("file", file);
+    if (metadata) body.append("metadata", metadata, "checkpoint.json");
+    return nodeRequest<{ adapter_id: string; version: string }>(
+      backendId,
+      "/v1/adapters",
+      { body },
+    );
+  },
+
+  deleteAdapter: (backendId: string, entry: AdapterEntry) =>
+    nodeRequest<unknown>(backendId, "/v1/adapters", {
+      method: "DELETE",
+      body: { adapter_id: entry.id, adapter_version: entry.version },
+    }),
 };

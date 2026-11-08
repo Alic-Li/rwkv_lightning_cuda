@@ -145,7 +145,7 @@ OpenAI 兼容主要面向 Chat Completions；不要假设 Responses、工具调�
 ## 3. 浏览器接入规则
 
 - 从 `/api/v1/backends` 获取列表，以 backend ID 保存选中项。业务请求统一加 `/api/v1/backends/${encodeURIComponent(id)}` 前缀，禁止浏览器直接 fetch 后端 `base_url`。
-- runtime / jobs / 模型 / State 缓存按 backend ID 隔离。切换节点后取消旧轮询和流；迟到响应不能覆盖新节点状态。运行中的任务应固定其目标节点。
+- runtime / jobs / 模型 / state / adapter 缓存按 backend ID 隔离。切换节点后取消旧轮询和流；迟到响应不能覆盖新节点状态。运行中的任务应固定其目标节点。
 - 根据能力位展示功能；未知字符串忽略。`kind:"inference_only"` 的节点只使用推理 API，不能起停进程、训练、量化、浏览目录或读取 Agent GPU 指标。
 - `reachable` 表示最近一次探测的节点可达性，不等于 runtime ready，更不等于模型已加载。
 - 文件浏览用 `POST /api/v1/node/fs`；`{}` 返回 `{"roots":[...]}`，`{"path":"..."}` 返回目录内容。返回的路径要原样回传，不用浏览器平台的路径规则重写 Windows 路径。用户也可手动填写远端路径；白名单外目录不能直接浏览。
@@ -185,7 +185,7 @@ OpenAI 兼容主要面向 Chat Completions；不要假设 Responses、工具调�
 
 1. Client 空列表正常；添加正确/错误 token 后分别显示可达/认证失败；重启后列表仍在并能重新探测。
 2. 通过 backend 前缀完成 runtime start → ready → stop；日志流实时可见；切换节点不串日志或模型信息。
-3. Chat 流式完成与主动中止、batch 原始续写、模型显式加载、State 上传均使用同一目标节点。
+3. Chat 流式完成与主动中止、batch 原始续写、模型显式加载、state 上传和 adapter 注册均使用同一目标节点。
 4. 裸推理节点及旧 Agent 能正确降级；未知 capability 不导致页面报错。
 5. 文件浏览覆盖根列表、正常目录、越界 403；指标不可用时显示原因；选卡区分缺省、空串和 `"0"`。
 

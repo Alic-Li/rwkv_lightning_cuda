@@ -10,15 +10,19 @@ import (
 )
 
 type config struct {
-	Listen                           string          `toml:"listen"`
-	MaxRequestBodyBytes              int64           `toml:"max_request_body_bytes"`
-	RequestTimeoutSeconds            int             `toml:"request_timeout_seconds"`
-	FailureCooldownSeconds           int             `toml:"failure_cooldown_seconds"`
-	StateUploadMaxAttempts           int             `toml:"state_upload_max_attempts"`
-	StateUploadAttemptTimeoutSeconds int             `toml:"state_upload_attempt_timeout_seconds"`
-	StateUploadRetryBaseMS           int             `toml:"state_upload_retry_base_ms"`
-	StateUploadRetryMaxMS            int             `toml:"state_upload_retry_max_ms"`
-	Backends                         []backendConfig `toml:"backends"`
+	Listen                             string          `toml:"listen"`
+	MaxRequestBodyBytes                int64           `toml:"max_request_body_bytes"`
+	RequestTimeoutSeconds              int             `toml:"request_timeout_seconds"`
+	FailureCooldownSeconds             int             `toml:"failure_cooldown_seconds"`
+	StateUploadMaxAttempts             int             `toml:"state_upload_max_attempts"`
+	StateUploadAttemptTimeoutSeconds   int             `toml:"state_upload_attempt_timeout_seconds"`
+	StateUploadRetryBaseMS             int             `toml:"state_upload_retry_base_ms"`
+	StateUploadRetryMaxMS              int             `toml:"state_upload_retry_max_ms"`
+	AdapterUploadMaxAttempts           int             `toml:"adapter_upload_max_attempts"`
+	AdapterUploadAttemptTimeoutSeconds int             `toml:"adapter_upload_attempt_timeout_seconds"`
+	AdapterUploadRetryBaseMS           int             `toml:"adapter_upload_retry_base_ms"`
+	AdapterUploadRetryMaxMS            int             `toml:"adapter_upload_retry_max_ms"`
+	Backends                           []backendConfig `toml:"backends"`
 }
 
 type backendConfig struct {
@@ -35,6 +39,9 @@ func newScheduler(c config) (*scheduler, error) {
 		return nil, fmt.Errorf("listen must be host:port: %w", err)
 	}
 	if _, err := configuredUploadPolicy(c); err != nil {
+		return nil, err
+	}
+	if _, err := configuredAdapterUploadPolicy(c); err != nil {
 		return nil, err
 	}
 	if c.MaxRequestBodyBytes < 0 || c.RequestTimeoutSeconds < 0 || c.FailureCooldownSeconds < 0 {
