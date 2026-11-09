@@ -10,7 +10,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <iostream>
 #include <list>
 #include <mutex>
@@ -330,7 +329,7 @@ struct InferenceEngine::Scheduler {
     const std::vector<std::vector<int64_t>>* tokens = nullptr;
     GenerationState* state = nullptr;
     DeviceLogits* logits = nullptr;
-    int length = 0, offset = 0;
+    int length = 0;
     std::exception_ptr error;
     std::promise<void> done;
   };
@@ -433,46 +432,34 @@ struct InferenceEngine::Scheduler {
            std::to_string(reinterpret_cast<std::uintptr_t>(state.adapter_gpu.get())) +
            (state.wkv32 ? "\nfp32" : "\nfp16");
   }
-  static int remaining(const PrefillJob& job) { return job.length - job.offset; }
-  static int top_bit(int value) {
-    int bit = 1;
-    while (bit <= value / 2) bit <<= 1;
-    return bit;
-  }
-
   // One forward for queued prefill chunks (at most one pass between decode
-  // steps). Chunks of different requests share a pass when they use the same
-  // adapter and initial-state identity: a pass of T tokens (T a power of two)
-  // takes every compatible chunk whose remaining length has bit T set, so
-  // short prompts of any lengths finish within popcount(length) shared passes
-  // instead of one full weight read each. Returns the jobs that finished.
+  // steps). Chunks of different requests share the pass when they have the
+  // same length and use the same adapter and initial-state identity, so every
+  // request is chunked exactly as if it ran alone (the recurrent state is
+  // rounded at the same boundaries); only the row count of the pass grows.
+  // Returns the jobs that finished.
   std::vector<std::shared_ptr<PrefillJob>> prefill_pass(
       const std::vector<std::shared_ptr<PrefillJob>>& queued) {
     const auto& head = queued.front();
-    const int T = top_bit(remaining(*head));
+    const int T = head->length;
     const auto key = prefill_key(*head->state);
     std::vector<std::shared_ptr<PrefillJob>> picked{head};
     int rows = head->state->batch_size;
     for (std::size_t i = 1; i < queued.size(); ++i) {
       const auto& job = queued[i];
       const int n = job->state->batch_size;
-      if ((remaining(*job) & T) == 0 || rows + n > max_rows ||
-          (rows + n) * T > prefill_token_budget || prefill_key(*job->state) != key)
+      if (job->length != T || rows + n > max_rows || (rows + n) * T > prefill_token_budget ||
+          prefill_key(*job->state) != key)
         continue;
       picked.push_back(job);
       rows += n;
     }
-    static const bool debug_no_merge = std::getenv("RWKV_DEBUG_NO_MERGE") != nullptr;
-    if (picked.size() == 1 || debug_no_merge) {
-      picked.resize(1);
+    if (picked.size() == 1) {
       prefill_single(*head);
     } else {
-      prefill_packed(picked, T, rows);
+      prefill_packed(picked, rows);
     }
-    std::vector<std::shared_ptr<PrefillJob>> finished;
-    for (const auto& job : picked)
-      if (job->error || job->offset == job->length) finished.push_back(job);
-    return finished;
+    return picked;
   }
 
   void prefill_single(PrefillJob& job) {
@@ -480,25 +467,18 @@ struct InferenceEngine::Scheduler {
       auto& logits = *job.logits;
       logits.backend_workspace = std::move(prefill_workspace);
       try {
-        if (job.offset == 0) {
-          model->forward_prefill(*job.tokens, *job.state, logits);
-        } else {
-          std::vector<std::vector<int64_t>> rest;
-          for (const auto& row : *job.tokens) rest.emplace_back(row.begin() + job.offset, row.end());
-          model->forward_prefill(rest, *job.state, logits);
-        }
+        model->forward_prefill(*job.tokens, *job.state, logits);
       } catch (...) {
         prefill_workspace = std::move(logits.backend_workspace);
         throw;
       }
       prefill_workspace = std::move(logits.backend_workspace);
-      job.offset = job.length;
     } catch (...) {
       job.error = std::current_exception();
     }
   }
 
-  void prefill_packed(const std::vector<std::shared_ptr<PrefillJob>>& picked, int T, int rows) {
+  void prefill_packed(const std::vector<std::shared_ptr<PrefillJob>>& picked, int rows) {
     try {
       const auto& lead = *picked.front()->state;
       if (prefill_pack.batch_size == 0 || state_row_stride(prefill_pack) < rows ||
@@ -528,8 +508,7 @@ struct InferenceEngine::Scheduler {
           state.request_started = now;
         for (int r = 0; r < state.batch_size; ++r, ++slot) {
           queue_state_row(state, r, pack, slot, gather);
-          const auto& row = (*job->tokens)[static_cast<std::size_t>(r)];
-          tokens.emplace_back(row.begin() + job->offset, row.begin() + job->offset + T);
+          tokens.push_back((*job->tokens)[static_cast<std::size_t>(r)]);
         }
       }
       model->run_device_copies({gather});
@@ -551,22 +530,18 @@ struct InferenceEngine::Scheduler {
           slot += state.batch_size;
           continue;
         }
-        const bool last = job->offset + T == job->length;
         auto& logits = *job->logits;
-        if (last) {
-          logits.rows = state.batch_size;
-          logits.vocab_size = prefill_logits.vocab_size;
-          logits.values.resize(static_cast<std::size_t>(logits.rows) * logits.vocab_size,
-                               "allocate prefill logits");
-        }
+        logits.rows = state.batch_size;
+        logits.vocab_size = prefill_logits.vocab_size;
+        logits.values.resize(static_cast<std::size_t>(logits.rows) * logits.vocab_size,
+                             "allocate prefill logits");
         for (int r = 0; r < state.batch_size; ++r, ++slot) {
           queue_state_row(pack, slot, state, r, scatter);
-          if (last) queue_logits_row(prefill_logits, slot, logits, r, scatter);
+          queue_logits_row(prefill_logits, slot, logits, r, scatter);
         }
         state.effective_key = pack.effective_key;
         state.adapter_identity = pack.adapter_identity;
         state.advanced = true;
-        job->offset += T;
       }
       model->run_device_copies({scatter});
     } catch (...) {
