@@ -1982,18 +1982,6 @@ void refresh_uniform_table(ForwardResources& res, const rwkv7_miss::GpuLease& le
   res.uniform_version = lease.version;
 }
 
-// Largest row count (B*T) that uses the multi-row low-rank kernels. On an
-// RTX 4060 Ti (1.5B) they beat cuBLAS for 5-8 rows (B=8 decode 11.37 -> 10.63
-// ms) and lose from 12 rows on, where cuBLAS tiles use tensor cores well.
-// RWKV_LOWRANK_ROWS_MAX overrides it for tuning (0 disables).
-int lowrank_rows_max() {
-  static const int value = [] {
-    const char* text = std::getenv("RWKV_LOWRANK_ROWS_MAX");
-    return text ? std::atoi(text) : 8;
-  }();
-  return value;
-}
-
 void run_backend_forward(
     const CudaWeights& weights,
     const std::vector<std::vector<int64_t>>& token_batches,
@@ -2233,17 +2221,7 @@ void run_backend_forward(
     bool v_done = false;
 
     const int profile_att_lowrank = profiler.begin(stream, "att_lowrank");
-    // Small batches above the fused single-row range: one multi-row launch
-    // each for rank-in and rank-out instead of one small GEMM per projection.
-    const bool lowrank_rows = C >= kLowrankFusedMinC && rows > kLowrankOutRowsT &&
-                              rows <= lowrank_rows_max() && Rw <= kLowrankMax &&
-                              ((Rw | Ra | Rg | Rv) & 1) == 0;
-    if (lowrank_rows) {
-      rwkv7_v3a_lowrank_rows_in_f16_launch(
-          stream, rows, C, Rw, Ra, Rg, Rv, xw, xa, xg, xv,
-          hp(w.att_w1_t), hp(w.att_a1_t), hp(w.att_g1_t), layer == 0 ? nullptr : hp(w.att_v1_t),
-          w1, a1, g1, v1);
-    } else if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
+    if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
       rwkv7_v3a_linear_wagv_rank_in_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, xw, xa, xg, xv,
           hp(w.att_w1_t), hp(w.att_a1_t), hp(w.att_g1_t), hp(w.att_v1_t), w1, a1, g1, v1);
@@ -2258,16 +2236,7 @@ void run_backend_forward(
     profiler.end(stream, profile_att_lowrank);
 
     const int profile_att_lowrank_out = profiler.begin(stream, "att_lowrank_out");
-    if (lowrank_rows) {
-      rwkv7_v3a_lowrank_rows_out_f16_launch(
-          stream, rows, C, Rw, Ra, Rg, Rv, w1, a1, g1, v1,
-          hp(w.att_w2_t), hp(w.att_a2_t), hp(w.att_g2_t), layer == 0 ? nullptr : hp(w.att_v2_t),
-          v_base, v_first, layer == 0 ? nullptr : hp(w.att_v0), w12, a12, g, v_out);
-      if (layer != 0) {
-        v_use = v_out;
-        v_done = true;
-      }
-    } else if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
+    if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
       rwkv7_v3a_linear_wagv_rank_out_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, w1, a1, g1, v1,
           hp(w.att_w2_t), hp(w.att_a2_t), hp(w.att_g2_t), hp(w.att_v2_t),
@@ -2349,14 +2318,6 @@ void run_backend_forward(
     CmixMode cmix_mode = w.ffn_value_w->is_int4() ? CmixMode::Dense : path.cmix;
     if (run.cmix_sparse != "off" && cmix_mode == CmixMode::Dense &&
         w.ffn_value_w->is_int8() && C >= 4096 && rows <= layer_sparse_max_rows) {
-      cmix_mode = CmixMode::NoFcRows2;
-    }
-    static const int debug_fp16_sparse_rows = [] {
-      const char* text = std::getenv("RWKV_DEBUG_FP16_SPARSE_ROWS");
-      return text ? std::atoi(text) : 0;
-    }();
-    if (run.cmix_sparse != "off" && cmix_mode == CmixMode::Dense && !w.ffn_value_w->is_int8() &&
-        !w.ffn_value_w->is_int4() && rows <= debug_fp16_sparse_rows) {
       cmix_mode = CmixMode::NoFcRows2;
     }
     const int profile_ffn_value = profiler.begin(stream, "ffn_value");
