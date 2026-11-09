@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <list>
 #include <mutex>
@@ -20,6 +22,7 @@
 #include "rwkv/inference/text_stop_matcher.hpp"
 #include "rwkv/inference/prefix_cache.hpp"
 #include "rwkv/inference/utf8.hpp"
+#include "rwkv/inference/rwkv_sampler.hpp"
 
 namespace rwkv7_server {
 namespace {
@@ -312,30 +315,49 @@ struct InferenceEngine::Scheduler {
   };
   struct Group {
     std::vector<std::shared_ptr<Row>> rows, incoming;
-    GenerationState state, spare_state;
-    size_t shift_per_row = 0, wkv16_per_row = 0, wkv32_per_row = 0, elapsed_per_row = 0;
+    // Slot i of state/logits/sampler belongs to rows[i]. The buffers hold
+    // `capacity` slots, so a membership change moves only the rows that leave,
+    // fill a hole or arrive; the rest stay in place.
+    int capacity = 0;
+    GenerationState state;
     DeviceLogits logits;
     SamplerPenaltyState sampler;
     std::vector<GenerateOptions> options;
     bool wkv32 = false;
+  };
+  // One prefill chunk of a request: equal-length token rows for its state.
+  struct PrefillJob {
+    const std::vector<std::vector<int64_t>>* tokens = nullptr;
+    GenerationState* state = nullptr;
+    DeviceLogits* logits = nullptr;
+    int length = 0, offset = 0;
+    std::exception_ptr error;
+    std::promise<void> done;
   };
 
   std::shared_ptr<IModelBackend> model;
   std::shared_ptr<TrieTokenizer> tokenizer;
   int device = 0;
   int max_rows;
+  // Upper bound on rows x tokens of one merged prefill pass.
+  int prefill_token_budget;
   std::mutex mutex;
   std::condition_variable changed;
   bool stopping = false;
-  std::deque<std::function<void()>> prefill;
+  std::deque<std::shared_ptr<PrefillJob>> prefill;
   std::deque<std::shared_ptr<Request>> incoming;
   std::vector<std::unique_ptr<Group>> groups;
   std::deque<std::shared_ptr<Row>> pending_rows;
   std::shared_ptr<void> prefill_workspace, decode_workspace;
+  // Scratch for merged prefill passes (rows of several requests).
+  GenerationState prefill_pack;
+  DeviceLogits prefill_logits;
   std::thread worker;
 
-  Scheduler(std::shared_ptr<IModelBackend> m, std::shared_ptr<TrieTokenizer> t, int limit)
-      : model(std::move(m)), tokenizer(std::move(t)), max_rows(limit) {
+  Scheduler(std::shared_ptr<IModelBackend> m, std::shared_ptr<TrieTokenizer> t, int limit,
+            int prefill_chunk_size)
+      : model(std::move(m)), tokenizer(std::move(t)), max_rows(limit),
+        prefill_token_budget(4 * prefill_chunk_size) {
     rwkv7_fast_v4::check_cuda(cudaGetDevice(&device), "get scheduler device");
     worker = std::thread([this] { loop(); });
   }
@@ -345,26 +367,215 @@ struct InferenceEngine::Scheduler {
     worker.join();
   }
 
-  void execute_prefill(std::function<void()> fn) {
-    auto task = std::make_shared<std::packaged_task<void()>>(std::move(fn));
-    auto result = task->get_future();
+  void forward_prefill(const std::vector<std::vector<int64_t>>& tokens,
+                       GenerationState& state, DeviceLogits& logits) {
+    if (tokens.empty() || state.batch_size != static_cast<int>(tokens.size()))
+      throw std::runtime_error("state batch size mismatch");
+    for (const auto& row : tokens) {
+      if (row.empty() || row.size() != tokens.front().size())
+        throw std::runtime_error("all token batches must share the same positive length");
+    }
+    auto job = std::make_shared<PrefillJob>();
+    job->tokens = &tokens;
+    job->state = &state;
+    job->logits = &logits;
+    job->length = static_cast<int>(tokens.front().size());
+    auto result = job->done.get_future();
     {
       std::lock_guard<std::mutex> lock(mutex);
       if (stopping) throw std::runtime_error("scheduler is shutting down");
-      prefill.push_back([task] { (*task)(); });
+      prefill.push_back(job);
     }
     changed.notify_one();
     result.get();
   }
 
-  void forward_prefill(const std::vector<std::vector<int64_t>>& tokens,
-                       GenerationState& state, DeviceLogits& logits) {
-    execute_prefill([&] {
+  // Moves one recurrent-state row without identity metadata. The default
+  // backend path goes through copy_state_slice, which rewrites the
+  // destination's identity, so restore it here.
+  void queue_state_row(const GenerationState& src, int from, GenerationState& dst, int to,
+                       std::vector<DeviceCopy>& out) {
+    auto adapter = dst.adapter;
+    auto lease = dst.adapter_gpu;
+    auto key = dst.effective_key;
+    auto identity = dst.adapter_identity;
+    auto initial = dst.initial_state_identity;
+    const bool advanced = dst.advanced;
+    const auto restore = [&] {
+      dst.adapter = std::move(adapter);
+      dst.adapter_gpu = std::move(lease);
+      dst.effective_key = std::move(key);
+      dst.adapter_identity = std::move(identity);
+      dst.initial_state_identity = std::move(initial);
+      dst.advanced = advanced;
+    };
+    dst.advanced = false;
+    try {
+      model->append_state_row_copies(src, from, dst, to, out);
+    } catch (...) {
+      restore();
+      throw;
+    }
+    restore();
+  }
+
+  static void queue_logits_row(const DeviceLogits& src, int from, DeviceLogits& dst, int to,
+                               std::vector<DeviceCopy>& out) {
+    const std::size_t vocab = static_cast<std::size_t>(src.vocab_size);
+    if (src.vocab_size <= 0 || dst.vocab_size != src.vocab_size || from < 0 || to < 0 ||
+        (from + 1) * vocab > src.values.n || (to + 1) * vocab > dst.values.n)
+      throw std::runtime_error("logits row copy exceeds buffer");
+    out.push_back({src.values.p + from * vocab, dst.values.p + to * vocab, vocab * sizeof(float)});
+  }
+
+  static std::string prefill_key(const GenerationState& state) {
+    return state.adapter_identity + '\n' + state.initial_state_identity + '\n' +
+           std::to_string(reinterpret_cast<std::uintptr_t>(state.adapter_gpu.get())) +
+           (state.wkv32 ? "\nfp32" : "\nfp16");
+  }
+  static int remaining(const PrefillJob& job) { return job.length - job.offset; }
+  static int top_bit(int value) {
+    int bit = 1;
+    while (bit <= value / 2) bit <<= 1;
+    return bit;
+  }
+
+  // One forward for queued prefill chunks (at most one pass between decode
+  // steps). Chunks of different requests share a pass when they use the same
+  // adapter and initial-state identity: a pass of T tokens (T a power of two)
+  // takes every compatible chunk whose remaining length has bit T set, so
+  // short prompts of any lengths finish within popcount(length) shared passes
+  // instead of one full weight read each. Returns the jobs that finished.
+  std::vector<std::shared_ptr<PrefillJob>> prefill_pass(
+      const std::vector<std::shared_ptr<PrefillJob>>& queued) {
+    const auto& head = queued.front();
+    const int T = top_bit(remaining(*head));
+    const auto key = prefill_key(*head->state);
+    std::vector<std::shared_ptr<PrefillJob>> picked{head};
+    int rows = head->state->batch_size;
+    for (std::size_t i = 1; i < queued.size(); ++i) {
+      const auto& job = queued[i];
+      const int n = job->state->batch_size;
+      if ((remaining(*job) & T) == 0 || rows + n > max_rows ||
+          (rows + n) * T > prefill_token_budget || prefill_key(*job->state) != key)
+        continue;
+      picked.push_back(job);
+      rows += n;
+    }
+    static const bool debug_no_merge = std::getenv("RWKV_DEBUG_NO_MERGE") != nullptr;
+    if (picked.size() == 1 || debug_no_merge) {
+      picked.resize(1);
+      prefill_single(*head);
+    } else {
+      prefill_packed(picked, T, rows);
+    }
+    std::vector<std::shared_ptr<PrefillJob>> finished;
+    for (const auto& job : picked)
+      if (job->error || job->offset == job->length) finished.push_back(job);
+    return finished;
+  }
+
+  void prefill_single(PrefillJob& job) {
+    try {
+      auto& logits = *job.logits;
       logits.backend_workspace = std::move(prefill_workspace);
-      try { model->forward_prefill(tokens, state, logits); }
-      catch (...) { prefill_workspace = std::move(logits.backend_workspace); throw; }
+      try {
+        if (job.offset == 0) {
+          model->forward_prefill(*job.tokens, *job.state, logits);
+        } else {
+          std::vector<std::vector<int64_t>> rest;
+          for (const auto& row : *job.tokens) rest.emplace_back(row.begin() + job.offset, row.end());
+          model->forward_prefill(rest, *job.state, logits);
+        }
+      } catch (...) {
+        prefill_workspace = std::move(logits.backend_workspace);
+        throw;
+      }
       prefill_workspace = std::move(logits.backend_workspace);
-    });
+      job.offset = job.length;
+    } catch (...) {
+      job.error = std::current_exception();
+    }
+  }
+
+  void prefill_packed(const std::vector<std::shared_ptr<PrefillJob>>& picked, int T, int rows) {
+    try {
+      const auto& lead = *picked.front()->state;
+      if (prefill_pack.batch_size == 0 || state_row_stride(prefill_pack) < rows ||
+          prefill_pack.wkv32 != lead.wkv32) {
+        const int capacity = std::max(rows, std::min(max_rows, 2 * state_row_stride(prefill_pack)));
+        prefill_pack = {};
+        prefill_pack = model->create_state(capacity);
+        prefill_pack.row_capacity = capacity;
+      }
+      auto& pack = prefill_pack;
+      pack.batch_size = rows;
+      pack.adapter = lead.adapter;
+      pack.adapter_gpu = lead.adapter_gpu;
+      pack.adapter_identity = lead.adapter_identity;
+      pack.initial_state_identity = lead.initial_state_identity;
+      pack.effective_key.clear();
+      pack.advanced = false;
+      pack.row_adapters.reset();
+      std::vector<DeviceCopy> gather, scatter;
+      std::vector<std::vector<int64_t>> tokens;
+      tokens.reserve(static_cast<std::size_t>(rows));
+      const auto now = std::chrono::steady_clock::now();
+      int slot = 0;
+      for (const auto& job : picked) {
+        auto& state = *job->state;
+        if (state.request_started == std::chrono::steady_clock::time_point{})
+          state.request_started = now;
+        for (int r = 0; r < state.batch_size; ++r, ++slot) {
+          queue_state_row(state, r, pack, slot, gather);
+          const auto& row = (*job->tokens)[static_cast<std::size_t>(r)];
+          tokens.emplace_back(row.begin() + job->offset, row.begin() + job->offset + T);
+        }
+      }
+      model->run_device_copies({gather});
+      prefill_logits.backend_workspace = std::move(prefill_workspace);
+      try {
+        model->forward_prefill(tokens, pack, prefill_logits);
+      } catch (...) {
+        prefill_workspace = std::move(prefill_logits.backend_workspace);
+        throw;
+      }
+      prefill_workspace = std::move(prefill_logits.backend_workspace);
+      slot = 0;
+      for (const auto& job : picked) {
+        auto& state = *job->state;
+        // Same check forward_prefill applies to a state it continues.
+        if (state.advanced && state.effective_key != pack.effective_key) {
+          job->error = std::make_exception_ptr(std::runtime_error(
+              "incompatible model/adapter/initial-state cache identity"));
+          slot += state.batch_size;
+          continue;
+        }
+        const bool last = job->offset + T == job->length;
+        auto& logits = *job->logits;
+        if (last) {
+          logits.rows = state.batch_size;
+          logits.vocab_size = prefill_logits.vocab_size;
+          logits.values.resize(static_cast<std::size_t>(logits.rows) * logits.vocab_size,
+                               "allocate prefill logits");
+        }
+        for (int r = 0; r < state.batch_size; ++r, ++slot) {
+          queue_state_row(pack, slot, state, r, scatter);
+          if (last) queue_logits_row(prefill_logits, slot, logits, r, scatter);
+        }
+        state.effective_key = pack.effective_key;
+        state.adapter_identity = pack.adapter_identity;
+        state.advanced = true;
+        job->offset += T;
+      }
+      model->run_device_copies({scatter});
+    } catch (...) {
+      for (const auto& job : picked)
+        if (!job->error) job->error = std::current_exception();
+    }
+    // The scratch outlives the pass; do not pin the adapter lease with it.
+    prefill_pack.adapter.reset();
+    prefill_pack.adapter_gpu.reset();
   }
 
   GenerationStats generate(GenerationState& state, DeviceLogits& logits,
@@ -440,30 +651,22 @@ struct InferenceEngine::Scheduler {
     if (!text.empty()) event(row, std::move(text));
   }
 
-  // A packed execution state may contain rows initialized from different saved
-  // states. Identity remains attached to each request, never to a physical slot.
-  // Backend slice copying intentionally checks identities for public callers;
-  // only this internal packing operation bypasses that whole-batch check.
-  void pack(const GenerationState& src, int from, GenerationState& dst, int to) {
-    dst.advanced = false;
-    model->copy_state_slice(src, from, dst, to, 1);
-  }
-  void export_row(Group& group, int slot) {
-    auto& row = *group.rows[slot];
+  // Copies a row's slot back to its request (state + terminal logits).
+  void queue_export(Group& group, int slot, std::vector<DeviceCopy>& out) {
+    auto& row = *group.rows[static_cast<std::size_t>(slot)];
     auto& dst = *row.request->state;
-    const auto key = dst.effective_key;
-    const auto initial = dst.initial_state_identity;
-    const auto identity = dst.adapter_identity;
-    auto adapter = dst.adapter;
-    auto lease = dst.adapter_gpu;
-    pack(group.state, slot, dst, row.index);
-    dst.effective_key = key;
-    dst.initial_state_identity = initial;
-    dst.adapter_identity = identity;
-    dst.adapter = std::move(adapter);
-    dst.adapter_gpu = std::move(lease);
-    model->copy_logits_slice(group.logits, slot, *row.request->logits, row.index, 1);
+    const bool advanced = dst.advanced || group.state.advanced;
+    queue_state_row(group.state, slot, dst, row.index, out);
+    dst.advanced = advanced;
+    queue_logits_row(group.logits, slot, *row.request->logits, row.index, out);
     if (dst.batch_size == 1) dst.text_stop_tail = row.stop_tail;
+  }
+  // Moves slot `from` of the group into slot `to` of the given buffers.
+  void queue_slot(Group& group, int from, GenerationState& state, DeviceLogits& logits,
+                  SamplerPenaltyState& sampler, int to, std::vector<DeviceCopy>& out) {
+    queue_state_row(group.state, from, state, to, out);
+    queue_logits_row(group.logits, from, logits, to, out);
+    append_sampler_row_copies(group.sampler, from, sampler, to, out);
   }
   void complete(Row& row) {
     if (row.completed) return;
@@ -490,92 +693,138 @@ struct InferenceEngine::Scheduler {
     return req.events.size() >= 128;
   }
 
+  void release(Group& group) {
+    group.rows.clear();
+    group.options.clear();
+    group.state = {};
+    group.logits = {};
+    group.sampler = {};
+    group.capacity = 0;
+  }
+
+  // Applies membership changes with one batched copy: finished/paused rows
+  // are exported, surviving tail rows fill the holes, arrivals take the slots
+  // after them. Rows that stay keep their slot and sampler stream.
   void rebuild(Group& group, bool allow_pause = false) {
-    std::vector<std::shared_ptr<Row>> live;
-    std::vector<int> old_slots;
-    for (size_t i = 0; i < group.rows.size(); ++i) {
+    std::vector<std::shared_ptr<Row>> leaving, paused, arrivals;
+    std::vector<char> keep(group.rows.size(), 0);
+    std::vector<DeviceCopy> exports, moves, appends;
+    bool changed = false;
+    for (std::size_t i = 0; i < group.rows.size(); ++i) {
       auto& row = *group.rows[i];
-      if (row.completed) continue;
+      if (row.completed) { changed = true; continue; }
       if (row.request->cancelled) row.finished = true;
       if (row.finished) {
-        export_row(group, int(i));
-        complete(row);
+        queue_export(group, int(i), exports);
+        leaving.push_back(group.rows[i]);
       } else if (allow_pause && backpressured(*row.request)) {
-        export_row(group, int(i));
+        queue_export(group, int(i), exports);
         row.saved_sampler = std::make_unique<SamplerPenaltyState>(
             make_sampler_penalties(model->vocab_size()));
-        copy_sampler_row(group.sampler, int(i), *row.saved_sampler, 0);
-        pending_rows.push_back(group.rows[i]);
+        append_sampler_row_copies(group.sampler, int(i), *row.saved_sampler, 0, exports);
+        paused.push_back(group.rows[i]);
       } else {
-        live.push_back(group.rows[i]);
-        old_slots.push_back(int(i));
+        keep[i] = 1;
       }
     }
     for (auto& row : group.incoming) {
       if (row->request->cancelled || row->request->options.max_tokens <= 0) {
         complete(*row);
       } else {
-        live.push_back(row);
-        old_slots.push_back(-1);
+        arrivals.push_back(row);
       }
     }
-    if (live == group.rows) { group.incoming.clear(); return; }
-    if (live.empty()) {
+    if (!changed && leaving.empty() && paused.empty() && arrivals.empty()) {
       group.incoming.clear();
-      group.rows.clear();
-      group.state = {};
-      group.logits = {};
-      group.sampler = {};
       return;
     }
-    GenerationState state;
-    if (group.state.batch_size == 0) {
-      state = model->create_state(int(live.size()));
-      group.shift_per_row = state.shift.n / live.size();
-      group.wkv16_per_row = state.wkv_state.n / live.size();
-      group.wkv32_per_row = state.wkv_state32.n / live.size();
-      group.elapsed_per_row = state.elapsed.n / live.size();
-    } else {
-      state = std::move(group.spare_state);
-      state.batch_size = int(live.size());
-      state.wkv32 = group.wkv32;
-      state.shift.resize(group.shift_per_row * live.size(), "grow shift slots");
-      state.wkv_state.resize(group.wkv16_per_row * live.size(), "grow WKV16 slots");
-      state.wkv_state32.resize(group.wkv32_per_row * live.size(), "grow WKV32 slots");
-      state.elapsed.resize(group.elapsed_per_row * live.size(), "grow elapsed slots");
-    }
-    DeviceLogits logits;
-    logits.rows = int(live.size());
-    logits.vocab_size = model->vocab_size();
-    logits.values.resize(live.size() * logits.vocab_size, "allocate decode slot logits");
-    auto sampler = make_sampler_penalties(logits.vocab_size, logits.rows);
-    for (size_t i = 0; i < live.size(); ++i) {
-      auto& row = *live[i];
-      if (old_slots[i] >= 0) {
-        pack(group.state, old_slots[i], state, int(i));
-        model->copy_logits_slice(group.logits, old_slots[i], logits, int(i), 1);
-        copy_sampler_row(group.sampler, old_slots[i], sampler, int(i));
-      } else {
-        pack(*row.request->state, row.index, state, int(i));
-        model->copy_logits_slice(*row.request->logits, row.index, logits, int(i), 1);
-        if (row.saved_sampler) {
-          copy_sampler_row(*row.saved_sampler, 0, sampler, int(i));
-          row.saved_sampler.reset();
-        }
+    const int kept = static_cast<int>(std::count(keep.begin(), keep.end(), 1));
+    const int live = kept + static_cast<int>(arrivals.size());
+    const int vocab = model->vocab_size();
+    std::vector<std::shared_ptr<Row>> next(static_cast<std::size_t>(live));
+    GenerationState grown_state;
+    DeviceLogits grown_logits;
+    SamplerPenaltyState grown_sampler;
+    const bool grow = live > group.capacity;
+    int capacity = group.capacity;
+    if (live > 0 && grow) {
+      capacity = std::max(live, std::min(max_rows, 2 * group.capacity));
+      grown_state = model->create_state(capacity);
+      grown_state.row_capacity = capacity;
+      grown_logits.vocab_size = vocab;
+      grown_logits.values.resize(static_cast<std::size_t>(capacity) * vocab, "allocate decode slot logits");
+      grown_sampler = make_sampler_penalties(vocab, capacity);
+      int slot = 0;
+      for (std::size_t i = 0; i < keep.size(); ++i) {
+        if (!keep[i]) continue;
+        queue_slot(group, int(i), grown_state, grown_logits, grown_sampler, slot, moves);
+        next[static_cast<std::size_t>(slot++)] = group.rows[i];
       }
+    } else if (live > 0) {
+      int hole = 0;
+      for (int i = 0; i < kept; ++i)
+        if (keep[static_cast<std::size_t>(i)]) next[static_cast<std::size_t>(i)] = group.rows[static_cast<std::size_t>(i)];
+      for (std::size_t i = static_cast<std::size_t>(kept); i < keep.size(); ++i) {
+        if (!keep[i]) continue;
+        while (next[static_cast<std::size_t>(hole)]) ++hole;
+        queue_slot(group, int(i), group.state, group.logits, group.sampler, hole, moves);
+        next[static_cast<std::size_t>(hole)] = group.rows[i];
+      }
+    }
+    if (live > 0) {
+      auto& state = grow ? grown_state : group.state;
+      auto& logits = grow ? grown_logits : group.logits;
+      auto& sampler = grow ? grown_sampler : group.sampler;
+      // Arrivals fill spare slots past the current live count.
+      state.batch_size = std::max(state.batch_size, live);
+      for (std::size_t a = 0; a < arrivals.size(); ++a) {
+        const int slot = kept + static_cast<int>(a);
+        auto& row = *arrivals[a];
+        auto& request = *row.request;
+        queue_state_row(*request.state, row.index, state, slot, appends);
+        queue_logits_row(*request.logits, row.index, logits, slot, appends);
+        if (row.saved_sampler) {
+          append_sampler_row_copies(*row.saved_sampler, 0, sampler, slot, appends);
+        } else {
+          append_sampler_row_reset(sampler, slot, appends);
+        }
+        next[static_cast<std::size_t>(slot)] = arrivals[a];
+      }
+    }
+    model->run_device_copies({exports, moves, appends});
+    group.incoming.clear();
+    for (auto& row : arrivals) row->saved_sampler.reset();
+    for (auto& row : leaving) complete(*row);
+    for (auto& row : paused) pending_rows.push_back(row);
+    if (live == 0) {
+      release(group);
+      return;
     }
     // Rows keep their own adapter; the packed state carries only the per-row
     // table, so one base forward serves base and every adapter together.
-    // Identity stays with each request (export_row restores it).
+    // Identity stays with each request (queue_export restores it).
+    auto adapters = std::move(group.state.row_adapters);
+    if (grow) {
+      grown_logits.backend_workspace = std::move(group.logits.backend_workspace);
+      group.state = std::move(grown_state);
+      group.logits = std::move(grown_logits);
+      group.sampler = std::move(grown_sampler);
+      group.capacity = capacity;
+    }
+    auto& state = group.state;
+    state.batch_size = live;
+    state.row_capacity = group.capacity;
+    group.logits.rows = live;
+    group.logits.vocab_size = vocab;
+    group.sampler.batch_size = live;
     state.adapter.reset();
     state.adapter_gpu.reset();
     state.adapter_identity.clear();
     state.advanced = false;
-    auto adapters = std::move(group.state.row_adapters);
     if (!adapters) adapters = std::make_shared<RowAdapters>();
     adapters->leases.clear();
     adapters->scales.clear();
-    for (const auto& row : live) {
+    for (const auto& row : next) {
       auto& owner = *row->request->state;
       if (owner.adapter && !owner.adapter_gpu) model->prepare_adapter(owner);
       adapters->leases.push_back(owner.adapter ? owner.adapter_gpu : nullptr);
@@ -583,14 +832,7 @@ struct InferenceEngine::Scheduler {
     }
     adapters->dirty = true;
     state.row_adapters = std::move(adapters);
-    // Reuse the backend's forward scratch as membership changes.
-    logits.backend_workspace = std::move(group.logits.backend_workspace);
-    group.spare_state = std::move(group.state);
-    group.state = std::move(state);
-    group.logits = std::move(logits);
-    group.sampler = std::move(sampler);
-    group.rows = std::move(live);
-    group.incoming.clear();
+    group.rows = std::move(next);
     group.options.clear();
     for (const auto& row : group.rows) group.options.push_back(row->request->options);
   }
@@ -696,16 +938,14 @@ struct InferenceEngine::Scheduler {
       row->request->cancelled = true;
       complete(*row);
     }
-    group.state = {};
-    group.logits = {};
-    group.sampler = {};
+    release(group);
   }
   void loop() {
     // Device selection is thread-local on CUDA and HIP.
     const auto device_error = cudaSetDevice(device);
     for (;;) {
       std::deque<std::shared_ptr<Request>> arrivals;
-      std::function<void()> chunk;
+      std::vector<std::shared_ptr<PrefillJob>> queued;
       bool shutdown;
       {
         std::unique_lock<std::mutex> lock(mutex);
@@ -716,15 +956,26 @@ struct InferenceEngine::Scheduler {
             changed.wait_for(lock, std::chrono::milliseconds(10));
         }
         arrivals.swap(incoming);
-        if (!prefill.empty()) { chunk = std::move(prefill.front()); prefill.pop_front(); }
+        queued.assign(prefill.begin(), prefill.end());
         shutdown = stopping;
       }
       for (auto& req : arrivals) admit(req);
       if (shutdown) for (auto& row : pending_rows) row->request->cancelled = true;
       admit_pending();
-      // At most one prefill chunk between decode sweeps. New long prompts
+      // At most one prefill pass between decode sweeps. New long prompts
       // therefore cannot monopolize the owner while existing rows decode.
-      if (chunk) chunk();
+      if (!queued.empty()) {
+        const auto finished = prefill_pass(queued);
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          for (const auto& job : finished)
+            prefill.erase(std::find(prefill.begin(), prefill.end(), job));
+        }
+        for (const auto& job : finished) {
+          if (job->error) job->done.set_exception(job->error);
+          else job->done.set_value();
+        }
+      }
       std::unordered_set<Request*> checked;
       {
         const auto check = [&](const auto& rows) {
@@ -755,6 +1006,14 @@ struct InferenceEngine::Scheduler {
       groups.erase(std::remove_if(groups.begin(), groups.end(), [](const auto& group) {
         return group->rows.empty() && group->incoming.empty();
       }), groups.end());
+      // Merged-prefill scratch is kept across a burst, released when idle.
+      if (groups.empty() && pending_rows.empty() && prefill_pack.batch_size != 0) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (prefill.empty()) {
+          prefill_pack = {};
+          prefill_logits = {};
+        }
+      }
       if (shutdown) {
         std::lock_guard<std::mutex> lock(mutex);
         if (groups.empty() && pending_rows.empty() && incoming.empty() && prefill.empty()) break;
@@ -765,7 +1024,8 @@ struct InferenceEngine::Scheduler {
 
 InferenceEngine::Scheduler& InferenceEngine::scheduler() const {
   std::lock_guard<std::mutex> lock(scheduler_mutex_);
-  if (!scheduler_) scheduler_ = std::make_shared<Scheduler>(model_, tokenizer_, max_decode_batch_size_);
+  if (!scheduler_) scheduler_ = std::make_shared<Scheduler>(model_, tokenizer_, max_decode_batch_size_,
+                                                       prefill_chunk_size_);
   return *scheduler_;
 }
 

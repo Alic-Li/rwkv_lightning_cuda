@@ -1982,6 +1982,18 @@ void refresh_uniform_table(ForwardResources& res, const rwkv7_miss::GpuLease& le
   res.uniform_version = lease.version;
 }
 
+// Largest row count (B*T) that uses the multi-row low-rank kernels. On an
+// RTX 4060 Ti (1.5B) they beat cuBLAS for 5-8 rows (B=8 decode 11.37 -> 10.63
+// ms) and lose from 12 rows on, where cuBLAS tiles use tensor cores well.
+// RWKV_LOWRANK_ROWS_MAX overrides it for tuning (0 disables).
+int lowrank_rows_max() {
+  static const int value = [] {
+    const char* text = std::getenv("RWKV_LOWRANK_ROWS_MAX");
+    return text ? std::atoi(text) : 8;
+  }();
+  return value;
+}
+
 void run_backend_forward(
     const CudaWeights& weights,
     const std::vector<std::vector<int64_t>>& token_batches,
@@ -2005,6 +2017,11 @@ void run_backend_forward(
   }
   if (state.batch_size != B) {
     throw std::runtime_error("state batch size mismatch");
+  }
+  // Rows per layer block: a packed decode group keeps spare slot capacity.
+  const int S = state_row_stride(state);
+  if (S < B) {
+    throw std::runtime_error("state row capacity is smaller than the batch");
   }
   if (state.wkv32 != use_wkv32) {
     throw std::runtime_error("state wkv precision mismatch");
@@ -2164,14 +2181,14 @@ void run_backend_forward(
       throw std::runtime_error("lowrank exceeds arena max");
     }
 
-    half* shift0 = state.shift.p + static_cast<std::size_t>(layer) * 2 * B * C;
-    half* shift1 = shift0 + static_cast<std::size_t>(B) * C;
+    half* shift0 = state.shift.p + static_cast<std::size_t>(layer) * 2 * S * C;
+    half* shift1 = shift0 + static_cast<std::size_t>(S) * C;
     half* layer_state16 = nullptr;
     float* layer_state32 = nullptr;
     if (use_wkv32) {
-      layer_state32 = state.wkv_state32.p + static_cast<std::size_t>(layer) * B * H * N * N;
+      layer_state32 = state.wkv_state32.p + static_cast<std::size_t>(layer) * S * H * N * N;
     } else {
-      layer_state16 = state.wkv_state.p + static_cast<std::size_t>(layer) * B * H * N * N;
+      layer_state16 = state.wkv_state.p + static_cast<std::size_t>(layer) * S * H * N * N;
     }
 
     if (!pre_mix_ready) {
@@ -2216,7 +2233,17 @@ void run_backend_forward(
     bool v_done = false;
 
     const int profile_att_lowrank = profiler.begin(stream, "att_lowrank");
-    if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
+    // Small batches above the fused single-row range: one multi-row launch
+    // each for rank-in and rank-out instead of one small GEMM per projection.
+    const bool lowrank_rows = C >= kLowrankFusedMinC && rows > kLowrankOutRowsT &&
+                              rows <= lowrank_rows_max() && Rw <= kLowrankMax &&
+                              ((Rw | Ra | Rg | Rv) & 1) == 0;
+    if (lowrank_rows) {
+      rwkv7_v3a_lowrank_rows_in_f16_launch(
+          stream, rows, C, Rw, Ra, Rg, Rv, xw, xa, xg, xv,
+          hp(w.att_w1_t), hp(w.att_a1_t), hp(w.att_g1_t), layer == 0 ? nullptr : hp(w.att_v1_t),
+          w1, a1, g1, v1);
+    } else if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
       rwkv7_v3a_linear_wagv_rank_in_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, xw, xa, xg, xv,
           hp(w.att_w1_t), hp(w.att_a1_t), hp(w.att_g1_t), hp(w.att_v1_t), w1, a1, g1, v1);
@@ -2231,7 +2258,16 @@ void run_backend_forward(
     profiler.end(stream, profile_att_lowrank);
 
     const int profile_att_lowrank_out = profiler.begin(stream, "att_lowrank_out");
-    if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
+    if (lowrank_rows) {
+      rwkv7_v3a_lowrank_rows_out_f16_launch(
+          stream, rows, C, Rw, Ra, Rg, Rv, w1, a1, g1, v1,
+          hp(w.att_w2_t), hp(w.att_a2_t), hp(w.att_g2_t), layer == 0 ? nullptr : hp(w.att_v2_t),
+          v_base, v_first, layer == 0 ? nullptr : hp(w.att_v0), w12, a12, g, v_out);
+      if (layer != 0) {
+        v_use = v_out;
+        v_done = true;
+      }
+    } else if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
       rwkv7_v3a_linear_wagv_rank_out_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, w1, a1, g1, v1,
           hp(w.att_w2_t), hp(w.att_a2_t), hp(w.att_g2_t), hp(w.att_v2_t),
@@ -2315,6 +2351,14 @@ void run_backend_forward(
         w.ffn_value_w->is_int8() && C >= 4096 && rows <= layer_sparse_max_rows) {
       cmix_mode = CmixMode::NoFcRows2;
     }
+    static const int debug_fp16_sparse_rows = [] {
+      const char* text = std::getenv("RWKV_DEBUG_FP16_SPARSE_ROWS");
+      return text ? std::atoi(text) : 0;
+    }();
+    if (run.cmix_sparse != "off" && cmix_mode == CmixMode::Dense && !w.ffn_value_w->is_int8() &&
+        !w.ffn_value_w->is_int4() && rows <= debug_fp16_sparse_rows) {
+      cmix_mode = CmixMode::NoFcRows2;
+    }
     const int profile_ffn_value = profiler.begin(stream, "ffn_value");
     if (cmix_mode == CmixMode::NoFcOne) {
       if (w.ffn_value_w->is_int8()) {
@@ -2367,7 +2411,7 @@ void run_backend_forward(
     if (layer + 1 < dims.layers) {
       const LayerWeights& next = weights.layers[layer + 1];
       if (B == 1 && T == 1) {
-        half* next_shift0 = state.shift.p + static_cast<std::size_t>(layer + 1) * 2 * B * C;
+        half* next_shift0 = state.shift.p + static_cast<std::size_t>(layer + 1) * 2 * S * C;
         const int profile_next_mix = profiler.begin(stream, "layer_norm_tmix_mix6");
         rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
             stream, rows, C, x_after_att, cmix_out, next_shift0, hp(next.ln1_w), hp(next.ln1_b),
@@ -2418,11 +2462,42 @@ void run_backend_forward(
   out.vocab_size = V;
   out.values.resize(static_cast<std::size_t>(output_rows) * V, "alloc backend logits f32");
   const int profile_logits = profiler.begin(stream, "f16_to_f32_logits");
-  rwkv7_v4_f16_to_f32_launch(stream, logits_f16, out.values.p, out.values.n);
+  rwkv7_v4_f16_to_f32_launch(stream, logits_f16, out.values.p,
+                             static_cast<std::size_t>(output_rows) * V);
   profiler.end(stream, profile_logits);
   check_cuda(cudaGetLastError(), "launch backend logits f16->f32");
   check_cuda(cudaStreamSynchronize(stream), "sync backend stream");
   profiler.report();
+}
+
+// Moves many small device regions (state/logits/sampler rows) in one launch.
+// Each block owns one descriptor; gridDim.y blocks split a large region.
+__global__ void device_copies_kernel(const DeviceCopy* copies) {
+  const DeviceCopy copy = copies[blockIdx.x];
+  const auto src = reinterpret_cast<std::uintptr_t>(copy.src);
+  const auto dst = reinterpret_cast<std::uintptr_t>(copy.dst);
+  const std::size_t first = static_cast<std::size_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+  const std::size_t step = static_cast<std::size_t>(gridDim.y) * blockDim.x;
+  if (((src | dst | copy.bytes) & 15) == 0) {
+    const std::size_t words = copy.bytes / 16;
+    auto* out = reinterpret_cast<uint4*>(copy.dst);
+    const auto* in = reinterpret_cast<const uint4*>(copy.src);
+    for (std::size_t i = first; i < words; i += step) out[i] = in ? in[i] : make_uint4(0, 0, 0, 0);
+  } else if (((src | dst | copy.bytes) & 3) == 0) {
+    const std::size_t words = copy.bytes / 4;
+    auto* out = reinterpret_cast<std::uint32_t*>(copy.dst);
+    const auto* in = reinterpret_cast<const std::uint32_t*>(copy.src);
+    for (std::size_t i = first; i < words; i += step) out[i] = in ? in[i] : 0u;
+  } else {
+    auto* out = reinterpret_cast<unsigned char*>(copy.dst);
+    const auto* in = reinterpret_cast<const unsigned char*>(copy.src);
+    for (std::size_t i = first; i < copy.bytes; i += step) out[i] = in ? in[i] : 0;
+  }
+}
+
+void launch_device_copies(cudaStream_t stream, const DeviceCopy* copies, int count) {
+  device_copies_kernel<<<dim3(static_cast<unsigned>(count), 8), 256, 0, stream>>>(copies);
+  check_cuda(cudaGetLastError(), "launch device copies");
 }
 
 }  // namespace
@@ -2452,6 +2527,8 @@ struct ModelBackend::Impl {
   }
 
   ~Impl() {
+    if (copy_stream != nullptr) cudaStreamDestroy(copy_stream);
+    if (copy_ready != nullptr) cudaEventDestroy(copy_ready);
     if (!weights.cmix_stats.enabled) return;
     std::vector<unsigned long long> nonzero(weights.dims.layers);
     std::vector<unsigned long long> total(weights.dims.layers);
@@ -2522,6 +2599,10 @@ struct ModelBackend::Impl {
   bool retune = false;
   std::string tune_cache_directory;
   CudaWeights weights;
+  std::mutex copy_mutex;
+  cudaStream_t copy_stream = nullptr;
+  cudaEvent_t copy_ready = nullptr;
+  DeviceBuffer<unsigned char> copy_descriptors;
   // Last member: destroyed first, joining the hash before its inputs go.
   std::future<void> fingerprint_job;
 };
@@ -2745,70 +2826,79 @@ void ModelBackend::copy_state_slice(
   dst.adapter_identity = src.adapter_identity;
   dst.initial_state_identity = src.initial_state_identity;
   dst.advanced = src.advanced;
+  std::vector<DeviceCopy> copies;
+  for (int row = 0; row < count; ++row) {
+    append_state_row_copies(src, src_offset + row, dst, dst_offset + row, copies);
+  }
+  run_device_copies({copies});
+}
+
+void ModelBackend::append_state_row_copies(
+    const GenerationState& src, int src_row,
+    GenerationState& dst, int dst_row,
+    std::vector<DeviceCopy>& out) const {
+  // Slots are bounded by capacity: a packed group fills spare slots before
+  // its live row count grows to include them.
+  if (src_row < 0 || dst_row < 0 || src_row >= state_row_stride(src) ||
+      dst_row >= state_row_stride(dst)) {
+    throw std::runtime_error("state row copy exceeds row capacity");
+  }
+  if (src.wkv32 != dst.wkv32 || src.wkv32 != impl_->use_wkv32) {
+    throw std::runtime_error("state row copy wkv precision mismatch");
+  }
   const auto& dims = impl_->weights.dims;
-  const std::size_t shift_lane_elems = static_cast<std::size_t>(dims.channels);
-  const std::size_t wkv_lane_elems =
-      static_cast<std::size_t>(dims.heads) * dims.head_size * dims.head_size;
-
+  const std::size_t C = static_cast<std::size_t>(dims.channels);
+  const std::size_t lane = static_cast<std::size_t>(dims.heads) * dims.head_size * dims.head_size;
+  const std::size_t src_stride = static_cast<std::size_t>(state_row_stride(src));
+  const std::size_t dst_stride = static_cast<std::size_t>(state_row_stride(dst));
   for (int layer = 0; layer < dims.layers; ++layer) {
-    half* src_shift0 = src.shift.p + static_cast<std::size_t>(layer) * 2 * src.batch_size * dims.channels +
-                       static_cast<std::size_t>(src_offset) * dims.channels;
-    half* src_shift1 = src.shift.p + static_cast<std::size_t>(layer) * 2 * src.batch_size * dims.channels +
-                       static_cast<std::size_t>(src.batch_size + src_offset) * dims.channels;
-    half* dst_shift0 = dst.shift.p + static_cast<std::size_t>(layer) * 2 * dst.batch_size * dims.channels +
-                       static_cast<std::size_t>(dst_offset) * dims.channels;
-    half* dst_shift1 = dst.shift.p + static_cast<std::size_t>(layer) * 2 * dst.batch_size * dims.channels +
-                       static_cast<std::size_t>(dst.batch_size + dst_offset) * dims.channels;
-
-    check_cuda(
-        cudaMemcpy(
-            dst_shift0,
-            src_shift0,
-            static_cast<std::size_t>(count) * shift_lane_elems * sizeof(half),
-            cudaMemcpyDeviceToDevice),
-        "copy backend state slice shift0");
-    check_cuda(
-        cudaMemcpy(
-            dst_shift1,
-            src_shift1,
-            static_cast<std::size_t>(count) * shift_lane_elems * sizeof(half),
-            cudaMemcpyDeviceToDevice),
-        "copy backend state slice shift1");
-
+    const std::size_t L = static_cast<std::size_t>(layer);
+    for (std::size_t half_index = 0; half_index < 2; ++half_index) {
+      out.push_back({src.shift.p + ((L * 2 + half_index) * src_stride + src_row) * C,
+                     dst.shift.p + ((L * 2 + half_index) * dst_stride + dst_row) * C,
+                     C * sizeof(half)});
+    }
     if (impl_->use_wkv32) {
-      float* src_wkv = src.wkv_state32.p + static_cast<std::size_t>(layer) * src.batch_size * wkv_lane_elems +
-                       static_cast<std::size_t>(src_offset) * wkv_lane_elems;
-      float* dst_wkv = dst.wkv_state32.p + static_cast<std::size_t>(layer) * dst.batch_size * wkv_lane_elems +
-                       static_cast<std::size_t>(dst_offset) * wkv_lane_elems;
-      check_cuda(
-          cudaMemcpy(
-              dst_wkv,
-              src_wkv,
-              static_cast<std::size_t>(count) * wkv_lane_elems * sizeof(float),
-              cudaMemcpyDeviceToDevice),
-          "copy backend state slice wkv32");
+      out.push_back({src.wkv_state32.p + (L * src_stride + src_row) * lane,
+                     dst.wkv_state32.p + (L * dst_stride + dst_row) * lane, lane * sizeof(float)});
     } else {
-      half* src_wkv = src.wkv_state.p + static_cast<std::size_t>(layer) * src.batch_size * wkv_lane_elems +
-                      static_cast<std::size_t>(src_offset) * wkv_lane_elems;
-      half* dst_wkv = dst.wkv_state.p + static_cast<std::size_t>(layer) * dst.batch_size * wkv_lane_elems +
-                      static_cast<std::size_t>(dst_offset) * wkv_lane_elems;
-      check_cuda(
-          cudaMemcpy(
-              dst_wkv,
-              src_wkv,
-              static_cast<std::size_t>(count) * wkv_lane_elems * sizeof(half),
-              cudaMemcpyDeviceToDevice),
-          "copy backend state slice wkv16");
+      out.push_back({src.wkv_state.p + (L * src_stride + src_row) * lane,
+                     dst.wkv_state.p + (L * dst_stride + dst_row) * lane, lane * sizeof(half)});
     }
   }
+  out.push_back({src.elapsed.p + src_row, dst.elapsed.p + dst_row, sizeof(int)});
+}
 
-  check_cuda(
-      cudaMemcpy(
-          dst.elapsed.p + dst_offset,
-          src.elapsed.p + src_offset,
-          static_cast<std::size_t>(count) * sizeof(int),
-          cudaMemcpyDeviceToDevice),
-      "copy backend state slice elapsed");
+void ModelBackend::run_device_copies(const std::vector<std::vector<DeviceCopy>>& phases) const {
+  std::size_t total = 0;
+  for (const auto& phase : phases) total += phase.size();
+  if (total == 0) return;
+  std::lock_guard<std::mutex> lock(impl_->copy_mutex);
+  check_cuda(cudaSetDevice(impl_->device), "select copy device");
+  if (impl_->copy_stream == nullptr) {
+    check_cuda(cudaStreamCreateWithFlags(&impl_->copy_stream, cudaStreamNonBlocking), "create copy stream");
+    check_cuda(cudaEventCreateWithFlags(&impl_->copy_ready, cudaEventDisableTiming), "create copy event");
+  }
+  // Callers' buffers may still be written by legacy-stream work (memsets,
+  // sampler kernels); order the copies after it like cudaMemcpy did.
+  check_cuda(cudaEventRecord(impl_->copy_ready, 0), "record legacy stream");
+  check_cuda(cudaStreamWaitEvent(impl_->copy_stream, impl_->copy_ready, 0), "order device copies");
+  std::vector<DeviceCopy> flat;
+  flat.reserve(total);
+  for (const auto& phase : phases) flat.insert(flat.end(), phase.begin(), phase.end());
+  impl_->copy_descriptors.resize(flat.size() * sizeof(DeviceCopy), "alloc copy descriptors");
+  check_cuda(cudaMemcpyAsync(impl_->copy_descriptors.p, flat.data(), flat.size() * sizeof(DeviceCopy),
+                             cudaMemcpyHostToDevice, impl_->copy_stream),
+             "upload copy descriptors");
+  const auto* descriptors = reinterpret_cast<const DeviceCopy*>(impl_->copy_descriptors.p);
+  std::size_t offset = 0;
+  for (const auto& phase : phases) {
+    if (!phase.empty()) {
+      launch_device_copies(impl_->copy_stream, descriptors + offset, static_cast<int>(phase.size()));
+      offset += phase.size();
+    }
+  }
+  check_cuda(cudaStreamSynchronize(impl_->copy_stream), "sync device copies");
 }
 
 void ModelBackend::copy_logits_slice(

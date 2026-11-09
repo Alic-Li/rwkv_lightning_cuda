@@ -80,6 +80,10 @@ struct GenerationState {
   double adapter_h2d_ms = 0;
   std::chrono::steady_clock::time_point request_started{};
   int batch_size = 0;
+  // Physical rows per layer block of the device buffers; 0 means batch_size.
+  // A packed decode group keeps a larger capacity so rows stay in their slots
+  // while the live row count changes.
+  int row_capacity = 0;
   bool wkv32 = false;
   rwkv7_fast_v4::DeviceBuffer<half> shift;
   rwkv7_fast_v4::DeviceBuffer<half> wkv_state;
@@ -94,6 +98,32 @@ struct GenerationState {
   GenerationState(GenerationState&&) noexcept = default;
   GenerationState& operator=(GenerationState&&) noexcept = default;
 };
+
+inline int state_row_stride(const GenerationState& state) {
+  return state.row_capacity > 0 ? state.row_capacity : state.batch_size;
+}
+
+// One device-to-device copy; a null source zero-fills the destination.
+struct DeviceCopy {
+  const void* src = nullptr;
+  void* dst = nullptr;
+  std::size_t bytes = 0;
+};
+
+// Runs each phase after the previous one and waits for completion. Copies in
+// one phase may run concurrently, so they must not overlap. This portable
+// fallback issues one synchronous call per copy.
+inline void run_device_copies_serially(const std::vector<std::vector<DeviceCopy>>& phases) {
+  for (const auto& phase : phases) {
+    for (const auto& copy : phase) {
+      if (copy.bytes == 0) continue;
+      rwkv7_fast_v4::check_cuda(
+          copy.src ? cudaMemcpy(copy.dst, copy.src, copy.bytes, cudaMemcpyDeviceToDevice)
+                   : cudaMemset(copy.dst, 0, copy.bytes),
+          "run device copy");
+    }
+  }
+}
 
 inline void
 bind_adapter(GenerationState &state,
@@ -156,6 +186,19 @@ class IModelBackend {
       DeviceLogits& dst,
       int dst_offset,
       int count) const = 0;
+  // Appends the copies that move one recurrent-state row (no identity
+  // metadata) for a later run_device_copies. The default copies immediately
+  // through copy_state_slice, which keeps only the order among state rows;
+  // callers preserve the destination metadata themselves.
+  virtual void append_state_row_copies(
+      const GenerationState& src, int src_row,
+      GenerationState& dst, int dst_row,
+      std::vector<DeviceCopy>&) const {
+    copy_state_slice(src, src_row, dst, dst_row, 1);
+  }
+  virtual void run_device_copies(const std::vector<std::vector<DeviceCopy>>& phases) const {
+    run_device_copies_serially(phases);
+  }
   virtual PrefillCapacity query_prefill_capacity(int prefill_chunk_size) const = 0;
 
   virtual int vocab_size() const = 0;
@@ -204,6 +247,11 @@ class ModelBackend final : public IModelBackend {
       DeviceLogits& dst,
       int dst_offset,
       int count) const override;
+  void append_state_row_copies(
+      const GenerationState& src, int src_row,
+      GenerationState& dst, int dst_row,
+      std::vector<DeviceCopy>& out) const override;
+  void run_device_copies(const std::vector<std::vector<DeviceCopy>>& phases) const override;
   PrefillCapacity query_prefill_capacity(int prefill_chunk_size) const override;
 
   int vocab_size() const override;
