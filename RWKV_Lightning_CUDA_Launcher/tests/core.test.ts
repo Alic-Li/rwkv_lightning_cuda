@@ -25,7 +25,7 @@ import {
   orderedMerge,
   type TranslateChunk,
 } from "../src/lib/translate/scheduler";
-import { resolveTheme, defaultGeneration } from "../src/stores/settings";
+import { resolveTheme } from "../src/stores/settings";
 import { defaultTuning } from "../src/lib/api/launcher";
 import { normalizeLanguage } from "../src/lib/translate/languages";
 import {
@@ -34,23 +34,40 @@ import {
   formatHTMLForMarkdown,
 } from "../src/lib/chat/html";
 import { suggestedQuantizedPath } from "../src/lib/api/launcher";
-import { generationBody } from "../src/lib/api/client";
-it("serializes State and sampling settings without retired fields", () => {
-  const legacy = {
-    ...defaultGeneration,
-    state_id: "initial",
-    temperature: 0,
-    top_k: 0,
-    adapter_id: "old",
-    adapter_version: "v1",
-    adapter_scale: "NaN",
-  };
-  expect(generationBody(legacy)).toEqual({
-    ...defaultGeneration,
-    state_id: "initial",
-    temperature: 0,
-    top_k: 0,
+import {
+  adapterFields,
+  adapterIDFromFilename,
+  generationBody,
+} from "../src/lib/api/client";
+it("derives an adapter ID for state-like file upload", () => {
+  expect(adapterIDFromFilename("adapter-final.pth")).toBe("adapter-final");
+  expect(adapterIDFromFilename("HTML.PTH")).toBe("HTML");
+  expect(adapterIDFromFilename(".pth")).toBe("adapter");
+});
+it("omits unset adapter fields and preserves explicit zero scale", () => {
+  expect(
+    adapterFields({
+      adapter_id: "",
+      adapter_version: "stale",
+      adapter_scale: "1",
+    }),
+  ).toEqual({});
+  expect(adapterFields({ adapter_id: "html", adapter_scale: "" })).toEqual({
+    adapter_id: "html",
   });
+  expect(
+    adapterFields({
+      adapter_id: "html",
+      adapter_version: "v1",
+      adapter_scale: "0",
+    }),
+  ).toEqual({ adapter_id: "html", adapter_version: "v1", adapter_scale: 0 });
+  expect(() =>
+    adapterFields({ adapter_id: "html", adapter_scale: "NaN" }),
+  ).toThrow();
+  expect(
+    generationBody({ adapter_id: "", adapter_scale: "", state_id: "initial" }),
+  ).toEqual({ state_id: "initial" });
 });
 const stream = (parts: string[]) =>
   new ReadableStream<Uint8Array>({

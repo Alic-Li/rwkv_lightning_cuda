@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import { adapterFields } from "@/lib/api/client";
 import { inferenceApi } from "@/lib/api/inference";
 import { chunkText, translationPrompt } from "@/lib/translate/chunk";
 import { normalizeLanguage } from "@/lib/translate/languages";
@@ -144,7 +145,10 @@ export const useTranslate = create(
             try {
               const response = await inferenceApi.batchCompletions(
                 backendId,
-                translationBody(batch.map((c) => c.prompt)),
+                {
+                  ...translationBody(batch.map((c) => c.prompt)),
+                  ...adapterFields(settings.generation),
+                },
                 signal,
               );
               const byIndex = new Map(

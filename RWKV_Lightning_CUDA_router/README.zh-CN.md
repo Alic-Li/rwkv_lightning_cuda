@@ -1,11 +1,9 @@
 # RWKV Lightning CUDA 路由器
 
-动态 Adapter 管理、同步和路由已移除。`/v1/adapters` 返回 404；包含 `adapter_id`、`adapter_version` 或 `adapter_scale` 的请求返回 400。请删除旧配置中的 `adapter_upload_*` 项。State API 继续支持。
-
 [English](README.md) | 简体中文
 
 这是一个 HTTP 反向代理，按正在处理的批大小而非请求数，对 RWKV 推理服务器进行负载均衡。
-推理请求和 SSE 流透传；State 管理接口由广播链路处理。
+推理请求和 SSE 流透传；State 与 adapter 的管理接口由共用广播链路处理。
 
 ## 运行
 
@@ -29,17 +27,17 @@ internal/
     app.go, config.go            # 启动与配置
     scheduler.go, proxy.go       # 调度、会话亲和、推理转发
     resource_sync.go             # 共用结果确认、错误汇总、列表发现
-    state_*.go                  # State 身份校验与副本状态
+    state_*.go, adapter_*.go     # 各资源的身份校验与副本状态
     diagnostics.go              # 路由诊断
 cmd/rwkv-batch-loadtest/         # 独立负载测试工具
 ```
 
-State 操作走同一条链路：验证请求并锁定该 ID → 并发广播全部后端 → 仅重试失败上传 →
+两种资源都走同一条链路：验证请求并锁定该 ID → 并发广播全部后端 → 仅重试失败上传 →
 等待全部结果 → 校验资源身份 → 发布副本就绪状态 → 返回统一结果。响应到达客户端前，
-就绪状态已经生效。State 保留统一 UUID 与原有重试配置。
+就绪状态已经生效。State 保留统一 UUID，adapter 保留 ID 和内容版本；重试配置键仍分别有效。
 
 - 上传、列表、删除和自动发现共用 HTTP 广播模块。上传才重试；列表/删除单次尝试也受
-  对应 `state_upload_attempt_timeout_seconds` 限制（默认 120 秒），全局请求超时可进一步缩短。
+  对应 `*_upload_attempt_timeout_seconds` 限制（默认 120 秒），全局请求超时可进一步缩短。
   自动发现最多 5 秒，同时保留认证头和 JSON `password`。
 - 同 ID 修改互斥，冲突返回 409；修改期间阻止该 ID 的新推理。删除必须收到有效的
   `deleted: true` 回执，不确定结果保持禁用，全部明确拒绝时才恢复之前的记录。
@@ -48,8 +46,8 @@ State 操作走同一条链路：验证请求并锁定该 ID → 并发广播全
 - 广播不跟随重定向；回执必须来自配置的目标后端。每个回执最多读取 8 MiB。
 - State 的 POST list/delete 别名和 OPTIONS 保持兼容；预检不会触发修改。
 
-在本目录执行 `go test -race ./...` 和 `go vet ./...`。测试覆盖共用广播引擎、State 的
-故障契约，以及 Router 与三个独立模拟后端之间的真实 HTTP 上传、列表和并发推理。
+在本目录执行 `go test -race ./...` 和 `go vet ./...`。测试覆盖共用广播引擎、两种资源的
+同一套故障契约，以及 Router 与三个独立模拟后端之间的真实 HTTP 上传、列表和并发推理。
 这些测试不需要模型/GPU，也不代表已验证某个线上集群的部署状态。
 
 ## 调度
@@ -107,20 +105,63 @@ HTTP 错误响应会直接转发，不会据此标记后端不健康，因为它
 - 删除开始后停止新请求使用该 State；不确定的删除结果保持禁用。全部节点明确返回
   验证/认证拒绝时恢复原就绪记录；过期的列表响应不会覆盖上传或删除的结果。
 
+## Adapter 全后端同步
+
+`/v1/adapters` 的 `POST`（multipart 上传或 JSON 路径注册）、`GET` 和 `DELETE`
+均并发发送到每个配置后端，包括处于连接冷却中的节点。只有所有后端注册成功，且返回
+相同的 `adapter_id` 和内容版本 `version`，上传才返回成功。JSON 的 `path` 必须在每个
+后端机器上都可读；不同机器推荐直接 multipart 上传，同一份 PTH 和可选的旧格式
+`checkpoint.json` 会原样发给所有后端：
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/adapters \
+  -F 'adapter_id=miss-r16-lr3e-5' \
+  -F 'file=@./rwkv7-g1k-7b-r16-lr3e-5-e2-miss.pth'
+```
+
+需要认证时添加 `-H 'Authorization: Bearer ...'`。上传后在生成请求中使用该
+`adapter_id`；推荐同时带上上传响应中的 `version`，作为 `adapter_version`。
+Router 会将省略版本的请求固定到它确认的当前内容版本，避免后端各自的 latest 不一致。
+`adapter_scale`、`stop`、SSE 的 `matched_stop` 等请求和响应字段正常透传。
+
+- 上传默认最多尝试 3 次，每次最长 120 秒；只重试失败节点，重发相同 ID 和相同请求体。
+  连接/响应读取失败、超时和 HTTP 408/429/500/502/503/504 可重试，确定性 4xx 不重试。
+  通过 `adapter_upload_*` 独立配置，支持 `Retry-After`、总请求期限和客户端取消。
+- 部分失败返回 HTTP 502 JSON，含 `adapter_id`、已确认的 `version`、`ready_backends`
+  和 `failed_backends`。成功副本不回滚；推理仅发往已确认有所需版本的健康节点。
+  同时使用 State 时，必须在同一节点同时具备该 State 和 adapter；没有满足条件的节点
+  返回 HTTP 503，不会去掉 adapter/State 后继续推理。推理请求本身不会自动重试。
+- 同一 ID 的上传/删除期间暂不接收该 ID 的新推理，同 ID 的并发修改返回 HTTP 409。
+  删除广播到所有后端；不确定的删除结果保持对应 ID/版本禁用，避免残留副本重新接收流量。
+  所有后端明确拒绝修改（例如认证失败）时恢复原有就绪记录。
+- 列表比较所有后端的 `(id, version, manifest)`，忽略条目顺序和各节点不同的缓存统计；
+  不一致时返回 HTTP 502，不会随机展示某个节点的列表。成功响应的统计来自第一个后端，
+  不是全局合计。过期列表不能覆盖正在发生的上传/删除。
+- Router 重启或遇到未知 adapter 后，会用最多 5 秒查询所有后端列表并恢复版本就绪记录。
+  旧后端列表不提供 latest 信息；同一 ID 仅有一个已发现版本时可自动使用，有多个版本时
+  请显式提供 `adapter_version`，或通过 Router 重新注册所需版本。
+
+广播不是分布式事务，也不在返回错误后无限后台补传。需要重新同步时，用相同 ID 重新上传，
+随后再次检查 Router 列表。Cloudflare 在 Router 外层返回的 502/超时仍可能发生在实际上传
+成功之后，应通过 Router 的全后端列表确认结果，不能仅凭客户端收到错误断定文件未上传。
+State 也必须通过上述 `/v1/state/*` 广播接口上传，旧 Router 已只上传到某个节点的内容
+不会自动复制到其他机器。
+
 ## 上传成功后列表失败的诊断
 
-列表超时、401/502、HTML 错误页或 JSON 解析失败不会清空已确认的 State 注册记录。
-只有有效列表确认资源缺失/身份不符，或推理层明确报告 `uploaded state not found`，才撤销对应副本的就绪状态。传输失败仍按连接冷却处理；
+列表超时、401/502、HTML 错误页或 JSON 解析失败不会清空已确认的 State 或 adapter 注册记录。
+只有有效列表确认资源缺失/身份不符，或推理层明确报告 `uploaded state not found`、
+`unknown adapter id/version`，才撤销对应副本的就绪状态。传输失败仍按连接冷却处理；
 并不表示资源已删除。
 列表接口本身仍会报告真正的上游错误或副本差异，不能用旧记录伪造列表同步成功。
 
-Router 日志现在记录每个后端的上传尝试、状态码、耗时、成功的 State ID，以及列表错误
+Router 日志现在记录每个后端的上传尝试、状态码、耗时、成功的 ID/版本，以及列表错误
 的类型和节点。列表不一致时，502 的 `failed_backends[].error` 会列出相对基准节点
-缺少、多出或元数据不一致的 State ID。不会记录上传内容或认证凭据。
-`route_unavailable` 日志会列出各节点的健康、State 就绪和修改状态。
+缺少、多出或 manifest 不一致的 ID/版本。不会记录上传内容或认证凭据。
+`route_unavailable` 日志会列出各节点的健康、adapter 就绪、State 就绪和修改状态。
 
 生成响应的 `X-RWKV-Backend` 是 Router 实际选择的节点名；`route_selected` 日志同时
-记录会话 ID 和 State ID。使用同一 `session_id` 或 `X-RWKV-Session-Id` 的生成请求，在绑定
+记录会话 ID 和版本。使用同一 `session_id` 或 `X-RWKV-Session-Id` 的生成请求，在绑定
 节点健康且有所需资源时保持亲和，包括并发请求；节点失效或资源不可用时允许迁移。
 仅有相同 messages 不会建立会话亲和。固定节点也不等于已命中模型缓存，缓存命中需另查
 后端的缓存/生成指标。

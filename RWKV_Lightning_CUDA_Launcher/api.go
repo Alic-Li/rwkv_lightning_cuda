@@ -566,10 +566,6 @@ func (l *launcher) backendView(e backendEntry) backendView {
 func (l *launcher) handleForward(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	rest := r.PathValue("rest")
-	if retiredInferenceRoute("/" + rest) {
-		http.NotFound(w, r)
-		return
-	}
 	// Only the two documented surfaces forward: the control plane and the
 	// OpenAI-compatible inference API. Everything else is refused here rather
 	// than handed to a remote host.

@@ -18,9 +18,7 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 
 两个训练二进制已切换到独立的 [BF16 训练 backbone](src/training/README.md)：基模逐层流式加载，直接复用原有 BF16 state-passing 算子，最终 state/adapter 导出为 BF16；推理仍使用原有 FP16/量化路线。
 
-新增 [NoRA-init tuning](src/nora/README.md)：`rwkv_nora_tune`、`rwkv_nora_tune_server`。使用随机 A 沿 rank 维按列归一化初始化，A/B 均可训练，固定 `alpha/rank=1`，支持独立训练、续训和导出。
-
-[CPU 权重合并工具](docs/peft-weight-merge.zh-CN.md)：`rwkv_peft_weight_merge --method miss|nora` 将 Adapter 离线合入基模，输出独立推理 `.pth`，支持无 GPU SDK 构建。
+新增 [NoRA-init tuning](src/nora/README.md)：`rwkv_nora_tune`、`rwkv_nora_tune_server`。使用随机 A 沿 rank 维按列归一化初始化，A/B 均可训练，固定 `alpha/rank=1`，支持推理引擎动态加载。
 
 新增三个常驻 [在线 RL Server](docs/online-rl.zh-CN.md)：`rwkv_miss_tune_server`、`rwkv_state_tune_server`、`rwkv_nora_tune_server`（MiSS / State / NoRA 三种模式，客户端支持 GRPO 与 Dr.GRPO），推训共享 BF16 Backbone，支持批量 Rollout、Signed Advantage 训练和策略版本发布。
 
@@ -30,10 +28,8 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 - 在显存、CPU RAM 和 SQLite 之间复用会话 state，并支持上传 `.pth` 初始 state。
 - 使用 `.rwkvq` 格式进行 W8A16/W4A16 推理。
 - 独立训练 `time_state`，不更新 Linear 权重。
-- 冻结基模训练 MiSS adapter，支持 checkpoint 续训和导出。
+- 冻结基模训练 MiSS adapter，并按请求动态绑定不同 adapter。
 - 多后端路由和带 Web UI 的桌面启动器。
-
-原生推理 Server 使用当前模型权重，保留动态 State；不支持请求级 Adapter、Adapter HTTP 管理或服务端在线权重融合（离线合并请使用 `rwkv_peft_weight_merge`）。
 
 ## 快速开始
 对于 Ubuntu 24.04 LTS，使用以下命令安装依赖：
@@ -76,7 +72,7 @@ curl -sS "http://127.0.0.1:8000/v1/server/status"
 | [运行](docs/run.zh-CN.md) | 服务参数、动态模型加载、state tuning 和运行示例 |
 | [HTTP API](docs/http-api.zh-CN.md) | 生成、流式、批量、state 和管理接口 |
 | [Launcher 前端与第三方联调](RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md) | Client / Agent、控制面、鉴权与多后端接入 |
-| [MiSS 适配器与参数高效微调](src/miss/README.zh-CN.md) | 训练、续训、导出和验收 |
+| [MiSS 适配器与参数高效微调](src/miss/README.zh-CN.md) | 训练、续训、导出、动态加载、缓存和验收 |
 | [状态微调](src/state_tuning/README.zh-CN.md) | `time_state` 训练与检查点说明 |
 | [MiSS 验证记录](src/miss/VALIDATION.zh-CN.md) / [优化计划](src/miss/OPTIMIZATION_PLAN.zh-CN.md) | 数值验证、实测性能和后续优化目标 |
 | [HIP 后端](hip/README.zh-CN.md) / [移植验证](hip/VALIDATION.zh-CN.md) | AMD 构建、状态微调与验证范围 |
@@ -99,11 +95,11 @@ curl -sS "http://127.0.0.1:8000/v1/server/status"
 - `src/inference/`：分词、采样和生成编排。
 - `src/io/`：PTH 与张量读写。
 - `src/server/`：HTTP API、模型路由、准入和 state 存储。
-- `src/miss/`：MiSS 训练、包格式和验证文档。
+- `src/miss/`：MiSS 训练、推理包和动态 adapter 文档。
 - `quant/`：W8A16/W4A16 量化工具。
 - `RWKV_Lightning_CUDA_router/`：多后端负载均衡路由器。
 - `RWKV_Lightning_CUDA_Launcher`: 带 Web UI 的桌面启动器。
 
 ## 连续批处理
 
-推理服务默认按设备聚合并发请求，使用逐行采样和独立 State 的统一前向。`--decode-batch-size` 控制活动解码槽位数（默认 64），`--chunk-size` 控制交错预填充的块长。配置、状态语义及基准方法见[连续批处理说明](docs/continuous-batching.zh-CN.md)。
+推理服务默认按设备聚合并发请求，使用逐行采样，基模行与 MiSS/NoRA adapter 行共用同一个 batch 前向。`--decode-batch-size` 控制活动解码槽位数（默认 64），`--chunk-size` 控制交错预填充的块长。配置、状态语义及基准方法见[连续批处理说明](docs/continuous-batching.zh-CN.md)。

@@ -1,5 +1,7 @@
 # HTTP API examples
 
+The adapter endpoints and generation adapter fields also accept [NoRA-init packages](../src/nora/README.md). Method selection is automatic from the manifest; both A and B count toward cache budgets.
+
 [English](http-api.md) | [简体中文](http-api.zh-CN.md) | [Back to README](../README.md)
 
 This page covers the native inference service. For Launcher Client/Agent control, authentication and backend forwarding, see the [integration guide (Chinese)](../RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md).
@@ -136,7 +138,66 @@ curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/state/delete" \
 When `--password` is enabled, use an `Authorization: Bearer ...` header for the
 multipart upload request.
 
-The native inference server uses only the currently loaded model weights. Request adapters and their HTTP management endpoints have been removed; legacy adapter fields return HTTP 400. Dynamic State upload, selection, caching and sessions remain supported. MiSS/NoRA kernels, package formats and standalone training tools are retained. Online adapter checkout and online weight merging are not implemented in the server; use `rwkv_peft_weight_merge` for offline weight merging.
+## MiSS adapter lifecycle and request fields
+
+Register a server-side PTH path or upload a local PTH using multipart form data.
+Both `adapter-final.pth` and new checkpoint `training.pth` files are supported.
+Legacy two-file inference directories also work. Registration returns
+`{"adapter_id":"task-a","version":"<content SHA-256>"}`. Registration
+validates and caches the package in CPU RAM; it does not upload weights to GPU.
+
+```bash
+curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
+  -H "Content-Type: application/json" \
+  --data '{"adapter_id":"task-a","path":"/absolute/path/miss_output/checkpoint-100/training.pth"}'
+
+curl -sS "${AUTH_HEADER[@]}" -X POST "http://127.0.0.1:8000/v1/adapters" \
+  -F 'adapter_id=task-a' -F 'file=@miss_output/adapter-final.pth'
+
+curl -sS "${AUTH_HEADER[@]}" "http://127.0.0.1:8000/v1/adapters"
+```
+
+All generation endpoints accept `adapter_id`, optional `adapter_version`, and
+optional `adapter_scale`. The first request uploads the complete adapter to the
+GPU; prefill and decode reuse it without per-layer or per-token transfers.
+
+New PTH files carry their manifest inside the archive. Old training checkpoints
+need the sibling `checkpoint.json`; for remote upload add
+`-F 'metadata=@miss_output/checkpoint-100/checkpoint.json'` alongside the PTH.
+Upload staging files are removed after registration; only D in its declared BF16/FP16 precision remains cached; BF16 D is converted once in pinned staging on GPU admission.
+Use bearer-header authentication for multipart uploads when password protection
+is enabled. HTTP request-body limits also apply to uploaded checkpoint files.
+
+```json
+{
+  "adapter_id": "task-a",
+  "adapter_version": "sha256-content-version",
+  "adapter_scale": 1.0
+}
+```
+
+Omit `adapter_version` to bind the latest registered version at request
+admission. `adapter_scale` is the absolute effective scale override. Stateful
+sessions are isolated by base-model lifetime, adapter content version, scale,
+initial state, and WKV precision, so an incompatible cached state is rejected.
+Deletion removes the registration while existing request handles remain valid.
+It does not remove files on disk. Omit `adapter_version` to delete every version
+of the ID, or include it to delete only that version. The response is
+`{"deleted":true}`, including when the ID or version does not exist. Deleting
+the latest version falls back to the most recently registered remaining version:
+
+```bash
+curl -sS "${AUTH_HEADER[@]}" -X DELETE "http://127.0.0.1:8000/v1/adapters" \
+  -H "Content-Type: application/json" \
+  --data '{"adapter_id":"task-a"}'
+```
+
+The `data` array contains `id`, `version`, and `manifest` for each registered
+version. Top-level metrics are `ram_hits`, `gpu_hits`, `gpu_misses`, `uploads`,
+`h2d_ms`, `ram_bytes`, `gpu_bytes`, and `gpu_peak_bytes`.
+The list response includes RAM/GPU hits, misses, uploads, H2D time, resident
+bytes, and adapter GPU peak bytes. Package format and cache-budget details are
+in the [MiSS guide](../src/miss/README.md).
 
 ## Chat completions
 

@@ -14,34 +14,43 @@ import (
 	"time"
 )
 
-// Verify the State HTTP contract. Each worker has its
+// Run the same HTTP contract against both resource types. Each worker has its
 // own store; an upload accepted by one worker cannot mask a missing replica.
 type resourceContract struct{ kind, listPath, deletePath string }
 
 var resourceContracts = []resourceContract{
 	{"State", "/v1/state/list", "/v1/state/delete"},
+	{"Adapter", "/v1/adapters", "/v1/adapters"},
 }
 
-func proxyCall(p *proxy, method, path, body string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(method, path, strings.NewReader(body))
-	r.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	return w
-}
 func (c resourceContract) upload(t *testing.T) *http.Request {
-	return stateUploadRequest(t, "state.pth", "checkpoint")
+	if c.kind == "State" {
+		return stateUploadRequest(t, "state.pth", "checkpoint")
+	}
+	return adapterUploadRequest(t, "miss")
 }
 func (c resourceContract) ack(w http.ResponseWriter, r *http.Request) string {
-	id := "state-" + r.Header.Get("X-RWKV-State-Upload-UUID")
-	fmt.Fprintf(w, `{"state_id":%q}`, id)
+	id := "miss"
+	if c.kind == "State" {
+		id = "state-" + r.Header.Get("X-RWKV-State-Upload-UUID")
+		fmt.Fprintf(w, `{"state_id":%q}`, id)
+	} else {
+		fmt.Fprintf(w, `{"adapter_id":"miss","version":%q}`, adapterV1)
+	}
 	return id
 }
 func (c resourceContract) list(w http.ResponseWriter, id string) {
-	fmt.Fprintf(w, `{"object":"list","data":[{"state_id":%q}]}`, id)
+	if c.kind == "State" {
+		fmt.Fprintf(w, `{"object":"list","data":[{"state_id":%q}]}`, id)
+	} else {
+		fmt.Fprintf(w, `{"data":[{"id":"miss","version":%q}]}`, adapterV1)
+	}
 }
 func (c resourceContract) body(id string) string {
-	return fmt.Sprintf(`{"contents":["hello"],"state_id":%q}`, id)
+	if c.kind == "State" {
+		return fmt.Sprintf(`{"contents":["hello"],"state_id":%q}`, id)
+	}
+	return `{"contents":["hello"],"adapter_id":"miss"}`
 }
 func contractUpload(t *testing.T, p *proxy, c resourceContract) string {
 	t.Helper()
@@ -54,7 +63,10 @@ func contractUpload(t *testing.T, p *proxy, c resourceContract) string {
 	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	return payload["state_id"]
+	if c.kind == "State" {
+		return payload["state_id"]
+	}
+	return payload["adapter_id"]
 }
 
 func TestResourceFailedObservationsPreserveConfirmedReplicas(t *testing.T) {
@@ -73,7 +85,7 @@ func TestResourceFailedObservationsPreserveConfirmedReplicas(t *testing.T) {
 					servers := make([]*httptest.Server, 3)
 					for i := range servers {
 						servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-							if r.Method == "POST" && r.URL.Path == "/v1/state/upload" {
+							if r.Method == "POST" && (r.URL.Path == "/v1/state/upload" || r.URL.Path == "/v1/adapters") {
 								uploads.Add(1)
 								c.ack(w, r)
 								return
@@ -89,9 +101,9 @@ func TestResourceFailedObservationsPreserveConfirmedReplicas(t *testing.T) {
 						}))
 						defer servers[i].Close()
 					}
-					p := testStateProxy(servers...)
+					p := adapterProxy(servers...)
 					id := contractUpload(t, p, c)
-					list := proxyCall(p, "GET", c.listPath, "")
+					list := adapterCall(p, "GET", c.listPath, "")
 					expected := 502
 					if bad.status == 401 {
 						expected = 401
@@ -100,7 +112,7 @@ func TestResourceFailedObservationsPreserveConfirmedReplicas(t *testing.T) {
 						t.Fatal(list.Code, list.Body.String())
 					}
 					for range 9 {
-						if w := proxyCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 200 {
+						if w := adapterCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 200 {
 							t.Fatal(w.Code, w.Body.String())
 						}
 					}
@@ -135,7 +147,7 @@ func TestResourceDiscoveryPreservesJSONAuthentication(t *testing.T) {
 				io.WriteString(w, `{}`)
 			}))
 			defer server.Close()
-			p := testStateProxy(server)
+			p := adapterProxy(server)
 			payload := strings.TrimSuffix(c.body("existing"), "}") + `,"password":"secret"}`
 			req := httptest.NewRequest("POST", "/v1/batch/completions", strings.NewReader(payload))
 			req.Header.Set("Authorization", "Bearer header")
@@ -159,13 +171,13 @@ func TestResourceDeletionRequiresAcknowledgmentAndStaysDeleted(t *testing.T) {
 				c.ack(w, r)
 			}))
 			defer server.Close()
-			p := testStateProxy(server)
+			p := adapterProxy(server)
 			id := contractUpload(t, p, c)
-			w := proxyCall(p, "DELETE", c.deletePath, c.body(id))
+			w := adapterCall(p, "DELETE", c.deletePath, c.body(id))
 			if w.Code != 502 || !strings.Contains(w.Body.String(), "confirm resource deletion") {
 				t.Fatal(w.Code, w.Body.String())
 			}
-			if w = proxyCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 503 {
+			if w = adapterCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 503 {
 				t.Fatal("uncertain deletion resurrected", w.Code)
 			}
 		})
@@ -179,14 +191,15 @@ func TestResourceManagementTimeoutAndReservationRelease(t *testing.T) {
 				t.Run(method, func(t *testing.T) {
 					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.Copy(io.Discard, r.Body); <-r.Context().Done() }))
 					defer server.Close()
-					p := testStateProxy(server)
+					p := adapterProxy(server)
 					p.uploadPolicy.AttemptTimeout = 20 * time.Millisecond
+					p.adapterUploadPolicy.AttemptTimeout = 20 * time.Millisecond
 					path := c.listPath
 					if method == "DELETE" {
 						path = c.deletePath
 					}
 					started := time.Now()
-					w := proxyCall(p, method, path, c.body("existing"))
+					w := adapterCall(p, method, path, c.body("existing"))
 					if w.Code != 502 || time.Since(started) > time.Second {
 						t.Fatal("management request not bounded", w.Code)
 					}
@@ -218,19 +231,19 @@ func TestResourceConcurrentDeletionConflicts(t *testing.T) {
 			defer server.Close()
 			var releaseOnce sync.Once
 			defer releaseOnce.Do(func() { close(release) })
-			p := testStateProxy(server)
+			p := adapterProxy(server)
 			id := contractUpload(t, p, c)
 			done := make(chan *httptest.ResponseRecorder, 1)
-			go func() { done <- proxyCall(p, "DELETE", c.deletePath, c.body(id)) }()
+			go func() { done <- adapterCall(p, "DELETE", c.deletePath, c.body(id)) }()
 			select {
 			case <-entered:
 			case <-time.After(time.Second):
 				t.Fatal("delete not started")
 			}
-			if w := proxyCall(p, "DELETE", c.deletePath, c.body(id)); w.Code != 409 {
+			if w := adapterCall(p, "DELETE", c.deletePath, c.body(id)); w.Code != 409 {
 				t.Fatal("concurrent deletion accepted", w.Code)
 			}
-			if w := proxyCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 503 {
+			if w := adapterCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 503 {
 				t.Fatal("inference during deletion", w.Code)
 			}
 			releaseOnce.Do(func() { close(release) })
@@ -262,7 +275,7 @@ func TestStatePOSTManagementAndOptionsCompatibility(t *testing.T) {
 	p := testStateProxy(server)
 	id := contractUpload(t, p, resourceContracts[0])
 	for _, path := range []string{"/v1/state/upload", "/v1/state/list", "/v1/state/delete"} {
-		if w := proxyCall(p, "OPTIONS", path, ""); w.Code != 204 {
+		if w := adapterCall(p, "OPTIONS", path, ""); w.Code != 204 {
 			t.Fatal(w.Code, w.Body.String())
 		}
 	}
@@ -273,7 +286,7 @@ func TestStatePOSTManagementAndOptionsCompatibility(t *testing.T) {
 		t.Fatal("preflight changed readiness")
 	}
 	for _, path := range []string{"/v1/state/list", "/v1/state/delete"} {
-		if w := proxyCall(p, "POST", path, resourceContracts[0].body(id)); w.Code != 200 {
+		if w := adapterCall(p, "POST", path, resourceContracts[0].body(id)); w.Code != 200 {
 			t.Fatal(w.Code, w.Body.String())
 		}
 	}
@@ -287,7 +300,7 @@ func TestResourceTransportFailurePreservesRegistrationWithoutReplaying(t *testin
 		t.Run(c.kind, func(t *testing.T) {
 			var calls atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/v1/state/upload" {
+				if r.URL.Path == "/v1/state/upload" || (r.URL.Path == "/v1/adapters" && r.Method == "POST") {
 					c.ack(w, r)
 					return
 				}
@@ -305,13 +318,13 @@ func TestResourceTransportFailurePreservesRegistrationWithoutReplaying(t *testin
 				io.WriteString(w, `{}`)
 			}))
 			defer server.Close()
-			p := testStateProxy(server)
+			p := adapterProxy(server)
 			p.scheduler.cooldown = 0
 			id := contractUpload(t, p, c)
-			if w := proxyCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 502 {
+			if w := adapterCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 502 {
 				t.Fatal(w.Code)
 			}
-			if w := proxyCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 200 {
+			if w := adapterCall(p, "POST", "/v1/batch/completions", c.body(id)); w.Code != 200 {
 				t.Fatal(w.Code, w.Body.String())
 			}
 			if calls.Load() != 2 {
@@ -321,9 +334,10 @@ func TestResourceTransportFailurePreservesRegistrationWithoutReplaying(t *testin
 	}
 }
 
-func TestStateBroadcastAndSessionAffinityOverHTTP(t *testing.T) {
+func TestStateAndAdapterBroadcastAndSessionAffinityOverHTTP(t *testing.T) {
 	var mu sync.Mutex
 	stateIDs := make([]string, 3)
+	adapters := make([]bool, 3)
 	inferences := make([]int, 3)
 	servers := make([]*httptest.Server, 3)
 	for i := range servers {
@@ -352,11 +366,29 @@ func TestStateBroadcastAndSessionAffinityOverHTTP(t *testing.T) {
 				stateIDs[i] = resourceContracts[0].ack(w, r)
 			case "/v1/state/list":
 				resourceContracts[0].list(w, stateIDs[i])
+			case "/v1/adapters":
+				if r.Method == "POST" {
+					if err := r.ParseMultipartForm(1 << 20); err != nil {
+						t.Error(err)
+						w.WriteHeader(400)
+						return
+					}
+					defer r.MultipartForm.RemoveAll()
+					if r.FormValue("adapter_id") != "miss" || len(r.MultipartForm.File["file"]) != 2 {
+						t.Error("adapter payload incomplete")
+					}
+					resourceContracts[1].ack(w, r)
+					adapters[i] = true
+				} else {
+					resourceContracts[1].list(w, "miss")
+				}
 			default:
 				var payload struct {
-					StateID string `json:"state_id"`
+					StateID   string `json:"state_id"`
+					AdapterID string `json:"adapter_id"`
+					Version   string `json:"adapter_version"`
 				}
-				if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.StateID != stateIDs[i] || stateIDs[i] == "" {
+				if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.StateID != stateIDs[i] || stateIDs[i] == "" || !adapters[i] || payload.AdapterID != "miss" || payload.Version != adapterV1 {
 					http.Error(w, "resource missing", 400)
 					return
 				}
@@ -366,7 +398,7 @@ func TestStateBroadcastAndSessionAffinityOverHTTP(t *testing.T) {
 		}))
 		defer servers[i].Close()
 	}
-	p := testStateProxy(servers...)
+	p := adapterProxy(servers...)
 	router := httptest.NewServer(p)
 	defer router.Close()
 	client := router.Client()
@@ -392,9 +424,11 @@ func TestStateBroadcastAndSessionAffinityOverHTTP(t *testing.T) {
 		if status != 200 {
 			t.Fatalf("upload: %d %s", status, data)
 		}
-		var payload map[string]string
-		json.Unmarshal(data, &payload)
-		id = payload["state_id"]
+		if c.kind == "State" {
+			var payload map[string]string
+			json.Unmarshal(data, &payload)
+			id = payload["state_id"]
+		}
 	}
 	for range 6 {
 		for _, c := range resourceContracts {
@@ -410,7 +444,7 @@ func TestStateBroadcastAndSessionAffinityOverHTTP(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := httptest.NewRequest("POST", "/v1/batch/completions", strings.NewReader(fmt.Sprintf(`{"contents":["hello"],"state_id":%q}`, id)))
+			req := httptest.NewRequest("POST", "/v1/batch/completions", strings.NewReader(fmt.Sprintf(`{"contents":["hello"],"state_id":%q,"adapter_id":"miss"}`, id)))
 			req.Header.Set("X-RWKV-Session-Id", "same-session")
 			status, headers, data := send(req)
 			if status != 200 {
@@ -434,7 +468,7 @@ func TestStateBroadcastAndSessionAffinityOverHTTP(t *testing.T) {
 	defer mu.Unlock()
 	total := 0
 	for i, n := range inferences {
-		if stateIDs[i] != id {
+		if stateIDs[i] != id || !adapters[i] {
 			t.Fatal("worker missing resource", i)
 		}
 		total += n
@@ -462,7 +496,7 @@ func TestResourceReadinessPublishedBeforeSuccessfulAcknowledgment(t *testing.T) 
 		t.Run(c.kind, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { c.ack(w, r) }))
 			defer server.Close()
-			p := testStateProxy(server)
+			p := adapterProxy(server)
 			observed := false
 			w := acknowledgmentObserver{ResponseRecorder: httptest.NewRecorder(), observe: func(status int) {
 				observed = true
@@ -473,10 +507,14 @@ func TestResourceReadinessPublishedBeforeSuccessfulAcknowledgment(t *testing.T) 
 				p.scheduler.mu.Lock()
 				defer p.scheduler.mu.Unlock()
 				b := p.scheduler.backends[0]
-				for id := range p.scheduler.states {
-					if !p.scheduler.stateReadyLocked(id, b) {
-						t.Error("upload acknowledged before State became routable")
+				if c.kind == "State" {
+					for id := range p.scheduler.states {
+						if !p.scheduler.stateReadyLocked(id, b) {
+							t.Error("upload acknowledged before State became routable")
+						}
 					}
+				} else if !p.scheduler.adapterReadyLocked("miss", adapterV1, b) {
+					t.Error("upload acknowledged before adapter became routable")
 				}
 			}}
 			p.ServeHTTP(w, c.upload(t))

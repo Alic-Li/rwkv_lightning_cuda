@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live Launcher -> Router -> native workers regression with a real State file.
+"""Live Launcher -> Router -> native workers regression with real State and adapter files.
 
 --url is the Launcher backend prefix, e.g.
 http://127.0.0.1:18081/api/v1/backends/formal-router
@@ -21,6 +21,8 @@ def main():
     parser.add_argument('--router', required=True)
     parser.add_argument('--worker', action='append', required=True)
     parser.add_argument('--state', default='./rwkv-state-agentic.pth')
+    parser.add_argument('--adapter', default='./adapter-final.pth',
+                        help='MiSS/NoRA inference PTH registered through the chain')
     parser.add_argument('--password', default='')
     parser.add_argument('--timeout', type=float, default=180)
     parser.add_argument('--output', default='build/router-launcher-e2e')
@@ -36,6 +38,11 @@ def main():
         for worker in workers:
             entries = worker.call('/v1/state/list')['data']
             require(any(e['state_id'] == sid for e in entries) == present, entries)
+
+    def adapter_replicas(aid, version, present):
+        for worker in workers:
+            entries = worker.call('/v1/adapters')['data']
+            require(any(e['id'] == aid and e['version'] == version for e in entries) == present, entries)
 
     def affinity(sid):
         session = suite.prefix+'-affinity'
@@ -74,12 +81,27 @@ def main():
         for i, worker in enumerate(workers):
             suite.check(f'worker {i} ready', worker.initial_status)
         suite.check('Launcher to Router models', lambda: require(suite.call('/v1/models')['data']))
-        for method in ['GET', 'POST', 'DELETE', 'OPTIONS']:
-            suite.check('retired management '+method, lambda m=method: suite.call('/v1/adapters', method=m, expected=404))
-        for path, body in [('/v1/chat/completions', suite.chat), ('/v1/batch/completions', suite.batch)]:
-            for key in ['adapter_id', 'adapter_version', 'adapter_scale']:
-                suite.check('retired field '+path+' '+key, lambda p=path,b=body,k=key:
-                    suite.call(p,b|{k:None},expected=400))
+        aid = suite.prefix + '-adapter'
+        adapter = {}
+        def upload_adapter():
+            data, headers = suite.multipart({'adapter_id': aid}, [('file', Path(args.adapter).name, Path(args.adapter).read_bytes())])
+            result = suite.call('/v1/adapters', raw=data, headers=headers)
+            require(result['adapter_id'] == aid and len(result['version']) == 64, result)
+            adapter['version'] = result['version']
+            suite.adapters.append(aid)
+        suite.check('adapter upload through full chain', upload_adapter)
+        require(adapter, 'adapter upload failed')
+        suite.check('adapter confirmed on every worker', lambda: adapter_replicas(aid, adapter['version'], True))
+        suite.check('Launcher adapter list', lambda: require(any(
+            e['id'] == aid for e in suite.call('/v1/adapters')['data'])))
+        for path, body, count in [('/v1/chat/completions',suite.chat,1),('/v1/batch/completions',suite.batch,2)]:
+            for stream in [False, True]:
+                suite.check(f'adapter {path} stream={stream}', lambda p=path,b=body,c=count,s=stream:
+                    suite.completion(p,b|{'adapter_id':aid,'adapter_version':adapter['version']},c,s))
+        suite.check('adapter scale override', lambda: suite.completion(
+            '/v1/chat/completions', suite.chat|{'adapter_id':aid,'adapter_scale':0.5}))
+        suite.check('unknown adapter rejected', lambda: suite.call(
+            '/v1/chat/completions', suite.chat|{'adapter_id':suite.prefix+'-missing'}, expected=(400, 404, 503)))
         def upload():
             data, headers = suite.multipart({}, [('file', Path(args.state).name, Path(args.state).read_bytes())])
             sid = suite.call('/v1/state/upload', raw=data, headers=headers)['state_id']
@@ -98,7 +120,7 @@ def main():
         suite.check('State header SSE', lambda: suite.header_stream(sid))
         suite.check('State repeated requests', lambda: [suite.completion(
             '/v1/batch/completions',suite.batch|{'state_id':sid},2) for _ in range(4)])
-        suite.check('mixed base/State continuous batching', lambda: suite.concurrent_mixed(sid))
+        suite.check('mixed base/State/adapter continuous batching', lambda: suite.concurrent_mixed(sid, aid))
         suite.check('State session affinity', lambda: affinity(sid))
         suite.check('State cache continuation and Session deletion', lambda: session_cache(sid))
         suite.check('unknown State has no zero-State fallback', lambda: suite.call(
@@ -106,6 +128,9 @@ def main():
     finally:
         router.cleanup()
         suite.cleanup()
+        if adapter:
+            suite.check('deleted adapter absent on every worker',
+                        lambda: adapter_replicas(aid, adapter['version'], False))
         for sid in suite.states:
             suite.check('deleted State absent on every worker', lambda s=sid: replicas(s,False))
             suite.check('deleted State cannot infer', lambda s=sid: suite.call(

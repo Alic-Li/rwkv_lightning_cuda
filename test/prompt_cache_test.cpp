@@ -88,6 +88,8 @@ class RecurrentBackend final : public rwkv7_server::IModelBackend {
       copy_buffer_slice(src.wkv_state, from, dst.wkv_state, to, count);
     }
     dst.advanced = src.advanced;
+    dst.adapter = src.adapter;
+    dst.adapter_identity = src.adapter_identity;
     dst.effective_key = src.effective_key;
     dst.initial_state_identity = src.initial_state_identity;
   }
@@ -221,7 +223,17 @@ int main() {
       run(disabled, {prefix}, true);
       TEST_EQ(run(disabled, {prefix}, true).second, 0);
 
-      // Engine instances cannot share cached states.
+      // Adapter namespaces and engine instances cannot share cached states.
+      auto package = std::make_shared<rwkv7_miss::Package>();
+      package->version = "test-v1";
+      options.max_tokens = 0;
+      options.adapter = std::make_shared<rwkv7_miss::AdapterHandle>(package, 1.0f);
+      TEST_EQ(run(engine, {prefix}, true).second, 0);
+      TEST_CHECK(run(engine, {prefix}, true).second > 0);
+      options.adapter_id = "same-weights-different-id";
+      TEST_EQ(run(engine, {prefix}, true).second, 0);
+      options.adapter = std::make_shared<rwkv7_miss::AdapterHandle>(package, 2.0f);
+      TEST_EQ(run(engine, {prefix}, true).second, 0);
       rwkv7_server::InferenceEngine fresh(backend, tokenizer, "fresh", 3, 2);
       TEST_EQ(run(fresh, {prefix}, true).second, 0);
     }

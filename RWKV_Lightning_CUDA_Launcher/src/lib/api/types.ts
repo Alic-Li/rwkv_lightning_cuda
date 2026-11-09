@@ -269,6 +269,19 @@ export interface UploadedState {
   head_size?: number;
 }
 
+export interface AdapterEntry {
+  id: string;
+  version: string;
+  manifest: { rank: number; scale: number; targets: unknown[] };
+}
+
+export interface AdapterListResponse {
+  data: AdapterEntry[];
+  ram_bytes: number;
+  gpu_bytes: number;
+  uploads: number;
+}
+
 export interface ModelListResponse {
   data: { id: string }[];
   available?: string[];

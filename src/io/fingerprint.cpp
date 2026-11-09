@@ -1,7 +1,5 @@
 #include "rwkv/io/fingerprint.hpp"
 #include <filesystem>
-#include <atomic>
-#include <random>
 #include <fstream>
 #include <iomanip>
 #include <json/json.h>
@@ -11,18 +9,6 @@
 #include <stdexcept>
 #include <vector>
 namespace rwkv7_miss {
-std::string new_runtime_identity() {
-  static const std::string process = [] {
-    std::random_device random;
-    std::ostringstream out;
-    for (int i = 0; i < 4; ++i)
-      out << std::hex << std::setw(8) << std::setfill('0') << random();
-    return out.str();
-  }();
-  static std::atomic<std::uint64_t> next{0};
-  return process + ":" + std::to_string(++next);
-}
-
 std::string fingerprint_file(const std::string &path) {
   std::ifstream f(path, std::ios::binary);
   if (!f)
@@ -76,22 +62,3 @@ std::string source_fingerprint(const std::string &path) {
   return m["source_sha256"].asString();
 }
 } // namespace rwkv7_miss
-
-namespace rwkv7_server {
-std::string effective_model_key(const std::string& runtime,
-                                const std::string& initial_state, bool fp32) {
-  // Length-prefixed components prevent ambiguous identities; retain the
-  // 64-character digest used by the Session deletion API.
-  const auto input = std::to_string(runtime.size()) + ":" + runtime +
-                     std::to_string(initial_state.size()) + ":" + initial_state +
-                     (fp32 ? ":fp32" : ":fp16");
-  unsigned char digest[EVP_MAX_MD_SIZE];
-  unsigned int size = 0;
-  if (EVP_Digest(input.data(), input.size(), digest, &size, EVP_sha256(), nullptr) != 1 || size != 32)
-    throw std::runtime_error("state identity SHA256 failed");
-  std::ostringstream out;
-  for (unsigned int i = 0; i < size; ++i)
-    out << std::hex << std::setw(2) << std::setfill('0') << int(digest[i]);
-  return out.str();
-}
-} // namespace rwkv7_server

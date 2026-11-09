@@ -60,9 +60,9 @@ void register_session_routes(
           cb(json_response(make_error(e.what()), k400BadRequest));
           return;
         }
-        session_id += ":" + effective_model_key(
+        session_id += ":" + rwkv7_miss::effective_model_key(
                                 engine.model()->runtime_identity(),
-                                "session", false);
+                                options.adapter.get(), "session", false);
         const int prompt_tokens = engine.count_tokens(prompts.front());
         const auto model = (*json).get("model", engine.model_name()).asString();
         auto active = RequestRegistry::instance().start(

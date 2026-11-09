@@ -3,12 +3,15 @@
 #include "rwkv/io/pth_writer.hpp"
 #include "rwkv/runtime/rwkv_adapter.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <openssl/evp.h>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -17,6 +20,10 @@ const std::array<const char *, TargetCount> target_names = {
     "att.receptance.weight", "att.key.weight", "att.value.weight",
     "att.output.weight",     "ffn.key.weight", "ffn.value.weight"};
 namespace {
+void check(cudaError_t e) {
+  if (e != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(e));
+}
 struct Hash {
   EVP_MD_CTX *ctx = EVP_MD_CTX_new();
   Hash() {
@@ -48,6 +55,17 @@ std::string tensor_name(const HostTensor &t, const char *factor = "D") {
          "." + factor;
 }
 } // namespace
+std::string new_runtime_identity() {
+  static const std::string process = [] {
+    std::random_device random;
+    std::ostringstream out;
+    for (int i = 0; i < 4; ++i)
+      out << std::hex << std::setw(8) << std::setfill('0') << random();
+    return out.str();
+  }();
+  static std::atomic<std::uint64_t> next{0};
+  return process + ":" + std::to_string(++next);
+}
 std::string content_version(const Json::Value &manifest,
                             const std::vector<std::uint16_t> &data) {
   auto m = manifest;
@@ -334,5 +352,287 @@ std::shared_ptr<const Package> load_package(const std::string &dir,
   if (content_version(m, p->data) != p->version)
     throw std::runtime_error("adapter content digest mismatch");
   return p;
+}
+AdapterHandle::AdapterHandle(std::shared_ptr<const Package> p, float s)
+    : package(std::move(p)), scale(s), identity([&] {
+        if (!package || !std::isfinite(s))
+          throw std::invalid_argument("invalid adapter handle");
+        if (s == 0)
+          s = 0;
+        std::ostringstream o;
+        o << package->version << ':' << std::hexfloat << s;
+        return o.str();
+      }()) {}
+AdapterCache::AdapterCache(size_t r, size_t g, size_t s)
+    : ram_budget_(r), gpu_budget_(g), staging_budget_(s) {}
+void AdapterCache::account_ram() {
+  stats_.ram_bytes = 0;
+  for (auto i = host_lifetimes_.begin(); i != host_lifetimes_.end();) {
+    if (auto p = i->lock()) {
+      stats_.ram_bytes += p->data.size() * 2;
+      ++i;
+    } else
+      i = host_lifetimes_.erase(i);
+  }
+}
+std::string AdapterCache::register_adapter(const std::string &id,
+                                           const std::string &dir) {
+  if (id.empty())
+    throw std::invalid_argument("empty adapter id");
+  std::lock_guard<std::mutex> lock(mutex_);
+  account_ram();
+  // Reserve payload capacity before reading disk; simultaneous registrations
+  // must not temporarily allocate several complete adapters beyond the budget.
+  auto p =
+      load_package(dir, ram_budget_ - std::min(ram_budget_, stats_.ram_bytes));
+  auto set_latest = [&] {
+    auto &order = registration_order_[id];
+    order.erase(std::remove(order.begin(), order.end(), p->version),
+                order.end());
+    order.push_back(p->version);
+    latest_[id] = p->version;
+  };
+  auto existing = registry_.find(id);
+  if (existing != registry_.end() && existing->second.count(p->version)) {
+    ++stats_.ram_hits;
+    set_latest();
+    return p->version;
+  }
+  for (const auto &weak : host_lifetimes_)
+    if (auto shared = weak.lock())
+      if (shared->version == p->version) {
+        registry_[id][p->version] = shared;
+        set_latest();
+        ++stats_.ram_hits;
+        return p->version;
+      }
+  account_ram();
+  if (p->data.size() * 2 >
+      ram_budget_ - std::min(ram_budget_, stats_.ram_bytes))
+    throw std::runtime_error("adapter RAM admission denied");
+  registry_[id][p->version] = p;
+  set_latest();
+  host_lifetimes_.push_back(p);
+  account_ram();
+  return p->version;
+}
+std::shared_ptr<const AdapterHandle>
+AdapterCache::resolve(const std::string &id, const std::string &version,
+                      const float *scale) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto i = registry_.find(id);
+  if (i == registry_.end())
+    throw std::runtime_error("unknown adapter id");
+  auto j = i->second.find(version.empty() ? latest_.at(id) : version);
+  if (j == i->second.end())
+    throw std::runtime_error("unknown adapter version");
+  ++stats_.ram_hits;
+  return std::make_shared<const AdapterHandle>(
+      j->second, scale ? *scale : j->second->scale);
+}
+void AdapterCache::admit_gpu(size_t bytes) {
+  if (bytes > gpu_budget_)
+    throw std::runtime_error("adapter exceeds GPU budget");
+  while (stats_.gpu_bytes > gpu_budget_ - bytes) {
+    auto best = gpu_.end();
+    for (auto i = gpu_.begin(); i != gpu_.end(); ++i)
+      if (i->second.lease.use_count() == 1 &&
+          (best == gpu_.end() || i->second.used < best->second.used))
+        best = i;
+    if (best == gpu_.end())
+      throw std::runtime_error("adapter GPU admission denied: active leases");
+    stats_.gpu_bytes -= best->second.lease->data.n * 2;
+    gpu_.erase(best);
+    ++stats_.evictions;
+  }
+}
+std::shared_ptr<const GpuLease> AdapterCache::acquire(const AdapterHandle &h,
+                                                      bool *cold) {
+  // Serial admission/upload is also a single-flight barrier: only a fully
+  // event-complete lease is published, concurrent misses never duplicate H2D.
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto i = gpu_.find(h.package->version);
+  if (i != gpu_.end()) {
+    if (cold)
+      *cold = false;
+    ++stats_.gpu_hits;
+    i->second.used = ++clock_;
+    return i->second.lease;
+  }
+  if (cold)
+    *cold = true;
+  ++stats_.gpu_misses;
+  // NoRA A is staged transposed, A^T[in,rank], in place of A: inference reads
+  // one contiguous span per input chunk instead of `rank` rows strided by
+  // `in`, at no extra GPU or staging memory.
+  const bool nora = h.package->manifest["method"] == "nora";
+  const size_t elements = h.package->data.size();
+  const size_t bytes = elements * 2;
+  if (bytes > staging_budget_)
+    throw std::runtime_error("adapter exceeds pinned staging budget");
+  admit_gpu(bytes);
+  auto lease = std::make_shared<GpuLease>();
+  lease->version = h.package->version;
+  size_t free_bytes = 0, total_bytes = 0;
+  check(cudaMemGetInfo(&free_bytes, &total_bytes));
+  if (bytes > free_bytes)
+    throw std::runtime_error("adapter GPU OOM admission denied");
+  half *allocation = nullptr;
+  check(cudaMalloc(&allocation, bytes));
+  lease->data.p = allocation;
+  lease->data.n = elements;
+  void *pinned = nullptr;
+  cudaStream_t stream = nullptr;
+  cudaEvent_t begin = nullptr, end = nullptr;
+  try {
+    check(cudaHostAlloc(&pinned, bytes, cudaHostAllocDefault));
+    if (h.package->manifest["dtype"] == "bfloat16") {
+      auto *target = static_cast<uint16_t *>(pinned);
+      for (size_t i = 0; i < h.package->data.size(); ++i)
+        target[i] = llm_infer::float_to_f16_bits(llm_infer::bf16_bits_to_float(h.package->data[i]));
+    } else
+      std::memcpy(pinned, h.package->data.data(), bytes);
+    auto *staged = static_cast<uint16_t *>(pinned);
+    std::vector<uint16_t> a;
+    for (size_t i = 0; nora && i < h.package->tensors.size(); ++i) {
+      const auto &t = h.package->tensors[i];
+      uint16_t *region = staged + t.a_offset;
+      a.assign(region, region + size_t(t.rank) * t.in);
+      for (int j = 0; j < t.rank; ++j)
+        for (int k = 0; k < t.in; ++k)
+          region[size_t(k) * t.rank + j] = a[size_t(j) * t.in + k];
+    }
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    check(cudaEventCreate(&begin));
+    check(cudaEventCreate(&end));
+    check(cudaEventRecord(begin, stream));
+    check(cudaMemcpyAsync(lease->data.p, pinned, bytes, cudaMemcpyHostToDevice,
+                          stream));
+    check(cudaEventRecord(end, stream));
+    check(cudaEventSynchronize(end));
+    float ms;
+    check(cudaEventElapsedTime(&ms, begin, end));
+    stats_.h2d_ms += ms;
+    lease->h2d_ms = ms;
+    for (size_t i = 0; i < h.package->tensors.size(); ++i) {
+      const auto &t = h.package->tensors[i];
+      if (lease->blocks.size() <= size_t(t.layer))
+        lease->blocks.resize(t.layer + 1);
+      lease->blocks[t.layer][t.target] = {
+          t.in,
+          t.out,
+          t.rank,
+          1,
+          lease->data.p + t.offset,
+          nullptr,  // only the transposed A is resident
+          nora ? lease->data.p + t.a_offset : nullptr};
+    }
+  } catch (...) {
+    if (stream)
+      cudaStreamSynchronize(stream);
+    if (end)
+      cudaEventDestroy(end);
+    if (begin)
+      cudaEventDestroy(begin);
+    if (stream)
+      cudaStreamDestroy(stream);
+    if (pinned)
+      cudaFreeHost(pinned);
+    throw;
+  }
+  cudaEventDestroy(end);
+  cudaEventDestroy(begin);
+  cudaStreamDestroy(stream);
+  cudaFreeHost(pinned);
+  gpu_[lease->version] = {lease, ++clock_};
+  stats_.gpu_bytes += bytes;
+  stats_.gpu_peak_bytes = std::max(stats_.gpu_peak_bytes, stats_.gpu_bytes);
+  ++stats_.uploads;
+  return lease;
+}
+void AdapterCache::erase(const std::string &id, const std::string &version) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto i = registry_.find(id);
+  if (i == registry_.end())
+    return;
+  if (version.empty()) {
+    registry_.erase(i);
+    latest_.erase(id);
+    registration_order_.erase(id);
+  } else {
+    i->second.erase(version);
+    auto &order = registration_order_[id];
+    order.erase(std::remove(order.begin(), order.end(), version), order.end());
+    if (i->second.empty()) {
+      registry_.erase(i);
+      latest_.erase(id);
+      registration_order_.erase(id);
+    } else if (latest_[id] == version)
+      latest_[id] = order.back();
+  }
+  account_ram();
+}
+void AdapterCache::trim() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto i = gpu_.begin(); i != gpu_.end();)
+    if (i->second.lease.use_count() == 1) {
+      stats_.gpu_bytes -= i->second.lease->data.n * 2;
+      i = gpu_.erase(i);
+      ++stats_.evictions;
+    } else
+      ++i;
+  account_ram();
+}
+CacheStats AdapterCache::stats() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto result = stats_;
+  result.ram_bytes = 0;
+  for (const auto &weak : host_lifetimes_)
+    if (auto p = weak.lock())
+      result.ram_bytes += p->data.size() * 2;
+  return result;
+}
+Json::Value AdapterCache::list() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  Json::Value out(Json::arrayValue);
+  for (const auto &i : registry_)
+    for (const auto &j : i.second) {
+      Json::Value v;
+      v["id"] = i.first;
+      v["version"] = j.first;
+      v["manifest"] = j.second->manifest;
+      out.append(v);
+    }
+  return out;
+}
+AdapterCache &adapter_cache() {
+  auto budget = [](const char *name, size_t fallback) -> size_t {
+    const char *value = std::getenv(name);
+    if (!value)
+      return fallback;
+    std::string s(value);
+    size_t used = 0;
+    auto n = std::stoull(s, &used);
+    if (s.empty() || s[0] == '-' || used != s.size() ||
+        n > SIZE_MAX / (1ULL << 20))
+      throw std::runtime_error(std::string("invalid budget: ") + name);
+    return size_t(n) * (1ULL << 20);
+  };
+  static AdapterCache c(budget("RWKV_ADAPTER_RAM_MIB", 1ULL << 30),
+                        budget("RWKV_ADAPTER_GPU_MIB", 512ULL << 20),
+                        budget("RWKV_ADAPTER_STAGING_MIB", 128ULL << 20));
+  return c;
+}
+std::string effective_model_key(const std::string &r, const AdapterHandle *a,
+                                const std::string &s, bool fp32) {
+  Json::Value v;
+  v.append(r);
+  v.append(a ? a->identity : "");
+  v.append(s);
+  v.append(fp32);
+  auto b = json(v);
+  Hash h;
+  h.add(b.data(), b.size());
+  return h.finish();
 }
 } // namespace rwkv7_miss

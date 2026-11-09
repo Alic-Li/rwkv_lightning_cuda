@@ -1,13 +1,34 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { ChevronRight, RotateCcw } from "lucide-react";
+import { AdapterManager } from "@/components/chat/adapter-manager";
 import { StateManager } from "@/components/chat/state-manager";
 import { Separator } from "@/components/ui/primitives";
 import { SliderField } from "@/components/ui/slider";
 import { Select } from "@/components/ui/select";
 import { inferenceApi } from "@/lib/api/inference";
-import type { UploadedState } from "@/lib/api/types";
+import type { AdapterEntry, UploadedState } from "@/lib/api/types";
 import { useI18n } from "@/lib/i18n";
 import { defaultGeneration, useSettings } from "@/stores/settings";
+
+const encodeAdapter = (id: string, version: string) =>
+  JSON.stringify([id, version]);
+
+/** `adapter_id + version` is the identity, so the select value carries both. */
+function decodeAdapter(value: string): [string, string] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (
+      Array.isArray(parsed) &&
+      parsed.length === 2 &&
+      typeof parsed[0] === "string" &&
+      typeof parsed[1] === "string"
+    )
+      return [parsed[0], parsed[1]];
+  } catch {
+    // Not an encoded adapter value: fall through to "no adapter".
+  }
+  return ["", ""];
+}
 
 /** Right-hand column of the chat page: generation settings and node assets. */
 export function GenerationPanel({ backendId }: { backendId: string }) {
@@ -16,14 +37,19 @@ export function GenerationPanel({ backendId }: { backendId: string }) {
   const setGeneration = useSettings((s) => s.setGeneration);
   const [states, setStates] = useState<UploadedState[]>([]);
   const [statesFailed, setStatesFailed] = useState(false);
+  const [adapters, setAdapters] = useState<AdapterEntry[]>([]);
+  const [adaptersError, setAdaptersError] = useState("");
   const [penaltiesOpen, setPenaltiesOpen] = useState(false);
   const [statesOpen, setStatesOpen] = useState(false);
+  const [adaptersOpen, setAdaptersOpen] = useState(false);
   const [revision, setRevision] = useState(0);
 
   useEffect(() => {
     if (!backendId) {
       setStates([]);
       setStatesFailed(false);
+      setAdapters([]);
+      setAdaptersError("");
       return;
     }
     const controller = new AbortController();
@@ -39,15 +65,40 @@ export function GenerationPanel({ backendId }: { backendId: string }) {
         setStates([]);
         setStatesFailed(true);
       });
+    inferenceApi
+      .listAdapters(backendId, controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        setAdapters(result?.data ?? []);
+        setAdaptersError("");
+      })
+      .catch((cause: unknown) => {
+        if (controller.signal.aborted) return;
+        setAdapters([]);
+        setAdaptersError(
+          cause instanceof Error ? cause.message : String(cause),
+        );
+      });
     return () => controller.abort();
   }, [backendId, revision]);
 
-  /** Re-read the State list once the manager dialog closes. */
+  /** Re-read both lists once a manager dialog closes; it may have changed them. */
   const closed = (setOpen: (open: boolean) => void) => (open: boolean) => {
     setOpen(open);
     if (!open) setRevision((value) => value + 1);
   };
 
+  const selectedAdapter = encodeAdapter(
+    generation.adapter_id ?? "",
+    generation.adapter_version ?? "",
+  );
+  const adapterMissing =
+    Boolean(generation.adapter_id) &&
+    !adapters.some(
+      (entry) =>
+        entry.id === generation.adapter_id &&
+        entry.version === (generation.adapter_version ?? ""),
+    );
   const stateMissing =
     Boolean(generation.state_id) &&
     !states.some((state) => state.state_id === generation.state_id);
@@ -176,6 +227,9 @@ export function GenerationPanel({ backendId }: { backendId: string }) {
 
       <Separator />
 
+      {/* State and adapter are the same shape: a picker, plus a way into the
+          manager that fills it. The manager is a secondary action, so it is
+          a quiet link in the heading row rather than a full-width button. */}
       <AssetSection
         title={t("chat.state")}
         manageLabel={t("chat.manage")}
@@ -202,10 +256,52 @@ export function GenerationPanel({ backendId }: { backendId: string }) {
         </Select>
       </AssetSection>
 
+      <AssetSection
+        title={t("chat.adapter")}
+        manageLabel={t("chat.manage")}
+        disabled={!backendId}
+        onManage={() => setAdaptersOpen(true)}
+        error={adaptersError}
+      >
+        <Select
+          value={selectedAdapter}
+          disabled={!backendId || Boolean(adaptersError)}
+          onChange={(event) => {
+            const [id, version] = decodeAdapter(event.target.value);
+            setGeneration({
+              adapter_id: id,
+              adapter_version: version,
+              adapter_scale: "",
+            });
+          }}
+        >
+          <option value={encodeAdapter("", "")}>
+            {adaptersError ? t("chat.unavailable") : t("chat.adapterNone")}
+          </option>
+          {adapterMissing && (
+            <option value={selectedAdapter}>{generation.adapter_id}</option>
+          )}
+          {adapters.map((entry) => (
+            <option
+              key={`${entry.id}@${entry.version}`}
+              value={encodeAdapter(entry.id, entry.version)}
+            >
+              {entry.id} · {entry.version.slice(0, 12)} · {t("adapter.rank")}{" "}
+              {entry.manifest.rank}
+            </option>
+          ))}
+        </Select>
+      </AssetSection>
+
       <StateManager
         backendId={backendId}
         open={statesOpen}
         onOpenChange={closed(setStatesOpen)}
+      />
+      <AdapterManager
+        backendId={backendId}
+        open={adaptersOpen}
+        onOpenChange={closed(setAdaptersOpen)}
       />
     </div>
   );

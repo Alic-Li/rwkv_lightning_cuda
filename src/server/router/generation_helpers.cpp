@@ -151,9 +151,24 @@ GenerateOptions parse_options(const Json::Value& body, GenerateOptions options) 
       options.stop->push_back(item.asString());
     }
   }
-  if (body.isMember("adapter_id") || body.isMember("adapter_version") ||
-      body.isMember("adapter_scale"))
-    throw std::invalid_argument("request adapters are no longer supported");
+  if (body.isMember("adapter_scale") && !body["adapter_scale"].isNumeric())
+    throw std::invalid_argument("adapter_scale must be numeric");
+  if (body.isMember("adapter_id")) {
+    const auto id = body["adapter_id"].asString();
+    options.adapter_id = id;
+    if (id.empty())
+      options.adapter.reset();
+    else {
+      float scale = body.get("adapter_scale", 0).asFloat();
+      options.adapter = rwkv7_miss::adapter_cache().resolve(
+          id, body.get("adapter_version", "").asString(),
+          body.isMember("adapter_scale") ? &scale : nullptr);
+    }
+  } else if (body.isMember("adapter_version") ||
+             body.isMember("adapter_scale")) {
+    throw std::invalid_argument(
+        "adapter_id is required with adapter_version/adapter_scale");
+  }
   options.max_tokens = body.get("max_tokens", options.max_tokens).asInt();
   options.temperature = body.get("temperature", options.temperature).asDouble();
   options.top_k = body.get("top_k", options.top_k).asInt();

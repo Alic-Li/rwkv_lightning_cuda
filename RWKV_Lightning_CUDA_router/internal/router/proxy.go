@@ -13,19 +13,15 @@ import (
 )
 
 type proxy struct {
-	scheduler    *scheduler
-	client       *http.Client
-	maxBody      int64
-	timeout      time.Duration
-	uploadPolicy uploadRetryPolicy
+	scheduler           *scheduler
+	client              *http.Client
+	maxBody             int64
+	timeout             time.Duration
+	uploadPolicy        uploadRetryPolicy
+	adapterUploadPolicy uploadRetryPolicy
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Retired endpoints must not reach legacy upstream workers.
-	if r.URL.Path == "/v1/adapters" || strings.HasPrefix(r.URL.Path, "/v1/adapters/") {
-		http.NotFound(w, r)
-		return
-	}
 	body, err := p.readBody(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
@@ -35,14 +31,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveSynchronizedState(w, r, body)
 		return
 	}
-	var payload map[string]json.RawMessage
-	if json.Unmarshal(body, &payload) == nil {
-		for _, key := range []string{"adapter_id", "adapter_version", "adapter_scale"} {
-			if _, exists := payload[key]; exists {
-				http.Error(w, "request adapters are no longer supported", http.StatusBadRequest)
-				return
-			}
-		}
+	if r.URL.Path == "/v1/adapters" {
+		p.serveSynchronizedAdapters(w, r, body)
+		return
 	}
 	bsz, session := batchSize(r, body)
 	stateID, err := resolvedRequestStateID(r, body)
@@ -53,17 +44,37 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if stateID != "" && p.scheduler.needsStateRefresh(stateID) {
 		p.refreshState(r, body)
 	}
-	b, release, err := p.scheduler.acquire(bsz, session, stateID)
+	adapterID, adapterVersion, err := requestAdapter(body)
 	if err != nil {
-		log.Printf("router route_unavailable path=%q session_id=%q state_id=%q backends=%s",
-			r.URL.Path, session, stateID, p.scheduler.routeDiagnostic(stateID))
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if adapterID != "" {
+		var refresh bool
+		adapterVersion, refresh = p.scheduler.resolveAdapterVersion(adapterID, adapterVersion)
+		if refresh {
+			p.refreshAdapters(r, body)
+			adapterVersion, _ = p.scheduler.resolveAdapterVersion(adapterID, adapterVersion)
+		}
+		if adapterVersion != "" {
+			var payload map[string]json.RawMessage
+			if json.Unmarshal(body, &payload) == nil {
+				payload["adapter_version"], _ = json.Marshal(adapterVersion)
+				body, _ = json.Marshal(payload)
+			}
+		}
+	}
+	b, release, err := p.scheduler.acquireWithAdapter(bsz, session, stateID, adapterID, adapterVersion)
+	if err != nil {
+		log.Printf("router route_unavailable path=%q session_id=%q adapter_id=%q version=%q state_id=%q backends=%s",
+			r.URL.Path, session, adapterID, adapterVersion, stateID, p.scheduler.routeDiagnostic(adapterID, adapterVersion, stateID))
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	defer release()
-	if stateID != "" || session != "" {
-		log.Printf("router route_selected backend=%q path=%q session_id=%q state_id=%q",
-			b.name, r.URL.Path, session, stateID)
+	if adapterID != "" || stateID != "" || session != "" {
+		log.Printf("router route_selected backend=%q path=%q session_id=%q adapter_id=%q version=%q state_id=%q",
+			b.name, r.URL.Path, session, adapterID, adapterVersion, stateID)
 	}
 	w.Header().Set("X-RWKV-Backend", b.name)
 	ctx := r.Context()
@@ -90,11 +101,14 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	if stateID != "" && (resp.StatusCode == 400 || resp.StatusCode == 404) {
+	if (stateID != "" || adapterID != "") && (resp.StatusCode == 400 || resp.StatusCode == 404) {
 		// A restarted runtime can lose its temporary State store.
 		errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		if readErr == nil && bytes.Contains(errorBody, []byte("uploaded state not found")) {
 			p.scheduler.stateUnavailable(stateID, b)
+		}
+		if readErr == nil && (bytes.Contains(errorBody, []byte("unknown adapter id")) || bytes.Contains(errorBody, []byte("unknown adapter version"))) {
+			p.scheduler.adapterUnavailable(adapterID, adapterVersion, b)
 		}
 		copyHeaders(w.Header(), resp.Header)
 		w.Header().Set("X-RWKV-Backend", b.name)

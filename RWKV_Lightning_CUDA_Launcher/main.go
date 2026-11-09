@@ -938,10 +938,6 @@ func quantizationArgs(req quantizeRequest) ([]string, error) {
 	return append(args, req.InputPath, req.OutputPath), nil
 }
 func (l *launcher) proxy(w http.ResponseWriter, r *http.Request) {
-	if retiredInferenceRoute(r.URL.Path) {
-		http.NotFound(w, r)
-		return
-	}
 	l.mu.Lock()
 	config := l.config
 	l.mu.Unlock()

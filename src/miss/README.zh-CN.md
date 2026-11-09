@@ -1,4 +1,4 @@
-# MiSS 适配器训练与 Kernel
+# MiSS 适配器训练与推理服务
 
 [English](README.md) | 简体中文
 
@@ -11,6 +11,7 @@
 - [训练选项](#训练选项)
 - [检查点与续训](#检查点与续训)
 - [推理包](#推理包)
+- [HTTP API 与缓存](#http-api-与缓存)
 - [性能分析](#性能分析)
 - [验证与当前限制](#验证与当前限制)
 
@@ -35,7 +36,8 @@ BF16 训练不使用 loss scaling，也不再提供 `--loss-scale` 参数。
 - `ffn.key.weight`、`ffn.value.weight`
 
 注意力 key/value 增量在 key 门控和值残差之前加入；第 0 层将适配后的 value 写入 `v_first`。
-FFN key 增量在 ReLU² 前加入，FFN value 使用 ReLU² 的输出。
+FFN key 增量在 ReLU² 前加入，FFN value 使用 ReLU² 的输出。推理时 FFN value 继续走稀疏
+算子：稀疏算子读取激活前的输入，适配器在读取输入时自行计算 ReLU²。
 
 训练复用精确的状态传递 WKV 算子及现有注意力移位、FFN 移位、`v_first` 和跨分块伴随梯度。
 归约后的输入（每个目标有 行数 × rank 个 FP32 值）保存在分块计算记录中，反向遍历时随
@@ -110,15 +112,81 @@ Adam 动量、初始状态、优化器步数、调度总步数、数据集轮次
 
 最终 PTH 包含 BF16 D 和文件内部的 `archive/miss.json` 元数据，仍可用
 `torch.load` 读取。新 checkpoint 的 `training.pth` 也内嵌推理所需元数据，
-供独立训练工具的包加载器使用；续训仍读取完整 checkpoint 目录。旧包仍支持双文件格式：
+可以独立上传或注册；程序只提取 `.D.master` 并按声明精度转为 D 缓存在 RAM；GPU miss 时才转换为 FP16 推理表示，
+梯度和 Adam 张量不进入 adapter RAM/GPU 缓存。续训仍读取完整 checkpoint 目录。
+
+旧 `training.pth` 注册时读取同目录的 `checkpoint.json`；上传旧文件时需同时
+上传该 JSON。旧文件若仅训练 FFN value，可能缺少输入宽度信息，需要重新导出。
+原来的双文件推理目录仍兼容：
 
 - `adapter.json`：`format_version=1`、`kind=inference_adapter`、`method=miss`、`dtype=bfloat16`（也接受旧 `float16` 包）、`layout=modulo_rank_zero_pad`、来源基模 SHA-256、rank、alpha、scale、目标名称、层号、输入宽度、D 形状，以及 `content_version`（不含版本字段的规范化清单与声明精度的 D 的 SHA-256）。
 - `adapter.pth`：PyTorch 可读取的 BF16 张量，名称如 `blocks.N.att.key.weight.D`，使用原始 `[out,rank]` 布局。
 
 加载器检查格式、形状、重复目标、有限值和内容哈希，
-训练时校验来源基模指纹。
+来源基模指纹必须匹配。加载模型时、请求可以绑定适配器之前，会一次性计算基模指纹，
+因此启动时增加一次顺序读取模型文件计算哈希的过程。
+`rwkv_quantize` 写入 `output.rwkvq.source.json`，将量化文件哈希绑定到来源 PTH；
+将此文件与量化模型放在一起，即可复用基于其未量化来源 PTH 训练的适配器。
+旧量化模型需重新量化以生成此来源文件。支持量化基模**推理**，训练使用独立 BF16 backbone，不支持量化基模。
 
-原生推理 Server 统一使用当前模型权重。请求级 Adapter 和 HTTP 管理接口已移除，旧 Adapter 请求字段返回 HTTP 400。State 上传、按请求选择、动态加载、缓存和 Session 行为保持支持。MiSS/NoRA Kernel、包格式与独立训练工具保留；服务端不支持在线 Adapter Checkout 或在线权重融合，离线权重融合请使用 [`rwkv_peft_weight_merge`](../../docs/peft-weight-merge.zh-CN.md)。
+## HTTP API 与缓存
+
+注册、列表、删除、鉴权和生成请求示例统一维护在
+[HTTP API 中文文档](../../docs/http-api.zh-CN.md#miss-适配器注册列表与删除)。
+注册支持服务端 PTH 路径、旧推理目录，或在 `POST /v1/adapters` 直接 multipart 上传。
+删除注册后，已有请求句柄仍有效，新请求无法查找已删除版本。
+
+GPU 缓存未命中时，使用锁页暂存内存和非阻塞复制流，一次性上传整段连续的 D 数据
+（NoRA 的 A 在暂存时直接写成转置布局 A^T[in,rank] 替换原布局，推理连续读取且不额外占用内存）。
+就绪事件完成后才发布可用对象。准入和上传在缓存互斥锁下串行执行，合并同版本的并发
+未命中；目前不同适配器的上传也串行执行。GPU 命中后，各层、预填充和解码复用同一分配。
+活跃租约阻止驱逐，无租约的分配使用 LRU。暂停释放适配器 GPU 租约并清理无租约分配，
+恢复时从 RAM 重新加载。RAM 统计包含已注册包和仍被活跃句柄持有的已删除版本。
+
+以下独立的进程环境变量设置预算，单位为 MiB：
+
+```bash
+RWKV_ADAPTER_RAM_MIB=1024
+RWKV_ADAPTER_GPU_MIB=512
+RWKV_ADAPTER_STAGING_MIB=128
+```
+
+适配器整体必须能放入暂存预算。超过 RAM、暂存、GPU 预算、活跃租约容量或 GPU 可用
+内存的包会被拒绝。这些限制只计算 D 数据，不包含 JSON/容器开销和基模内存。
+当前运行时假设每个服务进程只使用一个 GPU 设备。
+
+有效状态身份包含唯一的已加载模型运行实例、适配器内容版本、有效 scale、初始状态身份
+和 WKV 精度。状态复制与续推会拒绝不匹配的身份。会话缓存键按命名空间隔离，持久化
+状态保留有效身份，不能跨不同模型运行实例复用。本仓库目前没有 radix cache；将来若
+添加，也必须使用相同的有效身份。共享 `LayerWeights` 始终不被修改。
+
+`GET /v1/adapters` 返回 RAM/GPU 命中、未命中、上传次数、H2D 毫秒数、驻留字节数和
+适配器 GPU 峰值字节数。生成过程输出 JSON `miss_request_metrics` 记录，包含冷/热缓存
+状态、首 token 延迟（TTFT）和相邻采样间的每 token 延迟（TPOT）。
+
+### 服务开销
+
+适配器不会拆分连续解码批次。每行携带自己的 GPU 租约（或不带），基模对整个批次只跑
+一次；每个带适配器的投影只增加一次 latent 和一次 expand 启动，覆盖批次内所有适配器，
+基模行直接跳过。预填充使用同一组算子，所有行指向同一个适配器。租约在请求线程获取，
+注册在 HTTP 工作线程池执行，基模指纹在加载完成后于后台计算，冷切换不会卡住其他流。
+
+RTX 4060 Ti、1.5B FP16、rank 16、全部目标、每请求贪心生成 256 token
+（`test/adapter_hotswap_bench.py`），总吞吐 tokens/s：
+
+| 并发 | 基模 | MiSS | NoRA | 基模 + MiSS | 基模 + MiSS + NoRA |
+|---|---:|---:|---:|---:|---:|
+| 1 | 116 | 107 | 107 | – | – |
+| 8 | 660 | 638 | 633 | 613 | 603 |
+| 32 | 1767 | 1652 | 1622 | 1669 | 1644 |
+
+原实现在并发 1 时为 85/77（MiSS/NoRA），并发 8 为 546/287，并发 32 为 1602/922；
+并发 8 时基模 + MiSS 混合为 327，三方混合为 162。1913 token 的提示词预填充耗时：
+基模 0.237 s，MiSS 0.275 s，NoRA 0.289 s。
+
+500 个同时到达的流式请求（每个 128 token，64 个解码槽位）：5 个 NoRA 各 100 个请求时为
+1628 tokens/s，纯基模 1761，全部共用一个 NoRA 为 1638（原实现分别为 408 和 1109）。
+同时被使用的适配器必须能一起放进 `RWKV_ADAPTER_GPU_MIB`，因为租约中的适配器不能被换出。
 
 ## 性能分析
 
@@ -142,11 +210,13 @@ nvidia-smi dmon -i 0 \
 ```bash
 ctest --test-dir build --output-on-failure
 python tools/check_miss.py --build build --work /tmp/miss-acceptance
+python tools/check_miss_http.py --build build --work /tmp/miss-acceptance
 ```
 
 工作目录必须是新目录。测试覆盖显式 A/autograd dD/dX、有限差分、不完整分块、梯度累积、
 两层完整模型 autograd、完整序列与分块梯度、顺序批次累积、共享 WKV 记录、损失下降、
-逐位一致的检查点续训/导出、包格式和底层 Kernel。
+逐位一致的检查点续训/导出、无适配器与零 scale 输出、并发版本/scale、SQLite 身份往返、
+GPU 准入/LRU/重载、解码不重复上传，以及动态 FP16/W8A16/W4A16 推理。
 
 在 RTX PRO 6000 Blackwell 上，两层测试的损失在 16 次更新后由 5.2124 降至 2.9414。
 CUDA 数值和运行时测试通过。HIP 使用同一 MiSS 算子源码和等效钩子，但
