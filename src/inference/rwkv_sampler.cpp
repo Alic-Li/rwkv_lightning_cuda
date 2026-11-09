@@ -1,5 +1,6 @@
 #include "rwkv/inference/rwkv_sampler.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <random>
 #include <stdexcept>
@@ -154,6 +155,33 @@ void copy_sampler_row(const SamplerPenaltyState& src, int src_row,
   const auto bytes = rwkv_sampling::rand_state_bytes(1);
   rwkv7_fast_v4::check_cuda(cudaMemcpy(dst.rand_states.p + dst_row * bytes,
       src.rand_states.p + src_row * bytes, bytes, cudaMemcpyDeviceToDevice), "move row RNG");
+}
+
+int sampler_row_capacity(const SamplerPenaltyState& state) {
+  const std::size_t bytes = rwkv_sampling::rand_state_bytes(1);
+  if (state.vocab_size <= 0 || bytes == 0) return 0;
+  return static_cast<int>(std::min(state.penalties.n / static_cast<std::size_t>(state.vocab_size),
+                                   state.rand_states.n / bytes));
+}
+
+void append_sampler_row_copies(const SamplerPenaltyState& src, int src_row,
+                               SamplerPenaltyState& dst, int dst_row,
+                               std::vector<DeviceCopy>& out) {
+  if (src.vocab_size != dst.vocab_size || src_row < 0 || src_row >= sampler_row_capacity(src) ||
+      dst_row < 0 || dst_row >= sampler_row_capacity(dst))
+    throw std::invalid_argument("invalid sampler row copy");
+  const std::size_t vocab = static_cast<std::size_t>(src.vocab_size);
+  const std::size_t bytes = rwkv_sampling::rand_state_bytes(1);
+  out.push_back({src.penalties.p + src_row * vocab, dst.penalties.p + dst_row * vocab,
+                 vocab * sizeof(float)});
+  out.push_back({src.rand_states.p + src_row * bytes, dst.rand_states.p + dst_row * bytes, bytes});
+}
+
+void append_sampler_row_reset(SamplerPenaltyState& dst, int dst_row, std::vector<DeviceCopy>& out) {
+  if (dst_row < 0 || dst_row >= sampler_row_capacity(dst))
+    throw std::invalid_argument("invalid sampler row reset");
+  const std::size_t vocab = static_cast<std::size_t>(dst.vocab_size);
+  out.push_back({nullptr, dst.penalties.p + dst_row * vocab, vocab * sizeof(float)});
 }
 
 int sample_repetition_temperature_topk_topp(

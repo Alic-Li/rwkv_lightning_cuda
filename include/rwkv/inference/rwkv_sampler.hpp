@@ -36,4 +36,15 @@ std::vector<int> sample_rows(
 void copy_sampler_row(const SamplerPenaltyState& src, int src_row,
                       SamplerPenaltyState& dst, int dst_row);
 
+// Appends the penalty-history and RNG copies of one row for
+// IModelBackend::run_device_copies. Rows are checked against capacity, not
+// batch_size, so a packed decode group can move rows between spare slots.
+void append_sampler_row_copies(const SamplerPenaltyState& src, int src_row,
+                               SamplerPenaltyState& dst, int dst_row,
+                               std::vector<DeviceCopy>& out);
+// Clears one row's penalty history; the row keeps its own RNG stream.
+void append_sampler_row_reset(SamplerPenaltyState& dst, int dst_row,
+                              std::vector<DeviceCopy>& out);
+int sampler_row_capacity(const SamplerPenaltyState& state);
+
 }  // namespace rwkv7_server
