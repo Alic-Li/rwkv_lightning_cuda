@@ -31,6 +31,25 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 - 冻结基模训练 MiSS adapter，并按请求动态绑定不同 adapter。
 - 多后端路由和带 Web UI 的桌面启动器。
 
+## 性能评测 (Benchmark)
+
+**RWKV_Lightning_CUDA** 与 [irwkv](https://github.com/rwkv-org/irwkv/commit/1f0bd68709f11219669550903a6bcb63dd6be256) 在不同并发/批大小下的推理性能对比：
+
+- **测试硬件**：NVIDIA RTX PRO 6000 Blackwell（96 GB VRAM）
+- **模型规格**：RWKV-7 7.2B
+
+| 并发/批大小 (bsz) | RWKV_Lightning_CUDA 端到端耗时 | irwkv 端到端耗时 | RWKV_Lightning_CUDA 首字时延 (TTFT) | irwkv 首字时延 (TTFT) | RWKV_Lightning_CUDA 吞吐量 | irwkv 吞吐量 | 领先幅度 |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | **0.461s** | 0.672s | **3.8ms** | 16.2ms | **138.7 tok/s** | 95.2 tok/s | **+45.7%** |
+| **8** | **0.537s** | 0.698s | **10.6ms** | 35.7ms | **953.5 tok/s** | 733.5 tok/s | **+30.0%** |
+| **16** | **0.685s** | 0.737s | **17.7ms** | 44.4ms | **1,494.1 tok/s** | 1,389.6 tok/s | **+7.5%** |
+| **32** | **0.732s** | 0.756s | **35.7ms** | 62.1ms | **2,796.2 tok/s** | 2,707.4 tok/s | **+3.3%** |
+| **64** | **0.810s** | 0.869s | **60.1ms** | 99.6ms | **5,055.6 tok/s** | 4,714.6 tok/s | **+7.2%** |
+| **128** | **1.033s** | 1.111s | **119.9ms** | 173.1ms | **7,930.6 tok/s** | 7,375.4 tok/s | **+7.5%** |
+| **256** | **1.504s** | 1.936s | **258.7ms** | 294.8ms | **10,890.3 tok/s** | 8,461.7 tok/s | **+28.7%** |
+
+*注：在 bsz=256 时，RWKV_Lightning_CUDA 的纯 Decode 速度高达 **12,896 tokens/s**，常驻显存仅约 14.2 GB（对比 irwkv 需预分配约 66.2 GB 显存）。*
+
 ## 快速开始
 对于 Ubuntu 24.04 LTS，使用以下命令安装依赖：
 ```bash

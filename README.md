@@ -31,6 +31,25 @@ Both training binaries use the independent [BF16 training backbone](src/training
 
 The standalone `rwkv_miss_tune_server`, `rwkv_state_tune_server` and `rwkv_nora_tune_server` add persistent BF16 online RL (MiSS, State and NoRA modes, GRPO or Dr.GRPO advantages): batch rollouts, signed-advantage train steps, versioned actor snapshots, and shared prefix caching. See the [online RL guide](docs/online-rl.md).
 
+## Benchmark
+
+Inference performance comparison between **RWKV_Lightning_CUDA** and [irwkv](https://github.com/rwkv-org/irwkv/commit/1f0bd68709f11219669550903a6bcb63dd6be256):
+
+- **Hardware**: NVIDIA RTX PRO 6000 Blackwell (96 GB VRAM)
+- **Model**: RWKV-7 7.2B
+
+| Batch Size / Concurrency | RWKV_Lightning_CUDA E2E Latency | irwkv E2E Latency | RWKV_Lightning_CUDA TTFT | irwkv TTFT | RWKV_Lightning_CUDA Throughput | irwkv Throughput | Speedup |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | **0.461s** | 0.672s | **3.8ms** | 16.2ms | **138.7 tok/s** | 95.2 tok/s | **+45.7%** |
+| **8** | **0.537s** | 0.698s | **10.6ms** | 35.7ms | **953.5 tok/s** | 733.5 tok/s | **+30.0%** |
+| **16** | **0.685s** | 0.737s | **17.7ms** | 44.4ms | **1,494.1 tok/s** | 1,389.6 tok/s | **+7.5%** |
+| **32** | **0.732s** | 0.756s | **35.7ms** | 62.1ms | **2,796.2 tok/s** | 2,707.4 tok/s | **+3.3%** |
+| **64** | **0.810s** | 0.869s | **60.1ms** | 99.6ms | **5,055.6 tok/s** | 4,714.6 tok/s | **+7.2%** |
+| **128** | **1.033s** | 1.111s | **119.9ms** | 173.1ms | **7,930.6 tok/s** | 7,375.4 tok/s | **+7.5%** |
+| **256** | **1.504s** | 1.936s | **258.7ms** | 294.8ms | **10,890.3 tok/s** | 8,461.7 tok/s | **+28.7%** |
+
+*Note: Peak decode speed of RWKV_Lightning_CUDA reaches **12,896 tokens/s** at batch size 256 with only ~14.2 GB VRAM footprint (compared to irwkv's ~66.2 GB allocation).*
+
 ## Quick Start
 
 For Ubuntu 24.04 LTS，Use the following command to install the dependencies:

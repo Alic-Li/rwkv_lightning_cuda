@@ -1,0 +1,141 @@
+{
+  "max_tokens": 64,
+  "prompt": "User: Please describe the history and development of artificial intelligence in brief.\nAssistant:",
+  "non_streaming": {
+    "1": {
+      "status": 200,
+      "wall_time": 0.46148612606339157,
+      "gen_tokens": 64,
+      "prompt_tokens": 18,
+      "prefill_speed": 12408.145258020486,
+      "decode_speed": 139.65412500033113,
+      "e2e_throughput": 138.68239235258983,
+      "per_token_ms": 7.210720719740493
+    },
+    "8": {
+      "status": 200,
+      "wall_time": 0.5369989990722388,
+      "gen_tokens": 512,
+      "prompt_tokens": 144,
+      "prefill_speed": 14402.421046977997,
+      "decode_speed": 978.3726820430725,
+      "e2e_throughput": 953.4468423303786,
+      "per_token_ms": 8.390609360503731
+    },
+    "16": {
+      "status": 200,
+      "wall_time": 0.6853791349567473,
+      "gen_tokens": 1024,
+      "prompt_tokens": 288,
+      "prefill_speed": 20895.36948454751,
+      "decode_speed": 1533.9771673191137,
+      "e2e_throughput": 1494.0635741189033,
+      "per_token_ms": 10.709048983699176
+    },
+    "32": {
+      "status": 200,
+      "wall_time": 0.7324322969652712,
+      "gen_tokens": 2048,
+      "prompt_tokens": 576,
+      "prefill_speed": 18622.752405948067,
+      "decode_speed": 2944.200512751783,
+      "e2e_throughput": 2796.162878788382,
+      "per_token_ms": 11.444254640082363
+    },
+    "64": {
+      "status": 200,
+      "wall_time": 0.8101882899645716,
+      "gen_tokens": 4096,
+      "prompt_tokens": 1152,
+      "prefill_speed": 20874.44613181564,
+      "decode_speed": 5479.482350573303,
+      "e2e_throughput": 5055.614911663451,
+      "per_token_ms": 12.659192030696431
+    },
+    "128": {
+      "status": 200,
+      "wall_time": 1.0329600351396948,
+      "gen_tokens": 8192,
+      "prompt_tokens": 2304,
+      "prefill_speed": 18901.786669234378,
+      "decode_speed": 9119.354723543494,
+      "e2e_throughput": 7930.606917325834,
+      "per_token_ms": 16.14000054905773
+    },
+    "256": {
+      "status": 200,
+      "wall_time": 1.5044562430121005,
+      "gen_tokens": 16384,
+      "prompt_tokens": 4608,
+      "prefill_speed": 21374.066564873294,
+      "decode_speed": 12896.298240775452,
+      "e2e_throughput": 10890.313411307518,
+      "per_token_ms": 23.50712879706407
+    }
+  },
+  "streaming": {
+    "1": {
+      "status": 200,
+      "ttft": 0.0038047139532864094,
+      "wall_time": 0.46169297490268946,
+      "gen_tokens": 64,
+      "prefill_speed": 12189.052199616044,
+      "decode_speed": 139.77449163531458,
+      "throughput": 138.62025952092776
+    },
+    "8": {
+      "status": 200,
+      "ttft": 0.010648399125784636,
+      "wall_time": 0.5357787359971553,
+      "gen_tokens": 512,
+      "prefill_speed": 18583.5274064442,
+      "decode_speed": 975.8133325509039,
+      "throughput": 955.6183655685776
+    },
+    "16": {
+      "status": 200,
+      "ttft": 0.01772555080242455,
+      "wall_time": 0.6858114479109645,
+      "gen_tokens": 1024,
+      "prefill_speed": 19944.799995900234,
+      "decode_speed": 1534.3163095589657,
+      "throughput": 1493.1217656386232
+    },
+    "32": {
+      "status": 200,
+      "ttft": 0.035734098171815276,
+      "wall_time": 0.7311132200993598,
+      "gen_tokens": 2048,
+      "prefill_speed": 18200.138965644393,
+      "decode_speed": 2949.269269360027,
+      "throughput": 2801.2077250110083
+    },
+    "64": {
+      "status": 200,
+      "ttft": 0.06006458099000156,
+      "wall_time": 0.808893287088722,
+      "gen_tokens": 4096,
+      "prefill_speed": 21138.49435055389,
+      "decode_speed": 5479.353810226992,
+      "throughput": 5063.708730655763
+    },
+    "128": {
+      "status": 200,
+      "ttft": 0.11992889316752553,
+      "wall_time": 1.0307447081431746,
+      "gen_tokens": 8192,
+      "prefill_speed": 20796.552740310486,
+      "decode_speed": 9180.538231691391,
+      "throughput": 7947.651766029827
+    },
+    "256": {
+      "status": 200,
+      "ttft": 0.25867999414913356,
+      "wall_time": 1.5327954120002687,
+      "gen_tokens": 16384,
+      "prefill_speed": 18948.436997588084,
+      "decode_speed": 12834.991153977446,
+      "throughput": 10688.967276212807
+    }
+  }
+}
