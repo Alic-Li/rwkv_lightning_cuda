@@ -58,6 +58,42 @@ int main() {
     TEST_EQ(controller.snapshot(false).queued_requests, static_cast<std::size_t>(0));
     TEST_CHECK(refresh_count.load() >= 4);
 
+    // Free VRAM shrinking after startup must not strand a request that passed
+    // the hard limit: with nothing reserved, waiting cannot help.
+    std::atomic<int> shrinking_limit{4};
+    rwkv7_server::PrefillAdmissionController stalled(
+        [&]() {
+          rwkv7_server::PrefillCapacity capacity;
+          capacity.max_batch_size = shrinking_limit.load();
+          capacity.bytes_per_batch = 1024;
+          return capacity;
+        },
+        std::chrono::milliseconds(100));
+    shrinking_limit.store(2);
+    const auto stall_start = std::chrono::steady_clock::now();
+    bool stalled_rejected = false;
+    try {
+      stalled.acquire(3, "stalled");
+    } catch (const rwkv7_server::PrefillBatchLimitExceeded& error) {
+      stalled_rejected = true;
+      TEST_EQ(error.request_batch_size(), 3);
+      TEST_EQ(error.max_batch_size(), 2);
+    }
+    TEST_CHECK(stalled_rejected);
+    TEST_CHECK(std::chrono::steady_clock::now() - stall_start < std::chrono::seconds(2));
+    TEST_EQ(stalled.snapshot(false).queued_requests, static_cast<std::size_t>(0));
+
+    // While another prefill holds a reservation the head keeps waiting, past
+    // the idle timeout, and is admitted once that reservation is released.
+    auto holder = stalled.acquire(2, "holder");
+    TEST_CHECK(holder.has_value());
+    auto patient = std::async(std::launch::async, [&]() {
+      return stalled.acquire(2, "patient");
+    });
+    TEST_CHECK(patient.wait_for(std::chrono::milliseconds(300)) == std::future_status::timeout);
+    holder.reset();
+    TEST_CHECK(patient.get().has_value());
+
     std::cout << "rwkv_prefill_admission_test passed\n";
     return 0;
   } catch (const std::exception& error) {

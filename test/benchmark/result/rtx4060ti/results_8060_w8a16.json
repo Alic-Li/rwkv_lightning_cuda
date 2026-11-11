@@ -1,0 +1,122 @@
+{
+  "max_tokens": 64,
+  "prompt": "User: Please describe the history and development of artificial intelligence in brief.\nAssistant:",
+  "non_streaming": {
+    "1": {
+      "status": 200,
+      "wall_time": 1.329630805999841,
+      "gen_tokens": 64,
+      "prompt_tokens": 18,
+      "prefill_speed": 9012.13935170675,
+      "decode_speed": 48.27298602896061,
+      "e2e_throughput": 48.13366214982812,
+      "per_token_ms": 20.775481343747515
+    },
+    "8": {
+      "status": 200,
+      "wall_time": 1.5968527659997562,
+      "gen_tokens": 512,
+      "prompt_tokens": 144,
+      "prefill_speed": 11099.266754690017,
+      "decode_speed": 324.629503612843,
+      "e2e_throughput": 320.6306873755186,
+      "per_token_ms": 24.95082446874619
+    },
+    "16": {
+      "status": 200,
+      "wall_time": 1.8576350889998139,
+      "gen_tokens": 1024,
+      "prompt_tokens": 288,
+      "prefill_speed": 11317.002845833265,
+      "decode_speed": 561.9122550088633,
+      "e2e_throughput": 551.2385107622731,
+      "per_token_ms": 29.025548265622092
+    },
+    "32": {
+      "status": 200,
+      "wall_time": 2.266832504999911,
+      "gen_tokens": 2048,
+      "prompt_tokens": 576,
+      "prefill_speed": 11402.556179909294,
+      "decode_speed": 929.5826525207062,
+      "e2e_throughput": 903.4633108016423,
+      "per_token_ms": 35.41925789062361
+    },
+    "64": {
+      "status": 200,
+      "wall_time": 2.7341929660005917,
+      "gen_tokens": 4096,
+      "prompt_tokens": 1152,
+      "prefill_speed": 11406.378892638439,
+      "decode_speed": 1564.9422409428983,
+      "e2e_throughput": 1498.0654441487263,
+      "per_token_ms": 42.721765093759245
+    },
+    "128": {
+      "status": 200,
+      "wall_time": 4.038317382000059,
+      "gen_tokens": 8192,
+      "prompt_tokens": 2304,
+      "prefill_speed": 11413.647631370886,
+      "decode_speed": 2147.6923294063936,
+      "e2e_throughput": 2028.5676496141925,
+      "per_token_ms": 63.09870909375093
+    }
+  },
+  "streaming": {
+    "1": {
+      "status": 200,
+      "ttft": 0.004275584999959392,
+      "wall_time": 1.342522218999875,
+      "gen_tokens": 64,
+      "prefill_speed": 9545.683786496995,
+      "decode_speed": 47.82440272206188,
+      "throughput": 47.67146427392273
+    },
+    "8": {
+      "status": 200,
+      "ttft": 0.01763254399975267,
+      "wall_time": 1.6094532280003477,
+      "gen_tokens": 512,
+      "prefill_speed": 11137.949616402053,
+      "decode_speed": 321.9881178473166,
+      "throughput": 318.12045922957964
+    },
+    "16": {
+      "status": 200,
+      "ttft": 0.03280734500003746,
+      "wall_time": 1.874047143000098,
+      "gen_tokens": 1024,
+      "prefill_speed": 11226.569798001266,
+      "decode_speed": 556.8383319851212,
+      "throughput": 546.4110141651578
+    },
+    "32": {
+      "status": 200,
+      "ttft": 0.06256864199986012,
+      "wall_time": 2.282121303999702,
+      "gen_tokens": 2048,
+      "prefill_speed": 11356.840362967772,
+      "decode_speed": 922.910413038889,
+      "throughput": 897.4106663000888
+    },
+    "64": {
+      "status": 200,
+      "ttft": 0.12125564799953281,
+      "wall_time": 2.703371911999966,
+      "gen_tokens": 4096,
+      "prefill_speed": 11444.928820589952,
+      "decode_speed": 1583.0255074983156,
+      "throughput": 1515.1448388652384
+    },
+    "128": {
+      "status": 200,
+      "ttft": 0.2402659549998134,
+      "wall_time": 3.9898339279998254,
+      "gen_tokens": 8192,
+      "prefill_speed": 11444.599146879642,
+      "decode_speed": 2175.184444535295,
+      "throughput": 2053.2182912452186
+    }
+  }
+}
