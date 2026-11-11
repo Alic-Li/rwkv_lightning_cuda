@@ -51,8 +51,10 @@ void PrefillAdmissionController::Permit::release() {
 }
 
 PrefillAdmissionController::PrefillAdmissionController(
-    CapacityProvider capacity_provider)
-    : capacity_provider_(std::move(capacity_provider)) {
+    CapacityProvider capacity_provider,
+    std::chrono::milliseconds idle_stall_timeout)
+    : capacity_provider_(std::move(capacity_provider)),
+      idle_stall_timeout_(idle_stall_timeout) {
   if (!capacity_provider_) {
     throw std::runtime_error("prefill capacity provider must not be empty");
   }
@@ -80,6 +82,11 @@ std::optional<PrefillAdmissionController::Permit> PrefillAdmissionController::ac
   const std::uint64_t ticket = next_ticket_++;
   queue_.push_back({ticket, request_batch_size, request_label});
   bool queued_logged = false;
+  // Set while this ticket is at the head, nothing is reserved, and it still
+  // does not fit. The hard limit is measured once at startup, and the free VRAM
+  // it saw can shrink for good afterwards (CUDA lazy loading, cuBLAS
+  // workspaces), so a request under the hard limit may never fit.
+  std::optional<std::chrono::steady_clock::time_point> idle_stall_since;
 
   try {
     while (true) {
@@ -105,6 +112,23 @@ std::optional<PrefillAdmissionController::Permit> PrefillAdmissionController::ac
               reserved_batch_size_,
               dynamic_max_batch_size_);
           return Permit(this, request_batch_size, ticket);
+        }
+        if (reserved_batch_size_ == 0) {
+          const auto now = std::chrono::steady_clock::now();
+          if (!idle_stall_since) {
+            idle_stall_since = now;
+          } else if (now - *idle_stall_since >= idle_stall_timeout_) {
+            std::printf(
+                "[PrefillQueue] rejected ticket=%llu path=%s request_bsz=%d max_prefill_bsz=%d (no prefill in flight)\n",
+                static_cast<unsigned long long>(ticket),
+                request_label.c_str(),
+                request_batch_size,
+                dynamic_max_batch_size_);
+            std::fflush(stdout);
+            throw PrefillBatchLimitExceeded(request_batch_size, dynamic_max_batch_size_);
+          }
+        } else {
+          idle_stall_since.reset();
         }
       }
 

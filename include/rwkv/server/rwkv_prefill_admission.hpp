@@ -62,7 +62,14 @@ class PrefillAdmissionController {
     std::uint64_t ticket_ = 0;
   };
 
-  explicit PrefillAdmissionController(CapacityProvider capacity_provider);
+  // How long the head of the queue may wait for VRAM while no prefill holds a
+  // reservation. Nothing in flight can release capacity then, so a longer wait
+  // means the request will never fit and it is rejected instead of hanging.
+  static constexpr std::chrono::milliseconds kDefaultIdleStallTimeout{2000};
+
+  explicit PrefillAdmissionController(
+      CapacityProvider capacity_provider,
+      std::chrono::milliseconds idle_stall_timeout = kDefaultIdleStallTimeout);
 
   std::optional<Permit> acquire(
       int request_batch_size,
@@ -82,6 +89,7 @@ class PrefillAdmissionController {
   void remove_ticket_locked(std::uint64_t ticket);
 
   CapacityProvider capacity_provider_;
+  std::chrono::milliseconds idle_stall_timeout_;
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   std::deque<QueueEntry> queue_;
