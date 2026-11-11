@@ -33,26 +33,14 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 
 ## 性能评测 (Benchmark)
 
-**RWKV_Lightning_CUDA** 与 [irwkv](https://github.com/rwkv-org/irwkv/commit/1f0bd68709f11219669550903a6bcb63dd6be256) 在不同并发/批大小下的推理性能对比：
-
-- **测试硬件**：NVIDIA RTX PRO 6000 Blackwell（96 GB VRAM）
-- **模型规格**：RWKV-7 7.2B
+RWKV-7 7.2B 在 RTX PRO 6000 Blackwell 上，吞吐比
+[irwkv](https://github.com/rwkv-org/irwkv/commit/1f0bd68709f11219669550903a6bcb63dd6be256)
+最高提升 **45.7%**，bsz=256 时端到端 **10,890 tok/s**（纯 Decode 峰值 12,896 tok/s），
+常驻显存仅约 14.2 GB。另附 16 GB RTX 4060 Ti 的成绩作为甜品卡参考。
 
 ![Throughput comparison](assets/throughput.png)
-![E2E latency comparison](assets/latency.png)
-![Time to first token comparison](assets/ttft.png)
 
-| Batch / Concurrency | E2E latency (s) ↓ CUDA / irwkv | TTFT (ms) ↓ CUDA / irwkv | Throughput (tok/s) ↑ CUDA / irwkv | Throughput gain ↑ |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | **0.461** / 0.672 | **3.8** / 16.2 | **138.7** / 95.2 | **+45.7%** |
-| 8 | **0.537** / 0.698 | **10.6** / 35.7 | **953.5** / 733.5 | **+30.0%** |
-| 16 | **0.685** / 0.737 | **17.7** / 44.4 | **1,494.1** / 1,389.6 | **+7.5%** |
-| 32 | **0.732** / 0.756 | **35.7** / 62.1 | **2,796.2** / 2,707.4 | **+3.3%** |
-| 64 | **0.810** / 0.869 | **60.1** / 99.6 | **5,055.6** / 4,714.6 | **+7.2%** |
-| 128 | **1.033** / 1.111 | **119.9** / 173.1 | **7,930.6** / 7,375.4 | **+7.5%** |
-| 256 | **1.504** / 1.936 | **258.7** / 294.8 | **10,890.3** / 8,461.7 | **+28.7%** |
-
-*注：在 bsz=256 时，RWKV_Lightning_CUDA 的纯 Decode 速度高达 **12,896 tokens/s**，常驻显存仅约 14.2 GB（对比 irwkv 需预分配约 66.2 GB 显存）。*
+完整表格、TTFT/延迟图、测试条件和原始数据见 [性能评测](docs/benchmark.zh-CN.md)。
 
 ## 快速开始
 对于 Ubuntu 24.04 LTS，使用以下命令安装依赖：
@@ -102,6 +90,7 @@ curl -sS "http://127.0.0.1:8000/v1/server/status"
 | [W8A16 / W4A16 量化](quant/README.zh-CN.md) / [W7900 量化验证](hip/QUANTIZATION.zh-CN.md) | 量化格式、精度与吞吐实测 |
 | [多后端路由器](RWKV_Lightning_CUDA_router/README.zh-CN.md) | 负载均衡、会话亲和和状态文件广播 |
 | [Windows 构建与运行](docs/windows-build-run.zh-CN.md) | Windows 环境、编译、打包和启动 |
+| [性能评测](docs/benchmark.zh-CN.md) | RTX PRO 6000 对比 irwkv、RTX 4060 Ti 16 GB 参考成绩、脚本与原始数据 |
 | [CI 与版本发布](docs/releasing.zh-CN.md) | CI 检查、安装包和版本发布流程 |
 | [桌面启动器](RWKV_Lightning_CUDA_Launcher/README.md) | Web 界面、模型管理、聊天和训练 |
 | [W4A16 CUDA 算子](quant/gemmv/README_w4a16.md) / [算子审计](docs/kernel-audit-2026-09-12.md) | 量化算子实现、优化与验证 |

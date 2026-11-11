@@ -33,26 +33,14 @@ The standalone `rwkv_miss_tune_server`, `rwkv_state_tune_server` and `rwkv_nora_
 
 ## Benchmark
 
-Inference performance comparison between **RWKV_Lightning_CUDA** and [irwkv](https://github.com/rwkv-org/irwkv/commit/1f0bd68709f11219669550903a6bcb63dd6be256):
-
-- **Hardware**: NVIDIA RTX PRO 6000 Blackwell (96 GB VRAM)
-- **Model**: RWKV-7 7.2B
+RWKV-7 7.2B on an RTX PRO 6000 Blackwell: up to **+45.7%** throughput over
+[irwkv](https://github.com/rwkv-org/irwkv/commit/1f0bd68709f11219669550903a6bcb63dd6be256),
+**10,890 tok/s** end to end at batch 256 (peak decode 12,896 tok/s) in ~14.2 GB
+VRAM. A 16 GB RTX 4060 Ti reference is included as a mainstream-card baseline.
 
 ![Throughput comparison](assets/throughput.png)
-![E2E latency comparison](assets/latency.png)
-![Time to first token comparison](assets/ttft.png)
 
-| Batch / Concurrency | E2E latency (s) ↓ CUDA / irwkv | TTFT (ms) ↓ CUDA / irwkv | Throughput (tok/s) ↑ CUDA / irwkv | Throughput gain ↑ |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | **0.461** / 0.672 | **3.8** / 16.2 | **138.7** / 95.2 | **+45.7%** |
-| 8 | **0.537** / 0.698 | **10.6** / 35.7 | **953.5** / 733.5 | **+30.0%** |
-| 16 | **0.685** / 0.737 | **17.7** / 44.4 | **1,494.1** / 1,389.6 | **+7.5%** |
-| 32 | **0.732** / 0.756 | **35.7** / 62.1 | **2,796.2** / 2,707.4 | **+3.3%** |
-| 64 | **0.810** / 0.869 | **60.1** / 99.6 | **5,055.6** / 4,714.6 | **+7.2%** |
-| 128 | **1.033** / 1.111 | **119.9** / 173.1 | **7,930.6** / 7,375.4 | **+7.5%** |
-| 256 | **1.504** / 1.936 | **258.7** / 294.8 | **10,890.3** / 8,461.7 | **+28.7%** |
-
-*Note: Peak decode speed of RWKV_Lightning_CUDA reaches **12,896 tokens/s** at batch size 256 with only ~14.2 GB VRAM footprint (compared to irwkv's ~66.2 GB allocation).*
+Full tables, TTFT/latency charts, test conditions and raw data: [benchmark](docs/benchmark.md).
 
 ## Quick Start
 
@@ -101,6 +89,7 @@ are described in the [build guide](docs/build.md).
 | [MiSS adapters&peft](src/miss/README.md) | Frozen-base adapter training, checkpoint/resume, export, dynamic serving, caches, and validation |
 | [State tuning](src/state_tuning/README.md) | Standalone `time_state` training and checkpoint format |
 | [Router](RWKV_Lightning_CUDA_router/README.md) | Multi-backend load-balancing reverse proxy with session affinity and state fan-out |
+| [Benchmark](docs/benchmark.md) | RTX PRO 6000 vs irwkv, RTX 4060 Ti 16 GB reference, scripts and raw data |
 | [Releasing](docs/releasing.md) | CI packaging matrix and how to publish a versioned release |
 
 ## CI / Release
