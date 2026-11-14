@@ -39,7 +39,7 @@ HIP 实现包括 `rwkv7_statepassing_clampw.hip`、`backward_kernels.hip`、
 HIP 构建会使用 HIP 算子；CUDA 验证结果不能代替 HIP 验证。
 旧 FP16 训练 sidecar 和 `rwkv_state_tuning_cuda_test` 已移除。
 
-HIP 推理目前支持 W4A16/W8A16 `.rwkvq` 文件和 BF16 PTH 权重。
+HIP 推理目前支持 W8A16 `.rwkvq` 文件和 BF16 PTH 权重。
 量化投影权重在设备上保持压缩；gfx1100 使用向量化 GEMV 和原生 RDNA3 WMMA，
-以 FP32 累加。格式、测试、命令和实测限制见 [量化推理与 W7900 验证](QUANTIZATION.zh-CN.md)。
+以 FP32 累加。格式、测试、命令和实测限制见 [量化推理支持](QUANTIZATION.zh-CN.md)。
 状态微调仍要求冻结的 FP16/BF16 权重，不接受量化投影。

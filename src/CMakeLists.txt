@@ -44,7 +44,7 @@ else()
     ${PROJECT_SOURCE_DIR}/cuda/rwkv7_wkv_fp16_v2.cu
     ${PROJECT_SOURCE_DIR}/cuda/rwkv7_wkv_fp32_v2.cu
     ${PROJECT_SOURCE_DIR}/quant/gemmv/rwkv_w8a16.cu
-    ${PROJECT_SOURCE_DIR}/quant/gemmv/rwkv_w4a16.cu
+    ${PROJECT_SOURCE_DIR}/quant/gemmv/rwkv_asym_a16.cu
   )
 endif()
 

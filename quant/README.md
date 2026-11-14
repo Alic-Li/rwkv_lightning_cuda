@@ -1,105 +1,76 @@
-# W8A16 and W4A16 quantization
+# W8A16 and SB6 W4/W6A16
 
 English | [简体中文](README.zh-CN.md)
 
-This directory contains the shared archive format and CUDA W8A16/W4A16 implementations.
-The HIP implementation is in `hip/rwkv_quantized.hip`; see
-[W7900 migration and validation](../hip/QUANTIZATION.md). The
-`rwkv_quantize` tool converts a BF16 RWKV checkpoint into a streaming `.rwkvq`
-archive. Linear tensors use either per-output-channel symmetric INT8 or grouped
-symmetric INT4; embeddings, layer norms, LoRA factors, and other non-linear
-tensors remain BF16.
+The supported quantized formats are original per-row **W8A16**, asymmetric
+**SB6 W4** and **SB6 W6**. FP16 remains the unquantized inference baseline.
+See the [unified performance and accuracy report](VALIDATION.zh-CN.md).
 
-W4 export uses symmetric signed INT4 groups along K. Two values are packed in
-each byte and the group size (32 or 128) is recorded in every INT4 tensor:
+| Format / CLI name | CUDA | HIP | Aligned quantized weights: disk / device bpw |
+|---|---|---|---|
+| W8A16 / `w8a16` | Yes | Yes | `8 + 16/K` / `8 + 16/K` |
+| SB6 W4 / `w4a16_asym` | Yes | No | 4.5 / 5 |
+| SB6 W6 / `w6a16_asym` | Yes | No | 6.5 / 7 |
+
+These bit counts exclude floating tensors, headers and padding. SB6 expands its
+compact metadata to one FP16 `(scale, offset)` pair per 32 weights on load.
+Embedding, norms and low-rank tensors remain floating. SB6 W4 also protects
+`blocks.0.att.output.weight` as BF16 by default; SB6 W6 quantizes this projection.
+
+## Export and inference
 
 ```bash
-rwkv_quantize --format w4a16 --group-size 128 model.pth model.w4a16.rwkvq
-rwkv_quantized_smoke model.w4a16.rwkvq
+# Original W8 algorithm and rounding, no calibration required:
+build/rwkv_quantize model.pth model.w8a16.rwkvq
+
+# SB6: collect activation importance, then search and pack parameters.
+python tools/calibration/collect_activations.py \
+  --model model.pth --corpus calibration.txt --windows 16 --seq-len 256 \
+  --output artifacts/quantization/data/moments.pth
+python tools/calibration/export_calibrated.py \
+  --model model.pth --activation-stats artifacts/quantization/data/moments.pth \
+  --default w4a16_asym --output-dir artifacts/quantization/export/w4 \
+  --export model.sb6_w4.rwkvq
+# For SB6 W6 use --default w6a16_asym and separate output paths.
+
+build/rwkv_lighting_cuda --model-path model.sb6_w4.rwkvq \
+  --vocab-path assets/rwkv_vocab_v20230424.txt
 ```
 
-The CUDA backend detects `.rwkvq` files automatically. INT8 weights stay on the
-device and use W8A16 GEMV/GEMM for attention projections, FFN projections, and
-the output head. Runtime tuning selects split-K and batched kernel variants per
-GPU/model shape and persists the result in the `--tune-cache` file. INT4 tensors
-use the W4A16 GEMV/Tensor Core path and shape-based split-K selection. HIP builds
-also detect these archives and retain compressed weights on device. HIP uses raw
-NK weights, vectorized decode and gfx1100 WMMA prefill with deterministic split-K;
-CUDA PackedNK and CUDA tuning caches are not used by HIP.
+The backend detects the archive format automatically and retains packed weights
+on device. CUDA W8 uses its existing tuning cache; SB6 uses deterministic shape
+selection. HIP accepts W8 only; see [HIP support](../hip/QUANTIZATION.md).
+Keep the generated `.rwkvq.source.json` beside each model for adapter identity.
+The Launcher exposes the three formats; SB6 export requires an already prepared
+`manifest.json`. Offline calibration is described in the
+[calibration guide](../tools/calibration/README.md).
 
-## Measured result
+## Format and compatibility
 
-The following measurements are for CUDA; W7900 measurements are recorded separately
-in the [HIP validation report](../hip/QUANTIZATION.md).
+The native container magic remains `RWKVQ\0\1\0`. Dtypes 0/1 are BF16/FP16,
+2 is W8, 4 is SB6 W4, and 6 is SB6 W6. Retired dtype IDs 3 and 5 are explicitly
+rejected and never reused. Export old archives again from the source checkpoint.
+The legacy signed W4 G32/G128, SB6 W5, Autopick and GPTQ workflows have been
+removed. Existing W8 archives and their quantization grid remain unchanged.
 
-The final measurement used an NVIDIA GeForce RTX 4060 Ti 16 GB (`sm_89`) with
-the RWKV7 G1J 7.2B, context-16K model. Decode timing used independent random
-states, a 32-token prefill, three warmups, ten samples, and the median samples
-5 and 6. W8A16 values below are cache-hit results after runtime tuning.
+[SB6 layout and kernels](SB6.md) describes bit planes, metadata and rounding.
+This project uses its own archive format; external RWKVQ files are not compatible.
 
-| Batch | FP16 ms | W8A16 ms | W8A16 TPS | TPS gain |
-|---:|---:|---:|---:|---:|
-| 1 | 38.0691 | 20.6220 | 48.4919 | +84.6043% |
-| 2 | 39.9039 | 21.8185 | 91.6653 | +82.8902% |
-| 4 | 43.6685 | 24.2293 | 165.0894 | +80.2301% |
-| 8 | 46.1859 | 24.8054 | 322.5104 | +86.1929% |
-| 16 | 56.0823 | 28.6889 | 557.7070 | +95.4843% |
-| 32 | 58.8945 | 33.8133 | 946.3732 | +74.1755% |
-| 64 | 65.8202 | 40.7663 | 1569.9242 | +61.4574% |
+## Validation and local artifacts
 
-W8A16 is faster at every measured batch. Decode time is reduced by 38.1--48.8%
-and actual throughput increases by 61.5--95.5%. The largest relative gain is
-at batch 16; the largest absolute throughput is at batch 64.
+```bash
+ctest --test-dir build -R 'rwkv_(quantized_archive|quantized_model|sb6_kernels|w8a16_kernels)_test' --output-on-failure
+python test/kernels/calibration_test.py
+python test/kernels/sb6_calibration_test.py
+python tools/validate_quantization.py config.json --output artifacts/quantization/validation
+```
 
-For the 1024-token, chunk-128 prefill gate, FP16 measured 512.869 ms and W8A16
-measured 450.836 ms. W8A16 was 12.09% faster (0.8786x the FP16 time).
-
-## Accuracy and generation difference
-
-Teacher-forced logits were evaluated on the same token sequence, so sampled
-divergence could not contaminate the comparison. Across 54 positions, logit MSE
-was `0.02647262`, RMSE was `0.16270409`, and the top-1 token matched on 53/54
-positions (`98.15%`). This is numerical approximation rather than bitwise FP16
-equivalence.
-
-The 16K long-context checks showed no monotonic error accumulation:
-
-| Input sequence | Mean MSE at 16K | Top-1 equal |
-|---|---:|---:|
-| Fixed random tokens | 0.01005010 | 15,579/16,384 (95.09%) |
-| Real English prose | 0.05523100 | 15,947/16,384 (97.34%) |
-
-On the deterministic Chinese corpus, perplexity was `6.385901313` for FP16 and
-`6.391733437` for W8A16: absolute difference `0.005832123`, relative difference
-`0.091328%`.
-
-The same greedy HTTP request was also sent to sequential FP16 and W8A16
-services. Character-level agreement over 64 generated tokens was:
-
-| Prompt | Character agreement |
-|---|---:|
-| Chinese matrix explanation | 1.000 |
-| English sky explanation | 0.064 |
-| C++ explanation | 0.689 |
-
-Autoregressive text can diverge after the first small numerical difference, so
-these values are an output-stability observation rather than a direct quality
-score. The teacher-forced logit and PPL measurements above are the controlled
-degradation indicators.
-
-## Archived plots
-
-### Random-token 16K logit MSE
-
-![Random-token 16K logit MSE](logit_mse_curve_16k.svg)
-
-### Real-text 16K logit MSE
-
-![Real-text 16K logit MSE](logit_mse_curve_16k_text.svg)
-
-### Chinese PPL chunk distribution
-
-![Chinese PPL chunk distribution](ppl_chunk_distribution.svg)
-
-Reproducible benchmark and calibration programs remain under `tools/` and are
-built by the CUDA section of the top-level `CMakeLists.txt`.
+The validation config contains file paths for `source`, `w8a16`, `sb6_w4`,
+`sb6_w6`, `english` and `multilingual`. It compares all candidates against a
+single FP16 logit buffer, including a second FP16 pass to measure numerical
+noise, and runs three sequential performance rounds. Raw logs and data stay in
+the ignored `artifacts/quantization/` directory. Its `models/` contains only the
+three final archives plus identity/policy files; `data/` holds reusable AW
+statistics and separate evaluation corpora. Published metrics are in
+[validation/results.json](validation/results.json); the report is the single
+maintained measurement summary.

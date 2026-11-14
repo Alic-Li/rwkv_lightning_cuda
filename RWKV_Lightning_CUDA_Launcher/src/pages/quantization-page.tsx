@@ -49,6 +49,8 @@ export function QuantizationPage() {
     Boolean(backendId) &&
     config.input_path.trim() !== "" &&
     config.output_path.trim() !== "" &&
+    (config.format === "w8a16" ||
+      (config.calibrated_manifest ?? "").trim() !== "") &&
     supportsQuant &&
     !nodeBusy &&
     !quant?.running;
@@ -70,7 +72,8 @@ export function QuantizationPage() {
   };
 
   const onFormatChange = (value: string) => {
-    const format: QuantizationFormat = value === "w8a16" ? "w8a16" : "w4a16";
+    const format: QuantizationFormat =
+      value === "w4a16_asym" || value === "w6a16_asym" ? value : "w8a16";
     set(derive({ format }, format, config.input_path));
   };
 
@@ -126,24 +129,20 @@ export function QuantizationPage() {
                 value={config.format}
                 onChange={(event) => onFormatChange(event.target.value)}
               >
-                <option value="w4a16">{t("quant.formatW4")}</option>
                 <option value="w8a16">{t("quant.formatW8")}</option>
+                <option value="w4a16_asym">{t("quant.formatW4")}</option>
+                <option value="w6a16_asym">{t("quant.formatW6")}</option>
               </Select>
             </Field>
-            <Field label={t("quant.groupSize")}>
-              <Select
-                value={config.group_size}
-                disabled={config.format === "w8a16"}
-                onChange={(event) =>
-                  set({
-                    group_size: Number(event.target.value) === 32 ? 32 : 128,
-                  })
-                }
-              >
-                <option value="128">{t("quant.group128")}</option>
-                <option value="32">{t("quant.group32")}</option>
-              </Select>
-            </Field>
+            {config.format !== "w8a16" && (
+              <PathField
+                label={t("quant.manifest")}
+                value={config.calibrated_manifest ?? ""}
+                onChange={(value) => set({ calibrated_manifest: value })}
+                backendId={backendId}
+                hostDialog={hasCapability(backend, "host_dialog")}
+              />
+            )}
           </div>
         </CardContent>
 

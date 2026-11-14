@@ -152,6 +152,7 @@ func (l *launcher) allFSRoots() []string {
 	add(tc.Resume, true)
 	add(qc.InputPath, false)
 	add(qc.OutputPath, false)
+	add(qc.CalibratedManifest, false)
 	seen := map[string]bool{}
 	out := []string{}
 	for _, r := range roots {
@@ -256,6 +257,7 @@ func (l *launcher) recordFSConfigs(rc startRequest, tc tuneRequest, qc quantizeR
 	add(tc.Resume, true)
 	add(qc.InputPath, false)
 	add(qc.OutputPath, false)
+	add(qc.CalibratedManifest, false)
 	l.fs.record(dirs...)
 }
 

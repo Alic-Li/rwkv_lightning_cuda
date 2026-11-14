@@ -2,8 +2,8 @@
 
 [English](VALIDATION.md) | 简体中文
 
-本文记录早期 FP16/状态微调移植。W4A16/W8A16 随后单独完成移植和验证，详见
-[量化推理报告](QUANTIZATION.zh-CN.md)。
+本文记录早期 FP16/状态微调移植。W8A16 随后单独完成移植和验证，详见
+[量化推理支持](QUANTIZATION.zh-CN.md)。
 
 本地验证环境为 gfx1100、ROCm HIP 7.2.53211-9999。
 
@@ -21,7 +21,7 @@ ctest --test-dir build-hip --output-on-failure
 
 结果：10/10 测试通过。状态微调检查覆盖 WKV 有限差分、分块状态伴随梯度、LayerNorm、
 交叉熵、梯度归约和 Adam。推理测试的合成词表补齐至四的倍数，以满足两个后端现有采样器
-的约定。量化 W8 GPU 测试已像 W4 测试一样，正确限制为仅 CUDA 执行。
+的约定。CUDA W8 GPU 测试限制为仅 CUDA 执行，HIP 使用独立 W8 参考测试。
 
 ## 真实数据冒烟测试
 

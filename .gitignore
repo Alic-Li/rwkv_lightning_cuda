@@ -18,6 +18,7 @@ uploads/
 
 # Local scratch: design notes, benchmarks, experiment output
 tmp/
+artifacts/quantization/
 
 # Local dependencies and large model files
 third_party/

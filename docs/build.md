@@ -28,28 +28,20 @@ cmake --build ./build -j --config Release --target bundle_all
 
 `bundle_all` assembles every available runtime target below `build/bundle/`. Executables and `rwkv_vocab_v20230424.txt` sit directly in that directory; all executables share a single `build/bundle/lib/` directory for runtime libraries. Individual `bundle_<target>` targets remain available.
 
-## CUDA W8A16 / W4A16 quantization
+## CUDA W8A16 and SB6 W4/W6 quantization
 
-The build produces `build/bundle/rwkv_quantize`, a standalone converter for BF16 RWKV
-checkpoints. It writes a streaming `.rwkvq` file containing either per-output-channel
-INT8 weights or grouped INT4 weights with FP16 scales; embeddings, layer norms,
-LoRA factors, and other non-linear tensors remain BF16.
+Original W8 export requires no calibration and retains the two-argument command:
 
 ```bash
-./build/bundle/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
-
-# W4 with one FP16 scale for each 128-weight group (recommended default)
-./build/bundle/rwkv_quantize \
-  --format w4a16 --group-size 128 \
-  /path/to/model.pth /path/to/model.w4a16.rwkvq
+./build/bundle/rwkv_quantize model.pth model.w8a16.rwkvq
 ```
 
-The CUDA inference backend detects the tensor dtype in `.rwkvq` automatically,
-keeps packed INT4 or INT8 weights on device, and dispatches W4A16 or W8A16 for
-attention projections, FFN projections, and the output head. W4 also supports
-`--group-size 32` when higher fidelity is worth the extra scales. Existing
-two-positional-argument commands still export W8A16. HIP builds support both BF16/PTH and W4A16/W8A16 `.rwkvq` inference; see
-the [W7900 quantization report](../hip/QUANTIZATION.md).
+SB6 W4/W6 uses offline Python AW/least-squares calibration followed by the C++
+archive writer. See the [quantization guide](../quant/README.md) for commands.
+Only offline calibration needs PyTorch; the C++ exporter and runtime do not.
+CUDA detects W8/SB6 tensors automatically. HIP quantized inference supports W8
+only; see [HIP support](../hip/QUANTIZATION.md). Retired symmetric W4 and SB6 W5
+archives must be exported again from the source checkpoint.
 
 ## Windows
 

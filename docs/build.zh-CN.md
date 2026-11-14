@@ -32,27 +32,19 @@ cmake --build ./build -j --config Release --target bundle_all
 运行时依赖统一放在 `build/bundle/lib/`，由全部程序共用。
 单独的 `bundle_<target>` 目标依然可用。
 
-## CUDA W8A16 / W4A16 量化
+## CUDA W8A16 与 SB6 W4/W6 量化
 
-构建会产出 `build/bundle/rwkv_quantize`，这是一个独立的转换器，用于
-BF16 RWKV checkpoint。它输出流式 `.rwkvq` 文件：权重可以是按输出通道的 INT8，也可以
-是分组 INT4 加 FP16 scale；embedding、layer norm、LoRA 因子及其他非线性张量保持
-BF16。
+原始 W8 导出不需要校准，保留双位置参数用法：
 
 ```bash
-./build/bundle/rwkv_quantize /path/to/model.pth /path/to/model.w8a16.rwkvq
-
-# W4，每 128 个权重共享一个 FP16 scale（推荐默认值）
-./build/bundle/rwkv_quantize \
-  --format w4a16 --group-size 128 \
-  /path/to/model.pth /path/to/model.w4a16.rwkvq
+./build/bundle/rwkv_quantize model.pth model.w8a16.rwkvq
 ```
 
-CUDA 推理后端会自动识别 `.rwkvq` 中张量的 dtype，把打包后的 INT4/INT8 权重保留在显存
-中，并对 attention 投影、FFN 投影和输出 head 分别调度 W4A16 或 W8A16。W4 还支持
-`--group-size 32`，在愿意付出更多 scale 代价时换取更高保真度。旧的「两个位置参数」
-命令仍然导出 W8A16。HIP 同样支持 BF16/PTH 和 W4A16/W8A16 `.rwkvq` 推理，详见
-[W7900 量化验证](../hip/QUANTIZATION.zh-CN.md)。
+SB6 W4/W6 使用 Python 离线 AW/最小二乘校准，再由 C++ 验证并打包。
+参考[量化指南](../quant/README.zh-CN.md)的完整命令。Python 校准需要 PyTorch；
+C++ 导出与推理不依赖 PyTorch。CUDA 自动识别 `.rwkvq` 中的 W8/SB6 权重。
+HIP 仅支持 W8 量化推理，详见 [HIP 支持说明](../hip/QUANTIZATION.zh-CN.md)。
+旧对称 W4 与 SB6 W5 文件不再支持，需从来源 PTH 重新导出。
 
 ## Windows
 

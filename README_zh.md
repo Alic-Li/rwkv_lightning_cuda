@@ -13,7 +13,7 @@
 
 RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 AMD HIP
 后端。项目包含兼容 OpenAI 的接口、原生批量与流式接口、L1/L2/SQLite
-会话状态缓存、W8A16/W4A16 量化推理、state tuning、MiSS adapter、负载均衡
+会话状态缓存、W8A16 / SB6 W4/W6 量化推理、state tuning、MiSS adapter、负载均衡
 路由器以及带 Web UI 的桌面启动器。
 
 两个训练二进制已切换到独立的 [BF16 训练 backbone](src/training/README.md)：基模逐层流式加载，直接复用原有 BF16 state-passing 算子，最终 state/adapter 导出为 BF16；推理仍使用原有 FP16/量化路线。
@@ -26,7 +26,7 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 
 - 分块 prefill、逐 token decode、SSE 流式输出和显存自适应准入。
 - 在显存、CPU RAM 和 SQLite 之间复用会话 state，并支持上传 `.pth` 初始 state。
-- 使用 `.rwkvq` 格式进行 W8A16/W4A16 推理。
+- 使用 `.rwkvq` 格式进行 W8A16 / SB6 W4/W6 推理。
 - 独立训练 `time_state`，不更新 Linear 权重。
 - 冻结基模训练 MiSS adapter，并按请求动态绑定不同 adapter。
 - 多后端路由和带 Web UI 的桌面启动器。
@@ -87,13 +87,13 @@ curl -sS "http://127.0.0.1:8000/v1/server/status"
 | [状态微调](src/state_tuning/README.zh-CN.md) | `time_state` 训练与检查点说明 |
 | [MiSS 验证记录](src/miss/VALIDATION.zh-CN.md) / [优化计划](src/miss/OPTIMIZATION_PLAN.zh-CN.md) | 数值验证、实测性能和后续优化目标 |
 | [HIP 后端](hip/README.zh-CN.md) / [移植验证](hip/VALIDATION.zh-CN.md) | AMD 构建、状态微调与验证范围 |
-| [W8A16 / W4A16 量化](quant/README.zh-CN.md) / [W7900 量化验证](hip/QUANTIZATION.zh-CN.md) | 量化格式、精度与吞吐实测 |
+| [W8A16 / SB6 W4/W6 量化](quant/README.zh-CN.md) / [HIP 量化支持](hip/QUANTIZATION.zh-CN.md) | 量化格式及[统一精度、吞吐报告](quant/VALIDATION.zh-CN.md) |
 | [多后端路由器](RWKV_Lightning_CUDA_router/README.zh-CN.md) | 负载均衡、会话亲和和状态文件广播 |
 | [Windows 构建与运行](docs/windows-build-run.zh-CN.md) | Windows 环境、编译、打包和启动 |
 | [性能评测](docs/benchmark.zh-CN.md) | RTX PRO 6000 对比 irwkv、RTX 4060 Ti 16 GB 参考成绩、脚本与原始数据 |
 | [CI 与版本发布](docs/releasing.zh-CN.md) | CI 检查、安装包和版本发布流程 |
 | [桌面启动器](RWKV_Lightning_CUDA_Launcher/README.md) | Web 界面、模型管理、聊天和训练 |
-| [W4A16 CUDA 算子](quant/gemmv/README_w4a16.md) / [算子审计](docs/kernel-audit-2026-09-12.md) | 量化算子实现、优化与验证 |
+| [SB6 CUDA 算子](quant/SB6.md) / [算子审计](docs/kernel-audit-2026-09-12.md) | 量化算子实现、优化与验证 |
 | [W7900 风扇控制](docs/w7900-fan-control.zh-CN.md) | Linux 下的 AMD 风扇配置 |
 
 完整接口字段还可参考 [API 参考](rwkv_lightning_api_doc.md)。英文主文档中的
@@ -108,7 +108,7 @@ curl -sS "http://127.0.0.1:8000/v1/server/status"
 - `src/io/`：PTH 与张量读写。
 - `src/server/`：HTTP API、模型路由、准入和 state 存储。
 - `src/miss/`：MiSS 训练、推理包和动态 adapter 文档。
-- `quant/`：W8A16/W4A16 量化工具。
+- `quant/`：W8A16 / SB6 W4/W6 量化工具。
 - `RWKV_Lightning_CUDA_router/`：多后端负载均衡路由器。
 - `RWKV_Lightning_CUDA_Launcher`: 带 Web UI 的桌面启动器。
 

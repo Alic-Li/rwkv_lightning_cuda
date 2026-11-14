@@ -1,4 +1,4 @@
-#include "rwkv_w4a16.cuh"
+#include "rwkv/runtime/quantized_workspace.hpp"
 #include "rwkv_w8a16.cuh"
 #include "test_common.hpp"
 #include <iostream>
@@ -38,7 +38,7 @@ void run(int M, int K, int N, bool kn) {
   rwkv_test::copy_host_to_device(x, dx, "alloc x", "copy x");
   rwkv_test::copy_host_to_device(scales, ds, "alloc s", "copy s");
   hipStream_t streams[2];
-  const auto bytes = rwkv7_w4a16_workspace_bytes(M, N, 3);
+  const auto bytes = rwkv7_quantized_workspace_bytes(M, N, 3);
   for (int i = 0; i < 2; ++i) {
     require_cuda(hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking),
                  "create stream");

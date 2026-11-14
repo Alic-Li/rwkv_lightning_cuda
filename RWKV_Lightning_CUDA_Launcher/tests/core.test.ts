@@ -414,9 +414,9 @@ describe("generated HTML previews", () => {
   });
 });
 
-it("suggests quantized model names for both formats", () => {
-  expect(suggestedQuantizedPath("/models/demo.pth", "w4a16")).toBe(
-    "/models/demo.w4a16.rwkvq",
+it("suggests quantized model names for supported formats", () => {
+  expect(suggestedQuantizedPath("/models/demo.pth", "w4a16_asym")).toBe(
+    "/models/demo.w4a16_asym.rwkvq",
   );
   expect(suggestedQuantizedPath("C:\\models\\DEMO.PTH", "w8a16")).toBe(
     "C:\\models\\DEMO.w8a16.rwkvq",

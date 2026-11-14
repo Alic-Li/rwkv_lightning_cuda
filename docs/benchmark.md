@@ -71,6 +71,8 @@ its streaming step.
 
 ### W8A16 (recommended on 16 GB)
 
+These are historical RTX 4060 Ti measurements. The current three-format comparison is maintained in the [unified quantization report](../quant/VALIDATION.zh-CN.md).
+
 `rwkv_quantize --format w8a16` shrinks the weights to 7.7 GB (7.8 GB resident),
 which lifts one batch request to **bsz 138** and nearly doubles single-row
 decode, since decode is bandwidth bound on this card.

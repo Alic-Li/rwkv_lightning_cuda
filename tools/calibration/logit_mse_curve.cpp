@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "rwkv/runtime/rwkv_server_backend.hpp"
 #include "rwkv/inference/rwkv_tokenizer.hpp"
@@ -36,12 +37,14 @@ struct Options {
   std::uint32_t seed = kDefaultSeed;
   bool seed_specified = false;
   bool ppl = false;
+  std::vector<std::pair<std::string, std::string>> candidates;
 };
 
 void print_usage() {
   std::cerr << "usage: rwkv_logit_mse_curve FP16_MODEL INT8_MODEL VOCAB "
                "[--length N] [--seed N | --text FILE] [--output-prefix PATH] "
-               "[--tune-cache PATH] [--ppl] [--ppl-seq-len N] [--ppl-stride N]\n";
+               "[--tune-cache PATH] [--ppl] [--ppl-seq-len N] [--ppl-stride N] "
+               "[--candidate LABEL=MODEL ...]\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -80,6 +83,17 @@ Options parse_options(int argc, char** argv) {
       options.ppl_seq_len = std::stoi(require_value("--ppl-seq-len"));
     } else if (argument == "--ppl-stride") {
       options.ppl_stride = std::stoi(require_value("--ppl-stride"));
+    } else if (argument == "--candidate") {
+      const std::string value = require_value("--candidate");
+      const auto separator = value.find('=');
+      if (separator == std::string::npos || separator == 0 || separator + 1 == value.size())
+        throw std::runtime_error("--candidate requires LABEL=MODEL");
+      const auto label = value.substr(0, separator);
+      if (label == "primary" || label.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos)
+        throw std::runtime_error("invalid candidate label");
+      for (const auto& candidate : options.candidates)
+        if (candidate.first == label) throw std::runtime_error("duplicate candidate label");
+      options.candidates.emplace_back(label, value.substr(separator + 1));
     } else {
       print_usage();
       throw std::runtime_error("unknown argument: " + argument);
@@ -164,7 +178,7 @@ std::vector<float> run_model(
       throw std::runtime_error(std::string("copy logits failed: ") + cudaGetErrorString(status));
     }
     if ((position + 1) % 1024 == 0 || position + 1 == tokens.size()) {
-      std::cout << "mse_curve_progress model=" << label << " position=" << position + 1 << '\n';
+      std::cout << "mse_curve_progress model=" << label << " position=" << position + 1 << std::endl;
     }
   }
   model.reset();
@@ -203,6 +217,8 @@ std::vector<CurvePoint> compare_logits(
     std::size_t ref_best = 0;
     std::size_t got_best = 0;
     for (std::size_t index = 0; index < row_size; ++index) {
+      if (!std::isfinite(ref[index]) || !std::isfinite(got[index]))
+        throw std::runtime_error("nonfinite reference/candidate logit");
       const double difference = static_cast<double>(got[index]) - ref[index];
       sum_sq += difference * difference;
       max_abs = std::max(max_abs, std::abs(difference));
@@ -378,19 +394,25 @@ int main(int argc, char** argv) {
         : make_text_token_sequence(options.text_path, tokenizer, sequence_length);
     write_tokens(options.output_prefix + ".tokens", tokens);
     const std::vector<float> fp16 = run_model("FP16", options.fp16_model, tokens, {});
-    const std::vector<float> int8 = run_model("INT8", options.int8_model, tokens, options.tune_cache);
     const std::size_t vocab_size = fp16.size() / tokens.size();
-    const std::vector<CurvePoint> curve = compare_logits(fp16, int8, vocab_size);
-    write_curve_csv(options.output_prefix + ".csv", curve);
-    print_summary(curve);
-    if (options.ppl) {
-      print_ppl_summary(
-          fp16, int8, vocab_size, tokens, options.ppl_seq_len, options.ppl_stride,
-          options.output_prefix);
-    }
-    std::cout << "mse_curve_output csv=" << options.output_prefix << ".csv tokens="
-              << options.output_prefix << ".tokens source="
-              << (options.text_path.empty() ? "random" : options.text_path) << '\n';
+    const auto compare = [&](const std::string& label, const std::string& path, const std::string& prefix) {
+      std::cout << "comparison_start label=" << label << " model=" << path << std::endl;
+      const auto candidate = run_model(label, path, tokens, options.tune_cache);
+      const auto curve = compare_logits(fp16, candidate, vocab_size);
+      write_curve_csv(prefix + ".csv", curve);
+      print_summary(curve);
+      if (options.ppl)
+        print_ppl_summary(fp16, candidate, vocab_size, tokens, options.ppl_seq_len,
+                          options.ppl_stride, prefix);
+      std::cout << "mse_curve_output csv=" << prefix << ".csv tokens="
+                << options.output_prefix << ".tokens source="
+                << (options.text_path.empty() ? "random" : options.text_path) << '\n';
+    };
+    // Keep one exact FP16 logit buffer for the whole suite. This also permits
+    // a repeat-FP16 primary candidate to quantify the backend's numerical noise.
+    compare("primary", options.int8_model, options.output_prefix);
+    for (const auto& candidate : options.candidates)
+      compare(candidate.first, candidate.second, options.output_prefix + "." + candidate.first);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "logit MSE curve failed: " << error.what() << '\n';

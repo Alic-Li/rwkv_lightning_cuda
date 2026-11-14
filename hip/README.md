@@ -45,9 +45,9 @@ normalization backward and cross-entropy gradients. It uses HIP in a HIP build;
 CUDA results do not establish HIP correctness. The legacy FP16 training sidecar
 and `rwkv_state_tuning_cuda_test` have been removed.
 
-HIP inference now accepts W4A16/W8A16 `.rwkvq` archives as well as BF16 PTH
+HIP inference now accepts W8A16 `.rwkvq` archives as well as BF16 PTH
 weights. Quantized projection weights remain compressed on device; gfx1100
 uses vectorized GEMV and native RDNA3 WMMA with FP32 accumulation. See
-[quantized inference and W7900 validation](QUANTIZATION.md) for formats, tests,
+[quantized inference support](QUANTIZATION.md) for formats, tests,
 commands and measured limitations. State tuning still requires FP16/BF16 frozen
 weights and rejects quantized projections.

@@ -76,10 +76,15 @@ function createFormStore<C>(options: {
           set((s) =>
             backendId
               ? {
-                  byBackend: updateEntry(s.byBackend, backendId, empty, (e) => ({
-                    ...e,
-                    config: { ...e.config, ...patch },
-                  })),
+                  byBackend: updateEntry(
+                    s.byBackend,
+                    backendId,
+                    empty,
+                    (e) => ({
+                      ...e,
+                      config: { ...e.config, ...patch },
+                    }),
+                  ),
                 }
               : s,
           ),
@@ -88,10 +93,15 @@ function createFormStore<C>(options: {
           set((s) =>
             backendId
               ? {
-                  byBackend: updateEntry(s.byBackend, backendId, empty, (e) => ({
-                    ...e,
-                    devices,
-                  })),
+                  byBackend: updateEntry(
+                    s.byBackend,
+                    backendId,
+                    empty,
+                    (e) => ({
+                      ...e,
+                      devices,
+                    }),
+                  ),
                 }
               : s,
           ),
@@ -168,8 +178,8 @@ export const useTuningForm = createFormStore<TuningConfig>({
 });
 
 export const useQuantizationForm = createFormStore<QuantizationConfig>({
-  name: "rwkv-quantization-form-v2",
-  version: 2,
+  name: "rwkv-quantization-form-v3",
+  version: 3,
   empty: EMPTY_QUANTIZATION_FORM,
 });
 

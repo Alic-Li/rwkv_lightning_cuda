@@ -285,7 +285,7 @@ func sanitizeDeviceTag(spec string) string {
 }
 
 // deviceTuneCache derives a card-bound default --tune-cache path (§5.8(c)).
-// W8A16/W4A16 split-K and sparse thresholds are tuned per GPU: the C++ default
+// W8A16/SB6 split-K and sparse thresholds are tuned per GPU: the C++ default
 // path already keys on model stem + GPU model name, but two same-model cards
 // share that path, so switching visible_devices between them would silently
 // reuse the other card's results. The Agent therefore pins the cache next to

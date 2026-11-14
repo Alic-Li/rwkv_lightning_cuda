@@ -77,7 +77,7 @@ curl http://127.0.0.1:8848/v1/adapters \
 Then pass `adapter_id` (and optionally `adapter_version`) in generation requests.
 `adapter_scale` remains the explicit inference override supported by MiSS;
 training and the package's default scale are always 1. The loader automatically
-selects NoRA for FP16, W8A16 and W4A16 bases. Quantized bases require the matching
+selects NoRA for FP16, W8A16 and SB6 W4/W6 bases. Quantized bases require the matching
 source provenance sidecar, as with MiSS.
 
 RAM/GPU/staging budgets account for **both** factors. GPU admission uploads a

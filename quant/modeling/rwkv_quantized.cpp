@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include "rwkv/io/pth_tensor.hpp"
 #include <limits>
 #include <unordered_set>
 
@@ -23,7 +25,7 @@ void write_value(std::ofstream& file, T value) {
 }
 
 bool valid_dtype(std::uint8_t value) {
-  return value <= static_cast<std::uint8_t>(QuantizedDType::kInt4);
+  return value <= 2 || value == 4 || value == 6;
 }
 
 std::uint64_t checked_numel(const std::vector<std::int64_t>& shape) {
@@ -39,24 +41,72 @@ std::uint64_t checked_numel(const std::vector<std::int64_t>& shape) {
 }
 
 std::uint64_t data_bytes(const QuantizedTensorRecord& record) {
-  if (record.dtype == QuantizedDType::kInt8) return record.numel;
-  if (record.dtype == QuantizedDType::kInt4 && record.shape.size() == 2) {
-    const std::uint64_t rows = static_cast<std::uint64_t>(record.shape[0]);
-    const std::uint64_t cols = static_cast<std::uint64_t>(record.shape[1]);
-    const std::uint64_t row_bytes = cols / 2 + cols % 2;
-    if (row_bytes != 0 && rows > std::numeric_limits<std::uint64_t>::max() / row_bytes) {
-      return std::numeric_limits<std::uint64_t>::max();
-    }
-    return rows * row_bytes;
+  if (asym_bits(record.dtype)) {
+    if (record.shape.size() != 2) return UINT64_MAX;
+    return asym_weight_bytes(record.shape[0], record.shape[1], asym_bits(record.dtype));
   }
+  if (record.dtype == QuantizedDType::kInt8) return record.numel;
+
   return record.numel * 2;
 }
 
 bool is_integer_quantized(QuantizedDType dtype) {
-  return dtype == QuantizedDType::kInt8 || dtype == QuantizedDType::kInt4;
+  return dtype == QuantizedDType::kInt8 || asym_bits(dtype);
 }
 
 }  // namespace
+
+std::uint64_t asym_weight_bytes(std::uint64_t rows, std::uint64_t cols, int bits) {
+  if (bits != 4 && bits != 6) return UINT64_MAX;
+  const auto groups = cols / 32 + (cols % 32 != 0);
+  const std::uint64_t bytes = 16 + 4 * (bits - 4);
+  if (groups > UINT64_MAX / bytes || (groups && rows > UINT64_MAX / (groups * bytes)))
+    return UINT64_MAX;
+  return rows * groups * bytes;
+}
+
+Result<std::vector<std::uint16_t>> expand_asym_metadata(
+    const QuantizedTensorRecord& record, const std::vector<std::uint16_t>& metadata) {
+  if (!asym_bits(record.dtype) || record.shape.size() != 2 || record.quant_group_size != 32 ||
+      record.shape[0] <= 0 || record.shape[1] <= 0)
+    return Status::error("invalid SB6 metadata shape");
+  const std::uint64_t rows = record.shape[0], cols = record.shape[1];
+  const auto groups = cols / 32 + (cols % 32 != 0), superblocks = cols / 256 + (cols % 256 != 0);
+  if (superblocks > UINT64_MAX / 8 || rows > UINT64_MAX / (superblocks * 8) ||
+      metadata.size() != rows * superblocks * 8 || rows > SIZE_MAX / groups / 2)
+    return Status::error("invalid SB6 metadata length");
+  std::vector<std::uint16_t> expanded(rows * groups * 2);
+  for (std::uint64_t n = 0; n < rows; ++n) for (std::uint64_t sb = 0; sb < superblocks; ++sb) {
+    const auto* m = metadata.data() + (n * superblocks + sb) * 8;
+    const float d = f16_bits_to_float(m[0]), dm = f16_bits_to_float(m[1]);
+    if (!std::isfinite(d) || d < 0 || !std::isfinite(dm)) return Status::error("invalid SB6 base");
+    std::uint64_t qs = 0, qm = 0;
+    for (int j = 0; j < 3; ++j) {
+      qs |= std::uint64_t(m[2 + j]) << (16 * j);
+      qm |= std::uint64_t(m[5 + j]) << (16 * j);
+    }
+    for (int g = 0; g < 8 && sb * 8 + g < groups; ++g) {
+      // Multiplication of FP16 by a six-bit integer is exact in FP32.
+      // Round once to FP16, ties-to-even, for the runtime half2(s,m).
+      const auto round_half = [](float x) {
+        auto h = float_to_f16_bits(x);
+        auto mag = static_cast<std::uint16_t>(h & 0x7fff);
+        const float a = std::fabs(x);
+        if (!mag && a > 0x1p-25f) mag = 1;
+        if ((mag & 1) && mag < 0x7c00 && a ==
+            (f16_bits_to_float(mag) + f16_bits_to_float(mag - 1)) * .5f) --mag;
+        return static_cast<std::uint16_t>((h & 0x8000) | mag);
+      };
+      const auto s = round_half(d * ((qs >> (6 * g)) & 63));
+      const auto b = round_half(dm * ((qm >> (6 * g)) & 63));
+      if (!std::isfinite(f16_bits_to_float(s)) || !std::isfinite(f16_bits_to_float(b)))
+        return Status::error("expanded SB6 parameter overflow");
+      const auto i = (n * groups + sb * 8 + g) * 2;
+      expanded[i] = s; expanded[i + 1] = b;
+    }
+  }
+  return expanded;
+}
 
 bool is_quantized_archive(const std::string& path) {
   std::ifstream file(path, std::ios::binary);
@@ -97,6 +147,8 @@ Result<QuantizedArchive> QuantizedArchive::open(const std::string& path) {
         !read_value(file, &reserved) || !read_value(file, &numel)) {
       return Status::error("truncated quantized tensor header");
     }
+    if (dtype == 3 || dtype == 5)
+      return Status::error("retired quantized dtype; re-export as W8A16, SB6 W4 or SB6 W6");
     if (!valid_dtype(dtype) || rank > 16 || name_len == 0 || name_len > (1u << 20) ||
         (dtype >= static_cast<std::uint8_t>(QuantizedDType::kInt8) && rank == 0)) {
       return Status::error("invalid quantized tensor metadata");
@@ -106,7 +158,7 @@ Result<QuantizedArchive> QuantizedArchive::open(const std::string& path) {
     file.read(record.name.data(), static_cast<std::streamsize>(name_len));
     if (!file) return Status::error("truncated quantized tensor name");
     record.dtype = static_cast<QuantizedDType>(dtype);
-    record.quant_group_size = record.dtype == QuantizedDType::kInt4 ? reserved : 0;
+    record.quant_group_size = asym_bits(record.dtype) ? reserved : 0;
     if (!names.insert(record.name).second) {
       return Status::error("duplicate quantized tensor: " + record.name);
     }
@@ -120,7 +172,7 @@ Result<QuantizedArchive> QuantizedArchive::open(const std::string& path) {
     if (checked_numel(record.shape) != record.numel) {
       return Status::error("quantized tensor element count mismatch: " + record.name);
     }
-    if (record.dtype != QuantizedDType::kInt8 && record.dtype != QuantizedDType::kInt4 &&
+    if (!is_integer_quantized(record.dtype) &&
         record.numel > std::numeric_limits<std::uint64_t>::max() / sizeof(std::uint16_t)) {
       return Status::error("quantized tensor is too large: " + record.name);
     }
@@ -135,18 +187,14 @@ Result<QuantizedArchive> QuantizedArchive::open(const std::string& path) {
     if (is_integer_quantized(record.dtype)) {
       std::uint64_t scale_count = 0;
       std::uint64_t expected_scales = static_cast<std::uint64_t>(record.shape.front());
-      if (record.dtype == QuantizedDType::kInt4) {
-        if (record.shape.size() != 2 ||
-            (record.quant_group_size != 32 && record.quant_group_size != 128)) {
-          return Status::error("invalid INT4 metadata: " + record.name);
-        }
-        const std::uint64_t cols = static_cast<std::uint64_t>(record.shape[1]);
-        const std::uint64_t groups = cols / record.quant_group_size +
-                                     (cols % record.quant_group_size != 0);
-        if (groups != 0 && expected_scales > std::numeric_limits<std::uint64_t>::max() / groups) {
-          return Status::error("INT4 scale count overflow: " + record.name);
-        }
-        expected_scales *= groups;
+
+      if (asym_bits(record.dtype)) {
+        if (record.shape.size() != 2 || record.shape[0] <= 0 || record.shape[1] <= 0 || reserved != 32)
+          return Status::error("invalid SB6 tensor metadata: " + record.name);
+        const std::uint64_t sb = record.shape[1] / 256 + (record.shape[1] % 256 != 0);
+        if (sb > UINT64_MAX / 8 || expected_scales > UINT64_MAX / (sb * 8))
+          return Status::error("SB6 metadata overflow");
+        expected_scales *= sb * 8;
       }
       if (!read_value(file, &scale_count) || scale_count != expected_scales) {
         return Status::error("invalid quantized scale count: " + record.name);
@@ -217,40 +265,45 @@ Status QuantizedWriter::append(
     const std::string& name, QuantizedDType dtype, const std::vector<std::int64_t>& shape,
     const std::vector<std::uint8_t>& data, const std::vector<std::uint16_t>& scales,
     std::uint16_t quant_group_size) {
+  if (asym_bits(dtype)) {
+    QuantizedTensorRecord rec;
+    rec.dtype = dtype; rec.shape = shape; rec.quant_group_size = quant_group_size;
+    auto expanded = expand_asym_metadata(rec, scales);
+    if (!file_ || closed_ || count_ >= expected_count_ || name.empty() || name.size() > (1u << 20) ||
+        !expanded.ok() || data.size() != asym_weight_bytes(shape[0], shape[1], asym_bits(dtype)))
+      return Status::error("invalid SB6 tensor for output: " + name);
+    write_value(file_, static_cast<std::uint32_t>(name.size()));
+    write_value(file_, static_cast<std::uint8_t>(dtype));
+    write_value(file_, static_cast<std::uint8_t>(2));
+    write_value(file_, static_cast<std::uint16_t>(32));
+    write_value(file_, checked_numel(shape));
+    file_.write(name.data(), name.size());
+    for (auto dim : shape) write_value(file_, dim);
+    file_.write(reinterpret_cast<const char*>(data.data()), data.size());
+    write_value(file_, static_cast<std::uint64_t>(scales.size()));
+    file_.write(reinterpret_cast<const char*>(scales.data()), scales.size() * 2);
+    if (!file_) return Status::error("failed to write SB6 tensor: " + name);
+    ++count_;
+    return Status::ok();
+  }
   const std::uint64_t logical_numel = checked_numel(shape);
   const bool shape_nonnegative =
       std::all_of(shape.begin(), shape.end(), [](std::int64_t dim) { return dim >= 0; });
-  const bool int4 = dtype == QuantizedDType::kInt4;
-  const std::uint64_t rows = shape.empty() ? 0 : static_cast<std::uint64_t>(shape[0]);
-  const std::uint64_t cols = shape.size() == 2 ? static_cast<std::uint64_t>(shape[1]) : 0;
-  const std::uint64_t int4_row_bytes = cols / 2 + cols % 2;
-  const bool int4_size_overflow = int4_row_bytes != 0 &&
-                                  rows > std::numeric_limits<std::uint64_t>::max() / int4_row_bytes;
-  const std::uint64_t int4_data_bytes = int4_size_overflow ? 0 : rows * int4_row_bytes;
-  const std::uint64_t groups = int4 && quant_group_size != 0
-                                   ? cols / quant_group_size + (cols % quant_group_size != 0)
-                                   : 0;
-  const bool scale_count_overflow = groups != 0 &&
-                                    rows > std::numeric_limits<std::uint64_t>::max() / groups;
-  const std::uint64_t expected_scales = int4 ? rows * groups : rows;
   if (!file_) return Status::error("failed to open quantized output");
   if (closed_ || count_ >= expected_count_ || name.empty() || name.size() > std::numeric_limits<std::uint32_t>::max() ||
-      static_cast<std::uint8_t>(dtype) > static_cast<std::uint8_t>(QuantizedDType::kInt4) ||
+      !valid_dtype(static_cast<std::uint8_t>(dtype)) ||
       !shape_nonnegative ||
       (is_integer_quantized(dtype) && shape.empty()) || shape.size() > 16 ||
-      (int4 && (shape.size() != 2 || (quant_group_size != 32 && quant_group_size != 128) ||
-                int4_size_overflow || scale_count_overflow)) ||
-      (!int4 && quant_group_size != 0) ||
-      data.size() != (int4 ? int4_data_bytes
-                           : dtype == QuantizedDType::kInt8 ? logical_numel : logical_numel * 2) ||
-      (is_integer_quantized(dtype) && scales.size() != expected_scales) ||
+      quant_group_size != 0 ||
+      data.size() != (dtype == QuantizedDType::kInt8 ? logical_numel : logical_numel * 2) ||
+      (is_integer_quantized(dtype) && scales.size() != static_cast<std::uint64_t>(shape.front())) ||
       (!is_integer_quantized(dtype) && !scales.empty())) {
     return Status::error("invalid quantized tensor for output: " + name);
   }
   write_value(file_, static_cast<std::uint32_t>(name.size()));
   write_value(file_, static_cast<std::uint8_t>(dtype));
   write_value(file_, static_cast<std::uint8_t>(shape.size()));
-  write_value(file_, int4 ? quant_group_size : static_cast<std::uint16_t>(0));
+  write_value(file_, static_cast<std::uint16_t>(0));
   write_value(file_, logical_numel);
   file_.write(name.data(), static_cast<std::streamsize>(name.size()));
   for (std::int64_t dim : shape) write_value(file_, dim);

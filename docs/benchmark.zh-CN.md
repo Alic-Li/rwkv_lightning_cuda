@@ -70,6 +70,8 @@ BF16 权重占 14.2 GB，留给 prefill 缓冲的只有约 1.5 GB，单个 batch
 
 ### W8A16（16 GB 卡推荐配置）
 
+本节保留 RTX 4060 Ti 的历史服务测试；当前三个格式的统一对比维护在[量化验证报告](../quant/VALIDATION.zh-CN.md)。
+
 `rwkv_quantize --format w8a16` 把权重压到 7.7 GB（常驻 7.8 GB），单个 batch
 请求上限提高到 **bsz 138**；这张卡的 decode 受显存带宽限制，单路速度也接近翻倍。
 

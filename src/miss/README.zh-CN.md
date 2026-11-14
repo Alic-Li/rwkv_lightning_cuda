@@ -216,7 +216,7 @@ python tools/check_miss_http.py --build build --work /tmp/miss-acceptance
 工作目录必须是新目录。测试覆盖显式 A/autograd dD/dX、有限差分、不完整分块、梯度累积、
 两层完整模型 autograd、完整序列与分块梯度、顺序批次累积、共享 WKV 记录、损失下降、
 逐位一致的检查点续训/导出、无适配器与零 scale 输出、并发版本/scale、SQLite 身份往返、
-GPU 准入/LRU/重载、解码不重复上传，以及动态 FP16/W8A16/W4A16 推理。
+GPU 准入/LRU/重载、解码不重复上传，以及动态 FP16/W8A16/SB6 W4/W6 推理。
 
 在 RTX PRO 6000 Blackwell 上，两层测试的损失在 16 次更新后由 5.2124 降至 2.9414。
 CUDA 数值和运行时测试通过。HIP 使用同一 MiSS 算子源码和等效钩子，但

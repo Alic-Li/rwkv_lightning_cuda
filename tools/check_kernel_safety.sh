@@ -6,7 +6,7 @@ log_dir=${2:-"$build_dir/kernel-sanitizer"}
 mkdir -p "$log_dir"
 for tool in memcheck racecheck synccheck initcheck; do
   for target in rwkv_kernel_safety_test rwkv_cuda_non4096_kernels_test \
-                rwkv_bf16_training_test rwkv_w4a16_kernels_test rwkv_w8a16_kernels_test; do
+                rwkv_bf16_training_test rwkv_sb6_kernels_test rwkv_quantized_model_test rwkv_w8a16_kernels_test; do
     if [[ "$target" == rwkv_bf16_training_test && ! -x "$build_dir/test/$target" ]]; then
       echo "SKIP: BF16 training was not built"
       continue

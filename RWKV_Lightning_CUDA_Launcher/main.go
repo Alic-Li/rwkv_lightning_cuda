@@ -380,7 +380,7 @@ func toolBinary(name string) string {
 
 // capabilities is an open set (§5.4): clients must ignore unknown bits.
 // T2 decision: quantization stays a single bit — one tool binary serves
-// both w8a16 and w4a16; the format is a per-job config, not a deployment
+// W8A16 and calibrated SB6 W4/W6; the format is a per-job config, not a deployment
 // property.
 func (l *launcher) capabilities() []string {
 	if l.role() == "client" {
@@ -920,20 +920,24 @@ func quantizationArgs(req quantizeRequest) ([]string, error) {
 		return nil, fmt.Errorf("output: %w", err)
 	}
 	if req.Format == "" {
-		req.Format = "w4a16"
+		req.Format = "w8a16"
 	}
-	if req.Format != "w8a16" && req.Format != "w4a16" {
-		return nil, fmt.Errorf("format must be w8a16 or w4a16")
+	if req.Format != "w8a16" && req.Format != "w4a16_asym" && req.Format != "w6a16_asym" {
+		return nil, fmt.Errorf("format must be w8a16, w4a16_asym or w6a16_asym")
 	}
 	args := []string{"--format", req.Format}
-	if req.Format == "w4a16" {
-		if req.GroupSize == 0 {
-			req.GroupSize = 128
+	if req.Format != "w8a16" {
+		manifest := strings.TrimSpace(req.CalibratedManifest)
+		if manifest == "" {
+			return nil, fmt.Errorf("SB6 requires a calibrated manifest.json; generate it with tools/calibration/export_calibrated.py")
 		}
-		if req.GroupSize != 32 && req.GroupSize != 128 {
-			return nil, fmt.Errorf("W4A16 group size must be 32 or 128")
+		if !filepath.IsAbs(manifest) {
+			manifest = filepath.Join(appDir(), manifest)
 		}
-		args = append(args, "--group-size", strconv.Itoa(req.GroupSize))
+		if err := existingPath(manifest, false); err != nil {
+			return nil, fmt.Errorf("calibrated manifest: %w", err)
+		}
+		args = append(args, "--calibrated", filepath.Clean(manifest))
 	}
 	return append(args, req.InputPath, req.OutputPath), nil
 }

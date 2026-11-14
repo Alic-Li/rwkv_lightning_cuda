@@ -1,90 +1,64 @@
-# W8A16 与 W4A16 量化
+# W8A16 与 SB6 W4/W6A16 量化
 
 [English](README.md) | 简体中文
 
-本目录包含共享文件格式及 CUDA W8A16/W4A16 实现。HIP 实现位于 `hip/rwkv_quantized.hip`，
-详见 [W7900 移植与验证](../hip/QUANTIZATION.zh-CN.md)。`rwkv_quantize` 将 BF16 RWKV
-检查点转换为可流式读取的 `.rwkvq` 文件。线性张量采用逐输出通道对称 INT8 或分组对称
-INT4；嵌入、层归一化、LoRA 因子及其他非线性张量保持 BF16。
+当前只保留原始 **W8A16**、**SB6 W4**、**SB6 W6** 三种量化格式，FP16 用作未量化推理基线。
+统一速度和精度结果见[验证报告](VALIDATION.zh-CN.md)。
 
-W4 沿 K 维使用对称有符号 INT4 分组，每字节打包两个值，每个 INT4 张量记录分组大小（32 或 128）：
+| 格式 / 命令参数 | CUDA | HIP | 对齐量化矩阵磁盘 / 显存 bpw |
+|---|---|---|---|
+| W8A16 / `w8a16` | 支持 | 支持 | `8 + 16/K` / `8 + 16/K` |
+| SB6 W4 / `w4a16_asym` | 支持 | 不支持 | 4.5 / 5 |
+| SB6 W6 / `w6a16_asym` | 支持 | 不支持 | 6.5 / 7 |
+
+bpw 不包含浮点张量、文件头和尾部补齐。SB6 加载时将紧凑元数据展开为每 32 个权重一个
+FP16 `(scale, offset)` 对。Embedding、归一化、低秩参数保持浮点；SB6 W4 默认额外将
+`blocks.0.att.output.weight` 保留为 BF16，SB6 W6 默认量化该矩阵。
+
+## 导出与运行
 
 ```bash
-rwkv_quantize --format w4a16 --group-size 128 model.pth model.w4a16.rwkvq
-rwkv_quantized_smoke model.w4a16.rwkvq
+# 原始 W8：量化网格和舍入方式不变，无需校准。
+build/rwkv_quantize model.pth model.w8a16.rwkvq
+
+# SB6：先收集激活重要性，再搜索参数并打包。
+python tools/calibration/collect_activations.py \
+  --model model.pth --corpus calibration.txt --windows 16 --seq-len 256 \
+  --output artifacts/quantization/data/moments.pth
+python tools/calibration/export_calibrated.py \
+  --model model.pth --activation-stats artifacts/quantization/data/moments.pth \
+  --default w4a16_asym --output-dir artifacts/quantization/export/w4 \
+  --export model.sb6_w4.rwkvq
+# W6 改用 --default w6a16_asym，并使用独立输出路径。
+
+build/rwkv_lighting_cuda --model-path model.sb6_w4.rwkvq \
+  --vocab-path assets/rwkv_vocab_v20230424.txt
 ```
 
-CUDA 后端自动识别 `.rwkvq` 文件。INT8 权重驻留设备，注意力投影、FFN 投影和输出头
-使用 W8A16 GEMV/GEMM。运行时调优按 GPU/模型形状选择 split-K 与批量算子变体，
-将结果持久化到 `--tune-cache` 文件。INT4 张量使用 W4A16 GEMV/Tensor Core 路径和
-基于形状的 split-K 选择。HIP 构建也会识别这些文件，并在设备上保留压缩权重；
-HIP 使用原始 NK 权重、向量化解码、gfx1100 WMMA 预填充和确定性 split-K，
-不使用 CUDA PackedNK 和 CUDA 调优缓存。
+运行时自动识别格式，权重保持压缩。W8 保留原有调优缓存；SB6 按形状选择内核。
+`.rwkvq.source.json` 应与模型放在一起，以便复用来源模型的适配器。
+Launcher 同样只提供这三种格式，SB6 需要填写离线生成的 `manifest.json` 路径。
+详细流程见[校准工具说明](../tools/calibration/README.md)，编码见 [SB6 格式](SB6.md)。
 
-## 实测结果
+## 兼容性与目录
 
-以下为 CUDA 测量，W7900 测量单独记录在 [HIP 验证报告](../hip/QUANTIZATION.zh-CN.md)。
+本项目容器魔数保持 `RWKVQ\0\1\0`，dtype 0/1 为 BF16/FP16，2 为 W8，4/6 为 SB6 W4/W6。
+旧 dtype 3、5 已退役，读取时明确拒绝，编号不复用。旧模型需从来源 PTH 重新导出。
+旧对称 W4 G32/G128、SB6 W5、Autopick、GPTQ 入口均已删除。已有 W8 文件继续兼容。
+HIP 仅保留 W8 量化推理，参见 [HIP 支持说明](../hip/QUANTIZATION.zh-CN.md)。
 
-最终测量使用 NVIDIA GeForce RTX 4060 Ti 16 GB（`sm_89`）及 RWKV7 G1J 7.2B、
-上下文 16K 模型。解码计时使用独立随机状态、32 token 预填充、三次预热、十次采样，
-取第 5、6 个排序样本的中位数。下表 W8A16 数值为运行时调优后的缓存命中结果。
+`artifacts/quantization/` 不进入 Git：`models/` 只保存三个最终模型及身份/策略文件，
+`data/` 保存可复用的 AW 统计与独立评测语料，`validation/` 保存本轮原始测量。
+旧实验模型、中间 payload、日志及重复报告已清理。
 
-| 批大小 | FP16 ms | W8A16 ms | W8A16 TPS | TPS 提升 |
-|---:|---:|---:|---:|---:|
-| 1 | 38.0691 | 20.6220 | 48.4919 | +84.6043% |
-| 2 | 39.9039 | 21.8185 | 91.6653 | +82.8902% |
-| 4 | 43.6685 | 24.2293 | 165.0894 | +80.2301% |
-| 8 | 46.1859 | 24.8054 | 322.5104 | +86.1929% |
-| 16 | 56.0823 | 28.6889 | 557.7070 | +95.4843% |
-| 32 | 58.8945 | 33.8133 | 946.3732 | +74.1755% |
-| 64 | 65.8202 | 40.7663 | 1569.9242 | +61.4574% |
+```bash
+ctest --test-dir build -R 'rwkv_(quantized_archive|quantized_model|sb6_kernels|w8a16_kernels)_test' --output-on-failure
+python test/kernels/calibration_test.py
+python test/kernels/sb6_calibration_test.py
+python tools/validate_quantization.py config.json --output artifacts/quantization/validation
+```
 
-所有实测批大小下 W8A16 都更快。解码时间减少 38.1–48.8%，实际吞吐量增加 61.5–95.5%。
-相对增益最大的是批大小 16，绝对吞吐量最大的是批大小 64。
-
-1024 token、分块 128 的预填充验收中，FP16 为 512.869 ms，W8A16 为 450.836 ms。
-W8A16 耗时减少 12.09%（为 FP16 耗时的 0.8786 倍）。
-
-## 精度与生成差异
-
-教师强制 logit 在相同 token 序列上评估，避免采样分歧影响比较。54 个位置的 logit MSE
-为 `0.02647262`，RMSE 为 `0.16270409`，top-1 token 在 53/54 个位置一致（`98.15%`）。
-这是数值近似，不是与 FP16 逐位等价。
-
-16K 长上下文检查未发现误差单调累积：
-
-| 输入序列 | 16K 平均 MSE | Top-1 一致 |
-|---|---:|---:|
-| 固定随机 token | 0.01005010 | 15,579/16,384 (95.09%) |
-| 真实英文文本 | 0.05523100 | 15,947/16,384 (97.34%) |
-
-在确定性中文语料上，FP16 困惑度为 `6.385901313`，W8A16 为 `6.391733437`；
-绝对差 `0.005832123`，相对差 `0.091328%`。
-
-也将相同贪心 HTTP 请求分别发送到先后运行的 FP16 和 W8A16 服务。
-64 个生成 token 的字符级一致率为：
-
-| 提示词 | 字符一致率 |
-|---|---:|
-| 中文矩阵解释 | 1.000 |
-| 英文天空解释 | 0.064 |
-| C++ 解释 | 0.689 |
-
-自回归文本可能在首次微小数值差异后发生分歧，因此这些值反映输出稳定性，不能直接作为
-质量分数。上面的教师强制 logit 和困惑度（PPL）测量才是受控的精度退化指标。
-
-## 已保存图表
-
-### 随机 token 的 16K logit MSE
-
-![随机 token 的 16K logit MSE](logit_mse_curve_16k.svg)
-
-### 真实文本的 16K logit MSE
-
-![真实文本的 16K logit MSE](logit_mse_curve_16k_text.svg)
-
-### 中文 PPL 分块分布
-
-![中文 PPL 分块分布](ppl_chunk_distribution.svg)
-
-可复现的基准和校准程序保留在 `tools/`，由顶层 `CMakeLists.txt` 的 CUDA 部分构建。
+配置 JSON 包含六个文件路径：`source`、`w8a16`、`sb6_w4`、`sb6_w6`、`english`、`multilingual`。
+验证工具顺序执行三轮性能测试，以及共享同一 FP16 logits 的 4K/16K 精度对比；
+第二遍 FP16 衡量运行波动。最终指标保存在 [results.json](validation/results.json)，
+唯一维护的测量总结为[验证报告](VALIDATION.zh-CN.md)。

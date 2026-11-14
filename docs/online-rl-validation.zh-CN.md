@@ -15,7 +15,7 @@
 `rwkv_state_tuning_api_test`、`rwkv_bf16_training_test`、`rwkv_prefix_cache_index_test`。
 
 `tools/check_miss.py` 原 CLI 回归通过：全模型 Autograd 对照 Loss `5.2131605`、
-MiSS 训练 Loss `5.2132 → 2.9426`、Checkpoint Resume、FP16/W8A16/W4A16 Adapter 推理、BF16 数值范围和模型转换。
+MiSS 训练 Loss `5.2132 → 2.9426`、Checkpoint Resume、FP16/W8A16 Adapter 推理、BF16 数值范围和模型转换。
 额外运行 State CLI 两步 Adam：全长与 7-token Chunk 导出的 8,192 个参数相对 L2 差为 `0.0021142`。
 这是 BF16 反向归约和 Adam 放大近零梯度差异后的数值比较，不要求不同训练分块导出逐位相同。
 

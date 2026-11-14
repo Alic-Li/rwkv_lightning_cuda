@@ -60,8 +60,8 @@ export const defaultTuning: TuningConfig = {
 export const defaultQuantization: QuantizationConfig = {
   input_path: "",
   output_path: "",
-  format: "w4a16",
-  group_size: 128,
+  format: "w8a16",
+  calibrated_manifest: "",
 };
 
 export function suggestedQuantizedPath(

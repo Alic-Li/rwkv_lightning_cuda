@@ -122,33 +122,35 @@ func TestTuningArgs(t *testing.T) {
 }
 func TestQuantizationArgs(t *testing.T) {
 	input := testFile(t, "model.pth", "model")
-	output := filepath.Join(t.TempDir(), "model.w4a16.rwkvq")
-	args, err := quantizationArgs(quantizeRequest{InputPath: input, OutputPath: output, Format: "w4a16", GroupSize: 32})
-	if err != nil {
-		t.Fatal(err)
+	output := filepath.Join(t.TempDir(), "model.rwkvq")
+	manifest := testFile(t, "manifest.json", "{}")
+	for _, format := range []string{"w4a16_asym", "w6a16_asym"} {
+		args, err := quantizationArgs(quantizeRequest{InputPath: input, OutputPath: output, Format: format, CalibratedManifest: manifest})
+		want := []string{"--format", format, "--calibrated", manifest, input, output}
+		if err != nil || !reflect.DeepEqual(args, want) {
+			t.Fatalf("%v %v", args, err)
+		}
 	}
-	want := []string{"--format", "w4a16", "--group-size", "32", input, output}
-	if !reflect.DeepEqual(args, want) {
-		t.Fatalf("%v", args)
-	}
-	args, err = quantizationArgs(quantizeRequest{InputPath: input, OutputPath: filepath.Join(t.TempDir(), "model.w8a16.rwkvq"), Format: "w8a16", GroupSize: 128})
-	if err != nil || strings.Contains(strings.Join(args, " "), "group-size") {
+	args, err := quantizationArgs(quantizeRequest{InputPath: input, OutputPath: output})
+	if err != nil || !reflect.DeepEqual(args, []string{"--format", "w8a16", input, output}) {
 		t.Fatalf("%v %v", args, err)
 	}
 	for _, req := range []quantizeRequest{
-		{InputPath: input, OutputPath: output, Format: "w4a16", GroupSize: 64},
-		{InputPath: input, OutputPath: output, Format: "fp8", GroupSize: 128},
+		{InputPath: input, OutputPath: output, Format: "w4a16"},
+		{InputPath: input, OutputPath: output, Format: "w5a16_asym", CalibratedManifest: manifest},
+		{InputPath: input, OutputPath: output, Format: "w4a16_asym"},
+		{InputPath: input, OutputPath: output, Format: "w6a16_asym", CalibratedManifest: manifest + "missing"},
 		{InputPath: input, OutputPath: filepath.Join(t.TempDir(), "model.bin"), Format: "w8a16"},
 		{InputPath: testFile(t, "model.rwkvq", "model"), OutputPath: output, Format: "w8a16"},
 	} {
-		if _, err = quantizationArgs(req); err == nil {
+		if _, err := quantizationArgs(req); err == nil {
 			t.Fatalf("accepted invalid request: %+v", req)
 		}
 	}
-	if err = os.WriteFile(output, []byte("existing"), 0600); err != nil {
+	if err := os.WriteFile(output, []byte("existing"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = quantizationArgs(quantizeRequest{InputPath: input, OutputPath: output, Format: "w4a16", GroupSize: 128}); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if _, err := quantizationArgs(quantizeRequest{InputPath: input, OutputPath: output, Format: "w8a16"}); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatal("accepted existing output", err)
 	}
 }

@@ -15,12 +15,12 @@
 
 High-performance RWKV-7 inference server for NVIDIA CUDA GPUs, with an AMD HIP
 fallback path. It ships OpenAI-style and native batch APIs with streaming SSE,
-an L1/L2/SQLite session state cache, W8A16/W4A16 quantized serving, standalone
+an L1/L2/SQLite session state cache, W8A16 / SB6 W4/W6 quantized serving, standalone
 state tuning, a multi-backend Go router, and a Go desktop launcher with a Web UI.
 
 - **Fast prefill and decode** — chunked prefill with VRAM-adaptive admission control, SSE streaming with configurable chunk size.
 - **Session state cache** — reuse conversation states across L1 VRAM, L2 RAM, and SQLite persistence; uploaded `.pth` states work with every generation endpoint.
-- **Quantization** — W4A16/W8A16 `.rwkvq` checkpoints with packed INT4/INT8 weights on device.
+- **Quantization** — W8A16 / SB6 W4/W6 `.rwkvq` checkpoints with packed weights on device.
 - **State tuning** — train `time_state` blocks standalone from JSONL data without touching linear weights.
 - **MiSS adapters&peft** — train one compact `D` matrix per target linear, then load adapters per request without modifying shared model weights.
 - **Batteries included** — weighted least-inflight load-balancing router and a desktop launcher with Web UI.
@@ -82,13 +82,14 @@ are described in the [build guide](docs/build.md).
 
 | Guide | Description |
 |---|---|
-| [Build](docs/build.md) | CMake build for CUDA and ROCm, W8A16/W4A16 quantization tool, Go launcher; step-by-step [Windows guide](docs/windows-build-run.md) |
+| [Build](docs/build.md) | CMake build for CUDA and ROCm, W8A16 / SB6 W4/W6 quantization tool, Go launcher; step-by-step [Windows guide](docs/windows-build-run.md) |
 | [Run](docs/run.md) | Server flags, Windows runtime, dynamic model loading, standalone state tuning |
 | [HTTP API](docs/http-api.md) | curl examples for every endpoint; complete reference in [rwkv_lightning_api_doc.md](rwkv_lightning_api_doc.md) |
 | [Launcher integration (Chinese)](RWKV_Lightning_CUDA_Launcher/docs/integration-guide.md) | Client / Agent, control APIs, authentication and multi-backend integration |
 | [MiSS adapters&peft](src/miss/README.md) | Frozen-base adapter training, checkpoint/resume, export, dynamic serving, caches, and validation |
 | [State tuning](src/state_tuning/README.md) | Standalone `time_state` training and checkpoint format |
 | [Router](RWKV_Lightning_CUDA_router/README.md) | Multi-backend load-balancing reverse proxy with session affinity and state fan-out |
+| [Quantization](quant/README.md) / [measured results](quant/VALIDATION.zh-CN.md) | Original W8A16, SB6 W4/W6, calibration, performance and FP16 accuracy comparison |
 | [Benchmark](docs/benchmark.md) | RTX PRO 6000 vs irwkv, RTX 4060 Ti 16 GB reference, scripts and raw data |
 | [Releasing](docs/releasing.md) | CI packaging matrix and how to publish a versioned release |
 

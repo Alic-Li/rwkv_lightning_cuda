@@ -284,7 +284,7 @@ loading on "…" is refused`），runtime/tuning/quantization/`runtime/load` 四
 | 项 | 决议 |
 | --- | --- |
 | T1 metrics 字段表 | schema 见上节（§6.3 已定稿）。NVML 字段全量可取（index/name/mem/util/temp/power，可选字段缺失即省略）。**rocm-smi 的实际 key 集合仍需在 W7900 目标机上确认**：解析按 key 后缀匹配（`VRAM Total Memory (B)`、`GPU use (%)`、`Temperature (Sensor junction|edge) (C)`、`Average Graphics Package Power (W)`、`Card series`），上机后如 label 有出入只需调 `metrics.go` 的后缀表 |
-| T2 capabilities 初始清单 | `runtime` / `tuning_state` / `tuning_miss` / `quantization` / `metrics` / `fs` / `state_import` / `host_dialog`（仅本机全套）。量化**不**按 w8a16/w4a16 拆位：一个 `rwkv_quantize` 二进制同时支持两种 format，format 是任务参数不是部署属性 |
+| T2 capabilities 初始清单 | `runtime` / `tuning_state` / `tuning_miss` / `quantization` / `metrics` / `fs` / `state_import` / `host_dialog`（仅本机全套）。量化**不**按位宽拆位：一个 `rwkv_quantize` 二进制支持 W8A16、SB6 W4/W6 三种 format，format 是任务参数不是部署属性 |
 | T3 token 生成与分发 | 由操作者经 `--token` 显式提供，不自动生成（自动生成的 token 会进启动日志）。存储位置：只存在于启动参数/进程内，不落盘。轮换：用新 token 重启 Agent，再在各 Client 上删除再注册对应后端（当前没有更新接口，ID 会变化） |
 | T4 Client 配置文件位置 | `~/.rwkv_launcher/launcher.json`（macOS/Linux `$HOME`，Windows `%USERPROFILE%`），权限 0600，`--config` 可覆盖。理由：注册表是用户级状态，必须活过 launcher 二进制升级与「每卡一个文件夹」的整目录替换；appDir 会随构建/部署位置漂移 |
 
@@ -420,9 +420,9 @@ MiSS 请求在此基础上改 `method:"miss"`，补 `rank:16`、`alpha:16`、`ta
 ```json
 {
   "input_path": "/data/models/model.pth",
-  "output_path": "/data/models/model.w4a16.rwkvq",
-  "format": "w4a16",
-  "group_size": 128,
+  "output_path": "/data/models/model.sb6_w4.rwkvq",
+  "format": "w4a16_asym",
+  "calibrated_manifest": "/data/calibration/w4/manifest.json",
   "visible_devices": "0"
 }
 ```
@@ -431,11 +431,11 @@ MiSS 请求在此基础上改 `method:"miss"`，补 `rank:16`、`alpha:16`、`ta
 | --- | --- | --- |
 | `input_path` | string | 已存在的 BF16 `.pth` 模型 |
 | `output_path` | string | `.rwkvq` 路径，父目录须存在；文件须尚不存在，不能覆盖输入 |
-| `format` | string | `w8a16` 或 `w4a16`，空值按 w4a16 |
-| `group_size` | integer | W4A16 为 32/128；0 按 128；W8A16 不使用 |
+| `format` | string | `w8a16`、`w4a16_asym`、`w6a16_asym`；空值按 w8a16 |
+| `calibrated_manifest` | string | SB6 必填：已有的校准 manifest 文件路径；W8 不使用。payload 必须与模型及所选位宽一致 |
 | `visible_devices` | string，可省略 | **已忽略**：`rwkv_quantize` 为纯 CPU 工具（`tools/CMakeLists.txt` 不链接 `rwkv::backend`），Agent 不做 `--card` 校验、不采样显存、不注入 `CUDA_VISIBLE_DEVICES`。字段保留仅为兼容仍在发送它的客户端 |
 
-量化不占显卡，因此也不参与 runtime↔training 的同卡互斥。启动成功为 `200 {"ok":true}`。训练/量化的 `POST /api/v1/jobs/{id}/stop` 成功为 **HTTP 200 空响应体**，不要无条件 `response.json()`。
+Launcher 只做 CPU 归档写入，SB6 的 AW payload 需要另行离线准备。因此任务也不参与 runtime↔training 的同卡互斥。启动成功为 `200 {"ok":true}`。训练/量化的 `POST /api/v1/jobs/{id}/stop` 成功为 **HTTP 200 空响应体**，不要无条件 `response.json()`。
 
 ### ProcessStatus 与 RuntimeState
 

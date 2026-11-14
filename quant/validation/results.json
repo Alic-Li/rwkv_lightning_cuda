@@ -1,0 +1,717 @@
+{
+  "config": {
+    "source": "/mnt/nvme0n1/no22/rwkv7-g1l-7.2b-20261031-ctx34304.pth",
+    "w8a16": "/home/alic-li/rwkv_lightning_cuda/artifacts/quantization/models/w8a16.rwkvq",
+    "sb6_w4": "/home/alic-li/rwkv_lightning_cuda/artifacts/quantization/models/sb6_w4.rwkvq",
+    "sb6_w6": "/home/alic-li/rwkv_lightning_cuda/artifacts/quantization/models/sb6_w6.rwkvq",
+    "english": "/home/alic-li/rwkv_lightning_cuda/artifacts/quantization/data/english.txt",
+    "multilingual": "/home/alic-li/rwkv_lightning_cuda/artifacts/quantization/data/multilingual.txt"
+  },
+  "rounds": 3,
+  "model_bytes": {
+    "fp16": 14400007869,
+    "w8a16": 7691525695,
+    "sb6_w4": 4777139767,
+    "sb6_w6": 6430744127
+  },
+  "performance": [
+    {
+      "model": "fp16",
+      "kind": "decode",
+      "batch": 1,
+      "tokens": 1,
+      "latency_ms": 7.08061,
+      "tok_s": 141.23076966532545,
+      "round_ms": [
+        7.12432,
+        7.07324,
+        7.08061
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "decode",
+      "batch": 2,
+      "tokens": 1,
+      "latency_ms": 7.36437,
+      "tok_s": 271.57788106789855,
+      "round_ms": [
+        7.37014,
+        7.34294,
+        7.36437
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "decode",
+      "batch": 4,
+      "tokens": 1,
+      "latency_ms": 7.92988,
+      "tok_s": 504.4212522762009,
+      "round_ms": [
+        7.95782,
+        7.92988,
+        7.91661
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "decode",
+      "batch": 8,
+      "tokens": 1,
+      "latency_ms": 8.32788,
+      "tok_s": 960.6286353789919,
+      "round_ms": [
+        8.37336,
+        8.32622,
+        8.32788
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "decode",
+      "batch": 16,
+      "tokens": 1,
+      "latency_ms": 10.3236,
+      "tok_s": 1549.8469526134293,
+      "round_ms": [
+        10.4483,
+        10.3167,
+        10.3236
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "decode",
+      "batch": 32,
+      "tokens": 1,
+      "latency_ms": 10.7342,
+      "tok_s": 2981.1257476104415,
+      "round_ms": [
+        10.717,
+        10.7342,
+        10.7609
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "decode",
+      "batch": 64,
+      "tokens": 1,
+      "latency_ms": 11.5076,
+      "tok_s": 5561.541937502172,
+      "round_ms": [
+        11.4854,
+        11.5076,
+        11.5482
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 128,
+      "latency_ms": 12.9476,
+      "tok_s": 9886.002038987921,
+      "round_ms": [
+        12.9392,
+        12.9476,
+        12.9872
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 512,
+      "latency_ms": 31.1152,
+      "tok_s": 16454.980202601942,
+      "round_ms": [
+        31.0421,
+        31.1152,
+        31.1601
+      ]
+    },
+    {
+      "model": "fp16",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 1024,
+      "latency_ms": 56.5288,
+      "tok_s": 18114.66013784124,
+      "round_ms": [
+        56.023,
+        56.5288,
+        56.6307
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "decode",
+      "batch": 1,
+      "tokens": 1,
+      "latency_ms": 4.43729,
+      "tok_s": 225.3627777314532,
+      "round_ms": [
+        4.57887,
+        4.42795,
+        4.43729
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "decode",
+      "batch": 2,
+      "tokens": 1,
+      "latency_ms": 4.71249,
+      "tok_s": 424.4040836160926,
+      "round_ms": [
+        4.8464,
+        4.69024,
+        4.71249
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "decode",
+      "batch": 4,
+      "tokens": 1,
+      "latency_ms": 5.18332,
+      "tok_s": 771.7061651605535,
+      "round_ms": [
+        5.35529,
+        5.18332,
+        5.18065
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "decode",
+      "batch": 8,
+      "tokens": 1,
+      "latency_ms": 5.54326,
+      "tok_s": 1443.1940771315074,
+      "round_ms": [
+        5.73846,
+        5.54326,
+        5.53114
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "decode",
+      "batch": 16,
+      "tokens": 1,
+      "latency_ms": 6.19959,
+      "tok_s": 2580.815828143474,
+      "round_ms": [
+        6.41094,
+        6.19959,
+        6.17767
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "decode",
+      "batch": 32,
+      "tokens": 1,
+      "latency_ms": 7.44515,
+      "tok_s": 4298.100105437768,
+      "round_ms": [
+        7.69447,
+        7.44511,
+        7.44515
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "decode",
+      "batch": 64,
+      "tokens": 1,
+      "latency_ms": 9.05285,
+      "tok_s": 7069.5968672848885,
+      "round_ms": [
+        9.34619,
+        9.05285,
+        9.03252
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 128,
+      "latency_ms": 12.5744,
+      "tok_s": 10179.412138948976,
+      "round_ms": [
+        12.7477,
+        12.5744,
+        12.5652
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 512,
+      "latency_ms": 38.4857,
+      "tok_s": 13303.64265168621,
+      "round_ms": [
+        38.9629,
+        38.4672,
+        38.4857
+      ]
+    },
+    {
+      "model": "w8a16",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 1024,
+      "latency_ms": 74.7366,
+      "tok_s": 13701.452835692286,
+      "round_ms": [
+        75.4867,
+        74.7366,
+        74.6403
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "decode",
+      "batch": 1,
+      "tokens": 1,
+      "latency_ms": 3.9684,
+      "tok_s": 251.9907267412559,
+      "round_ms": [
+        3.98778,
+        3.9684,
+        3.96549
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "decode",
+      "batch": 2,
+      "tokens": 1,
+      "latency_ms": 4.3423,
+      "tok_s": 460.58540404854574,
+      "round_ms": [
+        4.3588,
+        4.3423,
+        4.34109
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "decode",
+      "batch": 4,
+      "tokens": 1,
+      "latency_ms": 5.70949,
+      "tok_s": 700.5879684525238,
+      "round_ms": [
+        5.70949,
+        5.71232,
+        5.6971
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "decode",
+      "batch": 8,
+      "tokens": 1,
+      "latency_ms": 8.7001,
+      "tok_s": 919.529660578614,
+      "round_ms": [
+        8.72778,
+        8.69092,
+        8.7001
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "decode",
+      "batch": 16,
+      "tokens": 1,
+      "latency_ms": 9.05859,
+      "tok_s": 1766.2792995377868,
+      "round_ms": [
+        9.06888,
+        9.05859,
+        9.04503
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "decode",
+      "batch": 32,
+      "tokens": 1,
+      "latency_ms": 11.0302,
+      "tok_s": 2901.125999528567,
+      "round_ms": [
+        11.083,
+        11.0268,
+        11.0302
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "decode",
+      "batch": 64,
+      "tokens": 1,
+      "latency_ms": 13.694,
+      "tok_s": 4673.579669928436,
+      "round_ms": [
+        13.7204,
+        13.694,
+        13.6771
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 128,
+      "latency_ms": 17.9065,
+      "tok_s": 7148.242258397788,
+      "round_ms": [
+        17.9065,
+        17.8795,
+        17.9236
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 512,
+      "latency_ms": 63.3144,
+      "tok_s": 8086.62800247653,
+      "round_ms": [
+        63.2948,
+        63.3144,
+        63.4167
+      ]
+    },
+    {
+      "model": "sb6_w4",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 1024,
+      "latency_ms": 126.295,
+      "tok_s": 8108.001108515777,
+      "round_ms": [
+        126.11,
+        126.295,
+        126.328
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "decode",
+      "batch": 1,
+      "tokens": 1,
+      "latency_ms": 5.14967,
+      "tok_s": 194.18720034487646,
+      "round_ms": [
+        5.15675,
+        5.14967,
+        5.14882
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "decode",
+      "batch": 2,
+      "tokens": 1,
+      "latency_ms": 5.61572,
+      "tok_s": 356.14311254834644,
+      "round_ms": [
+        5.61767,
+        5.60871,
+        5.61572
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "decode",
+      "batch": 4,
+      "tokens": 1,
+      "latency_ms": 6.99883,
+      "tok_s": 571.5240975991702,
+      "round_ms": [
+        7.00398,
+        6.99492,
+        6.99883
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "decode",
+      "batch": 8,
+      "tokens": 1,
+      "latency_ms": 12.024,
+      "tok_s": 665.3359946773121,
+      "round_ms": [
+        12.0495,
+        12.024,
+        12.0112
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "decode",
+      "batch": 16,
+      "tokens": 1,
+      "latency_ms": 12.3846,
+      "tok_s": 1291.927070716858,
+      "round_ms": [
+        12.3968,
+        12.377,
+        12.3846
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "decode",
+      "batch": 32,
+      "tokens": 1,
+      "latency_ms": 15.6421,
+      "tok_s": 2045.761119031332,
+      "round_ms": [
+        15.6435,
+        15.6279,
+        15.6421
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "decode",
+      "batch": 64,
+      "tokens": 1,
+      "latency_ms": 18.0189,
+      "tok_s": 3551.82613811054,
+      "round_ms": [
+        18.0227,
+        18.0189,
+        18.0186
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 128,
+      "latency_ms": 23.2445,
+      "tok_s": 5506.678999333176,
+      "round_ms": [
+        23.1965,
+        23.2574,
+        23.2445
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 512,
+      "latency_ms": 79.5454,
+      "tok_s": 6436.575842223435,
+      "round_ms": [
+        79.3234,
+        79.5638,
+        79.5454
+      ]
+    },
+    {
+      "model": "sb6_w6",
+      "kind": "prefill",
+      "batch": 1,
+      "tokens": 1024,
+      "latency_ms": 158.141,
+      "tok_s": 6475.234126507357,
+      "round_ms": [
+        157.727,
+        158.141,
+        158.143
+      ]
+    }
+  ],
+  "accuracy": [
+    {
+      "corpus": "english",
+      "tokens": 4096,
+      "model": "fp16",
+      "reference_ppl": 7.11489451457298,
+      "ppl": 7.1151215741247995,
+      "delta_ppl_percent": 0.00319132703028302,
+      "logit_rmse": 0.019146919438546094,
+      "top1_agreement_percent": 99.7314453125
+    },
+    {
+      "corpus": "english",
+      "tokens": 4096,
+      "model": "w8a16",
+      "reference_ppl": 7.11489451457298,
+      "ppl": 7.13242907805913,
+      "delta_ppl_percent": 0.24644867819523242,
+      "logit_rmse": 0.12167449445474139,
+      "top1_agreement_percent": 97.75390625
+    },
+    {
+      "corpus": "english",
+      "tokens": 4096,
+      "model": "sb6_w4",
+      "reference_ppl": 7.11489451457298,
+      "ppl": 7.302515560313217,
+      "delta_ppl_percent": 2.6370179537580585,
+      "logit_rmse": 0.46987701968176165,
+      "top1_agreement_percent": 91.4794921875
+    },
+    {
+      "corpus": "english",
+      "tokens": 4096,
+      "model": "sb6_w6",
+      "reference_ppl": 7.11489451457298,
+      "ppl": 7.126211013642459,
+      "delta_ppl_percent": 0.1590536450863711,
+      "logit_rmse": 0.12373693811152583,
+      "top1_agreement_percent": 98.0224609375
+    },
+    {
+      "corpus": "multilingual",
+      "tokens": 16384,
+      "model": "fp16",
+      "reference_ppl": 5.821122628483953,
+      "ppl": 5.8206098782656825,
+      "delta_ppl_percent": -0.00880844213384524,
+      "logit_rmse": 0.019617126167257033,
+      "top1_agreement_percent": 99.71923828125
+    },
+    {
+      "corpus": "multilingual",
+      "tokens": 16384,
+      "model": "w8a16",
+      "reference_ppl": 5.821122628483953,
+      "ppl": 5.8339336900484815,
+      "delta_ppl_percent": 0.22007888138004805,
+      "logit_rmse": 0.1311611382451787,
+      "top1_agreement_percent": 97.96142578125
+    },
+    {
+      "corpus": "multilingual",
+      "tokens": 16384,
+      "model": "sb6_w4",
+      "reference_ppl": 5.821122628483953,
+      "ppl": 5.97332907419281,
+      "delta_ppl_percent": 2.614726667397105,
+      "logit_rmse": 0.47857239990511036,
+      "top1_agreement_percent": 92.291259765625
+    },
+    {
+      "corpus": "multilingual",
+      "tokens": 16384,
+      "model": "sb6_w6",
+      "reference_ppl": 5.821122628483953,
+      "ppl": 5.831783037110887,
+      "delta_ppl_percent": 0.18313320827105795,
+      "logit_rmse": 0.1255792400918104,
+      "top1_agreement_percent": 98.028564453125
+    }
+  ],
+  "loaded_weight_gpu_mib": {
+    "fp16": 13634,
+    "w8a16": 7237,
+    "sb6_w4": 4856,
+    "sb6_w6": 6434
+  },
+  "environment": {
+    "date": "2026-11-14",
+    "timezone": "Asia/Shanghai",
+    "git_head": "31a1126badfd39ae7a9ebc4e4c91fb5a19fbae28",
+    "working_tree_modified": true,
+    "cuda": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Tue_Sep_01_08:45:21_PDT_2026\nCuda compilation tools, release 13.4, V13.4.92\nBuild cuda_13.4.r13.4/compiler.38855100_0",
+    "hardware": "name, driver_version, memory.total [MiB], memory.used [MiB], utilization.gpu [%]\nNVIDIA RTX PRO 6000 Blackwell Workstation Edition, 615.78.08, 97887 MiB, 16722 MiB, 0 %\n",
+    "sha256": {
+      "build/rwkv_model_bench": "77d42c78d3c11fcc66bbcd1aeef83bb26c204b966dbdd32479e10fab49a3b791",
+      "build/rwkv_logit_mse_curve": "4811cea96c076d9d5303495a14e50ce5b9c3017e22a01770d34319bd62e48579",
+      "build/rwkv_quantize": "8b0d1cd3efc882a07a18a67cc9a898f17808f8ee14a734cae93934211a988f0c",
+      "quant/gemmv/rwkv_asym_a16.cu": "dc3000d10d6bd30b8390740053e2c18a2941abd6890d862970914c9d72003e02",
+      "quant/gemmv/rwkv_w8a16.cu": "80e2562349f189d20c13a7feb85e425dacf28b812f3f5ce8214cb376caa5390c",
+      "src/backend/rwkv7_fast_v4.cu": "99f9487e19f2bdf798ac7a648cfa4544e7440dfde8a01d7f777b6459df8964a5",
+      "tools/validate_quantization.py": "3a0fcb736aaa43c56d442ee198c231fcfcbf1c33648eadce9bf7ba52dfd15042",
+      "assets/rwkv_vocab_v20230424.txt": "e6dee3d4e31b4d5c40ac99508ac6c701ceef4bed681bf2167ce9a908552bca89"
+    },
+    "archive_identities": {
+      "w8a16": {
+        "format_version": 1,
+        "runtime_sha256": "b642d1d0ae9edf9c11d96e69b988afc33e5ac304ba21abcf1238d70fcb056cab",
+        "source_sha256": "ce81c2d568bc9fc8c9f7b8ddb47da070d88bf179827b311f221e1e6c5148af91"
+      },
+      "sb6_w4": {
+        "format_version": 1,
+        "runtime_sha256": "d904ffafa14815b998e7a348f94cb06325c594daedea119ebc6bca05b31c0cc8",
+        "source_sha256": "ce81c2d568bc9fc8c9f7b8ddb47da070d88bf179827b311f221e1e6c5148af91"
+      },
+      "sb6_w6": {
+        "format_version": 1,
+        "runtime_sha256": "231def14405c9d4cef235073684c2a55547b2cdcfe070db4d74b15f56aecd0bd",
+        "source_sha256": "ce81c2d568bc9fc8c9f7b8ddb47da070d88bf179827b311f221e1e6c5148af91"
+      }
+    }
+  },
+  "data_check": {
+    "english": {
+      "corpus_tokens": 6156,
+      "used_tokens": 4097,
+      "overlapping_16grams_with_calibration": 0
+    },
+    "multilingual": {
+      "corpus_tokens": 18471,
+      "used_tokens": 16385,
+      "overlapping_16grams_with_calibration": 0
+    },
+    "english_is_prefix_of_multilingual": true,
+    "calibration_tokens": 49020
+  },
+  "provenance": {
+    "source": "/mnt/nvme0n1/no22/rwkv7-g1l-7.2b-20261031-ctx34304.pth",
+    "reference_repository": "https://github.com/RafaelUI/rwkv-quant",
+    "reference_commit": "d22874666d5131868579149fcbcda58ff2808ef1",
+    "aw_windows": 16,
+    "seq_len": 256,
+    "batch_size": 4,
+    "seed": 42,
+    "data_sha256": {
+      "moments.pth": "0cbe82d0576eb9457d8a84c451f03e2303cd9169ddbf062fb428668e6992c579",
+      "english.txt": "b517eccc1a949c28ab7cd5d00704eef95318e2bf2c0cba08006d589c81b22ab4",
+      "multilingual.txt": "92b743ff0603bf84611ae7020c4fdcea83e725f1a092434ac4db599cf50cdbb0",
+      "calibration.txt": "cb47d770d436782ead8c6c9d53ff5bb57b23c0513a60f55e7bcddd4eca7748c7",
+      "heldout.json": "b5f953842088f85189df85ec016c7a6c51ce7d39e4e2062f51d54fd431742687"
+    }
+  },
+  "cleanup_removed_bytes": 67791229901,
+  "validation": {
+    "cuda_release_build": "passed: SM75/80/86/87/89/90/100/120",
+    "ctest": {
+      "passed": 4,
+      "failed": 0
+    },
+    "python_calibration": "passed: 3 + 11 test executions",
+    "sb6_memcheck": {
+      "errors": 0
+    },
+    "sb6_racecheck": {
+      "errors": 0,
+      "warnings": 0
+    },
+    "miss_adapter_inference": "FP16/W8A16/SB6 W4/SB6 W6 passed",
+    "launcher_frontend": {
+      "passed": 83,
+      "failed": 0,
+      "lint": "passed",
+      "build": "passed"
+    },
+    "launcher_go_race": "passed",
+    "hip": "not tested; ROCm compiler/AMD GPU unavailable"
+  }
+}

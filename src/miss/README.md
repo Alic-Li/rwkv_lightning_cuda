@@ -262,7 +262,7 @@ differences, ragged blocks, gradient accumulation, two-layer full-model autograd
 full versus chunked gradients, sequential batch accumulation, shared WKV tape,
 loss decrease, bitwise checkpoint resume/export,
 no-adapter versus zero-scale outputs, concurrent versions/scales, SQLite identity round trips, GPU admission/LRU/reload,
-no repeated decode upload, and dynamic FP16/W8A16/W4A16 inference.
+no repeated decode upload, and dynamic FP16/W8A16/SB6 W4/W6 inference.
 
 On RTX PRO 6000 Blackwell, the two-layer test's loss decreased from 5.2124 to
 2.9414 in 16 updates. CUDA numerical and runtime tests passed. HIP uses the

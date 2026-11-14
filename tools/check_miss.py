@@ -5,6 +5,7 @@ import argparse
 import json
 import pathlib
 import subprocess
+import sys
 import torch
 
 p = argparse.ArgumentParser()
@@ -148,12 +149,19 @@ assert losses[-1]<losses[0],losses
 print(a.method+' acceptance passed; loss',losses[0],'->',losses[-1])
 
 # Dynamic runtime must reuse the same adapter semantics for all base formats.
-for fmt in ['fp16','w8a16','w4a16']:
+for fmt in ['fp16','w8a16','w4a16_asym','w6a16_asym']:
     model=a.work/'tiny.pth'
     if fmt!='fp16':
         model=a.work/('tiny.'+fmt)
         with (a.work/('quant-'+fmt+'.log')).open('w') as log:
-            subprocess.run([a.build/'rwkv_quantize','--format',fmt,a.work/'tiny.pth',model],check=True,stdout=log)
+            if fmt == 'w8a16':
+                cmd = [a.build/'rwkv_quantize','--format',fmt,a.work/'tiny.pth',model]
+            else:
+                cmd = [sys.executable, pathlib.Path(__file__).parent/'calibration/export_calibrated.py',
+                       '--model',a.work/'tiny.pth','--default',fmt,'--device','cpu',
+                       '--output-dir',a.work/('payload-'+fmt),'--export',model,
+                       '--quantizer',a.build/'rwkv_quantize']
+            subprocess.run(cmd,check=True,stdout=log)
     output=a.work/('logits-'+fmt+'.pth')
     with (a.work/('runtime-'+fmt+'.log')).open('w') as log:
         subprocess.run([a.build/'test/rwkv_miss_model_test',model,a.work/'learn/adapter-final.pth',output],check=True,stdout=log)
@@ -170,7 +178,7 @@ run('initial-state',7,1,extra=['--state',str(a.work/'initial.pth')])
 state_checkpoint=torch.load(a.work/'initial-state/checkpoint-1/training.pth',weights_only=True)
 expected_state=torch.cat([initial[k].transpose(-1,-2).reshape(-1) for k in sorted(initial)])
 torch.testing.assert_close(state_checkpoint['initial_state'],expected_state,atol=0,rtol=0)
-print('Dynamic FP16/W8A16/W4A16 model acceptance passed')
+print('Dynamic FP16/W8A16/SB6 W4/W6 model acceptance passed')
 
 # Loader conversion must be bitwise identical to an explicitly converted BF16
 # archive. No whole-model FP32 host copy is made by the native loader.

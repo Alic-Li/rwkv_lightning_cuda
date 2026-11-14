@@ -2,8 +2,8 @@
 
 English | [简体中文](VALIDATION.zh-CN.md)
 
-This file records the earlier FP16/state-tuning migration. W4A16/W8A16 were
-subsequently migrated and validated separately: [quantized inference report](QUANTIZATION.md).
+This file records the earlier FP16/state-tuning migration. W8A16 were
+subsequently migrated and validated separately: [quantized inference support](QUANTIZATION.md).
 
 Validated locally on gfx1100 with ROCm HIP 7.2.53211-9999.
 
@@ -22,8 +22,7 @@ ctest --test-dir build-hip --output-on-failure
 Result: 10/10 tests passed. State-tuning checks cover WKV finite differences,
 chunk state adjoints, LayerNorm, cross entropy, gradient reduction and Adam.
 The inference test's synthetic vocabulary was padded to a multiple of four
-to satisfy the existing sampler contract on both backends. Quantized W8 GPU
-tests are now correctly restricted to CUDA, as W4 tests already were.
+to satisfy the existing sampler contract on both backends. The CUDA W8 GPU test is restricted to CUDA; HIP has its own W8 reference test.
 
 ## Real-data smoke runs
 

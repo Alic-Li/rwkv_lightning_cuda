@@ -13,7 +13,9 @@ enum class QuantizedDType : std::uint8_t {
   kBFloat16 = 0,
   kFloat16 = 1,
   kInt8 = 2,
-  kInt4 = 3,
+  // Values 3 (legacy signed INT4) and 5 (SB6 W5) are retired.
+  kInt4Asym = 4,
+  kInt6Asym = 6,
 };
 
 struct QuantizedTensorRecord {
@@ -67,6 +69,18 @@ class QuantizedWriter {
   std::uint32_t count_ = 0;
   bool closed_ = false;
 };
+
+// SB6: each padded group of 32 stores q4[16], then uint32 bit-4 and
+// bit-5 planes for 6 bits. Each superblock of 8 groups stores 16 bytes:
+// FP16 d, signed FP16 dm, qs[8] packed into 6 bytes, qm[8] into 6 bytes.
+// read_scales returns these 8 raw uint16 words per superblock for asym types.
+inline int asym_bits(QuantizedDType dtype) {
+  const int v = static_cast<int>(dtype);
+  return v == 4 || v == 6 ? v : 0;
+}
+std::uint64_t asym_weight_bytes(std::uint64_t rows, std::uint64_t cols, int bits);
+Result<std::vector<std::uint16_t>> expand_asym_metadata(
+    const QuantizedTensorRecord& record, const std::vector<std::uint16_t>& metadata);
 
 bool is_quantized_archive(const std::string& path);
 

@@ -1,5 +1,7 @@
 #include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
 #include "rwkv_quantized.hpp"
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -25,33 +27,52 @@ int main(int argc, char **argv) {
       if (!status.ok_status())
         throw std::runtime_error(status.message());
       auto dtype = rec.dtype;
-      if (dtype == llm_infer::QuantizedDType::kInt4 ||
-          dtype == llm_infer::QuantizedDType::kInt8) {
+      if (llm_infer::asym_bits(dtype)) {
+        std::vector<std::uint16_t> metadata;
+        status = archive.value().read_scales(rec, &metadata);
+        if (!status.ok_status())
+          throw std::runtime_error(status.message());
+        auto expanded = llm_infer::expand_asym_metadata(rec, metadata);
+        if (!expanded.ok())
+          throw std::runtime_error(expanded.status().message());
+        const int bits = llm_infer::asym_bits(dtype);
+        const std::size_t N = rec.shape[0], K = rec.shape[1],
+                          groups = (K + 31) / 32, stride = 16 + 4 * (bits - 4);
+        std::vector<std::uint8_t> output(N * K * 2);
+        for (std::size_t n = 0; n < N; ++n)
+          for (std::size_t k = 0; k < K; ++k) {
+            const auto g = n * groups + k / 32, j = k % 32;
+            const auto *p = data.data() + g * stride;
+            int q = (p[j / 2] >> ((j & 1) * 4)) & 15;
+            for (int b = 4; b < bits; ++b)
+              q |= ((p[16 + (b - 4) * 4 + j / 8] >> (j % 8)) & 1) << b;
+            const float s =
+                llm_infer::f16_bits_to_float(expanded.value()[2 * g]);
+            const float m =
+                llm_infer::f16_bits_to_float(expanded.value()[2 * g + 1]);
+            const half h = __float2half_rn(std::fma(float(q), s, m));
+            std::uint16_t raw;
+            std::memcpy(&raw, &h, sizeof(raw));
+            output[(n * K + k) * 2] = raw;
+            output[(n * K + k) * 2 + 1] = raw >> 8;
+          }
+        data = std::move(output);
+        dtype = llm_infer::QuantizedDType::kFloat16;
+      } else if (dtype == llm_infer::QuantizedDType::kInt8) {
         if (rec.shape.size() != 2)
           throw std::runtime_error("reference requires rank-2 integer weights");
         std::vector<std::uint16_t> scales;
         status = archive.value().read_scales(rec, &scales);
         if (!status.ok_status())
           throw std::runtime_error(status.message());
-        const std::size_t N = rec.shape[0], K = rec.shape[1],
-                          G = rec.quant_group_size;
+        const std::size_t N = rec.shape[0], K = rec.shape[1];
         std::vector<std::uint8_t> output(N * K * 2);
         for (std::size_t n = 0; n < N; ++n)
           for (std::size_t k = 0; k < K; ++k) {
-            int q;
-            std::size_t si;
-            if (dtype == llm_infer::QuantizedDType::kInt4) {
-              const int v =
-                  (data[n * ((K + 1) / 2) + k / 2] >> (4 * (k % 2))) & 15;
-              q = (v ^ 8) - 8;
-              si = n * ((K + G - 1) / G) + k / G;
-            } else {
-              const int v = data[n * K + k];
-              q = v < 128 ? v : v - 256;
-              si = n;
-            }
+            const int v = data[n * K + k];
+            const int q = v < 128 ? v : v - 256;
             const auto h = llm_infer::float_to_f16_bits(
-                q * llm_infer::f16_bits_to_float(scales[si]));
+                q * llm_infer::f16_bits_to_float(scales[n]));
             output[(n * K + k) * 2] = h;
             output[(n * K + k) * 2 + 1] = h >> 8;
           }

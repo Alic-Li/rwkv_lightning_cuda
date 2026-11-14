@@ -1,5 +1,5 @@
 #include "rwkv/runtime/rwkv7_fast_v4_common.hpp"
-#include "rwkv_w4a16.cuh"
+#include "rwkv/runtime/quantized_workspace.hpp"
 #include "rwkv_w8a16.cuh"
 #include <iostream>
 #include <random>
@@ -28,7 +28,7 @@ int main() {
         v = __float2half(0.01f);
       DeviceBuffer<half> dx, ds, dy;
       DeviceBuffer<float> workspace;
-      const auto workspace_bytes = rwkv7_w4a16_workspace_bytes(M, N, 16);
+      const auto workspace_bytes = rwkv7_quantized_workspace_bytes(M, N, 16);
       workspace.resize(workspace_bytes / sizeof(float), "split workspace");
       DeviceBuffer<unsigned char> dq;
       dx.resize(x.size(), "x");
@@ -44,12 +44,8 @@ int main() {
       hipEvent_t start, stop;
       check_hip(hipEventCreate(&start), "event");
       check_hip(hipEventCreate(&stop), "event");
-      for (int bits : {4, 8}) {
+      for (int bits : {8}) {
         auto launch = [&]() {
-          if (bits == 4)
-            rwkv7_w4a16_linear_launch(nullptr, M, K, N, dx.p, dq.p, ds.p, dy.p,
-                                      128, workspace.p, workspace_bytes);
-          else
             rwkv7_w8a16_linear_launch(
                 nullptr, M, K, N, dx.p,
                 reinterpret_cast<const std::int8_t *>(dq.p), ds.p,

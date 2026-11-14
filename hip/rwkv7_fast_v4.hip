@@ -24,7 +24,6 @@
 #include "rwkv/runtime/rwkv_server_backend.hpp"
 #include "rwkv7_fast_v4_kernels.hip.hpp"
 #include "rwkv_quantized.hpp"
-#include "rwkv_w4a16.cuh"
 #include "rwkv_w8a16.cuh"
 
 namespace {
@@ -810,20 +809,7 @@ void load_quantized_tensor(
     GpuTensor* tensor) {
   std::vector<std::uint8_t> data;
   require_result(archive.read_data(rec, &data).ok_status(), "read quantized tensor " + rec.name);
-  if (rec.dtype == llm_infer::QuantizedDType::kInt4) {
-    require_result(rec.shape.size() == 2, "INT4 weight must be rank-2: " + rec.name);
-    tensor->dtype = GpuTensor::DType::I4;
-    tensor->quant_group_size = rec.quant_group_size;
-    tensor->i4.resize(data.size(), "alloc int4 weight");
-    tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int4 scales");
-    std::vector<std::uint16_t> scales;
-    require_result(archive.read_scales(rec, &scales).ok_status(), "read INT4 scales");
-    check_hip(hipMemcpy(tensor->i4.p, data.data(), data.size(), hipMemcpyHostToDevice),
-               "copy int4 weight");
-    check_hip(hipMemcpy(tensor->scale.p, scales.data(), scales.size() * sizeof(std::uint16_t),
-                          hipMemcpyHostToDevice), "copy int4 scales");
-    return;
-  }
+
   if (rec.dtype == llm_infer::QuantizedDType::kInt8) {
     tensor->dtype = GpuTensor::DType::I8;
     tensor->i8.resize(static_cast<std::size_t>(rec.numel), "alloc int8 weight");
@@ -875,7 +861,8 @@ HipWeights load_quantized_model_weights(
       return;
     }
     const auto& rec = *it->second;
-    if (rec.dtype == llm_infer::QuantizedDType::kInt4 || rec.dtype == llm_infer::QuantizedDType::kInt8) {
+    require_result(!llm_infer::asym_bits(rec.dtype), "SB6 inference requires CUDA");
+    if (rec.dtype == llm_infer::QuantizedDType::kInt8) {
       const bool linear = key == "head.weight" ||
           ends_with(key, "att.receptance.weight") || ends_with(key, "att.key.weight") ||
           ends_with(key, "att.value.weight") || ends_with(key, "att.output.weight") ||
@@ -886,23 +873,15 @@ HipWeights load_quantized_model_weights(
     auto tensor = std::make_unique<GpuTensor>();
     tensor->name = rec.name;
     tensor->shape = rec.shape;
-    if (rec.dtype != llm_infer::QuantizedDType::kInt4 && rec.dtype != llm_infer::QuantizedDType::kInt8 && should_transpose_like_v3a(rec.name)) {
+    if (rec.dtype != llm_infer::QuantizedDType::kInt8 && should_transpose_like_v3a(rec.name)) {
       tensor->shape = {rec.shape[1], rec.shape[0]};
     }
     tensor->dtype = rec.dtype == llm_infer::QuantizedDType::kInt8
                         ? GpuTensor::DType::I8
-                        : rec.dtype == llm_infer::QuantizedDType::kInt4
-                              ? GpuTensor::DType::I4
-                              : GpuTensor::DType::F16;
+                        : GpuTensor::DType::F16;
     if (tensor->is_int8()) {
       tensor->i8.resize(static_cast<std::size_t>(rec.numel), "alloc int8 tensor");
       tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int8 tensor scales");
-    } else if (tensor->is_int4()) {
-      const std::size_t rows = static_cast<std::size_t>(rec.shape[0]);
-      const std::size_t cols = static_cast<std::size_t>(rec.shape[1]);
-      tensor->i4.resize(rows * (cols / 2 + cols % 2), "alloc int4 tensor");
-      tensor->scale.resize(static_cast<std::size_t>(rec.scale_count), "alloc int4 tensor scales");
-      tensor->quant_group_size = rec.quant_group_size;
     } else {
       tensor->f16.resize(static_cast<std::size_t>(rec.numel), "alloc quantized f16 tensor");
     }
@@ -1196,10 +1175,7 @@ void linear_weight_launch(hipStream_t stream, const PathConfig& path, LinearGrou
                           void* workspace, std::size_t bytes, half* y) {
   if (w->is_quantized() && (w->shape.size() != 2 || w->shape[0] != N || w->shape[1] != K))
     throw std::runtime_error("quantized projection shape mismatch: " + w->name);
-  if (w->is_int4()) {
-    rwkv7_w4a16_linear_launch(stream, M, K, N, x, w->i4.p,
-        reinterpret_cast<const half*>(w->scale.p), y, w->quant_group_size, workspace, bytes);
-  } else if (w->is_int8()) {
+  if (w->is_int8()) {
     rwkv7_w8a16_linear_launch(stream, M, K, N, x, w->i8.p,
         reinterpret_cast<const half*>(w->scale.p), W8BLayout::NK, y, workspace, bytes);
   } else {

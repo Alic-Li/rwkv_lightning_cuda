@@ -43,9 +43,9 @@ type tuneRequest struct {
 	VisibleDevices *string `json:"visible_devices,omitempty"`
 }
 type quantizeRequest struct {
-	InputPath      string  `json:"input_path"`
-	OutputPath     string  `json:"output_path"`
-	Format         string  `json:"format"`
-	GroupSize      int     `json:"group_size"`
-	VisibleDevices *string `json:"visible_devices,omitempty"`
+	InputPath          string  `json:"input_path"`
+	OutputPath         string  `json:"output_path"`
+	Format             string  `json:"format"`
+	CalibratedManifest string  `json:"calibrated_manifest"`
+	VisibleDevices     *string `json:"visible_devices,omitempty"`
 }

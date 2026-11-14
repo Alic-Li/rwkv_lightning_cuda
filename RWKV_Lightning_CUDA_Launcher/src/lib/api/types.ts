@@ -244,13 +244,13 @@ export interface TuningConfig {
   visible_devices?: string;
 }
 
-export type QuantizationFormat = "w8a16" | "w4a16";
+export type QuantizationFormat = "w8a16" | "w4a16_asym" | "w6a16_asym";
 
 export interface QuantizationConfig {
   input_path: string;
   output_path: string;
   format: QuantizationFormat;
-  group_size: 32 | 128;
+  calibrated_manifest: string;
   visible_devices?: string;
 }
 

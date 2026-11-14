@@ -35,7 +35,7 @@ Single-file adapter registration validation:
 - 16 optimizer updates: loss 5.2124 → 2.9414 on a repeated ASCII fixture.
 - Continuous four updates versus two updates plus resume: bitwise identical
   FP32 master D, moments and FP16 inference exports.
-- Dynamic FP16, W8A16 and W4A16: prefill/decode, full/chunked prefill,
+- Dynamic FP16 and W8A16: prefill/decode, full/chunked prefill,
   concurrent different content versions and scales, zero-scale equivalence,
   incompatible-state rejection, SQLite identity round trip, eviction/reload.
 - RAM, GPU and staging admission rejection; single upload for eight concurrent
@@ -50,8 +50,8 @@ validates the chain and serialization; it is not a quality benchmark on a
 pretrained model or a large-model training stability result.
 
 Production-binary smoke tests also passed on this machine: one state-tuning
-update with shared WKV tape and checkpoint export; fresh W8A16 and W4A16
-quantization plus MiSS inference on both archives; HTTP adapter registration,
+update with shared WKV tape and checkpoint export; fresh W8A16
+quantization plus MiSS inference on the archive; HTTP adapter registration,
 cold/hot generation, listing, and deletion; and an unquantized 7.2B server
 request. The 7.2B prompt `The capital of France is` produced a coherent greedy
 continuation and exercised server status and token-count endpoints.
