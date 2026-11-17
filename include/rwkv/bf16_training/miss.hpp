@@ -21,6 +21,7 @@ using Block = std::array<Linear, TargetCount>;
 void forward(cudaStream_t, int rows, const Linear &, const bf16 *x, bf16 *y,
              float *reduced = nullptr);
 // Adds adapter contribution to the already-computed frozen-base dx.
+// dx may be null when only adapter parameter gradients are needed.
 void backward(cudaStream_t, int rows, const Linear &, const float *reduced,
               const bf16 *dy, bf16 *dx);
 void cast_master(cudaStream_t, const float *, bf16 *, std::size_t);

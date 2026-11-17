@@ -210,15 +210,11 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
     for (int t = stop - 1; t >= first; --t) {
       const long long token = (static_cast<long long>(t) * H + head) * kN;
       const float *before = history + (t - first) * kN * kN;
-      float column[kN];
-#pragma unroll
-      for (int key = 0; key < kN; ++key)
-        column[key] = before[key * kN + value];
       const float *sa = sa_history + (t - first) * kN;
       __syncthreads();
 #pragma unroll
       for (int key = 0; key < kN; ++key)
-        previous[key * kPad + value] = column[key];
+        previous[key * kPad + value] = before[key * kN + value];
       r[value] = as_float(r_ptr[token + value]);
       const float raw_w = as_float(w_ptr[token + value]);
       w_sig[value] = 1.0f / (1.0f + expf(-raw_w));

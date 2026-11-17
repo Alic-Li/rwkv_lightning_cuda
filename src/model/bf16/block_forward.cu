@@ -13,7 +13,6 @@ namespace {
 constexpr int kN = 64;
 constexpr int kThreads = 256;
 constexpr float kLnEps = 1.0e-5f;
-constexpr float kGnEps = 64.0e-5f;
 
 __global__ void alpha_kernel(int C, const bf16 *__restrict__ a0,
                              const bf16 *__restrict__ a12,
@@ -42,39 +41,6 @@ vres_forward_kernel(int C, const bf16 *__restrict__ base,
   const float b = to_float(base[i]);
   gate[i] = to_bf16(g);
   out[i] = to_bf16(b + (to_float(first[i]) - b) * g);
-}
-
-__device__ __forceinline__ float warp_sum(float x) {
-#pragma unroll
-  for (int offset = 16; offset; offset >>= 1) {
-    x += __shfl_down_sync(0xffffffffu, x, offset);
-  }
-  return x;
-}
-
-__global__ __launch_bounds__(kN) void group_norm_forward_kernel(
-    int H, const bf16 *__restrict__ x, const bf16 *__restrict__ weight,
-    const bf16 *__restrict__ bias, bf16 *__restrict__ y) {
-  const int bth = blockIdx.x;
-  const int head = bth % H;
-  const int lane = threadIdx.x;
-  const long long i = static_cast<long long>(bth) * kN + lane;
-  const int c = head * kN + lane;
-  const float value = to_float(x[i]);
-  float sum = warp_sum(value);
-  __shared__ float partial[2];
-  if ((lane & 31) == 0)
-    partial[lane >> 5] = sum;
-  __syncthreads();
-  const float mean = (partial[0] + partial[1]) / kN;
-  __syncthreads();
-  const float centered = value - mean;
-  float square = warp_sum(centered * centered);
-  if ((lane & 31) == 0)
-    partial[lane >> 5] = square;
-  __syncthreads();
-  const float rstd = rsqrtf((partial[0] + partial[1]) / kN + kGnEps);
-  y[i] = to_bf16(centered * rstd * to_float(weight[c]) + to_float(bias[c]));
 }
 
 struct Arena {
@@ -286,13 +252,10 @@ void block_forward_state_tuning_bf16(
               tape.raw_w, tape.wkv_k, tape.v, tape.neg_kk, tape.kka, tape.wkv_y,
               final_state, tape.wkv_replay_initial ? WkvTapeView{} : tape.wkv);
 
-  group_norm_forward_kernel<<<rows * w.heads, kN, 0, stream>>>(
-      w.heads, tape.wkv_y, w.att_group_norm_weight, w.att_group_norm_bias,
-      tape.att_group_norm);
   rwkv7_tmix_lnx_rkvres_xg_launch(
       stream, dense, T, C, w.heads, tape.wkv_y, tape.r, tape.wkv_k, tape.v, w.r_k,
       w.att_group_norm_weight, w.att_group_norm_bias, tape.att_gate,
-      attention_post);
+      attention_post, tape.att_group_norm);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, C, attention_post,
                                     w.output, attention_out);
   rwkv_bf16_miss::forward(stream, rows, w.miss[3], attention_post,

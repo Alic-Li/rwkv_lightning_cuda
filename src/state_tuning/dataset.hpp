@@ -13,6 +13,8 @@ namespace rwkv7_state_tuning {
 struct TextSegment {
   std::string text;
   bool train = true;
+  // Optional training label after this segment; never inserted into inputs.
+  int end_target = -1;
 };
 
 class JsonlTextReader {

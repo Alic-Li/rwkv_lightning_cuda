@@ -200,7 +200,9 @@ block_backward_workspace_bf16_elements(int batch, int time,
 
 // grad_out/grad_in are [B,T,C]. The model executor calls this from layer N to
 // layer 0 and ping-pongs those two long-lived buffers. workspace is ephemeral
-// per-block scratch and is reused for every layer.
+// per-block scratch and is reused for every layer. At layer 0 only, grad_in
+// may be null to skip the embedding-side gradient. Other requested outputs,
+// including att_shift_grad, are still computed.
 void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
                                bf16 *grad_in, BlockBackwardState state_grad,
                                const BlockTapeView &tape,
@@ -259,16 +261,20 @@ const bf16 *model_output_backward_state_only(
     BlockBackwardState *state_gradients, const bf16 *final_block_output,
     const bf16 *ln_out_weight, const bf16 *head_weight_orig, int vocab,
     const bf16 *d_logits, bf16 *gradient_ping, bf16 *gradient_pong,
-    bf16 *block_workspace, std::size_t block_workspace_elements);
+    bf16 *block_workspace, std::size_t block_workspace_elements,
+    bool compute_input_gradient = true);
 
 // Reverse-order block scheduler. gradient_ping and gradient_pong are the only
 // two model-sized [B,T,C] gradient buffers. The return value aliases one of
-// them and is the gradient at the embedding side.
+// them and is the gradient at the embedding side. With compute_input_gradient
+// false, that output is skipped and the return value is null; requested state
+// and shift gradients are still computed.
 const bf16 *model_backward_state_only(
     cudaStream_t stream, int layers, const FrozenBlockWeights *weights,
     const BlockTapeView *tapes, BlockBackwardState *state_gradients,
     const bf16 *output_gradient, bf16 *gradient_ping, bf16 *gradient_pong,
-    bf16 *block_workspace, std::size_t block_workspace_elements);
+    bf16 *block_workspace, std::size_t block_workspace_elements,
+    bool compute_input_gradient = true);
 
 // Reduces [B,H,K,V] to the trainable [H,K,V]. Set accumulate=true when
 // accumulating micro-batches.

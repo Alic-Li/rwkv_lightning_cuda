@@ -3,6 +3,7 @@
 namespace rwkv_bf16_nora {
 void forward(cudaStream_t, int, const rwkv_bf16_miss::Linear &, const bf16 *,
              bf16 *, float *);
+// dx may be null when only adapter parameter gradients are needed.
 void backward(cudaStream_t, int, const rwkv_bf16_miss::Linear &, const bf16 *x,
               const float *latent, const bf16 *dy, bf16 *dx,
               float *latent_gradient);

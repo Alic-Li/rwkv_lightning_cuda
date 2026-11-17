@@ -140,6 +140,7 @@ TextSegment parse_segment(const std::string &line, std::size_t &at) {
   expect(line, at, '{', "segment must be an object");
   bool has_text = false;
   bool has_train = false;
+  bool has_end_target = false;
   TextSegment segment;
   while (true) {
     const std::string key = json_string(line, at);
@@ -150,9 +151,13 @@ TextSegment parse_segment(const std::string &line, std::size_t &at) {
     } else if (key == "train" && !has_train) {
       segment.train = json_bool(line, at);
       has_train = true;
+    } else if (key == "end_target" && !has_end_target) {
+      if (at >= line.size() || line[at++] != '0')
+        throw std::runtime_error("end_target must be EOS token 0");
+      segment.end_target = 0;
+      has_end_target = true;
     } else {
-      throw std::runtime_error(
-          "segment must contain exactly one text and one train field");
+      throw std::runtime_error("unknown or duplicate segment field");
     }
     whitespace(line, at);
     if (at < line.size() && line[at] == ',') {
@@ -164,6 +169,8 @@ TextSegment parse_segment(const std::string &line, std::size_t &at) {
   }
   if (!has_text || !has_train)
     throw std::runtime_error("segment requires both text and train");
+  if (has_end_target && (!segment.train || segment.text.empty()))
+    throw std::runtime_error("end_target requires a nonempty trained segment");
   return segment;
 }
 
@@ -232,7 +239,7 @@ bool JsonlTextReader::next(std::string &text) {
   std::vector<TextSegment> segments;
   if (!next(segments))
     return false;
-  if (segments.size() != 1 || !segments[0].train)
+  if (segments.size() != 1 || !segments[0].train || segments[0].end_target != -1)
     throw std::runtime_error(path_ + ":" + std::to_string(line_number_) +
                              ": expected a plain text row");
   text = std::move(segments[0].text);

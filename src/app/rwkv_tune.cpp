@@ -51,6 +51,7 @@ constexpr const char *program_name =
 // because the tuned initial state receives its gradient through them.
 struct Sample {
   std::vector<int> tokens;
+  std::vector<int> labels;
   std::vector<unsigned char> train;
 };
 
@@ -517,15 +518,25 @@ int main(int argc, char **argv) {
           // Segments are tokenized independently so the mask follows their
           // boundaries exactly.
           Sample sample;
+          std::vector<std::size_t> eos_positions;
           for (const auto &segment : segments) {
             const auto encoded = tokenizer.encode(segment.text);
             sample.tokens.insert(sample.tokens.end(), encoded.begin(),
                                  encoded.end());
             sample.train.insert(sample.train.end(), encoded.size(),
                                 segment.train ? 1 : 0);
+            if (segment.end_target == 0) eos_positions.push_back(sample.tokens.size());
           }
-          std::size_t count = std::min(
-              sample.tokens.size(), static_cast<std::size_t>(options.ctx) + 1);
+          sample.labels = sample.tokens;
+          for (const auto position : eos_positions) {
+            if (position >= sample.tokens.size() || sample.train[position])
+              throw std::runtime_error("EOS label collides with trained input or missing boundary");
+            sample.labels[position] = 0;
+            sample.train[position] = 1;
+          }
+          if (sample.tokens.size() > static_cast<std::size_t>(options.ctx) + 1)
+            throw std::runtime_error("Training row exceeds ctx; use a longer context bucket (truncation forbidden)");
+          std::size_t count = sample.tokens.size();
           // Positions after the last trained target carry no gradient.
           while (count >= 2 && !sample.train[count - 1])
             --count;
@@ -534,6 +545,7 @@ int main(int argc, char **argv) {
             continue;
           }
           sample.tokens.resize(count);
+          sample.labels.resize(count);
           sample.train.resize(count);
           batch_tokens += static_cast<std::size_t>(
               std::count(sample.train.begin() + 1, sample.train.end(), 1));
@@ -584,16 +596,17 @@ int main(int argc, char **argv) {
             const auto &sample = batch[first];
             std::vector<float> weights(sample.train.begin(), sample.train.end());
             batch_loss += executor.backward(frozen, sample.tokens, weights,
-                                             time_state.p, batch_tokens);
+                                             time_state.p, batch_tokens, 1.0f, &sample.labels);
           } else {
-            std::vector<std::vector<int>> tokens;
+            std::vector<std::vector<int>> tokens, labels;
             std::vector<std::vector<float>> weights;
             for (std::size_t i = first; i < last; ++i) {
               tokens.push_back(batch[i].tokens);
+              labels.push_back(batch[i].labels);
               weights.emplace_back(batch[i].train.begin(), batch[i].train.end());
             }
             batch_loss += executor.backward_packed(frozen, tokens, weights,
-                                                    time_state.p, batch_tokens);
+                                                    time_state.p, batch_tokens, 1.0f, &labels);
           }
 #if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
 #ifdef RWKV_NCCL_DP

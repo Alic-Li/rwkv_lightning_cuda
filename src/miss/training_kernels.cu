@@ -185,7 +185,7 @@ void backward(cudaStream_t stream, int rows, const Linear &w, const float *s,
   if (!w.d)
     return;
   validate(rows, w);
-  if (!g || !dx || (w.gradient && !s))
+  if (!g || (w.gradient && !s))
     throw std::invalid_argument("null MiSS backward input");
   if (w.gradient) {
     if (rows < 32)
@@ -198,8 +198,9 @@ void backward(cudaStream_t stream, int rows, const Linear &w, const float *s,
       grad_d<<<w.out * w.rank, threads, 0, stream>>>(rows, w.out, w.rank,
                                                      w.scale, s, g, w.gradient);
   }
-  grad_x<<<dim3(rows, w.rank), threads, 0, stream>>>(w.in, w.out, w.rank,
-                                                     w.scale, w.d, g, dx);
+  if (dx)
+    grad_x<<<dim3(rows, w.rank), threads, 0, stream>>>(w.in, w.out, w.rank,
+                                                       w.scale, w.d, g, dx);
   checked();
 }
 void cast_master(cudaStream_t stream, const float *x, bf16 *y, size_t n) {

@@ -14,16 +14,52 @@
 #include <string>
 namespace rwkv_bf16_training {
 namespace {
-__device__ float sum(float v, float *s) {
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    v += __shfl_down_sync(0xffffffffu, v, offset);
+  return v;
+}
+__device__ __forceinline__ float sum64(float v, float *s) {
   __syncthreads();
-  int i = threadIdx.x;
-  s[i] = v;
+  int t = threadIdx.x;
+  if (t >= 32)
+    s[t - 32] = v;
   __syncthreads();
-  for (int k = blockDim.x / 2; k; k /= 2) {
-    if (i < k)
-      s[i] += s[i + k];
-    __syncthreads();
+  if (t < 32) {
+    v = warp_sum(v + s[t]);
+    if (t == 0)
+      s[0] = v;
   }
+  __syncthreads();
+  return s[0];
+}
+__device__ __forceinline__ float sum64_warp(float v, float *s) {
+  __syncthreads();
+  int lane = threadIdx.x;
+  v = warp_sum(v);
+  if ((lane & 31) == 0)
+    s[lane >> 5] = v;
+  __syncthreads();
+  return s[0] + s[1];
+}
+__device__ __forceinline__ float sum256(float v, float *s) {
+  __syncthreads();
+  int t = threadIdx.x;
+  s[t] = v;
+  __syncthreads();
+  if (t < 128)
+    s[t] += s[t + 128];
+  __syncthreads();
+  if (t < 64)
+    s[t] += s[t + 64];
+  __syncthreads();
+  if (t < 32) {
+    v = warp_sum(s[t] + s[t + 32]);
+    if (t == 0)
+      s[0] = v;
+  }
+  __syncthreads();
   return s[0];
 }
 __global__ void element(const bf16 *x, const bf16 *y, bf16 *z, long long n,
@@ -51,13 +87,13 @@ __global__ void norm(int C, const bf16 *x, const bf16 *w, const bf16 *b,
   float v = 0;
   for (int i = threadIdx.x; i < C; i += blockDim.x)
     v += to_float(x[off + i]);
-  float mean = sum(v, s) / C;
+  float mean = sum256(v, s) / C;
   v = 0;
   for (int i = threadIdx.x; i < C; i += blockDim.x) {
     float d = to_float(x[off + i]) - mean;
     v += d * d;
   }
-  float inv = rsqrtf(sum(v, s) / C + eps);
+  float inv = rsqrtf(sum256(v, s) / C + eps);
   for (int i = threadIdx.x; i < C; i += blockDim.x)
     y[off + i] = to_bf16((to_float(x[off + i]) - mean) * inv * to_float(w[i]) +
                          to_float(b[i]));
@@ -75,6 +111,26 @@ __global__ void mix(int B, int T, int C, const int *offsets, const bf16 *x,
   float p = to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
   y[i] = to_bf16(v + (p - v) * to_float(w[c]));
 }
+__global__ void mix6(int B, int T, int C, const int *offsets, const bf16 *x,
+                     const bf16 *shift, const bf16 *wr, const bf16 *ww,
+                     const bf16 *wk, const bf16 *wv, const bf16 *wa,
+                     const bf16 *wg, bf16 *yr, bf16 *yw, bf16 *yk, bf16 *yv,
+                     bf16 *ya, bf16 *yg) {
+  size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (i >= size_t(offsets ? 1 : B) * T * C)
+    return;
+  int c = i % C;
+  LaneRow at = lane_row(offsets, B, T, i / C);
+  float v = to_float(x[i]);
+  float p = to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
+  float d = p - v;
+  yr[i] = to_bf16(v + d * to_float(wr[c]));
+  yw[i] = to_bf16(v + d * to_float(ww[c]));
+  yk[i] = to_bf16(v + d * to_float(wk[c]));
+  yv[i] = to_bf16(v + d * to_float(wv[c]));
+  ya[i] = to_bf16(v + d * to_float(wa[c]));
+  yg[i] = to_bf16(v + d * to_float(wg[c]));
+}
 // An empty packed lane keeps its incoming shift.
 __global__ void shift_last(int B, int T, int C, const int *offsets,
                            const bf16 *x, bf16 *s) {
@@ -90,11 +146,11 @@ __global__ void shift_last(int B, int T, int C, const int *offsets,
 __global__ void kk(int H, const bf16 *k, const bf16 *kw, const bf16 *a0,
                    const bf16 *a12, const bf16 *ka, bf16 *nk, bf16 *neg,
                    bf16 *kka) {
-  __shared__ float s[64];
+  __shared__ float s[32];
   int j = threadIdx.x, c = (blockIdx.x % H) * 64 + j;
   size_t i = size_t(blockIdx.x) * 64 + j;
   float v = to_float(k[i]), u = v * to_float(kw[c]);
-  float inv = 1 / fmaxf(sqrtf(sum(u * u, s)), 1e-12f);
+  float inv = 1 / fmaxf(sqrtf(sum64(u * u, s)), 1e-12f);
   float a = 1 / (1 + expf(-to_float(a0[c]) - to_float(a12[i])));
   float b = to_float(ka[c]);
   nk[i] = to_bf16(v * (1 - b + a * b));
@@ -103,18 +159,24 @@ __global__ void kk(int H, const bf16 *k, const bf16 *kw, const bf16 *a0,
 }
 __global__ void post(int H, const bf16 *x, const bf16 *r, const bf16 *k,
                      const bf16 *v, const bf16 *rk, const bf16 *w,
-                     const bf16 *b, const bf16 *g, bf16 *y) {
-  __shared__ float s[64];
+                     const bf16 *b, const bf16 *g, bf16 *y, bf16 *gn_out) {
+  __shared__ float s[32];
   int j = threadIdx.x, c = (blockIdx.x % H) * 64 + j;
   size_t i = size_t(blockIdx.x) * 64 + j;
   float a = to_float(x[i]);
-  float mean = sum(a, s) / 64;
+  float mean = sum64(a, s) / 64;
   float d = a - mean;
-  float inv = rsqrtf(sum(d * d, s) / 64 + 64e-5f);
-  float q = sum(to_float(r[i]) * to_float(k[i]) * to_float(rk[c]), s);
-  y[i] =
-      to_bf16((d * inv * to_float(w[c]) + to_float(b[c]) + q * to_float(v[i])) *
-              to_float(g[i]));
+  float inv = rsqrtf(sum64(d * d, s) / 64 + 64e-5f);
+  float q = sum64(to_float(r[i]) * to_float(k[i]) * to_float(rk[c]), s);
+  float wf = to_float(w[c]), bf = to_float(b[c]);
+  float gn = d * inv * wf + bf;
+  if (gn_out) {
+    float m2 = sum64_warp(a, s) / 64;
+    float d2 = a - m2;
+    float inv2 = rsqrtf(sum64_warp(d2 * d2, s) / 64 + 64e-5f);
+    gn_out[i] = to_bf16(d2 * inv2 * wf + bf);
+  }
+  y[i] = to_bf16((gn + q * to_float(v[i])) * to_float(g[i]));
 }
 thread_local bool consistent_forward = false;
 thread_local bool tensor_forward = false;
@@ -332,6 +394,7 @@ void set_consistent_forward(bool enabled, bool tensor_cores, int rows) {
   tensor_forward = tensor_cores;
   pin_rows = rows;
 }
+bool consistent_forward_enabled() { return consistent_forward; }
 void rwkv7_v3a_linear_bf16_launch(cudaStream_t s, int M, int K, int N,
                                   const bf16 *x, const bf16 *w, bf16 *y) {
   gemm(s, M, K, N, x, w, y, false);
@@ -377,11 +440,9 @@ void rwkv7_tmix_mix6_launch(cudaStream_t s, int B, int T, int C, const bf16 *x,
                             const bf16 *wk, const bf16 *wv, const bf16 *wa,
                             const bf16 *wg, bf16 *r, bf16 *w, bf16 *k, bf16 *v,
                             bf16 *a, bf16 *g, const int *offsets) {
-  const bf16 *ws[] = {wr, ww, wk, wv, wa, wg};
-  bf16 *ys[] = {r, w, k, v, a, g};
   const size_t n = size_t(offsets ? 1 : B) * T * C;
-  for (int j = 0; j < 6; ++j)
-    mix<<<(n + 255) / 256, 256, 0, s>>>(B, T, C, offsets, x, sh, ws[j], ys[j]);
+  mix6<<<(n + 255) / 256, 256, 0, s>>>(B, T, C, offsets, x, sh, wr, ww, wk, wv,
+                                       wa, wg, r, w, k, v, a, g);
   shift_last<<<(B * C + 255) / 256, 256, 0, s>>>(B, T, C, offsets, x, sh);
 }
 void rwkv7_tmix_kk_a_gate_launch(cudaStream_t s, int B, int T, int C, int H,
@@ -394,8 +455,9 @@ void rwkv7_tmix_lnx_rkvres_xg_launch(cudaStream_t s, int B, int T, int C, int H,
                                      const bf16 *x, const bf16 *r,
                                      const bf16 *k, const bf16 *v,
                                      const bf16 *rk, const bf16 *w,
-                                     const bf16 *b, const bf16 *g, bf16 *y) {
-  post<<<B * T * H, 64, 0, s>>>(H, x, r, k, v, rk, w, b, g, y);
+                                     const bf16 *b, const bf16 *g, bf16 *y,
+                                     bf16 *gn_out) {
+  post<<<B * T * H, 64, 0, s>>>(H, x, r, k, v, rk, w, b, g, y, gn_out);
 }
 } // namespace rwkv_bf16_training
 namespace rwkv_bf16_training {
@@ -403,6 +465,41 @@ __global__ void transpose_kernel(int rows, int cols, const bf16 *x, bf16 *y) {
   size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (i < size_t(rows) * cols)
     y[(i % cols) * rows + i / cols] = x[i];
+}
+__global__ void gather_rows_kernel(int active_rows, int C, const bf16 *src,
+                                   const int *row_indices, bf16 *dst) {
+  size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (i >= size_t(active_rows) * C)
+    return;
+  int r = int(i / C), c = int(i % C);
+  dst[i] = src[size_t(row_indices[r]) * C + c];
+}
+__global__ void scatter_rows_kernel(int active_rows, int C, const bf16 *src,
+                                    const int *row_indices, bf16 *dst) {
+  size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (i >= size_t(active_rows) * C)
+    return;
+  int r = int(i / C), c = int(i % C);
+  dst[size_t(row_indices[r]) * C + c] = src[i];
+}
+void rwkv7_gather_rows_bf16_launch(cudaStream_t stream, int active_rows, int C,
+                                   const bf16 *src, const int *row_indices,
+                                   bf16 *dst) {
+  size_t n = size_t(active_rows) * C;
+  if (n > 0)
+    gather_rows_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        active_rows, C, src, row_indices, dst);
+}
+void rwkv7_scatter_rows_bf16_launch(cudaStream_t stream, int total_rows,
+                                    int active_rows, int C, const bf16 *src,
+                                    const int *row_indices, bf16 *dst) {
+  gpu_check(cudaMemsetAsync(dst, 0, size_t(total_rows) * C * sizeof(bf16),
+                            stream),
+            "zero scattered rows");
+  size_t n = size_t(active_rows) * C;
+  if (n > 0)
+    scatter_rows_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        active_rows, C, src, row_indices, dst);
 }
 void transpose_bf16(int rows, int cols, const bf16 *x, bf16 *y) {
   transpose_kernel<<<(size_t(rows) * cols + 255) / 256, 256>>>(rows, cols, x,

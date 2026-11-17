@@ -12,7 +12,8 @@ const bf16 *model_output_backward_state_only(
     BlockBackwardState *state_gradients, const bf16 *final_block_output,
     const bf16 *ln_out_weight, const bf16 *head_weight_orig, int vocab,
     const bf16 *d_logits, bf16 *gradient_ping, bf16 *gradient_pong,
-    bf16 *block_workspace, std::size_t block_workspace_elements) {
+    bf16 *block_workspace, std::size_t block_workspace_elements,
+    bool compute_input_gradient) {
   if (layers <= 0 || batch <= 0 || time <= 0 || !weights || !tapes ||
       !state_gradients || !final_block_output || !ln_out_weight ||
       !head_weight_orig || vocab <= 0 || !d_logits || !gradient_ping ||
@@ -28,14 +29,16 @@ const bf16 *model_output_backward_state_only(
                                  1.0e-5f);
   return model_backward_state_only(
       stream, layers, weights, tapes, state_gradients, gradient_pong,
-      gradient_ping, gradient_pong, block_workspace, block_workspace_elements);
+      gradient_ping, gradient_pong, block_workspace, block_workspace_elements,
+      compute_input_gradient);
 }
 
 const bf16 *model_backward_state_only(
     cudaStream_t stream, int layers, const FrozenBlockWeights *weights,
     const BlockTapeView *tapes, BlockBackwardState *state_gradients,
     const bf16 *output_gradient, bf16 *gradient_ping, bf16 *gradient_pong,
-    bf16 *block_workspace, std::size_t block_workspace_elements) {
+    bf16 *block_workspace, std::size_t block_workspace_elements,
+    bool compute_input_gradient) {
   if (layers <= 0 || !weights || !tapes || !state_gradients ||
       !output_gradient || !gradient_ping || !gradient_pong ||
       !block_workspace) {
@@ -84,10 +87,11 @@ const bf16 *model_backward_state_only(
     if (layer_workspace > block_workspace_elements) {
       throw std::invalid_argument("model block workspace is too small");
     }
-    block_backward_state_only(stream, current, next, state_gradients[layer],
+    bf16 *grad_in = layer == 0 && !compute_input_gradient ? nullptr : next;
+    block_backward_state_only(stream, current, grad_in, state_gradients[layer],
                               tapes[layer], weights[layer], block_workspace,
                               block_workspace_elements, layer == 0);
-    current = next;
+    current = grad_in;
     next = next == gradient_ping ? gradient_pong : gradient_ping;
   }
   return current;
