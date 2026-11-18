@@ -40,6 +40,25 @@ void rwkv7_v4_emb_ln0_bf16_to_f16_launch(
 void rwkv7_v4_f16_to_f32_launch(
     cudaStream_t stream, const half* src_f16, float* dst_f32, long long elems);
 
+void rwkv7_v4_copy_state_slice_launch(
+    cudaStream_t stream,
+    int layers,
+    int src_batch,
+    int src_offset,
+    int dst_batch,
+    int dst_offset,
+    int count,
+    std::size_t shift_lane_elems,
+    std::size_t wkv_lane_elems,
+    const half* src_shift,
+    half* dst_shift,
+    const half* src_wkv16,
+    half* dst_wkv16,
+    const float* src_wkv32,
+    float* dst_wkv32,
+    const int* src_elapsed,
+    int* dst_elapsed);
+
 void rwkv7_wkv_fp16_seq_launch(
     cudaStream_t stream, int B, int T, int C, int H,
     half* state, const half* r, const half* w, const half* k, const half* v,

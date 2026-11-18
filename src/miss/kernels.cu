@@ -60,8 +60,18 @@ __global__ void project(int in, int out, int rank, float scale, const half *x,
   if (o >= out)
     return;
   float delta = 0;
-  for (int j = 0; j < rank; ++j)
-    delta = fmaf(s[j], __half2float(d[o * (size_t)rank + j]), delta);
+  const half *d_row = d + o * (size_t)rank;
+  if ((rank & 1) == 0 && (reinterpret_cast<size_t>(d_row) & 3) == 0) {
+    const __half2 *d2 = reinterpret_cast<const __half2 *>(d_row);
+    for (int j = 0; j < rank; j += 2) {
+      const float2 dv = __half22float2(d2[j >> 1]);
+      delta = fmaf(s[j], dv.x, delta);
+      delta = fmaf(s[j + 1], dv.y, delta);
+    }
+  } else {
+    for (int j = 0; j < rank; ++j)
+      delta = fmaf(s[j], __half2float(d_row[j]), delta);
+  }
   const size_t i = row * (size_t)out + o;
   y[i] = __float2half_rn(fmaf(scale, delta, __half2float(y[i])));
 }

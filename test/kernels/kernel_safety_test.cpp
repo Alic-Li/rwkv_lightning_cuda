@@ -119,6 +119,60 @@ void odd_linear() {
       y.p,y1.p,y2.p,y3.p);
   for (auto output : {&y,&y1,&y2,&y3}) near(output->get(),ref.get(),0.002f,"odd K rank projection");
 }
+template<class T> void state_slices() {
+  // Check every destination element, including untouched rows and spare slots.
+  // Odd widths exercise the scalar fallback; aligned widths use vector loads.
+  for (auto shape : {std::pair<int,int>{64,4096},{63,4095}}) {
+    for (bool same_buffer : {false,true}) {
+      constexpr int layers=3, source_capacity=7;
+      const int destination_capacity=same_buffer ? 7 : 5;
+      const int from=same_buffer ? 0 : 2, to=same_buffer ? 5 : 1;
+      const int count=same_buffer ? 2 : 3;
+      const int C=shape.first, W=shape.second;
+      auto values=[](auto type, std::size_t n, int salt) {
+        std::vector<decltype(type)> v(n);
+        for (std::size_t i=0;i<n;++i) v[i]=static_cast<decltype(type)>((i*17+salt)%30001);
+        return v;
+      };
+      auto ss=values(std::uint16_t{},layers*2*source_capacity*C,11);
+      auto sw=values(T{},layers*source_capacity*W,23);
+      auto se=values(int{},source_capacity,37);
+      auto ds=same_buffer ? ss : values(std::uint16_t{},layers*2*destination_capacity*C,47);
+      auto dw=same_buffer ? sw : values(T{},layers*destination_capacity*W,59);
+      auto de=same_buffer ? se : values(int{},destination_capacity,71);
+      Buffer<std::uint16_t> source_shift(ss), destination_shift(ds);
+      Buffer<T> source_wkv(sw), destination_wkv(dw);
+      Buffer<int> source_elapsed(se), destination_elapsed(de);
+      auto* shift=same_buffer ? source_shift.p : destination_shift.p;
+      auto* wkv=same_buffer ? source_wkv.p : destination_wkv.p;
+      auto* elapsed=same_buffer ? source_elapsed.p : destination_elapsed.p;
+      auto copy_rows=[&](const auto& src, auto& dst, int blocks, int width) {
+        for (int block=0;block<blocks;++block)
+          std::copy_n(src.begin()+(std::size_t(block)*source_capacity+from)*width,
+                      count*width,
+                      dst.begin()+(std::size_t(block)*destination_capacity+to)*width);
+      };
+      copy_rows(ss,ds,layers*2,C);
+      copy_rows(sw,dw,layers,W);
+      copy_rows(se,de,1,1);
+      cudaStream_t stream;
+      check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+      rwkv7_v4_copy_state_slice_launch(
+          stream,layers,source_capacity,from,destination_capacity,to,count,C,W,
+          reinterpret_cast<const half*>(source_shift.p),reinterpret_cast<half*>(shift),
+          sizeof(T)==2 ? reinterpret_cast<const half*>(source_wkv.p) : nullptr,
+          sizeof(T)==2 ? reinterpret_cast<half*>(wkv) : nullptr,
+          sizeof(T)==4 ? reinterpret_cast<const float*>(source_wkv.p) : nullptr,
+          sizeof(T)==4 ? reinterpret_cast<float*>(wkv) : nullptr,
+          source_elapsed.p,elapsed);
+      check(cudaStreamSynchronize(stream));
+      check(cudaStreamDestroy(stream));
+      require((same_buffer ? source_shift.get() : destination_shift.get())==ds,"state slice shifts");
+      require((same_buffer ? source_wkv.get() : destination_wkv.get())==dw,"state slice WKV");
+      require((same_buffer ? source_elapsed.get() : destination_elapsed.get())==de,"state slice elapsed");
+    }
+  }
+}
 void odd_elementwise() {
   const auto input=pattern(65);
   Buffer<half> x(input), y(65), v(std::vector<half>(5,__float2half(1.0f)));
@@ -205,6 +259,7 @@ int main() {
   try {
     int count=0; if (cudaGetDeviceCount(&count)!=cudaSuccess || !count) return 77;
     sampling();
+    state_slices<std::uint16_t>(); state_slices<float>();
     for (auto bt : {std::pair<int,int>{1,8},{4,4},{3,3},{65,1},{129,1}}) wkv(bt.first,bt.second);
     sparse(256,512,2); sparse(768,384,2); sparse(512,1024,2);
     odd_linear(); odd_elementwise(); normalization_tiles(); quantized_batch(); concurrent_linear();
