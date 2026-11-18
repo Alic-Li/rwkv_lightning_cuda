@@ -111,6 +111,34 @@ template <bool TR> void expansion(int rows, int rank, int cols) {
               << " reference_us=" << time_us(old)
               << " fast_us=" << time_us(fast) << '\n';
 }
+void grad_weight_check(int rows, int rank, int width) {
+  std::mt19937 gen(9012);
+  DeviceBuffer<bf16> g, x;
+  DeviceBuffer<float> s, da0, da1, db0, db1;
+  fill(g, size_t(rows) * width, gen);
+  fill(x, size_t(rows) * width, gen);
+  fill(s, size_t(rows) * rank, gen);
+  fill(da0, size_t(rank) * width, gen);
+  fill(db0, size_t(width) * rank, gen);
+  da1.resize(da0.n, "da1");
+  db1.resize(db0.n, "db1");
+  gpu_check(cudaMemcpy(da1.p, da0.p, da0.n * 4, cudaMemcpyDeviceToDevice), "copy da");
+  gpu_check(cudaMemcpy(db1.p, db0.p, db0.n * 4, cudaMemcpyDeviceToDevice), "copy db");
+  rwkv_nora_detail::gemm<true, false, true>(nullptr, width, rank, rows, g.p,
+                                            s.p, db0.p, .7f);
+  rwkv_bf16_nora::detail::grad_weight(nullptr, width, rank, rows, g.p, s.p,
+                                      db1.p, .7f);
+  rwkv_nora_detail::gemm<true, false, true>(nullptr, rank, width, rows, s.p,
+                                            x.p, da0.p, 1.0f);
+  rwkv_bf16_nora::detail::grad_weight(nullptr, rank, width, rows, s.p, x.p,
+                                      da1.p, 1.0f);
+  auto h_db0 = read(db0), h_db1 = read(db1);
+  auto h_da0 = read(da0), h_da1 = read(da1);
+  if (std::memcmp(h_db0.data(), h_db1.data(), h_db0.size() * 4))
+    throw std::runtime_error("grad_weight dB differs from reference");
+  if (std::memcmp(h_da0.data(), h_da1.data(), h_da0.size() * 4))
+    throw std::runtime_error("grad_weight dA differs from reference");
+}
 int main(int argc, char **argv) {
   try {
     int devices = 0;
@@ -126,6 +154,7 @@ int main(int argc, char **argv) {
           projection<false>(rows, rank, width);
           expansion<true>(rows, rank, width);
           expansion<false>(rows, rank, width);
+          grad_weight_check(rows, rank, width);
         }
     if (!quick)
       for (int rows : {512, 3072})
@@ -134,6 +163,7 @@ int main(int argc, char **argv) {
           projection<false>(rows, 16, width);
           expansion<true>(rows, 16, width);
           expansion<false>(rows, 16, width);
+          grad_weight_check(rows, 16, width);
         }
     std::cout << "NoRA optimized projections/expansions passed\n";
   } catch (const std::exception &e) {

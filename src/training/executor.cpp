@@ -108,16 +108,27 @@ struct Executor::Impl {
       shifts, shift_grad, first, first_grad, workspace, terminal_shift,
       nora_input;
   DeviceBuffer<float> nora_ds;
-  DeviceBuffer<int> targets, offsets;
+  DeviceBuffer<int> targets, offsets, active_rows_dev;
   DeviceBuffer<float> state_gradient, per_batch_gradient, state_batch,
-      state_final, loss, shared_tape, shared_final, carried, weights,
-      reduced_gradient;
+      state_final, loss, chunk_losses, shared_tape, shared_final, carried,
+      weights, reduced_gradient;
   std::vector<OwnedTape> owned;
   std::vector<BlockTapeView> tapes;
   std::vector<BlockBackwardState> gradients;
   std::vector<DeviceBuffer<float>> checkpoints;
   std::vector<DeviceBuffer<bf16>> shift_checkpoints;
   std::vector<uint16_t> host_input;
+  std::vector<float> host_losses;
+  struct PinnedSlot {
+    uint16_t *input = nullptr;
+    int *offsets = nullptr;
+    int *targets = nullptr;
+    int *active_rows = nullptr;
+    float *weights = nullptr;
+    cudaEvent_t copied = nullptr;
+    bool in_flight = false;
+  } staging[2];
+  int next_slot = 0;
   const bf16 *final_block = nullptr;
   Impl(const FrozenModelView &m, int time, cudaStream_t s, int lanes)
       : L(m.layers), C(m.channels), H(m.heads), V(m.vocab), chunk(time),
@@ -137,6 +148,7 @@ struct Executor::Impl {
     dlogits.resize(logits.n, "executor dlogits");
     targets.resize(capacity, "executor targets");
     weights.resize(capacity, "CE row weights");
+    active_rows_dev.resize(capacity, "active CE row indices");
     offsets.resize(B + 1, "packed lane offsets");
     for (auto *b : {&state_gradient, &per_batch_gradient, &carried})
       b->resize(states, "executor states");
@@ -147,6 +159,25 @@ struct Executor::Impl {
     loss.resize(1, "executor loss");
     shared_tape.resize(wkv_tape_elements({B, chunk, H, 64}),
                        "shared WKV replay tape");
+    for (auto &slot : staging) {
+      gpu_check(cudaHostAlloc(reinterpret_cast<void **>(&slot.input),
+                              rows * sizeof(uint16_t), cudaHostAllocDefault),
+                "alloc pinned input");
+      gpu_check(cudaHostAlloc(reinterpret_cast<void **>(&slot.offsets),
+                              (B + 1) * sizeof(int), cudaHostAllocDefault),
+                "alloc pinned offsets");
+      gpu_check(cudaHostAlloc(reinterpret_cast<void **>(&slot.targets),
+                              capacity * sizeof(int), cudaHostAllocDefault),
+                "alloc pinned targets");
+      gpu_check(cudaHostAlloc(reinterpret_cast<void **>(&slot.active_rows),
+                              capacity * sizeof(int), cudaHostAllocDefault),
+                "alloc pinned active rows");
+      gpu_check(cudaHostAlloc(reinterpret_cast<void **>(&slot.weights),
+                              capacity * sizeof(float), cudaHostAllocDefault),
+                "alloc pinned weights");
+      gpu_check(cudaEventCreateWithFlags(&slot.copied, cudaEventDisableTiming),
+                "create staging event");
+    }
     owned.resize(L);
     tapes.resize(L);
     gradients.resize(L);
@@ -162,10 +193,10 @@ struct Executor::Impl {
       const size_t state_at = size_t(l) * B * lane, shift_at = size_t(l) * 2 * B * C;
       gradients[l] = {state_gradient.p + state_at,
                       per_batch_gradient.p + state_at,
-                      shift_grad.p + shift_at,
+                      l == 0 ? nullptr : shift_grad.p + shift_at,
                       shift_grad.p + shift_at + size_t(B) * C,
                       first_grad.p,
-                      terminal_shift.p + shift_at,
+                      l == 0 ? nullptr : terminal_shift.p + shift_at,
                       terminal_shift.p + shift_at + size_t(B) * C};
     }
     size_t nora_in = 0, nora_rank = 0;
@@ -185,9 +216,46 @@ struct Executor::Impl {
     }
     workspace.resize(scratch, "executor block workspace");
   }
+  ~Impl() {
+    for (auto &slot : staging) {
+      if (slot.in_flight && slot.copied)
+        cudaEventSynchronize(slot.copied);
+      if (slot.copied)
+        cudaEventDestroy(slot.copied);
+      if (slot.input)
+        cudaFreeHost(slot.input);
+      if (slot.offsets)
+        cudaFreeHost(slot.offsets);
+      if (slot.targets)
+        cudaFreeHost(slot.targets);
+      if (slot.active_rows)
+        cudaFreeHost(slot.active_rows);
+      if (slot.weights)
+        cudaFreeHost(slot.weights);
+    }
+  }
+  PinnedSlot &acquire_slot() {
+    PinnedSlot &s = staging[next_slot++ & 1];
+    if (s.in_flight) {
+      gpu_check(cudaEventSynchronize(s.copied), "wait staging slot");
+      s.in_flight = false;
+    }
+    return s;
+  }
+  void record_slot(PinnedSlot &s) {
+    gpu_check(cudaEventRecord(s.copied, stream), "record staging slot");
+    s.in_flight = true;
+  }
   void copy(void *to, const void *from, size_t n) {
     gpu_check(cudaMemcpyAsync(to, from, n, cudaMemcpyDeviceToDevice, stream),
               "copy boundary");
+  }
+  void carry_shift_gradient() {
+    // Layer 0 attention shifts depend only on frozen embeddings. Their
+    // gradients are not requested; carry only the written, live suffix.
+    const size_t first = size_t(B) * C;
+    copy(terminal_shift.p + first, shift_grad.p + first,
+         (shift_count - first) * sizeof(bf16));
   }
   void reserve_checkpoints(int count) {
     if (checkpoints.size() < size_t(count)) {
@@ -198,12 +266,18 @@ struct Executor::Impl {
       checkpoints[j].resize(states, "WKV boundary checkpoint");
       shift_checkpoints[j].resize(shift_count, "shift boundary checkpoint");
     }
+    if (chunk_losses.n < size_t(count))
+      chunk_losses.resize(count, "chunk losses");
+    if (host_losses.size() < size_t(count))
+      host_losses.resize(count);
   }
   void zero(void *to, size_t n) {
     gpu_check(cudaMemsetAsync(to, 0, n, stream), "clear adjoint");
   }
-  void sync() const {
+  void sync() {
     gpu_check(cudaStreamSynchronize(stream), "BF16 execution");
+    for (auto &slot : staging)
+      slot.in_flight = false;
   }
   void single_lane() const {
     if (B != 1)
@@ -212,45 +286,50 @@ struct Executor::Impl {
   // Advances every lane by its packed rows [lane_offsets[b],
   // lane_offsets[b + 1]) of tokens. Lanes without rows keep their state.
   void packed_forward(const FrozenModelView &m, const std::vector<int> &tokens,
-                      const std::vector<int> &lane_offsets, bool with_logits) {
+                      const std::vector<int> &lane_offsets, bool with_logits,
+                      bool sync_host = true) {
     const int rows = int(tokens.size());
     if (rows <= 0 || rows > capacity || int(lane_offsets.size()) != B + 1 ||
         lane_offsets.front() != 0 || lane_offsets.back() != rows)
       throw std::invalid_argument("packed forward rows");
-    host_input.resize(size_t(rows) * C);
+    PinnedSlot &slot = acquire_slot();
     for (int t = 0; t < rows; ++t)
       std::copy_n(m.cpu_emb_ln0_bf16 + size_t(tokens[t]) * C, C,
-                  host_input.data() + size_t(t) * C);
-    gpu_check(cudaMemcpyAsync(input.p, host_input.data(), host_input.size() * 2,
+                  slot.input + size_t(t) * C);
+    std::copy(lane_offsets.begin(), lane_offsets.end(), slot.offsets);
+    gpu_check(cudaMemcpyAsync(input.p, slot.input, size_t(rows) * C * 2,
                               cudaMemcpyHostToDevice, stream),
               "upload packed embeddings");
-    gpu_check(cudaMemcpyAsync(offsets.p, lane_offsets.data(),
+    gpu_check(cudaMemcpyAsync(offsets.p, slot.offsets,
                               lane_offsets.size() * sizeof(int),
                               cudaMemcpyHostToDevice, stream),
               "upload lane offsets");
+    record_slot(slot);
     final_block = model_forward_state_tuning_bf16(
         stream, L, B, rows, m.blocks.data(), tapes.data(), input.p, carried.p,
         shifts.p, m.ln_out_weight, m.ln_out_bias, m.head_weight_orig, V, ping.p,
         pong.p, state_batch.p, state_final.p, workspace.p, workspace.n, norm.p,
         logits.p, carried.p, with_logits, offsets.p);
     last_time = 0;
-    sync(); // host staging may be reused after returning
+    if (sync_host)
+      sync();
   }
   void forward(const FrozenModelView &m, const int *tokens, int T,
-               LogitsMode mode = LogitsMode::All) {
+               LogitsMode mode = LogitsMode::All, bool sync_host = true) {
     single_lane();
     if (T <= 0 || T > chunk)
       throw std::invalid_argument("forward chunk length");
-    host_input.resize(size_t(T) * C);
+    PinnedSlot &slot = acquire_slot();
     for (int t = 0; t < T; ++t) {
       if (tokens[t] < 0 || tokens[t] >= V)
         throw std::invalid_argument("token out of range");
       std::copy_n(m.cpu_emb_ln0_bf16 + size_t(tokens[t]) * C, C,
-                  host_input.data() + size_t(t) * C);
+                  slot.input + size_t(t) * C);
     }
-    gpu_check(cudaMemcpyAsync(input.p, host_input.data(), host_input.size() * 2,
+    gpu_check(cudaMemcpyAsync(input.p, slot.input, size_t(T) * C * 2,
                               cudaMemcpyHostToDevice, stream),
               "upload embeddings");
+    record_slot(slot);
     for (auto &t : tapes)
       t.time = T;
     final_block = model_forward_state_tuning_bf16(
@@ -266,7 +345,77 @@ struct Executor::Impl {
                                         m.head_weight_orig, logits.p);
     }
     last_time = mode == LogitsMode::None ? 0 : mode == LogitsMode::Last ? 1 : T;
-    sync(); // host input staging may be reused after returning
+    if (sync_host)
+      sync();
+  }
+  void supervised_output_backward(const FrozenModelView &m, int rows,
+                                  const int *chunk_targets,
+                                  const float *scaled_row_weights,
+                                  float temperature, float *chunk_loss) {
+    PinnedSlot &slot = acquire_slot();
+    int active = 0;
+    for (int r = 0; r < rows; ++r) {
+      if (scaled_row_weights[r] != 0.0f) {
+        slot.active_rows[active] = r;
+        slot.targets[active] = chunk_targets[r];
+        slot.weights[active] = scaled_row_weights[r];
+        ++active;
+      }
+    }
+    if (active == rows) {
+      gpu_check(cudaMemcpyAsync(targets.p, slot.targets, rows * sizeof(int),
+                                cudaMemcpyHostToDevice, stream),
+                "upload targets");
+      gpu_check(cudaMemcpyAsync(weights.p, slot.weights, rows * sizeof(float),
+                                cudaMemcpyHostToDevice, stream),
+                "upload loss weights");
+      record_slot(slot);
+      rwkv7_v3a_layer_norm_bf16_launch(stream, rows, C, final_block,
+                                       m.ln_out_weight, m.ln_out_bias, norm.p,
+                                       1.0e-5f);
+      rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, V, norm.p,
+                                        m.head_weight_orig, logits.p);
+      cross_entropy_forward_backward_bf16(stream, rows, V, logits.p, targets.p,
+                                          -1, chunk_loss, dlogits.p,
+                                          float(rows), weights.p, temperature);
+      model_output_backward_state_only(
+          stream, L, 1, rows, m.blocks.data(), tapes.data(), gradients.data(),
+          final_block, m.ln_out_weight, m.head_weight_orig, V, dlogits.p,
+          gping.p, gpong.p, workspace.p, workspace.n, false);
+      return;
+    }
+    gpu_check(cudaMemcpyAsync(active_rows_dev.p, slot.active_rows,
+                              active * sizeof(int), cudaMemcpyHostToDevice,
+                              stream),
+              "upload active row indices");
+    gpu_check(cudaMemcpyAsync(targets.p, slot.targets, active * sizeof(int),
+                              cudaMemcpyHostToDevice, stream),
+              "upload active targets");
+    gpu_check(cudaMemcpyAsync(weights.p, slot.weights, active * sizeof(float),
+                              cudaMemcpyHostToDevice, stream),
+              "upload active loss weights");
+    record_slot(slot);
+    // Gather only supervised rows for ln_out -> LM Head -> CE -> LM Head grad ->
+    // ln_out grad, then scatter back into [rows, C] with zeros at masked rows.
+    rwkv7_gather_rows_bf16_launch(stream, active, C, final_block,
+                                  active_rows_dev.p, gping.p);
+    rwkv7_v3a_layer_norm_bf16_launch(stream, active, C, gping.p,
+                                     m.ln_out_weight, m.ln_out_bias, norm.p,
+                                     1.0e-5f);
+    rwkv7_v3a_linear_bf16_orig_launch(stream, active, C, V, norm.p,
+                                      m.head_weight_orig, logits.p);
+    cross_entropy_forward_backward_bf16(stream, active, V, logits.p, targets.p,
+                                        -1, chunk_loss, dlogits.p,
+                                        float(active), weights.p, temperature);
+    linear_orig_backward_input_bf16(stream, active, C, V, dlogits.p,
+                                    m.head_weight_orig, gpong.p);
+    layer_norm_backward_input_bf16(stream, active, C, gping.p, m.ln_out_weight,
+                                   gpong.p, norm.p, 1.0e-5f);
+    rwkv7_scatter_rows_bf16_launch(stream, rows, active, C, norm.p,
+                                   active_rows_dev.p, gpong.p);
+    model_backward_state_only(stream, L, m.blocks.data(), tapes.data(),
+                              gradients.data(), gpong.p, gping.p, gpong.p,
+                              workspace.p, workspace.n, false);
   }
 };
 Executor::Executor(const FrozenModelView &m, int chunk, cudaStream_t s,
@@ -322,7 +471,7 @@ float Executor::backward(const FrozenModelView &m,
                          const std::vector<int> &tokens,
                          const std::vector<float> &weights,
                          const float *initial, size_t normalizer,
-                         float temperature) {
+                         float temperature, const std::vector<int> *label_ids) {
   auto &w = *impl_;
   w.single_lane();
   if (tokens.size() < 2 || weights.size() != tokens.size() || !normalizer ||
@@ -331,6 +480,11 @@ float Executor::backward(const FrozenModelView &m,
   for (size_t i = 0; i < tokens.size(); ++i)
     if (tokens[i] < 0 || tokens[i] >= w.V || !std::isfinite(weights[i]))
       throw std::invalid_argument("invalid backward token/weight");
+  if (label_ids) {
+    if (label_ids->size() != tokens.size()) throw std::invalid_argument("label size mismatch");
+    for (const int id : *label_ids) if (id < 0 || id >= w.V) throw std::invalid_argument("invalid label id");
+  }
+  const auto &labels = label_ids ? *label_ids : tokens;
   // A suffix after the last nonzero target has no loss and no terminal
   // adjoint. Earlier masked context must still participate in full BPTT.
   int length = int(tokens.size()) - 1;
@@ -349,9 +503,10 @@ float Executor::backward(const FrozenModelView &m,
     w.copy(w.checkpoints[j].p, w.carried.p, w.states * 4);
     w.copy(w.shift_checkpoints[j].p, w.shifts.p, w.shift_count * 2);
     if (j + 1 < chunks)
-      w.forward(m, tokens.data() + j * w.chunk, w.chunk, LogitsMode::None);
+      w.forward(m, tokens.data() + j * w.chunk, w.chunk, LogitsMode::None,
+                false);
   }
-  float total = 0;
+  std::vector<float> scaled_weights;
   for (int j = chunks - 1; j >= 0; --j) {
     int off = j * w.chunk, T = std::min(w.chunk, length - off);
     w.copy(w.carried.p, w.checkpoints[j].p, w.states * 4);
@@ -359,41 +514,36 @@ float Executor::backward(const FrozenModelView &m,
     const bool supervised =
         std::any_of(weights.begin() + off + 1, weights.begin() + off + T + 1,
                     [](float x) { return x != 0; });
-    w.forward(m, tokens.data() + off, T,
-              supervised ? LogitsMode::All : LogitsMode::None);
+    w.forward(m, tokens.data() + off, T, LogitsMode::None, false);
     if (supervised) {
-      gpu_check(cudaMemcpyAsync(w.targets.p, tokens.data() + off + 1,
-                                T * sizeof(int), cudaMemcpyHostToDevice,
-                                w.stream),
-                "upload targets");
-      gpu_check(cudaMemcpyAsync(w.weights.p, weights.data() + off + 1,
-                                T * sizeof(float), cudaMemcpyHostToDevice,
-                                w.stream),
-                "upload loss weights");
-      cross_entropy_forward_backward_bf16(
-          w.stream, T, w.V, w.logits.p, w.targets.p, -1, w.loss.p, w.dlogits.p,
-          float(T) / normalizer, w.weights.p, temperature);
-      model_output_backward_state_only(
-          w.stream, w.L, 1, T, m.blocks.data(), w.tapes.data(),
-          w.gradients.data(), w.final_block, m.ln_out_weight,
-          m.head_weight_orig, w.V, w.dlogits.p, w.gping.p, w.gpong.p,
-          w.workspace.p, w.workspace.n);
+      const float lane_scale = float(T) / normalizer / T;
+      scaled_weights.resize(T);
+      for (int t = 0; t < T; ++t)
+        scaled_weights[t] = lane_scale * weights[off + 1 + t];
+      w.supervised_output_backward(m, T, labels.data() + off + 1,
+                                   scaled_weights.data(), temperature,
+                                   w.chunk_losses.p + j);
     } else {
       // No local CE/head derivative, but recurrent and shift adjoints from
       // later supervised chunks still flow through every frozen block.
       w.zero(w.gping.p, size_t(T) * w.C * sizeof(bf16));
-      w.zero(w.loss.p, sizeof(float));
+      w.zero(w.chunk_losses.p + j, sizeof(float));
       model_backward_state_only(w.stream, w.L, m.blocks.data(), w.tapes.data(),
                                 w.gradients.data(), w.gping.p, w.gping.p,
-                                w.gpong.p, w.workspace.p, w.workspace.n);
+                                w.gpong.p, w.workspace.p, w.workspace.n, false);
     }
     w.copy(w.state_gradient.p, w.per_batch_gradient.p, w.states * 4);
-    w.copy(w.terminal_shift.p, w.shift_grad.p, w.shift_count * 2);
-    float loss;
-    gpu_check(
-        cudaMemcpyAsync(&loss, w.loss.p, 4, cudaMemcpyDeviceToHost, w.stream),
-        "read loss");
-    w.sync();
+    if (j > 0)
+      w.carry_shift_gradient();
+  }
+  gpu_check(cudaMemcpyAsync(w.host_losses.data(), w.chunk_losses.p,
+                            chunks * sizeof(float), cudaMemcpyDeviceToHost,
+                            w.stream),
+            "read chunk losses");
+  w.sync();
+  float total = 0;
+  for (int j = chunks - 1; j >= 0; --j) {
+    const float loss = w.host_losses[j];
     if (!std::isfinite(loss))
       throw std::runtime_error("nonfinite loss; optimizer not executed");
     total += loss;
@@ -404,12 +554,20 @@ float Executor::backward_packed(const FrozenModelView &m,
                                 const std::vector<std::vector<int>> &tokens,
                                 const std::vector<std::vector<float>> &weights,
                                 const float *initial, size_t normalizer,
-                                float temperature) {
+                                float temperature,
+                                const std::vector<std::vector<int>> *label_ids) {
   auto &w = *impl_;
   const int n = int(tokens.size());
   if (n < 1 || n > w.B || weights.size() != tokens.size() || !normalizer ||
       !std::isfinite(temperature) || temperature <= 0)
     throw std::invalid_argument("packed backward samples/normalizer");
+  if (label_ids) {
+    if (label_ids->size() != tokens.size()) throw std::invalid_argument("packed label size mismatch");
+    for (size_t b = 0; b < tokens.size(); ++b) {
+      if ((*label_ids)[b].size() != tokens[b].size()) throw std::invalid_argument("packed label length mismatch");
+      for (const int id : (*label_ids)[b]) if (id < 0 || id >= w.V) throw std::invalid_argument("invalid packed label id");
+    }
+  }
   // Per lane, the same trimmed length as backward(): positions after the last
   // weighted target carry neither loss nor adjoint.
   std::vector<int> length(w.B, 0);
@@ -458,7 +616,7 @@ float Executor::backward_packed(const FrozenModelView &m,
         if (inputs)
           inputs->push_back(tokens[b][t]);
         if (targets) {
-          targets->push_back(tokens[b][t + 1]);
+          targets->push_back(label_ids ? (*label_ids)[b][t + 1] : tokens[b][t + 1]);
           row_weights->push_back(lane_scale * weights[b][t + 1]);
         }
       }
@@ -474,10 +632,9 @@ float Executor::backward_packed(const FrozenModelView &m,
     w.copy(w.shift_checkpoints[j].p, w.shifts.p, w.shift_count * 2);
     if (j + 1 < steps) {
       pack(j, offsets, &inputs, nullptr, nullptr);
-      w.packed_forward(m, inputs, offsets, false);
+      w.packed_forward(m, inputs, offsets, false, false);
     }
   }
-  float total = 0;
   for (int j = steps - 1; j >= 0; --j) {
     pack(j, offsets, &inputs, &targets, &row_weights);
     const int rows = int(inputs.size());
@@ -485,47 +642,38 @@ float Executor::backward_packed(const FrozenModelView &m,
     w.copy(w.shifts.p, w.shift_checkpoints[j].p, w.shift_count * 2);
     const bool supervised = std::any_of(row_weights.begin(), row_weights.end(),
                                         [](float x) { return x != 0; });
-    w.packed_forward(m, inputs, offsets, supervised);
+    w.packed_forward(m, inputs, offsets, false, false);
     if (supervised) {
-      gpu_check(cudaMemcpyAsync(w.targets.p, targets.data(), rows * sizeof(int),
-                                cudaMemcpyHostToDevice, w.stream),
-                "upload packed targets");
-      gpu_check(cudaMemcpyAsync(w.weights.p, row_weights.data(),
-                                rows * sizeof(float), cudaMemcpyHostToDevice,
-                                w.stream),
-                "upload packed loss weights");
-      cross_entropy_forward_backward_bf16(
-          w.stream, rows, w.V, w.logits.p, w.targets.p, -1, w.loss.p,
-          w.dlogits.p, float(rows), w.weights.p, temperature);
-      model_output_backward_state_only(
-          w.stream, w.L, 1, rows, m.blocks.data(), w.tapes.data(),
-          w.gradients.data(), w.final_block, m.ln_out_weight,
-          m.head_weight_orig, w.V, w.dlogits.p, w.gping.p, w.gpong.p,
-          w.workspace.p, w.workspace.n);
+      w.supervised_output_backward(m, rows, targets.data(), row_weights.data(),
+                                   temperature, w.chunk_losses.p + j);
     } else {
       w.zero(w.gping.p, size_t(rows) * w.C * sizeof(bf16));
-      w.zero(w.loss.p, sizeof(float));
+      w.zero(w.chunk_losses.p + j, sizeof(float));
       model_backward_state_only(w.stream, w.L, m.blocks.data(), w.tapes.data(),
                                 w.gradients.data(), w.gping.p, w.gping.p,
-                                w.gpong.p, w.workspace.p, w.workspace.n);
+                                w.gpong.p, w.workspace.p, w.workspace.n, false);
     }
     w.copy(w.state_gradient.p, w.per_batch_gradient.p, w.states * 4);
-    w.copy(w.terminal_shift.p, w.shift_grad.p, w.shift_count * 2);
-    float loss;
-    gpu_check(
-        cudaMemcpyAsync(&loss, w.loss.p, 4, cudaMemcpyDeviceToHost, w.stream),
-        "read loss");
-    w.sync();
-    if (!std::isfinite(loss))
-      throw std::runtime_error("nonfinite loss; optimizer not executed");
-    total += loss;
+    if (j > 0)
+      w.carry_shift_gradient();
   }
+  gpu_check(cudaMemcpyAsync(w.host_losses.data(), w.chunk_losses.p,
+                            steps * sizeof(float), cudaMemcpyDeviceToHost,
+                            w.stream),
+            "read packed chunk losses");
   if (w.B > 1)
     for (int l = 0; l < w.L; ++l)
       reduce_state_gradient_f32(w.stream, w.B, w.H, 64,
                                 w.state_gradient.p + size_t(l) * w.B * w.lane,
                                 summed + size_t(l) * w.lane, false);
   w.sync();
+  float total = 0;
+  for (int j = steps - 1; j >= 0; --j) {
+    const float loss = w.host_losses[j];
+    if (!std::isfinite(loss))
+      throw std::runtime_error("nonfinite loss; optimizer not executed");
+    total += loss;
+  }
   return total;
 }
 std::vector<float> Executor::score(const FrozenModelView &m,

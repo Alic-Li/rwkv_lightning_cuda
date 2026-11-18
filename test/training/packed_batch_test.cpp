@@ -4,6 +4,7 @@
 #include "rwkv/bf16_training/model.hpp"
 #include "rwkv/bf16_training/ops.hpp"
 #include "rwkv/bf16_training/trainer.hpp"
+#include "bf16_model_fixture.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -71,13 +72,11 @@ std::vector<float> adapter_gradients(const FrozenModelView &view) {
     }
   return result;
 }
-void check(Model &model, const std::string &method, double tolerance) {
-  auto view = model.state_tuning_model_view();
+void check(FrozenModelView view, const std::string &method, double tolerance) {
   constexpr int chunk = 16, lanes = 4;
   std::unique_ptr<rwkv_bf16_miss::Trainer> trainer;
   if (method != "state") {
     Json::Value config;
-    config["base_fingerprint"] = model.base_fingerprint();
     if (method == "nora") {
       config["method"] = "nora";
       config["initialization"] = "nora_init";
@@ -142,12 +141,21 @@ void check(Model &model, const std::string &method, double tolerance) {
 }
 } // namespace
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::cerr << "usage: packed_batch_test model.pth\n";
-    return 77;
+  if (argc > 2) {
+    std::cerr << "usage: packed_batch_test [model.pth]\n";
+    return 1;
   }
   try {
-    Model model(argv[1]);
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
+      return 77;
+    std::unique_ptr<Model> model;
+    std::unique_ptr<Bf16ModelFixture> fixture;
+    if (argc == 2)
+      model = std::make_unique<Model>(argv[1]);
+    else
+      fixture = std::make_unique<Bf16ModelFixture>();
+    const auto view = model ? model->state_tuning_model_view() : fixture->view;
     // Consistent GEMMs make every row independent of packing, so only the
     // adapter-gradient row summation order may differ. The auto policy lets
     // cuBLAS pick kernels per row count; on these random-token inputs that
@@ -156,7 +164,7 @@ int main(int argc, char **argv) {
     for (bool tensor_cores : {false, true}) {
       set_consistent_forward(true, tensor_cores);
       for (const char *method : {"state", "miss", "nora"})
-        check(model, method, 1e-5);
+        check(view, method, 1e-5);
     }
     std::cout << "Packed micro-batch matches per-sample accumulation\n";
   } catch (const std::exception &e) {

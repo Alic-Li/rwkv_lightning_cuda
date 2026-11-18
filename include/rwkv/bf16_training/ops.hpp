@@ -11,6 +11,8 @@ namespace rwkv_bf16_training {
 // the same pin_rows.
 void set_consistent_forward(bool enabled, bool tensor_cores = false,
                             int pin_rows = 64);
+// The calling thread's policy as set above (default: not consistent).
+bool consistent_forward_enabled();
 // Token-shift mixes. With device offsets[B + 1], B is the lane count, T the
 // packed row count, and shift_state holds one row per lane.
 void rwkv7_tmix_mix6_launch(cudaStream_t stream, int B, int T, int C,
@@ -29,7 +31,7 @@ void rwkv7_tmix_lnx_rkvres_xg_launch(cudaStream_t stream, int B, int T, int C,
                                      const bf16 *k, const bf16 *v,
                                      const bf16 *r_k, const bf16 *weight,
                                      const bf16 *bias, const bf16 *g,
-                                     bf16 *out);
+                                     bf16 *out, bf16 *gn_out = nullptr);
 void rwkv7_cmix_mix_launch(cudaStream_t stream, int B, int T, int C,
                            const bf16 *x, bf16 *shift_state, const bf16 *x_k,
                            bf16 *out, const int *offsets = nullptr);
@@ -51,4 +53,10 @@ void rwkv7_v3a_linear_bf16_launch(cudaStream_t stream, int M, int K, int N,
 void rwkv7_v3a_linear_bf16_orig_launch(cudaStream_t stream, int M, int K, int N,
                                        const bf16 *x, const bf16 *weight_orig,
                                        bf16 *y);
+void rwkv7_gather_rows_bf16_launch(cudaStream_t stream, int active_rows, int C,
+                                   const bf16 *src, const int *row_indices,
+                                   bf16 *dst);
+void rwkv7_scatter_rows_bf16_launch(cudaStream_t stream, int total_rows,
+                                    int active_rows, int C, const bf16 *src,
+                                    const int *row_indices, bf16 *dst);
 } // namespace rwkv_bf16_training

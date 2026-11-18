@@ -42,7 +42,8 @@ public:
   // signed sum of advantages. The initial-state gradient remains available.
   float backward(const FrozenModelView &, const std::vector<int> &tokens,
                  const std::vector<float> &weights, const float *initial,
-                 size_t normalizer, float temperature = 1.0f);
+                 size_t normalizer, float temperature = 1.0f,
+                 const std::vector<int> *label_ids = nullptr);
   // Teacher-forced log softmax(logits / temperature) of tokens[i + 1] given
   // tokens[0..i], for every i: tokens.size() - 1 values. Starts from
   // `initial` with zero shifts and uses the same forward as backward().
@@ -55,7 +56,8 @@ public:
                         const std::vector<std::vector<int>> &tokens,
                         const std::vector<std::vector<float>> &weights,
                         const float *initial, size_t normalizer,
-                        float temperature = 1.0f);
+                        float temperature = 1.0f,
+                        const std::vector<std::vector<int>> *label_ids = nullptr);
   std::vector<float> score(const FrozenModelView &,
                            const std::vector<int> &tokens, const float *initial,
                            float temperature = 1.0f);
