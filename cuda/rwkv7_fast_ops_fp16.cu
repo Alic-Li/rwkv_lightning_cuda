@@ -529,6 +529,90 @@ __global__ void f16_to_f32_kernel(const dtype* __restrict__ src, float* __restri
   dst[idx] = load_h1(src + idx);
 }
 
+__global__ void copy_state_slice_vec_kernel(
+    int src_batch,
+    int src_offset,
+    int dst_batch,
+    int dst_offset,
+    int count,
+    std::size_t shift_lane_vec,
+    std::size_t wkv_lane_vec,
+    const uint4* __restrict__ src_shift,
+    uint4* __restrict__ dst_shift,
+    const uint4* __restrict__ src_wkv16,
+    uint4* __restrict__ dst_wkv16,
+    const float4* __restrict__ src_wkv32,
+    float4* __restrict__ dst_wkv32,
+    const int* __restrict__ src_elapsed,
+    int* __restrict__ dst_elapsed) {
+  const std::size_t layer = static_cast<std::size_t>(blockIdx.y);
+  const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t shift_slice_vec = static_cast<std::size_t>(count) * shift_lane_vec;
+  if (idx < shift_slice_vec) {
+    const std::size_t src_base0 = (layer * 2 * src_batch + src_offset) * shift_lane_vec;
+    const std::size_t src_base1 = ((layer * 2 + 1) * src_batch + src_offset) * shift_lane_vec;
+    const std::size_t dst_base0 = (layer * 2 * dst_batch + dst_offset) * shift_lane_vec;
+    const std::size_t dst_base1 = ((layer * 2 + 1) * dst_batch + dst_offset) * shift_lane_vec;
+    dst_shift[dst_base0 + idx] = src_shift[src_base0 + idx];
+    dst_shift[dst_base1 + idx] = src_shift[src_base1 + idx];
+  }
+  const std::size_t wkv_slice_vec = static_cast<std::size_t>(count) * wkv_lane_vec;
+  if (idx < wkv_slice_vec) {
+    const std::size_t src_wkv_base = (layer * src_batch + src_offset) * wkv_lane_vec;
+    const std::size_t dst_wkv_base = (layer * dst_batch + dst_offset) * wkv_lane_vec;
+    if (src_wkv32 != nullptr) {
+      dst_wkv32[dst_wkv_base + idx] = src_wkv32[src_wkv_base + idx];
+    } else {
+      dst_wkv16[dst_wkv_base + idx] = src_wkv16[src_wkv_base + idx];
+    }
+  }
+  if (layer == 0 && idx < static_cast<std::size_t>(count)) {
+    dst_elapsed[dst_offset + idx] = src_elapsed[src_offset + idx];
+  }
+}
+
+__global__ void copy_state_slice_scalar_kernel(
+    int src_batch,
+    int src_offset,
+    int dst_batch,
+    int dst_offset,
+    int count,
+    std::size_t shift_lane_elems,
+    std::size_t wkv_lane_elems,
+    const dtype* __restrict__ src_shift,
+    dtype* __restrict__ dst_shift,
+    const dtype* __restrict__ src_wkv16,
+    dtype* __restrict__ dst_wkv16,
+    const float* __restrict__ src_wkv32,
+    float* __restrict__ dst_wkv32,
+    const int* __restrict__ src_elapsed,
+    int* __restrict__ dst_elapsed) {
+  const std::size_t layer = static_cast<std::size_t>(blockIdx.y);
+  const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t shift_slice_elems = static_cast<std::size_t>(count) * shift_lane_elems;
+  if (idx < shift_slice_elems) {
+    const std::size_t src_base0 = (layer * 2 * src_batch + src_offset) * shift_lane_elems;
+    const std::size_t src_base1 = ((layer * 2 + 1) * src_batch + src_offset) * shift_lane_elems;
+    const std::size_t dst_base0 = (layer * 2 * dst_batch + dst_offset) * shift_lane_elems;
+    const std::size_t dst_base1 = ((layer * 2 + 1) * dst_batch + dst_offset) * shift_lane_elems;
+    dst_shift[dst_base0 + idx] = src_shift[src_base0 + idx];
+    dst_shift[dst_base1 + idx] = src_shift[src_base1 + idx];
+  }
+  const std::size_t wkv_slice_elems = static_cast<std::size_t>(count) * wkv_lane_elems;
+  if (idx < wkv_slice_elems) {
+    const std::size_t src_wkv_base = (layer * src_batch + src_offset) * wkv_lane_elems;
+    const std::size_t dst_wkv_base = (layer * dst_batch + dst_offset) * wkv_lane_elems;
+    if (src_wkv32 != nullptr) {
+      dst_wkv32[dst_wkv_base + idx] = src_wkv32[src_wkv_base + idx];
+    } else {
+      dst_wkv16[dst_wkv_base + idx] = src_wkv16[src_wkv_base + idx];
+    }
+  }
+  if (layer == 0 && idx < static_cast<std::size_t>(count)) {
+    dst_elapsed[dst_offset + idx] = src_elapsed[src_offset + idx];
+  }
+}
+
 __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_one_kernel(
     int C,
     const dtype* __restrict__ act,
@@ -1562,9 +1646,64 @@ void rwkv7_add_vec_launch(
 
 void rwkv7_v4_f16_to_f32_launch(
     cudaStream_t stream, const half* src_f16, float* dst_f32, long long elems) {
+  if (elems <= 0) return;
   constexpr int threads = 256;
   f16_to_f32_kernel<<<static_cast<int>(ceil_div(elems, static_cast<int64_t>(threads))), threads, 0, stream>>>(
       src_f16, dst_f32, elems);
+}
+
+void rwkv7_v4_copy_state_slice_launch(
+    cudaStream_t stream,
+    int layers,
+    int src_batch,
+    int src_offset,
+    int dst_batch,
+    int dst_offset,
+    int count,
+    std::size_t shift_lane_elems,
+    std::size_t wkv_lane_elems,
+    const half* src_shift,
+    half* dst_shift,
+    const half* src_wkv16,
+    half* dst_wkv16,
+    const float* src_wkv32,
+    float* dst_wkv32,
+    const int* src_elapsed,
+    int* dst_elapsed) {
+  if (layers <= 0 || count <= 0) return;
+  constexpr int threads = 256;
+  const bool use_wkv32 = (src_wkv32 != nullptr);
+  const std::size_t wkv_vec_div = use_wkv32 ? 4 : 8;
+  if ((shift_lane_elems & 7) == 0 && (wkv_lane_elems % wkv_vec_div) == 0) {
+    const std::size_t shift_lane_vec = shift_lane_elems >> 3;
+    const std::size_t wkv_lane_vec = wkv_lane_elems / wkv_vec_div;
+    const std::size_t max_vec = std::max(
+        static_cast<std::size_t>(count),
+        static_cast<std::size_t>(count) * std::max(shift_lane_vec, wkv_lane_vec));
+    const dim3 grid(static_cast<unsigned int>((max_vec + threads - 1) / threads),
+                    static_cast<unsigned int>(layers), 1);
+    copy_state_slice_vec_kernel<<<grid, threads, 0, stream>>>(
+        src_batch, src_offset, dst_batch, dst_offset, count,
+        shift_lane_vec, wkv_lane_vec,
+        reinterpret_cast<const uint4*>(src_shift),
+        reinterpret_cast<uint4*>(dst_shift),
+        reinterpret_cast<const uint4*>(src_wkv16),
+        reinterpret_cast<uint4*>(dst_wkv16),
+        reinterpret_cast<const float4*>(src_wkv32),
+        reinterpret_cast<float4*>(dst_wkv32),
+        src_elapsed, dst_elapsed);
+    return;
+  }
+  const std::size_t max_elems = std::max(
+      static_cast<std::size_t>(count),
+      static_cast<std::size_t>(count) * std::max(shift_lane_elems, wkv_lane_elems));
+  const dim3 grid(static_cast<unsigned int>((max_elems + threads - 1) / threads),
+                  static_cast<unsigned int>(layers), 1);
+  copy_state_slice_scalar_kernel<<<grid, threads, 0, stream>>>(
+      src_batch, src_offset, dst_batch, dst_offset, count,
+      shift_lane_elems, wkv_lane_elems,
+      src_shift, dst_shift, src_wkv16, dst_wkv16, src_wkv32, dst_wkv32,
+      src_elapsed, dst_elapsed);
 }
 
 void rwkv7_v4_i8_pack_launch(

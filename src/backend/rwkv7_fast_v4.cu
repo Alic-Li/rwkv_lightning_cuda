@@ -530,6 +530,7 @@ struct BackendProfile {
 
 struct ForwardResources {
   HalfArena arena;
+  PinnedHostBuffer host_x;
   DeviceBuffer<float> adapter_latent;
   DeviceBuffer<rwkv7_miss::Linear> uniform_table;
   std::vector<std::uint8_t> uniform_present;
@@ -2047,7 +2048,7 @@ void run_backend_forward(
     out.backend_workspace = std::make_shared<ForwardResources>();
   }
   auto resources = std::static_pointer_cast<ForwardResources>(out.backend_workspace);
-  resources->arena.allocate(static_cast<std::size_t>(rows) * C * 31 + static_cast<std::size_t>(output_rows) * C +
+  resources->arena.allocate(static_cast<std::size_t>(rows) * C * 21 + static_cast<std::size_t>(output_rows) * C +
                             static_cast<std::size_t>(rows) * F +
                             static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * V);
   resources->lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc backend cublasLt workspace");
@@ -2061,7 +2062,9 @@ void run_backend_forward(
     throw std::runtime_error("cpu emb+ln0 table is not ready");
   }
 
-  std::vector<std::uint16_t> host_x(static_cast<std::size_t>(rows) * C);
+  const std::size_t host_x_bytes = static_cast<std::size_t>(rows) * C * sizeof(std::uint16_t);
+  resources->host_x.resize(host_x_bytes);
+  std::uint16_t* host_x_ptr = reinterpret_cast<std::uint16_t*>(resources->host_x.p);
   for (int b = 0; b < B; ++b) {
     for (int t = 0; t < T; ++t) {
       const int token_id = static_cast<int>(token_batches[static_cast<size_t>(b)][static_cast<size_t>(t)]);
@@ -2070,7 +2073,7 @@ void run_backend_forward(
       }
       const std::size_t row = static_cast<std::size_t>(b) * T + t;
       const std::uint16_t* src = weights.cpu_emb_ln0_f16.data() + static_cast<std::size_t>(token_id) * C;
-      std::copy(src, src + C, host_x.data() + row * C);
+      std::copy(src, src + C, host_x_ptr + row * C);
     }
   }
 
@@ -2108,22 +2111,22 @@ void run_backend_forward(
   half* w12 = arena.take(row_elems, "w12");
   half* a12 = arena.take(row_elems, "a12");
   half* g = arena.take(row_elems, "g");
-  half* k2 = arena.take(row_elems, "k2");
-  half* neg_kk = arena.take(row_elems, "neg_kk");
-  half* kka = arena.take(row_elems, "kka");
   half* w_raw = arena.take(row_elems, "w_raw");
-  half* y = arena.take(row_elems, "wkv_y");
-  half* y2 = arena.take(row_elems, "tmix_out");
-  half* att_out = arena.take(row_elems, "att_out");
-  half* x_after_att = arena.take(row_elems, "x_after_att");
-  half* ln2_out = arena.take(row_elems, "ln2_out");
-  half* mixed = arena.take(row_elems, "cmix_mixed");
+  half* k2 = xr;
+  half* neg_kk = xw;
+  half* kka = xk;
+  half* y = xv;
+  half* y2 = xa;
+  half* att_out = xg;
+  half* x_after_att = w12;
+  half* ln2_out = r;
+  half* mixed = k;
   half* hid = arena.take(static_cast<std::size_t>(rows) * F, "ffn_hid");
-  half* cmix_out = arena.take(row_elems, "cmix_out");
+  half* cmix_out = v_base;
   half* final_x = arena.take(static_cast<std::size_t>(output_rows) * C, "final_x");
   half* logits_f16 = arena.take(static_cast<std::size_t>(output_rows) * V, "logits_f16");
 
-  check_cuda(cudaMemcpyAsync(x0, host_x.data(), host_x.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice, stream),
+  check_cuda(cudaMemcpyAsync(x0, host_x_ptr, host_x_bytes, cudaMemcpyHostToDevice, stream),
              "copy backend emb rows");
 
   const int profile_ln1 = profiler.begin(stream, "layer_norm_ln1");
@@ -2374,7 +2377,7 @@ void run_backend_forward(
 
     if (layer + 1 < dims.layers) {
       const LayerWeights& next = weights.layers[layer + 1];
-      if (B == 1 && T == 1) {
+      if (T == 1 && (C != 4096 || B < 512)) {
         half* next_shift0 = state.shift.p + static_cast<std::size_t>(layer + 1) * 2 * S * C;
         const int profile_next_mix = profiler.begin(stream, "layer_norm_tmix_mix6");
         rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
@@ -2790,6 +2793,24 @@ void ModelBackend::copy_state_slice(
   dst.adapter_identity = src.adapter_identity;
   dst.initial_state_identity = src.initial_state_identity;
   dst.advanced = src.advanced;
+  if (&src == &dst && src_offset == dst_offset) return;
+  if (&src != &dst || src_offset + count <= dst_offset || dst_offset + count <= src_offset) {
+    const auto& dims = impl_->weights.dims;
+    rwkv7_v4_copy_state_slice_launch(
+        nullptr, dims.layers, state_row_stride(src), src_offset,
+        state_row_stride(dst), dst_offset, count,
+        static_cast<std::size_t>(dims.channels),
+        static_cast<std::size_t>(dims.heads) * dims.head_size * dims.head_size,
+        src.shift.p, dst.shift.p,
+        impl_->use_wkv32 ? nullptr : src.wkv_state.p,
+        impl_->use_wkv32 ? nullptr : dst.wkv_state.p,
+        impl_->use_wkv32 ? src.wkv_state32.p : nullptr,
+        impl_->use_wkv32 ? dst.wkv_state32.p : nullptr,
+        src.elapsed.p, dst.elapsed.p);
+    check_cuda(cudaGetLastError(), "launch copy backend state slice");
+    check_cuda(cudaStreamSynchronize(nullptr), "sync copy backend state slice");
+    return;
+  }
   std::vector<DeviceCopy> copies;
   for (int row = 0; row < count; ++row) {
     append_state_row_copies(src, src_offset + row, dst, dst_offset + row, copies);
@@ -2920,7 +2941,7 @@ PrefillCapacity ModelBackend::query_prefill_capacity(int prefill_chunk_size) con
 
   // Match the peak allocations in run_backend_forward for one batch lane.
   const std::size_t arena_half_elements =
-      tokens * channels * 31 + channels + tokens * ffn +
+      tokens * channels * 21 + channels + tokens * ffn +
       tokens * static_cast<std::size_t>(kLowrankMax) * 4 + vocab;
   const std::size_t arena_bytes = arena_half_elements * sizeof(half);
   const std::size_t logits_bytes = vocab * sizeof(float);

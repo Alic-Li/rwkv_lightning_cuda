@@ -233,13 +233,24 @@ void InferenceEngine::prefill_cached(
   logits.values.resize(count * logits.vocab_size, "prompt cache batch logits");
   std::vector<std::vector<int64_t>> remaining, reordered;
   std::vector<size_t> original;
-  // One temporary GPU row serves all transfers; cached entries own CPU memory only.
-  auto staging = model_->create_state(1);
+  // One temporary GPU row serves multi-row transfers; single-row requests transfer directly.
+  std::optional<GenerationState> staging;
+  auto ensure_staging = [&]() -> GenerationState& {
+    if (!staging) {
+      staging = model_->create_state(1);
+    }
+    return *staging;
+  };
   for (size_t row = 0; row < count; ++row) {
     const auto i = order[row];
     if (hits[i]) {
-      upload_prompt_state(hits[i]->state, staging);
-      model_->copy_state_slice(staging, 0, state, static_cast<int>(row), 1);
+      if (count == 1) {
+        upload_prompt_state(hits[i]->state, state);
+      } else {
+        auto& tmp = ensure_staging();
+        upload_prompt_state(hits[i]->state, tmp);
+        model_->copy_state_slice(tmp, 0, state, static_cast<int>(row), 1);
+      }
       if (offsets[i] == prompt_ids[i].size()) {
         if (hits[i]->logits.size() != static_cast<size_t>(logits.vocab_size)) {
           throw std::runtime_error("prompt cache logits shape mismatch");
@@ -266,8 +277,13 @@ void InferenceEngine::prefill_cached(
     if (cache.index.find(identity, prompt_ids[row]).length == prompt_ids[row].size())
       continue;
     auto entry = std::make_shared<PromptCache::Entry>();
-    model_->copy_state_slice(state, static_cast<int>(row), staging, 0, 1);
-    entry->state = download_prompt_state(staging);
+    if (count == 1) {
+      entry->state = download_prompt_state(state);
+    } else {
+      auto& tmp = ensure_staging();
+      model_->copy_state_slice(state, static_cast<int>(row), tmp, 0, 1);
+      entry->state = download_prompt_state(tmp);
+    }
     entry->logits.resize(logits.vocab_size);
     rwkv7_fast_v4::check_cuda(
         cudaMemcpy(entry->logits.data(), logits.values.p + row * logits.vocab_size,
