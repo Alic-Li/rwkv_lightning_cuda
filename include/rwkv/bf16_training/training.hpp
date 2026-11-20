@@ -35,7 +35,8 @@ void linear_runtime_backward_input_bf16(cudaStream_t stream, int rows,
 
 void layer_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
                                     const bf16 *x, const bf16 *frozen_weight,
-                                    const bf16 *dy, bf16 *dx, float eps);
+                                    const bf16 *dy, bf16 *dx, float eps,
+                                    const bf16 *residual_grad = nullptr);
 void group_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
                                     int groups, const bf16 *x,
                                     const bf16 *frozen_weight, const bf16 *dy,
@@ -182,7 +183,7 @@ void block_forward_state_tuning_bf16(
     float *final_state, bf16 *v_first, bf16 *output,
     const FrozenBlockWeights &frozen_weights, BlockTapeView &tape,
     bf16 *workspace, std::size_t workspace_elements, bool layer_zero,
-    const int *offsets = nullptr);
+    const int *offsets = nullptr, bool record_tape = true);
 
 struct BlockBackwardState {
   const float *final_state_grad = nullptr; // optional [B,H,K,V]
@@ -223,7 +224,12 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
                                          float *loss, bf16 *d_logits,
                                          float gradient_scale = 1.0f,
                                          const float *row_weights = nullptr,
-                                         float temperature = 1.0f);
+                                         float temperature = 1.0f,
+                                         bool accumulate_loss = false);
+
+void gradient_norm_and_check_f32(cudaStream_t stream, const float *gradient,
+                                 std::size_t elements, double *out_norm_sq,
+                                 int *out_bad_flag);
 
 // out[row] = log softmax(logits[row] / temperature)[targets[row]] in FP32,
 // reduced exactly like the CE kernel above.
@@ -247,7 +253,7 @@ const bf16 *model_forward_state_tuning_bf16(
     float *state_final, bf16 *block_workspace,
     std::size_t block_workspace_elements, bf16 *final_normalized, bf16 *logits,
     float *carried_states = nullptr, bool compute_logits = true,
-    const int *offsets = nullptr);
+    const int *offsets = nullptr, bool record_tape = true);
 
 void add_last_shift_gradient(cudaStream_t stream, int batch, int time,
                              int channels, bf16 *dx, const bf16 *dshift,

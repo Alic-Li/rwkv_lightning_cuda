@@ -60,6 +60,18 @@ int main() {
       require(readonly["planned_steps"].isNull(), "missing scheduler default changed");
       require(saved == readonly && saved.size() == 6, "const read mutated config");
     }
+    Json::Value dp4 = original;
+    dp4.removeMember("kind");
+    dp4["batch_size"] = 64;
+    dp4["dp_world_size"] = 4;
+    dp4["dp_micro_bsz"] = 16;
+    Json::Value dp2 = dp4;
+    dp2["dp_world_size"] = 2;
+    dp2["dp_micro_bsz"] = 8;
+    require(checkpoint_config_matches(dp4, dp2), "DP world/micro reshape rejected");
+    Json::Value dp_wrong_batch = dp2;
+    dp_wrong_batch["batch_size"] = 32;
+    require(!checkpoint_config_matches(dp4, dp_wrong_batch), "DP batch mismatch ignored");
     std::cout << "Checkpoint config regression passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

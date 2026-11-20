@@ -315,8 +315,8 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln2,
                           state_grad.final_ffn_shift_grad, tape.offsets);
   layer_norm_backward_input_bf16(stream, rows, C, tape.x_after_att,
-                                 w.ln2_weight, d_ln2, temp0, kLnEps);
-  add_bf16(stream, grad_out, temp0, grad_x_after, R);
+                                 w.ln2_weight, d_ln2, grad_x_after, kLnEps,
+                                 grad_out);
 
   // Attention output projection and fused post-WKV GroupNorm/rkv/gate.
   linear_orig_backward_input_bf16(stream, rows, C, C, grad_x_after, w.output,
@@ -439,8 +439,7 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
     add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln1,
                             state_grad.final_att_shift_grad, tape.offsets);
     layer_norm_backward_input_bf16(stream, rows, C, tape.x, w.ln1_weight, d_ln1,
-                                   temp1, kLnEps);
-    add_bf16(stream, grad_x_after, temp1, grad_in, R);
+                                   grad_in, kLnEps, grad_x_after);
   }
 }
 

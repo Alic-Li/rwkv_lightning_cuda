@@ -42,7 +42,8 @@ const bf16 *model_forward_state_tuning_bf16(
     bf16 *activation_ping, bf16 *activation_pong, float *state_batch,
     float *state_final, bf16 *block_workspace,
     std::size_t block_workspace_elements, bf16 *final_normalized, bf16 *logits,
-    float *carried_states, bool compute_logits, const int *offsets) {
+    float *carried_states, bool compute_logits, const int *offsets,
+    bool record_tape) {
   if (layers <= 0 || B <= 0 || T <= 0 || vocab <= 0 || !weights || !tapes ||
       !input || !time_state || !shifts || !ln_out_weight || !ln_out_bias ||
       !head_weight_orig || !activation_ping || !activation_pong ||
@@ -77,10 +78,11 @@ const bf16 *model_forward_state_tuning_bf16(
     if (required > block_workspace_elements) {
       throw std::invalid_argument("model forward block workspace is too small");
     }
+    float *initial = state_batch;
+    float *final_out = state_final;
     if (carried_states) {
-      check(cudaMemcpyAsync(
-          state_batch, carried_states + layer * B * state_lane,
-          B * state_lane * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+      initial = carried_states + static_cast<std::size_t>(layer) * B * state_lane;
+      final_out = initial;
     } else
       broadcast_state_kernel<<<blocks(static_cast<std::size_t>(B) * state_lane),
                                kThreads, 0, stream>>>(
@@ -90,14 +92,9 @@ const bf16 *model_forward_state_tuning_bf16(
     bf16 *att_shift = shifts + static_cast<std::size_t>(layer) * 2 * B * C;
     bf16 *ffn_shift = att_shift + static_cast<std::size_t>(B) * C;
     block_forward_state_tuning_bf16(
-        stream, B, T, current, att_shift, ffn_shift, state_batch, state_final,
+        stream, B, T, current, att_shift, ffn_shift, initial, final_out,
         tapes[0].v_first, next, weights[layer], tapes[layer], block_workspace,
-        block_workspace_elements, layer == 0, offsets);
-    if (carried_states) {
-      check(cudaMemcpyAsync(carried_states + layer * B * state_lane,
-                            state_final, B * state_lane * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream));
-    }
+        block_workspace_elements, layer == 0, offsets, record_tape);
     current = next;
     next = next == activation_ping ? activation_pong : activation_ping;
   }

@@ -50,15 +50,37 @@ __global__ void repeat_weight_kernel(size_t total, int r, int c, bool side,
     y[i] = w[i % (size_t(r) * c)];
   }
 }
+__global__ void accum_grad_b_pair(int out, int rank, const float *__restrict__ gp,
+                                  float *__restrict__ dst) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t total = size_t(out) * rank;
+  if (i >= total)
+    return;
+  const size_t row = i / rank, j = i % rank;
+  dst[i] += gp[row * 2 * rank + j] + gp[row * 2 * rank + rank + j];
+}
+__global__ void accum_grad_a_pair(int rank, int in, const float *__restrict__ gp,
+                                  float *__restrict__ dst) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t total = size_t(rank) * in;
+  if (i >= total)
+    return;
+  dst[i] += gp[i] + gp[total + i];
+}
 struct Blas {
   cublasHandle_t h = nullptr;
-  rwkv_bf16_training::DeviceBuffer<float> latent;
+  rwkv_bf16_training::DeviceBuffer<uint8_t> ws;
+  rwkv_bf16_training::DeviceBuffer<float> latent, grad_pair;
   rwkv_bf16_training::DeviceBuffer<bf16> pair, twice;
   Blas() {
     if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("NoRA cublasCreate");
+    ws.resize(32 * 1024 * 1024, "NoRA cuBLAS workspace");
+    if (cublasSetWorkspace(h, ws.p, ws.n) != CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("NoRA cublasSetWorkspace");
   }
   ~Blas() { cublasDestroy(h); }
+  cudaStream_t last_stream = reinterpret_cast<cudaStream_t>(~uintptr_t(0));
   template <class T>
   T *grow(rwkv_bf16_training::DeviceBuffer<T> &b, size_t n) {
     if (b.n < n)
@@ -68,7 +90,12 @@ struct Blas {
 };
 Blas &blas(cudaStream_t stream) {
   static thread_local Blas b;
-  cublasSetStream(b.h, stream);
+  if (b.last_stream != stream) {
+    if (cublasSetStream(b.h, stream) != CUBLAS_STATUS_SUCCESS ||
+        cublasSetWorkspace(b.h, b.ws.p, b.ws.n) != CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("NoRA cublasSetStream/Workspace");
+    b.last_stream = stream;
+  }
   return b;
 }
 bool tensor_cores(const rwkv_bf16_miss::Linear &w) {
@@ -127,17 +154,24 @@ void backward_tensor(cudaStream_t stream, int rows,
   const int r = w.rank;
   if (w.gradient) {
     const bf16 *sp = pair(stream, b, s, rows, r);
-    for (int k = 0; k < 2; ++k)
-      product(b.h, true, false, w.out, r, rows, w.scale, g, w.out, sp + k * r,
-              2 * r, 1.f, w.gradient);
+    float *gp = b.grow(b.grad_pair, size_t(w.out) * 2 * r);
+    product(b.h, true, false, w.out, 2 * r, rows, w.scale, g, w.out, sp, 2 * r,
+            0.f, gp);
+    const size_t total_b = size_t(w.out) * r;
+    accum_grad_b_pair<<<(total_b + 255) / 256, 256, 0, stream>>>(
+        w.out, r, gp, w.gradient);
   }
   product(b.h, false, false, rows, r, w.out, w.scale, g, w.out, w.d, r, 0.f,
           ds);
   const bf16 *dp = pair(stream, b, ds, rows, r);
-  if (w.gradient_a)
-    for (int k = 0; k < 2; ++k)
-      product(b.h, true, false, r, w.in, rows, 1.f, dp + k * r, 2 * r, x,
-              w.in, 1.f, w.gradient_a);
+  if (w.gradient_a) {
+    float *gp = b.grow(b.grad_pair, 2 * size_t(r) * w.in);
+    product(b.h, true, false, 2 * r, w.in, rows, 1.f, dp, 2 * r, x, w.in, 0.f,
+            gp);
+    const size_t total_a = size_t(r) * w.in;
+    accum_grad_a_pair<<<(total_a + 255) / 256, 256, 0, stream>>>(
+        r, w.in, gp, w.gradient_a);
+  }
   if (dx)
     product(b.h, false, false, rows, w.in, 2 * r, 1.f, dp, 2 * r,
             twice(stream, b, w.a, r, w.in, false), w.in, 1.f, dx);

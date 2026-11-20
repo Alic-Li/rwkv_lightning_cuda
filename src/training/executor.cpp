@@ -100,11 +100,12 @@ struct OwnedTape {
 
 } // namespace
 struct Executor::Impl {
+  static constexpr int kOutputTileRows = 1024;
   // B lanes; states/shifts are lane-major within each layer: [L,B,...].
   int L, C, H, V, chunk, B, capacity, last_time = 0;
   size_t lane, states, shift_count;
   cudaStream_t stream;
-  DeviceBuffer<bf16> input, ping, pong, norm, logits, dlogits, gping, gpong,
+  DeviceBuffer<bf16> input, ping, pong, norm, logits, gping, gpong,
       shifts, shift_grad, first, first_grad, workspace, terminal_shift,
       nora_input;
   DeviceBuffer<float> nora_ds;
@@ -144,8 +145,8 @@ struct Executor::Impl {
       b->resize(rows, "executor activations");
     for (auto *b : {&shifts, &shift_grad, &terminal_shift})
       b->resize(shift_count, "executor shifts");
-    logits.resize(size_t(capacity) * V, "executor logits");
-    dlogits.resize(logits.n, "executor dlogits");
+    const int logit_rows = std::max(chunk, std::min(capacity, kOutputTileRows));
+    logits.resize(size_t(logit_rows) * V, "executor tiled logits");
     targets.resize(capacity, "executor targets");
     weights.resize(capacity, "CE row weights");
     active_rows_dev.resize(capacity, "active CE row indices");
@@ -287,7 +288,7 @@ struct Executor::Impl {
   // lane_offsets[b + 1]) of tokens. Lanes without rows keep their state.
   void packed_forward(const FrozenModelView &m, const std::vector<int> &tokens,
                       const std::vector<int> &lane_offsets, bool with_logits,
-                      bool sync_host = true) {
+                      bool sync_host = true, bool record_tape = true) {
     const int rows = int(tokens.size());
     if (rows <= 0 || rows > capacity || int(lane_offsets.size()) != B + 1 ||
         lane_offsets.front() != 0 || lane_offsets.back() != rows)
@@ -309,13 +310,14 @@ struct Executor::Impl {
         stream, L, B, rows, m.blocks.data(), tapes.data(), input.p, carried.p,
         shifts.p, m.ln_out_weight, m.ln_out_bias, m.head_weight_orig, V, ping.p,
         pong.p, state_batch.p, state_final.p, workspace.p, workspace.n, norm.p,
-        logits.p, carried.p, with_logits, offsets.p);
+        logits.p, carried.p, with_logits, offsets.p, record_tape);
     last_time = 0;
     if (sync_host)
       sync();
   }
   void forward(const FrozenModelView &m, const int *tokens, int T,
-               LogitsMode mode = LogitsMode::All, bool sync_host = true) {
+               LogitsMode mode = LogitsMode::All, bool sync_host = true,
+               bool record_tape = true) {
     single_lane();
     if (T <= 0 || T > chunk)
       throw std::invalid_argument("forward chunk length");
@@ -336,7 +338,7 @@ struct Executor::Impl {
         stream, L, 1, T, m.blocks.data(), tapes.data(), input.p, carried.p,
         shifts.p, m.ln_out_weight, m.ln_out_bias, m.head_weight_orig, V, ping.p,
         pong.p, state_batch.p, state_final.p, workspace.p, workspace.n, norm.p,
-        logits.p, carried.p, mode == LogitsMode::All);
+        logits.p, carried.p, mode == LogitsMode::All, nullptr, record_tape);
     if (mode == LogitsMode::Last) {
       rwkv7_v3a_layer_norm_bf16_launch(
           stream, 1, C, final_block + size_t(T - 1) * C, m.ln_out_weight,
@@ -362,6 +364,14 @@ struct Executor::Impl {
         ++active;
       }
     }
+    if (active == 0) {
+      zero(gping.p, size_t(rows) * C * sizeof(bf16));
+      zero(chunk_loss, sizeof(float));
+      model_backward_state_only(stream, L, m.blocks.data(), tapes.data(),
+                                gradients.data(), gping.p, gping.p, gpong.p,
+                                workspace.p, workspace.n, false);
+      return;
+    }
     if (active == rows) {
       gpu_check(cudaMemcpyAsync(targets.p, slot.targets, rows * sizeof(int),
                                 cudaMemcpyHostToDevice, stream),
@@ -370,18 +380,26 @@ struct Executor::Impl {
                                 cudaMemcpyHostToDevice, stream),
                 "upload loss weights");
       record_slot(slot);
-      rwkv7_v3a_layer_norm_bf16_launch(stream, rows, C, final_block,
-                                       m.ln_out_weight, m.ln_out_bias, norm.p,
+      for (int off = 0; off < rows; off += kOutputTileRows) {
+        const int cnt = std::min(kOutputTileRows, rows - off);
+        const bf16 *x_tile = final_block + size_t(off) * C;
+        rwkv7_v3a_layer_norm_bf16_launch(stream, cnt, C, x_tile,
+                                         m.ln_out_weight, m.ln_out_bias, norm.p,
+                                         1.0e-5f);
+        rwkv7_v3a_linear_bf16_orig_launch(stream, cnt, C, V, norm.p,
+                                          m.head_weight_orig, logits.p);
+        cross_entropy_forward_backward_bf16(
+            stream, cnt, V, logits.p, targets.p + off, -1, chunk_loss, logits.p,
+            float(cnt), weights.p + off, temperature, off > 0);
+        linear_orig_backward_input_bf16(stream, cnt, C, V, logits.p,
+                                        m.head_weight_orig, gping.p);
+        layer_norm_backward_input_bf16(stream, cnt, C, x_tile, m.ln_out_weight,
+                                       gping.p, gpong.p + size_t(off) * C,
                                        1.0e-5f);
-      rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, V, norm.p,
-                                        m.head_weight_orig, logits.p);
-      cross_entropy_forward_backward_bf16(stream, rows, V, logits.p, targets.p,
-                                          -1, chunk_loss, dlogits.p,
-                                          float(rows), weights.p, temperature);
-      model_output_backward_state_only(
-          stream, L, 1, rows, m.blocks.data(), tapes.data(), gradients.data(),
-          final_block, m.ln_out_weight, m.head_weight_orig, V, dlogits.p,
-          gping.p, gpong.p, workspace.p, workspace.n, false);
+      }
+      model_backward_state_only(stream, L, m.blocks.data(), tapes.data(),
+                                gradients.data(), gpong.p, gping.p, gpong.p,
+                                workspace.p, workspace.n, false);
       return;
     }
     gpu_check(cudaMemcpyAsync(active_rows_dev.p, slot.active_rows,
@@ -395,22 +413,26 @@ struct Executor::Impl {
                               cudaMemcpyHostToDevice, stream),
               "upload active loss weights");
     record_slot(slot);
-    // Gather only supervised rows for ln_out -> LM Head -> CE -> LM Head grad ->
-    // ln_out grad, then scatter back into [rows, C] with zeros at masked rows.
+    // Gather only supervised rows, stream through tiled L2-resident logits
+    // in-place, then scatter back into [rows, C] with zeros at masked rows.
     rwkv7_gather_rows_bf16_launch(stream, active, C, final_block,
                                   active_rows_dev.p, gping.p);
-    rwkv7_v3a_layer_norm_bf16_launch(stream, active, C, gping.p,
-                                     m.ln_out_weight, m.ln_out_bias, norm.p,
-                                     1.0e-5f);
-    rwkv7_v3a_linear_bf16_orig_launch(stream, active, C, V, norm.p,
-                                      m.head_weight_orig, logits.p);
-    cross_entropy_forward_backward_bf16(stream, active, V, logits.p, targets.p,
-                                        -1, chunk_loss, dlogits.p,
-                                        float(active), weights.p, temperature);
-    linear_orig_backward_input_bf16(stream, active, C, V, dlogits.p,
-                                    m.head_weight_orig, gpong.p);
-    layer_norm_backward_input_bf16(stream, active, C, gping.p, m.ln_out_weight,
-                                   gpong.p, norm.p, 1.0e-5f);
+    for (int off = 0; off < active; off += kOutputTileRows) {
+      const int cnt = std::min(kOutputTileRows, active - off);
+      const bf16 *x_tile = gping.p + size_t(off) * C;
+      bf16 *norm_tile = norm.p + size_t(off) * C;
+      rwkv7_v3a_layer_norm_bf16_launch(stream, cnt, C, x_tile, m.ln_out_weight,
+                                       m.ln_out_bias, norm_tile, 1.0e-5f);
+      rwkv7_v3a_linear_bf16_orig_launch(stream, cnt, C, V, norm_tile,
+                                        m.head_weight_orig, logits.p);
+      cross_entropy_forward_backward_bf16(
+          stream, cnt, V, logits.p, targets.p + off, -1, chunk_loss, logits.p,
+          float(cnt), weights.p + off, temperature, off > 0);
+      linear_orig_backward_input_bf16(stream, cnt, C, V, logits.p,
+                                      m.head_weight_orig, gpong.p);
+      layer_norm_backward_input_bf16(stream, cnt, C, x_tile, m.ln_out_weight,
+                                     gpong.p, norm_tile, 1.0e-5f);
+    }
     rwkv7_scatter_rows_bf16_launch(stream, rows, active, C, norm.p,
                                    active_rows_dev.p, gpong.p);
     model_backward_state_only(stream, L, m.blocks.data(), tapes.data(),
@@ -504,7 +526,7 @@ float Executor::backward(const FrozenModelView &m,
     w.copy(w.shift_checkpoints[j].p, w.shifts.p, w.shift_count * 2);
     if (j + 1 < chunks)
       w.forward(m, tokens.data() + j * w.chunk, w.chunk, LogitsMode::None,
-                false);
+                false, false);
   }
   std::vector<float> scaled_weights;
   for (int j = chunks - 1; j >= 0; --j) {
@@ -632,7 +654,7 @@ float Executor::backward_packed(const FrozenModelView &m,
     w.copy(w.shift_checkpoints[j].p, w.shifts.p, w.shift_count * 2);
     if (j + 1 < steps) {
       pack(j, offsets, &inputs, nullptr, nullptr);
-      w.packed_forward(m, inputs, offsets, false, false);
+      w.packed_forward(m, inputs, offsets, false, false, false);
     }
   }
   for (int j = steps - 1; j >= 0; --j) {

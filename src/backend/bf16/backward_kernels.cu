@@ -42,7 +42,8 @@ __global__ void norm_backward_kernel(int group_size, int group_count,
                                      const bf16 *__restrict__ x,
                                      const bf16 *__restrict__ weight,
                                      const bf16 *__restrict__ dy,
-                                     bf16 *__restrict__ dx, float eps) {
+                                     bf16 *__restrict__ dx, float eps,
+                                     const bf16 *__restrict__ residual_grad) {
   const int group = blockIdx.x;
   const int offset = group * group_size;
   const int weight_offset = (group % group_count) * group_size;
@@ -79,7 +80,57 @@ __global__ void norm_backward_kernel(int group_size, int group_count,
         to_float(dy[offset + i]) * to_float(weight[weight_offset + i]);
     const float value = rstd * (scaled_dy - sum_d / group_size -
                                 xhat * sum_d_xhat / group_size);
-    dx[offset + i] = to_bf16(value);
+    const bf16 d_norm = to_bf16(value);
+    dx[offset + i] = residual_grad
+                         ? to_bf16(to_float(residual_grad[offset + i]) +
+                                   to_float(d_norm))
+                         : d_norm;
+  }
+}
+
+__global__ void norm_backward_cached_kernel(
+    int C, const bf16 *__restrict__ x, const bf16 *__restrict__ weight,
+    const bf16 *__restrict__ dy, bf16 *__restrict__ dx, float eps,
+    const bf16 *__restrict__ residual_grad) {
+  const size_t offset = static_cast<size_t>(blockIdx.x) * C;
+  float reg_x[32];
+  float reg_sdy[32];
+  float local_x = 0.0f;
+  int n = 0;
+  for (int i = threadIdx.x; i < C; i += kThreads, ++n) {
+    const float xv = to_float(x[offset + i]);
+    reg_x[n] = xv;
+    reg_sdy[n] = to_float(dy[offset + i]) * to_float(weight[i]);
+    local_x += xv;
+  }
+  __shared__ float scratch[8];
+  const float mean = block_sum(local_x, scratch) / C;
+  float local_x2 = 0.0f;
+  for (int k = 0; k < n; ++k) {
+    const float centered = reg_x[k] - mean;
+    local_x2 += centered * centered;
+  }
+  const float rstd = rsqrtf(block_sum(local_x2, scratch) / C + eps);
+  float local_d = 0.0f;
+  float local_dxhat_xhat = 0.0f;
+  for (int k = 0; k < n; ++k) {
+    const float xhat = (reg_x[k] - mean) * rstd;
+    const float sdy = reg_sdy[k];
+    local_d += sdy;
+    local_dxhat_xhat += sdy * xhat;
+  }
+  const float sum_d = block_sum(local_d, scratch);
+  const float sum_d_xhat = block_sum(local_dxhat_xhat, scratch);
+  n = 0;
+  for (int i = threadIdx.x; i < C; i += kThreads, ++n) {
+    const float xhat = (reg_x[n] - mean) * rstd;
+    const float value =
+        rstd * (reg_sdy[n] - sum_d / C - xhat * sum_d_xhat / C);
+    const bf16 d_norm = to_bf16(value);
+    dx[offset + i] = residual_grad
+                         ? to_bf16(to_float(residual_grad[offset + i]) +
+                                   to_float(d_norm))
+                         : d_norm;
   }
 }
 
@@ -255,13 +306,19 @@ void linear_runtime_backward_input_bf16(cudaStream_t stream, int rows,
 
 void layer_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
                                     const bf16 *x, const bf16 *frozen_weight,
-                                    const bf16 *dy, bf16 *dx, float eps) {
+                                    const bf16 *dy, bf16 *dx, float eps,
+                                    const bf16 *residual_grad) {
   if (rows <= 0 || channels <= 0 || !x || !frozen_weight || !dy || !dx ||
       eps <= 0.0f) {
     throw std::invalid_argument("invalid layer-norm backward arguments");
   }
-  norm_backward_kernel<<<rows, kThreads, 0, stream>>>(
-      channels, 1, x, frozen_weight, dy, dx, eps);
+  if (channels <= 8192) {
+    norm_backward_cached_kernel<<<rows, kThreads, 0, stream>>>(
+        channels, x, frozen_weight, dy, dx, eps, residual_grad);
+  } else {
+    norm_backward_kernel<<<rows, kThreads, 0, stream>>>(
+        channels, 1, x, frozen_weight, dy, dx, eps, residual_grad);
+  }
 }
 
 void group_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
@@ -274,7 +331,7 @@ void group_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
   }
   const int group_size = channels / groups;
   norm_backward_kernel<<<rows * groups, kThreads, 0, stream>>>(
-      group_size, groups, x, frozen_weight, dy, dx, eps);
+      group_size, groups, x, frozen_weight, dy, dx, eps, nullptr);
 }
 
 void time_mix_backward_input_bf16(cudaStream_t stream, int batch, int time,

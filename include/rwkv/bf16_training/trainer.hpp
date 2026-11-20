@@ -35,6 +35,8 @@ private:
   float alpha_;
   std::vector<HostTensor> targets_;
   rwkv_bf16_training::DeviceBuffer<float> master_, gradient_, m_, v_;
+  rwkv_bf16_training::DeviceBuffer<double> norm_sq_;
+  rwkv_bf16_training::DeviceBuffer<int> bad_flag_;
   rwkv_bf16_training::DeviceBuffer<bf16> forward_;
   std::vector<std::array<rwkv_bf16_training::DeviceBuffer<float>, TargetCount>>
       reduced_;

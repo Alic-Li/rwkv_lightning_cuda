@@ -62,6 +62,8 @@ Trainer::Trainer(rwkv_bf16_training::FrozenModelView &model, int rank,
   gradient_.resize(count, "adapter FP32 gradient");
   m_.resize(count, "adapter Adam m");
   v_.resize(count, "adapter Adam v");
+  norm_sq_.resize(1, "adapter gradient norm_sq");
+  bad_flag_.resize(1, "adapter gradient bad_flag");
   forward_.resize(count, "adapter BF16 factors");
   for (auto *p : {master_.p, gradient_.p, m_.p, v_.p})
     check(cudaMemsetAsync(p, 0, count * 4, stream_));
@@ -107,24 +109,25 @@ void Trainer::bind_tapes(
     tapes[t.layer].miss_reduced[t.target] = reduced_[t.layer][t.target].p;
 }
 double Trainer::update(float lr, uint64_t step) {
-  // Check the whole accumulated gradient before touching any optimizer tensor.
-  std::vector<float> g(gradient_.n);
-  check(cudaMemcpyAsync(g.data(), gradient_.p, g.size() * 4,
+  // Check the whole accumulated gradient on-device before touching optimizer state.
+  rwkv_bf16_training::gradient_norm_and_check_f32(
+      stream_, gradient_.p, gradient_.n, norm_sq_.p, bad_flag_.p);
+  double norm_sq = 0.0;
+  int bad = 0;
+  check(cudaMemcpyAsync(&norm_sq, norm_sq_.p, sizeof(double),
+                        cudaMemcpyDeviceToHost, stream_));
+  check(cudaMemcpyAsync(&bad, bad_flag_.p, sizeof(int),
                         cudaMemcpyDeviceToHost, stream_));
   check(cudaStreamSynchronize(stream_));
-  double norm = 0;
-  for (float x : g) {
-    norm += double(x) * x;
-    if (!std::isfinite(x) || std::abs(x) > 1e18f)
-      throw std::runtime_error(
-          "nonfinite/overflow adapter gradient; optimizer not executed");
-  }
+  if (bad || !std::isfinite(norm_sq))
+    throw std::runtime_error(
+        "nonfinite/overflow adapter gradient; optimizer not executed");
   rwkv_bf16_training::AdamConfig adam;
   adam.learning_rate = lr;
   rwkv_bf16_training::adam_update_state_f32(
       stream_, master_.p, gradient_.p, m_.p, v_.p, master_.n, step, adam, true);
   cast_master(stream_, master_.p, forward_.p, master_.n);
-  return std::sqrt(norm);
+  return std::sqrt(norm_sq);
 }
 void Trainer::zero_gradient() {
   check(cudaMemsetAsync(gradient_.p, 0, gradient_.n * 4, stream_));

@@ -1,6 +1,7 @@
 #include "nccl_dp.hpp"
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -140,7 +141,7 @@ int launch(const std::string &list) {
 Group::Group() {
   rwkv_bf16_training::gpu_check(cudaSetDevice(device), "DP select GPU");
   check(ncclCommInitRank(&comm_, world, unique_id, worker_rank));
-  scalar_.resize(1, "DP collective scalar");
+  scalar_.resize(1 + size_t(world), "DP collective scalars");
   std::fprintf(stderr, "DP rank=%d/%d device=%d\n", worker_rank, world, device);
 }
 Group::~Group() {
@@ -167,31 +168,100 @@ float Group::sum_loss(float value, cudaStream_t stream) {
   gpu_check(cudaStreamSynchronize(stream), "DP loss reduction");
   return value;
 }
+float Group::sum_loss_and_times(float local_loss, float local_compute_s,
+                                std::vector<float> &rank_compute_s,
+                                cudaStream_t stream) {
+  using rwkv_bf16_training::gpu_check;
+  std::vector<float> buf(1 + size_t(world), 0.0f);
+  buf[0] = local_loss;
+  buf[1 + size_t(worker_rank)] = local_compute_s;
+  gpu_check(cudaMemcpyAsync(scalar_.p, buf.data(), buf.size() * sizeof(float),
+                            cudaMemcpyHostToDevice, stream),
+            "DP upload loss and compute time");
+  sum(scalar_.p, buf.size(), stream);
+  gpu_check(cudaMemcpyAsync(buf.data(), scalar_.p, buf.size() * sizeof(float),
+                            cudaMemcpyDeviceToHost, stream),
+            "DP download loss and compute times");
+  gpu_check(cudaStreamSynchronize(stream), "DP loss/time reduction");
+  rank_compute_s.assign(buf.begin() + 1, buf.end());
+  return buf[0];
+}
 void Group::barrier(cudaStream_t stream) { (void)sum_loss(0, stream); }
 std::vector<int> assign(const std::vector<size_t> &lengths, int ranks,
-                        int micro_bsz) {
+                        int micro_bsz, const std::vector<double> *inv_speeds,
+                        std::vector<size_t> *out_raw_loads) {
   if (ranks < 1 || micro_bsz < 1)
     throw std::invalid_argument("invalid DP world size/micro batch");
+  std::vector<double> scale(ranks, 1.0);
+  const bool weighted =
+      inv_speeds && int(inv_speeds->size()) == ranks;
+  if (weighted) {
+    for (int r = 0; r < ranks; ++r)
+      if (std::isfinite((*inv_speeds)[r]) && (*inv_speeds)[r] > 0.0)
+        scale[r] = std::clamp((*inv_speeds)[r], 0.5, 2.0);
+  }
   std::vector<size_t> order(lengths.size()), load(ranks, 0), count(ranks, 0);
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(),
                    [&](size_t a, size_t b) { return lengths[a] > lengths[b]; });
   std::vector<int> owners(lengths.size());
   for (auto i : order) {
-    // Cost = processed tokens + longest sequence in each packed micro-batch.
-    // The latter accounts for chunk sweeps with few active lanes: balancing
-    // tokens alone leaves the rank with the longest sequence a straggler.
-    auto cost = [&](int r) {
-      return load[r] + lengths[i] * (count[r] % micro_bsz == 0 ? 2 : 1);
+    // Cost = processed tokens + sweep penalty for each micro-batch's longest
+    // sequence. Spilling into a second micro-batch pays an extra full sweep of
+    // block kernels, so penalize spilling (weight 3) when adaptive timing is active.
+    auto next_raw = [&](int r) -> size_t {
+      const size_t weight = (count[r] % micro_bsz == 0)
+                                ? (weighted && count[r] > 0 ? 3 : 2)
+                                : 1;
+      return load[r] + lengths[i] * weight;
     };
     int best = 0;
-    for (int r = 1; r < ranks; ++r)
-      if (cost(r) < cost(best))
-        best = r;
+    if (!weighted) {
+      for (int r = 1; r < ranks; ++r)
+        if (next_raw(r) < next_raw(best))
+          best = r;
+    } else {
+      double best_time = double(next_raw(0)) * scale[0];
+      for (int r = 1; r < ranks; ++r) {
+        const double t = double(next_raw(r)) * scale[r];
+        if (t < best_time) {
+          best = r;
+          best_time = t;
+        }
+      }
+    }
     owners[i] = best;
-    load[best] = cost(best);
+    load[best] = next_raw(best);
     ++count[best];
   }
+  if (out_raw_loads)
+    *out_raw_loads = std::move(load);
   return owners;
+}
+void update_speed_model(const std::vector<size_t> &raw_loads,
+                        const std::vector<float> &rank_compute_s,
+                        std::vector<double> &inv_speeds, bool &ready) {
+  const size_t ranks = raw_loads.size();
+  if (ranks < 2 || rank_compute_s.size() != ranks)
+    return;
+  std::vector<double> spu(ranks, 0.0);
+  double sum_spu = 0.0;
+  for (size_t r = 0; r < ranks; ++r) {
+    if (raw_loads[r] == 0 || !std::isfinite(rank_compute_s[r]) ||
+        rank_compute_s[r] <= 1.0e-3f)
+      return;
+    spu[r] = double(rank_compute_s[r]) / double(raw_loads[r]);
+    sum_spu += spu[r];
+  }
+  const double mean_spu = sum_spu / double(ranks);
+  if (!(mean_spu > 0.0) || !std::isfinite(mean_spu))
+    return;
+  if (inv_speeds.size() != ranks)
+    inv_speeds.assign(ranks, 1.0);
+  for (size_t r = 0; r < ranks; ++r) {
+    const double rel = std::clamp(spu[r] / mean_spu, 0.65, 1.5);
+    inv_speeds[r] = ready ? (0.7 * inv_speeds[r] + 0.3 * rel) : rel;
+  }
+  ready = true;
 }
 } // namespace rwkv_dp

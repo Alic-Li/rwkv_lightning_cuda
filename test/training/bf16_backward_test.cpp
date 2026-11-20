@@ -4,6 +4,7 @@
 #include "rwkv/bf16_training/trainer.hpp"
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <type_traits>
 
@@ -217,6 +218,101 @@ void check(int layers, const std::string &method, bool residual_only,
   std::cout << "backward contract/pruning: layers=" << layers
             << " method=" << method << " identity=" << residual_only << '\n';
 }
+
+void check_tiled_head_and_grad_norm(cudaStream_t stream) {
+  set_consistent_forward(true, true);
+  Bf16ModelFixture fixture(2, false);
+  auto view = fixture.view;
+  Json::Value config;
+  config["method"] = "nora";
+  config["initialization"] = "nora_init";
+  constexpr int chunk = 256, lanes = 8;
+  rwkv_bf16_miss::Trainer trainer(view, 16, 16, "all", chunk * lanes, config,
+                                  stream);
+  Executor single(view, chunk, stream), packed(view, chunk, stream, lanes);
+  const size_t states = size_t(view.layers) * view.heads * 4096;
+  DeviceBuffer<float> initial;
+  initial.resize(states, "tiled head test state");
+  fill(initial, .01f);
+
+  std::vector<std::vector<int>> batch_tokens(lanes, std::vector<int>(chunk));
+  std::vector<std::vector<float>> batch_weights(lanes,
+                                                std::vector<float>(chunk, 1.f));
+  size_t normalizer = 0;
+  for (int b = 0; b < lanes; ++b) {
+    batch_weights[b][0] = 0.f;
+    for (int t = 0; t < chunk; ++t) {
+      batch_tokens[b][t] = 33 + ((b * 31 + t * 7) % (view.vocab - 33));
+      if (t > 0)
+        normalizer += 1;
+    }
+  }
+  require(normalizer > 1024, "tiled head test must exceed kOutputTileRows");
+
+  trainer.bind_tapes(single.tapes());
+  trainer.zero_gradient();
+  float expected_loss = 0.f;
+  std::vector<float> expected_state(states, 0.f);
+  for (int b = 0; b < lanes; ++b) {
+    expected_loss += single.backward(view, batch_tokens[b], batch_weights[b],
+                                     initial.p, normalizer);
+    const auto g = read(single.state_gradient(), states);
+    for (size_t j = 0; j < states; ++j)
+      expected_state[j] += g[j];
+  }
+  const auto expected_adapter = adapter_gradients(view);
+
+  trainer.bind_tapes(packed.tapes());
+  trainer.zero_gradient();
+  const float loss = packed.backward_packed(view, batch_tokens, batch_weights,
+                                            initial.p, normalizer);
+  require(std::abs(loss - expected_loss) <= 1e-5f * std::abs(expected_loss),
+          "tiled cross-entropy loss mismatch");
+  const auto got_adapter = adapter_gradients(view);
+  double err = 0.0, norm = 0.0;
+  for (size_t i = 0; i < expected_adapter.size(); ++i) {
+    const double d = double(expected_adapter[i]) - got_adapter[i];
+    err += d * d;
+    norm += double(expected_adapter[i]) * expected_adapter[i];
+  }
+  require(norm > 0.0 && std::sqrt(err / norm) <= 1e-5,
+          "tiled cross-entropy adapter gradient mismatch");
+
+  // Exercise device-side gradient_norm_and_check_f32 finite & NaN paths.
+  DeviceBuffer<float> gbuf;
+  DeviceBuffer<double> d_norm_sq;
+  DeviceBuffer<int> d_bad;
+  gbuf.resize(5000, "grad norm test");
+  d_norm_sq.resize(1, "grad norm accum");
+  d_bad.resize(1, "grad bad flag");
+  std::vector<float> host_g(gbuf.n);
+  double ref_sq = 0.0;
+  for (size_t i = 0; i < host_g.size(); ++i) {
+    host_g[i] = 0.001f * float(int(i % 97) - 48);
+    ref_sq += double(host_g[i]) * host_g[i];
+  }
+  gpu_check(cudaMemcpyAsync(gbuf.p, host_g.data(), host_g.size() * sizeof(float),
+                            cudaMemcpyHostToDevice, stream),
+            "upload grad norm test");
+  gradient_norm_and_check_f32(stream, gbuf.p, gbuf.n, d_norm_sq.p, d_bad.p);
+  gpu_check(cudaStreamSynchronize(stream), "sync grad norm");
+  const double got_sq = read(d_norm_sq.p, 1)[0];
+  const int got_bad = read(d_bad.p, 1)[0];
+  if (got_bad != 0 || std::abs(got_sq - ref_sq) > 1e-9 * ref_sq) {
+    std::cerr << "got_bad=" << got_bad << " got_sq=" << got_sq
+              << " ref_sq=" << ref_sq << '\n';
+    require(false, "device gradient norm mismatch");
+  }
+  host_g[3333] = std::numeric_limits<float>::quiet_NaN();
+  gpu_check(cudaMemcpyAsync(gbuf.p, host_g.data(), host_g.size() * sizeof(float),
+                            cudaMemcpyHostToDevice, stream),
+            "upload nan grad test");
+  gradient_norm_and_check_f32(stream, gbuf.p, gbuf.n, d_norm_sq.p, d_bad.p);
+  gpu_check(cudaStreamSynchronize(stream), "sync nan grad norm");
+  require(read(d_bad.p, 1)[0] != 0, "NaN gradient was not flagged on device");
+  std::cout << "tiled head & device grad norm verified (supervised="
+            << normalizer << ")\n";
+}
 } // namespace
 int main() {
   int devices = 0;
@@ -233,6 +329,7 @@ int main() {
         for (const char *method : {"state", "miss", "nora"})
           check(layers, method, false, stream);
     }
+    check_tiled_head_and_grad_norm(stream);
     gpu_check(cudaStreamDestroy(stream), "destroy regression stream");
   } catch (const std::exception &e) {
     if (stream)

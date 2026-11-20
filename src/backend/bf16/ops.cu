@@ -98,6 +98,44 @@ __global__ void norm(int C, const bf16 *x, const bf16 *w, const bf16 *b,
     y[off + i] = to_bf16((to_float(x[off + i]) - mean) * inv * to_float(w[i]) +
                          to_float(b[i]));
 }
+// Register-cached LayerNorm with optional fused residual add (sum_out = x + residual)
+// for C <= 8192 (<= 32 elements per thread at blockDim=256). Bit-identical to
+// separate add + norm while eliminating two extra global-memory passes over x.
+__global__ void norm_cached(int C, const bf16 *__restrict__ x,
+                            const bf16 *__restrict__ residual,
+                            bf16 *__restrict__ sum_out,
+                            const bf16 *__restrict__ w,
+                            const bf16 *__restrict__ b,
+                            bf16 *__restrict__ y, float eps) {
+  __shared__ float s[256];
+  const size_t off = size_t(blockIdx.x) * C;
+  float reg[32];
+  float v = 0.0f;
+  int n = 0;
+  for (int i = threadIdx.x; i < C; i += 256, ++n) {
+    float val = to_float(x[off + i]);
+    if (residual) {
+      const bf16 added = to_bf16(val + to_float(residual[off + i]));
+      if (sum_out)
+        sum_out[off + i] = added;
+      val = to_float(added);
+    }
+    reg[n] = val;
+    v += val;
+  }
+  const float mean = sum256(v, s) / C;
+  v = 0.0f;
+  for (int k = 0; k < n; ++k) {
+    const float d = reg[k] - mean;
+    v += d * d;
+  }
+  const float inv = rsqrtf(sum256(v, s) / C + eps);
+  n = 0;
+  for (int i = threadIdx.x; i < C; i += 256, ++n) {
+    y[off + i] =
+        to_bf16((reg[n] - mean) * inv * to_float(w[i]) + to_float(b[i]));
+  }
+}
 // Shift is updated by a separate kernel, after all t=0 readers finish.
 // Packed calls pass offsets with B lanes and T total rows.
 __global__ void mix(int B, int T, int C, const int *offsets, const bf16 *x,
@@ -145,13 +183,15 @@ __global__ void shift_last(int B, int T, int C, const int *offsets,
 }
 __global__ void kk(int H, const bf16 *k, const bf16 *kw, const bf16 *a0,
                    const bf16 *a12, const bf16 *ka, bf16 *nk, bf16 *neg,
-                   bf16 *kka) {
+                   bf16 *kka, bf16 *alpha_out) {
   __shared__ float s[32];
   int j = threadIdx.x, c = (blockIdx.x % H) * 64 + j;
   size_t i = size_t(blockIdx.x) * 64 + j;
   float v = to_float(k[i]), u = v * to_float(kw[c]);
   float inv = 1 / fmaxf(sqrtf(sum64(u * u, s)), 1e-12f);
-  float a = 1 / (1 + expf(-to_float(a0[c]) - to_float(a12[i])));
+  float a = 1 / (1 + expf(-(to_float(a0[c]) + to_float(a12[i]))));
+  if (alpha_out)
+    alpha_out[i] = to_bf16(a);
   float b = to_float(ka[c]);
   nk[i] = to_bf16(v * (1 - b + a * b));
   neg[i] = to_bf16(-u * inv);
@@ -203,20 +243,38 @@ void gemm_raw(cudaStream_t st, int M, int K, int N, const bf16 *x,
     throw std::runtime_error("BF16 hipblasGemmEx");
 #else
   struct Handle {
-    cublasHandle_t h;
+    cublasHandle_t h = nullptr;
+    DeviceBuffer<uint8_t> ws;
+    cudaStream_t last_stream = reinterpret_cast<cudaStream_t>(~uintptr_t(0));
+    bool has_last_mode = false;
+    bool last_tensor_forward = false;
     Handle() {
       if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("cublasCreate");
+      ws.resize(32 * 1024 * 1024, "BF16 cuBLAS workspace");
     }
-    ~Handle() { cublasDestroy(h); }
+    ~Handle() {
+      if (h)
+        cublasDestroy(h);
+    }
   };
   static thread_local Handle h;
-  cublasSetStream(h.h, st);
+  if (h.last_stream != st) {
+    if (cublasSetStream(h.h, st) != CUBLAS_STATUS_SUCCESS ||
+        cublasSetWorkspace(h.h, h.ws.p, h.ws.n) != CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("BF16 cublasSetStream/Workspace");
+    h.last_stream = st;
+  }
   // Keep FP32 reductions while allowing BF16 Tensor Cores in online mode.
-  if (cublasSetMathMode(h.h, tensor_forward
-                                ? CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION
-                                : CUBLAS_DEFAULT_MATH) != CUBLAS_STATUS_SUCCESS)
-    throw std::runtime_error("BF16 cublasSetMathMode");
+  if (!h.has_last_mode || h.last_tensor_forward != tensor_forward) {
+    if (cublasSetMathMode(
+            h.h, tensor_forward
+                     ? CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION
+                     : CUBLAS_DEFAULT_MATH) != CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("BF16 cublasSetMathMode");
+    h.has_last_mode = true;
+    h.last_tensor_forward = tensor_forward;
+  }
   auto e = cublasGemmEx(
       h.h, orig ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &a, w,
       CUDA_R_16BF, orig ? K : N, x, CUDA_R_16BF, K, &b, y, CUDA_R_16BF, N,
@@ -406,7 +464,21 @@ void rwkv7_v3a_linear_bf16_orig_launch(cudaStream_t s, int M, int K, int N,
 void rwkv7_v3a_layer_norm_bf16_launch(cudaStream_t s, int rows, int C,
                                       const bf16 *x, const bf16 *w,
                                       const bf16 *b, bf16 *y, float eps) {
-  norm<<<rows, 256, 0, s>>>(C, x, w, b, y, eps);
+  if (C <= 8192)
+    norm_cached<<<rows, 256, 0, s>>>(C, x, nullptr, nullptr, w, b, y, eps);
+  else
+    norm<<<rows, 256, 0, s>>>(C, x, w, b, y, eps);
+}
+void rwkv7_add_layer_norm_bf16_launch(cudaStream_t s, int rows, int C,
+                                      const bf16 *a, const bf16 *b_in,
+                                      bf16 *sum_out, const bf16 *w,
+                                      const bf16 *bias, bf16 *y, float eps) {
+  if (C <= 8192) {
+    norm_cached<<<rows, 256, 0, s>>>(C, a, b_in, sum_out, w, bias, y, eps);
+  } else {
+    rwkv7_v3a_add_bf16_launch(s, a, b_in, sum_out, static_cast<long long>(rows) * C);
+    norm<<<rows, 256, 0, s>>>(C, sum_out, w, bias, y, eps);
+  }
 }
 void rwkv7_v3a_add_bf16_launch(cudaStream_t s, const bf16 *x, const bf16 *y,
                                bf16 *z, long long n) {
@@ -448,8 +520,8 @@ void rwkv7_tmix_mix6_launch(cudaStream_t s, int B, int T, int C, const bf16 *x,
 void rwkv7_tmix_kk_a_gate_launch(cudaStream_t s, int B, int T, int C, int H,
                                  const bf16 *k, const bf16 *kw, const bf16 *a0,
                                  const bf16 *a12, const bf16 *ka, bf16 *nk,
-                                 bf16 *neg, bf16 *kka) {
-  kk<<<B * T * H, 64, 0, s>>>(H, k, kw, a0, a12, ka, nk, neg, kka);
+                                 bf16 *neg, bf16 *kka, bf16 *alpha_out) {
+  kk<<<B * T * H, 64, 0, s>>>(H, k, kw, a0, a12, ka, nk, neg, kka, alpha_out);
 }
 void rwkv7_tmix_lnx_rkvres_xg_launch(cudaStream_t s, int B, int T, int C, int H,
                                      const bf16 *x, const bf16 *r,

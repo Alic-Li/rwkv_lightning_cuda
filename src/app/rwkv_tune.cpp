@@ -478,6 +478,8 @@ int main(int argc, char **argv) {
       stop = true;
 #endif
 #ifdef RWKV_NCCL_DP
+    std::vector<double> dp_inv_speeds(rwkv_dp::size(), 1.0);
+    bool dp_ema_ready = false;
     dp.barrier(stream.value);
     size_t free_bytes = 0, total_bytes = 0;
     check(cudaMemGetInfo(&free_bytes, &total_bytes), "DP memory report");
@@ -559,8 +561,10 @@ int main(int argc, char **argv) {
         std::vector<size_t> lengths;
         for (const auto &sample : batch)
           lengths.push_back(sample.tokens.size() - 1);
-        const auto owners =
-            rwkv_dp::assign(lengths, rwkv_dp::size(), micro_bsz);
+        std::vector<size_t> rank_loads;
+        const auto owners = rwkv_dp::assign(
+            lengths, rwkv_dp::size(), micro_bsz,
+            dp_ema_ready ? &dp_inv_speeds : nullptr, &rank_loads);
         std::vector<Sample> local;
         for (size_t i = 0; i < batch.size(); ++i)
           if (owners[i] == rwkv_dp::rank())
@@ -676,10 +680,18 @@ int main(int argc, char **argv) {
             throw std::runtime_error(
                 "nonfinite/overflow global state gradient");
 #endif
-        batch_loss = dp.sum_loss(batch_loss, stream.value);
+        const double local_compute_s =
+            std::chrono::duration<double>(reduce_started - compute_started)
+                .count();
+        std::vector<float> rank_compute_s;
+        batch_loss = dp.sum_loss_and_times(
+            batch_loss, static_cast<float>(local_compute_s), rank_compute_s,
+            stream.value);
         if (!std::isfinite(batch_loss))
           throw std::runtime_error(
               "nonfinite global loss; optimizer not executed");
+        rwkv_dp::update_speed_model(rank_loads, rank_compute_s, dp_inv_speeds,
+                                    dp_ema_ready);
         if (options.dp_profile) {
           const auto reduced = std::chrono::steady_clock::now();
           check(cudaMemGetInfo(&free_bytes, &total_bytes), "DP profile memory");
@@ -688,9 +700,7 @@ int main(int argc, char **argv) {
               "DP step=%llu rank=%d samples=%zu tokens=%zu compute_s=%.3f "
               "reduce_wait_s=%.3f used_MiB=%zu\n",
               static_cast<unsigned long long>(next_step), rwkv_dp::rank(),
-              batch.size(), local_positions,
-              std::chrono::duration<double>(reduce_started - compute_started)
-                  .count(),
+              batch.size(), local_positions, local_compute_s,
               std::chrono::duration<double>(reduced - reduce_started).count(),
               (total_bytes - free_bytes) / (1024 * 1024));
         }

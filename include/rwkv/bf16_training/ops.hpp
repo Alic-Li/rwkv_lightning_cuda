@@ -25,7 +25,7 @@ void rwkv7_tmix_kk_a_gate_launch(cudaStream_t stream, int B, int T, int C,
                                  int H, const bf16 *k, const bf16 *k_k,
                                  const bf16 *a0, const bf16 *a12,
                                  const bf16 *k_a, bf16 *new_k, bf16 *neg_kk,
-                                 bf16 *kka);
+                                 bf16 *kka, bf16 *alpha_out = nullptr);
 void rwkv7_tmix_lnx_rkvres_xg_launch(cudaStream_t stream, int B, int T, int C,
                                      int H, const bf16 *x, const bf16 *r,
                                      const bf16 *k, const bf16 *v,
@@ -47,6 +47,10 @@ void rwkv7_v3a_add_bf16_launch(cudaStream_t stream, const bf16 *x,
                                const bf16 *y, bf16 *out, long long elems);
 void rwkv7_v3a_layer_norm_bf16_launch(cudaStream_t stream, int rows, int C,
                                       const bf16 *x, const bf16 *weight,
+                                      const bf16 *bias, bf16 *y, float eps);
+void rwkv7_add_layer_norm_bf16_launch(cudaStream_t stream, int rows, int C,
+                                      const bf16 *a, const bf16 *b,
+                                      bf16 *sum_out, const bf16 *weight,
                                       const bf16 *bias, bf16 *y, float eps);
 void rwkv7_v3a_linear_bf16_launch(cudaStream_t stream, int M, int K, int N,
                                   const bf16 *x, const bf16 *weight, bf16 *y);
