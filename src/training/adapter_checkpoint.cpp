@@ -138,7 +138,7 @@ void Trainer::resume(const std::string &dir, uint64_t &step, int &epoch,
             load(name + "." + p.first, p.second + offset, {rows, cols});
           });
   load("initial_state", initial, {int64_t(states)});
-  cast_master(stream_, master_.p, forward_.p, master_.n);
+  sync_forward_weights();
   step = m["step"].asUInt64();
   epoch = m["epoch"].asInt();
   row = m["row"].asUInt64();

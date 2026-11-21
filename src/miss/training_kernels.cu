@@ -169,8 +169,14 @@ void forward(cudaStream_t stream, int rows, const Linear &w, const bf16 *x,
   if (!w.d)
     return;
   validate(rows, w);
-  if (!x || !y)
+  if (!x || (!y && !s))
     throw std::invalid_argument("null MiSS forward input");
+  if (!y) {
+    reduce<<<(rows * w.rank + threads - 1) / threads, threads, 0, stream>>>(
+        rows, w.in, w.rank, x, s);
+    checked();
+    return;
+  }
   const bool separate = s && w.out > threads;
   if (separate)
     reduce<<<(rows * w.rank + threads - 1) / threads, threads, 0, stream>>>(

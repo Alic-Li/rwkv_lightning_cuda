@@ -14,6 +14,8 @@ struct Linear {
   float *gradient = nullptr; // optional D/B FP32 accumulator; never a base dW
   const bf16 *a = nullptr;   // NoRA A[rank,in]; null selects MiSS
   float *gradient_a = nullptr;
+  const bf16 *d_twice = nullptr; // optional cached [out, 2*rank] [B|B]
+  const bf16 *a_twice = nullptr; // optional cached [2*rank, in] [A;A]
 };
 using Block = std::array<Linear, TargetCount>;
 // reduced may be null for inference (fused reduction/project/add), otherwise

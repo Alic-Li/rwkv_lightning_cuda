@@ -43,7 +43,7 @@ const bf16 *model_forward_state_tuning_bf16(
     float *state_final, bf16 *block_workspace,
     std::size_t block_workspace_elements, bf16 *final_normalized, bf16 *logits,
     float *carried_states, bool compute_logits, const int *offsets,
-    bool record_tape) {
+    bool record_tape, const std::uint8_t *doc_start) {
   if (layers <= 0 || B <= 0 || T <= 0 || vocab <= 0 || !weights || !tapes ||
       !input || !time_state || !shifts || !ln_out_weight || !ln_out_bias ||
       !head_weight_orig || !activation_ping || !activation_pong ||
@@ -94,7 +94,7 @@ const bf16 *model_forward_state_tuning_bf16(
     block_forward_state_tuning_bf16(
         stream, B, T, current, att_shift, ffn_shift, initial, final_out,
         tapes[0].v_first, next, weights[layer], tapes[layer], block_workspace,
-        block_workspace_elements, layer == 0, offsets, record_tape);
+        block_workspace_elements, layer == 0, offsets, record_tape, doc_start);
     current = next;
     next = next == activation_ping ? activation_pong : activation_ping;
   }

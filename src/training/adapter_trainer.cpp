@@ -1,4 +1,5 @@
 #include "rwkv/bf16_training/trainer.hpp"
+#include "rwkv/bf16_training/nora.hpp"
 #include "gpu_check.hpp"
 #include "rwkv/io/adapter_layout.hpp"
 #include "rwkv/io/pth_tensor.hpp"
@@ -65,9 +66,13 @@ Trainer::Trainer(rwkv_bf16_training::FrozenModelView &model, int rank,
   norm_sq_.resize(1, "adapter gradient norm_sq");
   bad_flag_.resize(1, "adapter gradient bad_flag");
   forward_.resize(count, "adapter BF16 factors");
+  if (nora_)
+    forward_twice_.resize(2 * count, "adapter BF16 repeated factors");
   for (auto *p : {master_.p, gradient_.p, m_.p, v_.p})
     check(cudaMemsetAsync(p, 0, count * 4, stream_));
   check(cudaMemsetAsync(forward_.p, 0, count * 2, stream_));
+  if (nora_)
+    check(cudaMemsetAsync(forward_twice_.p, 0, 2 * count * 2, stream_));
   if (nora_) {
     // Random Kaiming-uniform directions, normalized along rank (each input
     // column), exactly once. B remains zero; both factors are then trainable.
@@ -89,7 +94,7 @@ Trainer::Trainer(rwkv_bf16_training::FrozenModelView &model, int rank,
     }
     check(cudaMemcpyAsync(master_.p, initial.data(), count * 4,
                           cudaMemcpyHostToDevice, stream_));
-    cast_master(stream_, master_.p, forward_.p, count);
+    sync_forward_weights();
     check(cudaStreamSynchronize(stream_));
   }
   for (const auto &t : targets_)
@@ -101,7 +106,22 @@ Trainer::Trainer(rwkv_bf16_training::FrozenModelView &model, int rank,
         forward_.p + t.offset,
         gradient_.p + t.offset,
         nora_ ? forward_.p + t.a_offset : nullptr,
-        nora_ ? gradient_.p + t.a_offset : nullptr};
+        nora_ ? gradient_.p + t.a_offset : nullptr,
+        nora_ ? forward_twice_.p + 2 * t.offset : nullptr,
+        nora_ ? forward_twice_.p + 2 * t.a_offset : nullptr};
+}
+void Trainer::sync_forward_weights() {
+  cast_master(stream_, master_.p, forward_.p, master_.n);
+  if (nora_) {
+    for (const auto &t : targets_) {
+      rwkv_bf16_nora::refresh_weight_twice(
+          stream_, t.out, rank_, true, forward_.p + t.offset,
+          forward_twice_.p + 2 * t.offset);
+      rwkv_bf16_nora::refresh_weight_twice(
+          stream_, rank_, t.in, false, forward_.p + t.a_offset,
+          forward_twice_.p + 2 * t.a_offset);
+    }
+  }
 }
 void Trainer::bind_tapes(
     std::vector<rwkv_bf16_training::BlockTapeView> &tapes) {
@@ -126,7 +146,7 @@ double Trainer::update(float lr, uint64_t step) {
   adam.learning_rate = lr;
   rwkv_bf16_training::adam_update_state_f32(
       stream_, master_.p, gradient_.p, m_.p, v_.p, master_.n, step, adam, true);
-  cast_master(stream_, master_.p, forward_.p, master_.n);
+  sync_forward_weights();
   return std::sqrt(norm_sq);
 }
 void Trainer::zero_gradient() {
@@ -166,7 +186,7 @@ void Trainer::load_adapter(const rwkv7_miss::Package &package) {
                         cudaMemcpyHostToDevice, stream_));
   for (auto *p : {gradient_.p, m_.p, v_.p})
     check(cudaMemsetAsync(p, 0, master_.n * 4, stream_));
-  cast_master(stream_, master_.p, forward_.p, master_.n);
+  sync_forward_weights();
   check(cudaStreamSynchronize(stream_));
 }
 rwkv_bf16_training::DeviceBuffer<bf16>
@@ -181,6 +201,8 @@ Trainer::snapshot(rwkv_bf16_training::FrozenModelView &model) const {
     linear.gradient = nullptr;
     linear.a = nora_ ? result.p + t.a_offset : nullptr;
     linear.gradient_a = nullptr;
+    linear.d_twice = nullptr;
+    linear.a_twice = nullptr;
   }
   check(cudaStreamSynchronize(stream_));
   return result;

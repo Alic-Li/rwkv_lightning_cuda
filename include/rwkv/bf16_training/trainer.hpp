@@ -27,6 +27,7 @@ public:
   void export_adapter(const std::string &);
 
 private:
+  void sync_forward_weights();
   cudaStream_t stream_;
   // Missing optional-key reads must not change later checkpoint configs.
   const Json::Value config_;
@@ -37,7 +38,7 @@ private:
   rwkv_bf16_training::DeviceBuffer<float> master_, gradient_, m_, v_;
   rwkv_bf16_training::DeviceBuffer<double> norm_sq_;
   rwkv_bf16_training::DeviceBuffer<int> bad_flag_;
-  rwkv_bf16_training::DeviceBuffer<bf16> forward_;
+  rwkv_bf16_training::DeviceBuffer<bf16> forward_, forward_twice_;
   std::vector<std::array<rwkv_bf16_training::DeviceBuffer<float>, TargetCount>>
       reduced_;
 };

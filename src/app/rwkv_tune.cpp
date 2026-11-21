@@ -346,12 +346,9 @@ int main(int argc, char **argv) {
       return launch_status;
     rwkv_dp::Group dp;
     const bool primary = rwkv_dp::rank() == 0;
-    // Avoid reserving excessive lanes for small global batches. Ranks may own
-    // different sample counts and accumulate as many micro-batches as needed.
-    const int micro_bsz =
-        std::min(options.micro_bsz,
-                 int((size_t(options.batch_size) + rwkv_dp::size() - 1) /
-                     rwkv_dp::size()));
+    // Allow unequal sample counts across thermally/architecturally unequal DP
+    // ranks up to --micro-bsz without spilling to a second micro-batch.
+    const int micro_bsz = std::min(options.micro_bsz, options.batch_size);
 #else
     const bool primary = true;
     const int micro_bsz = options.micro_bsz;
@@ -470,10 +467,21 @@ int main(int argc, char **argv) {
 #endif
     int resume_epoch = 1;
     std::uint64_t resume_row = 0;
+    std::uint64_t start_step = 0;
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
-    if (!options.resume.empty())
+    if (!options.resume.empty()) {
       miss.resume(options.resume, global_step, resume_epoch, resume_row,
                   time_state.p, state_count);
+      start_step = global_step;
+      if (dataset_rows >= resume_row) {
+        const std::uint64_t rem_cur =
+            (dataset_rows - resume_row + options.batch_size - 1) / options.batch_size;
+        const std::uint64_t rem_eps =
+            static_cast<std::uint64_t>(std::max(0, options.epochs - resume_epoch)) *
+            ((dataset_rows + options.batch_size - 1) / options.batch_size);
+        planned = global_step + rem_cur + rem_eps;
+      }
+    }
     if (options.max_steps && global_step >= options.max_steps)
       stop = true;
 #endif
@@ -593,9 +601,20 @@ int main(int argc, char **argv) {
 #endif
 #endif
         float batch_loss = 0.0f;
-        for (std::size_t first = 0; first < batch.size(); first += micro_bsz) {
-          const std::size_t last = std::min(
-              batch.size(), first + static_cast<std::size_t>(micro_bsz));
+        const std::size_t step_bsz =
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
+            (!rwkv_bf16_training::consistent_forward_enabled() && micro_bsz > 1)
+                ? std::max<std::size_t>(
+                      1, std::min<std::size_t>(
+                             batch.size(),
+                             static_cast<std::size_t>(micro_bsz) * 2))
+                : static_cast<std::size_t>(micro_bsz);
+#else
+            static_cast<std::size_t>(micro_bsz);
+#endif
+        for (std::size_t first = 0; first < batch.size(); first += step_bsz) {
+          const std::size_t last =
+              std::min(batch.size(), first + step_bsz);
           if (micro_bsz == 1) {
             const auto &sample = batch[first];
             std::vector<float> weights(sample.train.begin(), sample.train.end());
@@ -733,6 +752,8 @@ int main(int argc, char **argv) {
         const double fraction =
             std::min(1.0, static_cast<double>(global_step) / display_steps);
         const int filled = static_cast<int>(fraction * 24);
+        const std::uint64_t steps_since_start =
+            std::max<std::uint64_t>(1, global_step - start_step);
         if (primary)
           std::cout << '\r' << '[' << std::string(filled, '=')
                     << std::string(24 - filled, ' ') << "] " << global_step
@@ -746,7 +767,7 @@ int main(int argc, char **argv) {
                     << " tok/s=" << std::setprecision(1)
                     << processed_tokens / elapsed
                     << " ETA=" << std::setprecision(0)
-                    << elapsed / global_step *
+                    << elapsed / steps_since_start *
                            (display_steps > global_step
                                 ? display_steps - global_step
                                 : 0)

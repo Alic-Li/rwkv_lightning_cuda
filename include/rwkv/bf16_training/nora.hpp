@@ -13,4 +13,6 @@ void backward_target(cudaStream_t,
                      const rwkv_bf16_training::FrozenBlockWeights &,
                      const rwkv_bf16_training::BlockTapeView &, int target,
                      const bf16 *dy, bf16 *dx);
+void refresh_weight_twice(cudaStream_t, int rows, int cols, bool side,
+                          const bf16 *src, bf16 *dst);
 } // namespace rwkv_bf16_nora

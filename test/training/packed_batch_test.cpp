@@ -95,7 +95,10 @@ void check(FrozenModelView view, const std::string &method, double tolerance) {
                        cudaMemcpyHostToDevice),
             "initial");
   const std::vector<std::vector<int>> cases = {
-      {37, 5, 50, 18}, {33, 6, 21}, {64, 16, 17, 2}};
+      {37, 5, 50, 18},
+      {33, 6, 21},
+      {64, 16, 17, 2},
+      {29, 14, 41, 9, 23, 19}};
   for (int round = 0; round < 2; ++round) {
     for (size_t c = 0; c < cases.size(); ++c) {
       const auto batch = make_batch(cases[c], view.vocab, unsigned(c + 7));

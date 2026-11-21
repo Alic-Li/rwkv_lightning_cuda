@@ -143,8 +143,12 @@ void forward_tensor(cudaStream_t stream, int rows,
   if (!s)
     s = b.grow(b.latent, size_t(rows) * r);
   product(b.h, false, true, rows, r, w.in, 1.f, x, w.in, w.a, w.in, 0.f, s);
-  product(b.h, false, true, rows, w.out, 2 * r, w.scale, pair(stream, b, s, rows, r),
-          2 * r, twice(stream, b, w.d, w.out, r, true), 2 * r, 1.f, y);
+  if (!y)
+    return;
+  const bf16 *d_rep =
+      w.d_twice ? w.d_twice : twice(stream, b, w.d, w.out, r, true);
+  product(b.h, false, true, rows, w.out, 2 * r, w.scale,
+          pair(stream, b, s, rows, r), 2 * r, d_rep, 2 * r, 1.f, y);
 }
 // dB += scale g^T s; ds = scale g B; dA += ds^T x; dx += ds A.
 void backward_tensor(cudaStream_t stream, int rows,
@@ -172,28 +176,35 @@ void backward_tensor(cudaStream_t stream, int rows,
     accum_grad_a_pair<<<(total_a + 255) / 256, 256, 0, stream>>>(
         r, w.in, gp, w.gradient_a);
   }
-  if (dx)
-    product(b.h, false, false, rows, w.in, 2 * r, 1.f, dp, 2 * r,
-            twice(stream, b, w.a, r, w.in, false), w.in, 1.f, dx);
+  if (dx) {
+    const bf16 *a_rep =
+        w.a_twice ? w.a_twice : twice(stream, b, w.a, r, w.in, false);
+    product(b.h, false, false, rows, w.in, 2 * r, 1.f, dp, 2 * r, a_rep, w.in,
+            1.f, dx);
+  }
 }
 #endif
 __global__ void replay_mix(int lanes, int time, int C, int rows,
-                           const int *offsets, const bf16 *x,
-                           const bf16 *shift, const bf16 *mix, bf16 *y) {
+                           const int *offsets, const std::uint8_t *doc_start,
+                           const bf16 *x, const bf16 *shift, const bf16 *mix,
+                           bf16 *y) {
   size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= size_t(rows) * C)
     return;
   int c = i % C;
-  auto at = rwkv_bf16_training::lane_row(offsets, lanes, time, i / C);
+  long long row = static_cast<long long>(i / C);
+  auto at = rwkv_bf16_training::lane_row(offsets, lanes, time, row);
   float v = to_float(x[i]),
-        p = to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
+        p = (doc_start && doc_start[row])
+                ? 0.0f
+                : to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
   y[i] = to_bf16(v + (p - v) * to_float(mix[c]));
 }
 } // namespace
 void forward(cudaStream_t stream, int rows, const rwkv_bf16_miss::Linear &w,
              const bf16 *x, bf16 *y, float *s) {
   validate(rows, w);
-  if (!x || !y)
+  if (!x || (!y && !s))
     throw std::invalid_argument("null NoRA forward input");
   using namespace rwkv_nora_detail;
 #ifndef RWKV_USE_HIP
@@ -205,7 +216,8 @@ void forward(cudaStream_t stream, int rows, const rwkv_bf16_miss::Linear &w,
 #endif
   if (s) {
     detail::projection<true>(stream, rows, w.rank, w.in, x, w.a, s);
-    detail::expansion<true>(stream, rows, w.out, w.rank, s, w.d, y, w.scale);
+    if (y)
+      detail::expansion<true>(stream, rows, w.out, w.rank, s, w.d, y, w.scale);
   } else {
     fused<<<dim3((w.out + 255) / 256, rows), 256, w.rank * sizeof(float),
             stream>>>(w.in, w.out, w.rank, w.scale, w.a, w.d, x, y);
@@ -235,6 +247,20 @@ void backward(cudaStream_t stream, int rows, const rwkv_bf16_miss::Linear &w,
     detail::expansion<false>(stream, rows, w.in, w.rank, ds, w.a, dx);
   checked();
 }
+void refresh_weight_twice(cudaStream_t stream, int rows, int cols, bool side,
+                          const bf16 *src, bf16 *dst) {
+  if (!src || !dst || rows < 1 || cols < 1)
+    throw std::invalid_argument("invalid NoRA repeated weight buffer");
+#ifndef RWKV_USE_HIP
+  const size_t total = 2 * size_t(rows) * cols;
+  repeat_weight_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+      total, rows, cols, side, src, dst);
+  checked();
+#else
+  (void)stream;
+  (void)side;
+#endif
+}
 void backward_target(cudaStream_t stream,
                      const rwkv_bf16_training::FrozenBlockWeights &w,
                      const rwkv_bf16_training::BlockTapeView &t, int target,
@@ -246,10 +272,17 @@ void backward_target(cudaStream_t stream,
     return;
   }
   int rows = rwkv_bf16_training::tape_rows(t), C = w.channels;
-  bf16 *x = t.nora_input;
-  if (!t.nora_ds || (a.gradient_a && !x))
+  const bf16 *cached_in = target == 0   ? t.xr
+                          : target == 1 ? t.xk
+                          : target == 2 ? t.xv
+                          : target == 3 ? t.att_post
+                          : target == 4 ? t.ffn_mixed
+                                        : nullptr;
+  const bf16 *x_in = cached_in;
+  if (!t.nora_ds || (a.gradient_a && !x_in && !t.nora_input))
     throw std::invalid_argument("missing NoRA replay scratch");
-  if (a.gradient_a) {
+  if (a.gradient_a && !x_in) {
+    bf16 *x = t.nora_input;
     using namespace rwkv_bf16_training;
     if (target == 5)
       rwkv7_relu_square_launch(stream, t.ffn_hid, x, size_t(rows) * w.ffn);
@@ -266,10 +299,11 @@ void backward_target(cudaStream_t stream,
       if (!shift)
         throw std::invalid_argument("missing NoRA incoming shift");
       replay_mix<<<(size_t(rows) * C + 255) / 256, 256, 0, stream>>>(
-          t.batch, t.time, C, rows, t.offsets, target == 4 ? t.ln2 : t.ln1,
-          shift, mix, x);
+          t.batch, t.time, C, rows, t.offsets, t.doc_start,
+          target == 4 ? t.ln2 : t.ln1, shift, mix, x);
     }
+    x_in = x;
   }
-  backward(stream, rows, a, x, t.miss_reduced[target], g, dx, t.nora_ds);
+  backward(stream, rows, a, x_in, t.miss_reduced[target], g, dx, t.nora_ds);
 }
 } // namespace rwkv_bf16_nora

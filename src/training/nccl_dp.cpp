@@ -206,14 +206,18 @@ std::vector<int> assign(const std::vector<size_t> &lengths, int ranks,
                    [&](size_t a, size_t b) { return lengths[a] > lengths[b]; });
   std::vector<int> owners(lengths.size());
   for (auto i : order) {
-    // Cost = processed tokens + sweep penalty for each micro-batch's longest
-    // sequence. Spilling into a second micro-batch pays an extra full sweep of
-    // block kernels, so penalize spilling (weight 3) when adaptive timing is active.
+    // Cost = actual processed tokens + small initial sweep setup on first
+    // sample; spilling past 1.5x micro_bsz (virtual-stream capacity) pays a
+    // full extra weight sweep penalty.
+    const size_t single_pass_cap =
+        micro_bsz > 2 ? size_t(micro_bsz + micro_bsz / 2) : size_t(micro_bsz);
     auto next_raw = [&](int r) -> size_t {
-      const size_t weight = (count[r] % micro_bsz == 0)
-                                ? (weighted && count[r] > 0 ? 3 : 2)
-                                : 1;
-      return load[r] + lengths[i] * weight;
+      size_t penalty = 0;
+      if (count[r] == 0)
+        penalty = lengths[i] / 5;
+      else if (count[r] % single_pass_cap == 0)
+        penalty = lengths[i] * 5;
+      return load[r] + lengths[i] + penalty;
     };
     int best = 0;
     if (!weighted) {
@@ -260,7 +264,7 @@ void update_speed_model(const std::vector<size_t> &raw_loads,
     inv_speeds.assign(ranks, 1.0);
   for (size_t r = 0; r < ranks; ++r) {
     const double rel = std::clamp(spu[r] / mean_spu, 0.65, 1.5);
-    inv_speeds[r] = ready ? (0.7 * inv_speeds[r] + 0.3 * rel) : rel;
+    inv_speeds[r] = ready ? (0.82 * inv_speeds[r] + 0.18 * rel) : rel;
   }
   ready = true;
 }

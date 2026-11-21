@@ -257,7 +257,8 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   // Regenerate only this layer's WKV history just before consuming it.
   if (tape.wkv_replay_initial) {
     wkv_forward(stream, IoType::BF16,
-                {tape.batch, tape.time, w.heads, kN, tape.offsets},
+                {tape.batch, tape.time, w.heads, kN, tape.offsets,
+                 tape.doc_start, tape.doc_initial_state},
                 tape.wkv_replay_initial, tape.r, tape.raw_w, tape.wkv_k, tape.v,
                 tape.neg_kk, tape.kka, tape.wkv_y, tape.wkv_replay_final,
                 tape.wkv);
@@ -311,7 +312,7 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   const bf16 *ffn_mixes[] = {w.ffn_mix};
   time_mix_backward_input_bf16(stream, tape.batch, tape.time, C, 1, ffn_grads,
                                ffn_mixes, d_ln2, state_grad.ffn_shift_grad,
-                               tape.offsets);
+                               tape.offsets, tape.doc_start);
   add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln2,
                           state_grad.final_ffn_shift_grad, tape.offsets);
   layer_norm_backward_input_bf16(stream, rows, C, tape.x_after_att,
@@ -331,11 +332,12 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
 
   // Exact WKV reverse recurrence. The only persistent result is ds_initial.
   wkv_backward_input(stream, IoType::BF16,
-                     {tape.batch, tape.time, w.heads, kN, tape.offsets},
+                     {tape.batch, tape.time, w.heads, kN, tape.offsets,
+                      tape.doc_start, tape.doc_initial_state},
                      tape.r, tape.raw_w, tape.wkv_k, tape.v, tape.neg_kk,
                      tape.kka, d_wkv_y, state_grad.final_state_grad, tape.wkv,
                      state_grad.initial_state_grad, wkv_dr, d_w, d_wkv_k, d_v,
-                     d_neg_kk, d_kka);
+                     d_neg_kk, d_kka, state_grad.doc_state_grad);
   if (layer_zero && !grad_in && !state_grad.att_shift_grad) {
     // The frozen-embedding executor explicitly opts out of these outputs.
     // Keep all state and adapter gradients, including the v_first edge from
@@ -416,14 +418,10 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   rwkv_bf16_nora::backward_target(stream, w, tape, 2, d_v_base, dx_v);
   if (!layer_zero) {
     bf16 *d_v1 = arena.take(static_cast<std::size_t>(rows) * w.rank_v);
-    bf16 *rank_v_padding =
-        arena.take(static_cast<std::size_t>(rows) * w.rank_v);
-    (void)rank_v_padding;
     linear_runtime_backward_input_bf16(stream, rows, w.rank_v, C, d_v12, w.v2,
                                        d_v1);
-    linear_runtime_backward_input_bf16(stream, rows, C, w.rank_v, d_v1, w.v1,
-                                       temp0);
-    add_inplace_bf16(stream, dx_v, temp0, R);
+    linear_runtime_backward_input_accumulate_bf16(stream, rows, C, w.rank_v,
+                                                  d_v1, w.v1, dx_v);
   }
 
   const bf16 *tmix_grads[] = {dx_r, dx_w, dx_k, dx_v, dx_a, dx_g};
@@ -434,7 +432,7 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   }
   time_mix_backward_input_bf16(stream, tape.batch, tape.time, C, 6, tmix_grads,
                                tmix_weights, d_ln1, state_grad.att_shift_grad,
-                               tape.offsets);
+                               tape.offsets, tape.doc_start);
   if (grad_in) {
     add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln1,
                             state_grad.final_att_shift_grad, tape.offsets);

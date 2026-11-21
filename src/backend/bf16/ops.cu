@@ -34,15 +34,6 @@ __device__ __forceinline__ float sum64(float v, float *s) {
   __syncthreads();
   return s[0];
 }
-__device__ __forceinline__ float sum64_warp(float v, float *s) {
-  __syncthreads();
-  int lane = threadIdx.x;
-  v = warp_sum(v);
-  if ((lane & 31) == 0)
-    s[lane >> 5] = v;
-  __syncthreads();
-  return s[0] + s[1];
-}
 __device__ __forceinline__ float sum256(float v, float *s) {
   __syncthreads();
   int t = threadIdx.x;
@@ -138,18 +129,23 @@ __global__ void norm_cached(int C, const bf16 *__restrict__ x,
 }
 // Shift is updated by a separate kernel, after all t=0 readers finish.
 // Packed calls pass offsets with B lanes and T total rows.
-__global__ void mix(int B, int T, int C, const int *offsets, const bf16 *x,
+__global__ void mix(int B, int T, int C, const int *offsets,
+                    const std::uint8_t *doc_start, const bf16 *x,
                     const bf16 *shift, const bf16 *w, bf16 *y) {
   size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (i >= size_t(offsets ? 1 : B) * T * C)
     return;
   int c = i % C;
-  LaneRow at = lane_row(offsets, B, T, i / C);
+  long long row = static_cast<long long>(i / C);
+  LaneRow at = lane_row(offsets, B, T, row);
   float v = to_float(x[i]);
-  float p = to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
+  float p = (doc_start && doc_start[row])
+                ? 0.0f
+                : to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
   y[i] = to_bf16(v + (p - v) * to_float(w[c]));
 }
-__global__ void mix6(int B, int T, int C, const int *offsets, const bf16 *x,
+__global__ void mix6(int B, int T, int C, const int *offsets,
+                     const std::uint8_t *doc_start, const bf16 *x,
                      const bf16 *shift, const bf16 *wr, const bf16 *ww,
                      const bf16 *wk, const bf16 *wv, const bf16 *wa,
                      const bf16 *wg, bf16 *yr, bf16 *yw, bf16 *yk, bf16 *yv,
@@ -158,9 +154,12 @@ __global__ void mix6(int B, int T, int C, const int *offsets, const bf16 *x,
   if (i >= size_t(offsets ? 1 : B) * T * C)
     return;
   int c = i % C;
-  LaneRow at = lane_row(offsets, B, T, i / C);
+  long long row = static_cast<long long>(i / C);
+  LaneRow at = lane_row(offsets, B, T, row);
   float v = to_float(x[i]);
-  float p = to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
+  float p = (doc_start && doc_start[row])
+                ? 0.0f
+                : to_float(!at.first ? x[i - C] : shift[at.lane * C + c]);
   float d = p - v;
   yr[i] = to_bf16(v + d * to_float(wr[c]));
   yw[i] = to_bf16(v + d * to_float(ww[c]));
@@ -200,30 +199,40 @@ __global__ void kk(int H, const bf16 *k, const bf16 *kw, const bf16 *a0,
 __global__ void post(int H, const bf16 *x, const bf16 *r, const bf16 *k,
                      const bf16 *v, const bf16 *rk, const bf16 *w,
                      const bf16 *b, const bf16 *g, bf16 *y, bf16 *gn_out) {
-  __shared__ float s[32];
+  __shared__ float s[64];
   int j = threadIdx.x, c = (blockIdx.x % H) * 64 + j;
   size_t i = size_t(blockIdx.x) * 64 + j;
   float a = to_float(x[i]);
-  float mean = sum64(a, s) / 64;
-  float d = a - mean;
-  float inv = rsqrtf(sum64(d * d, s) / 64 + 64e-5f);
-  float q = sum64(to_float(r[i]) * to_float(k[i]) * to_float(rk[c]), s);
-  float wf = to_float(w[c]), bf = to_float(b[c]);
-  float gn = d * inv * wf + bf;
-  if (gn_out) {
-    float m2 = sum64_warp(a, s) / 64;
-    float d2 = a - m2;
-    float inv2 = rsqrtf(sum64_warp(d2 * d2, s) / 64 + 64e-5f);
-    gn_out[i] = to_bf16(d2 * inv2 * wf + bf);
+  float q_piece = to_float(r[i]) * to_float(k[i]) * to_float(rk[c]);
+  if (j >= 32) {
+    s[j - 32] = a;
+    s[j] = q_piece;
   }
+  __syncthreads();
+  if (j < 32) {
+    float sa = warp_sum(a + s[j]);
+    float sq = warp_sum(q_piece + s[j + 32]);
+    if (j == 0) {
+      s[0] = sa;
+      s[1] = sq;
+    }
+  }
+  __syncthreads();
+  float mean = s[0] * (1.0f / 64.0f);
+  float q = s[1];
+  float d = a - mean;
+  float inv = rsqrtf(sum64(d * d, s) * (1.0f / 64.0f) + 64e-5f);
+  float gn = d * inv * to_float(w[c]) + to_float(b[c]);
+  if (gn_out)
+    gn_out[i] = to_bf16(gn);
   y[i] = to_bf16((gn + q * to_float(v[i])) * to_float(g[i]));
 }
 thread_local bool consistent_forward = false;
 thread_local bool tensor_forward = false;
 thread_local int pin_rows = 64;
 void gemm_raw(cudaStream_t st, int M, int K, int N, const bf16 *x,
-              const bf16 *w, bf16 *y, bool orig) {
-  float a = 1, b = 0;
+              const bf16 *w, bf16 *y, bool orig, bool accumulate = false) {
+  float a = 1, b = accumulate ? 1.0f : 0.0f;
 #ifdef RWKV_USE_HIP
   struct Handle {
     hipblasHandle_t h;
@@ -323,7 +332,7 @@ struct LtGemm {
   cublasLtMatmulAlgo_t algo{};
 };
 void gemm_pinned(cudaStream_t st, int M, int K, int N, const bf16 *x,
-                 const bf16 *w, bf16 *y, bool orig) {
+                 const bf16 *w, bf16 *y, bool orig, bool accumulate = false) {
   // Pinned algorithms assume 16-byte aligned rows (every model width is a
   // multiple of 8 BF16 values).
   if (K % 8 || N % 8 ||
@@ -399,9 +408,9 @@ void gemm_pinned(cudaStream_t st, int M, int K, int N, const bf16 *x,
       throw;
     }
   }
-  const float one = 1, zero = 0;
+  const float one = 1, beta = accumulate ? 1.0f : 0.0f;
   LtLayouts l(M, K, N, orig);
-  lt_check(cublasLtMatmul(h.h, g.desc, &one, w, l.a, x, l.b, &zero, y, l.c, y,
+  lt_check(cublasLtMatmul(h.h, g.desc, &one, w, l.a, x, l.b, &beta, y, l.c, y,
                           l.c, &g.algo, nullptr, 0, st),
            "pinned BF16 matmul");
 }
@@ -411,13 +420,13 @@ void gemm_pinned(cudaStream_t st, int M, int K, int N, const bf16 *x,
 // prefill, decode and teacher forcing consistent. WKV always sees the true
 // sequence length. The default policy lets cuBLAS choose per call.
 void gemm(cudaStream_t st, int M, int K, int N, const bf16 *x, const bf16 *w,
-          bf16 *y, bool orig) {
+          bf16 *y, bool orig, bool accumulate = false) {
   if (!consistent_forward) {
-    gemm_raw(st, M, K, N, x, w, y, orig);
+    gemm_raw(st, M, K, N, x, w, y, orig, accumulate);
     return;
   }
 #ifndef RWKV_USE_HIP
-  gemm_pinned(st, M, K, N, x, w, y, orig);
+  gemm_pinned(st, M, K, N, x, w, y, orig, accumulate);
 #else
   constexpr int tile = 32;
   thread_local DeviceBuffer<bf16> padded_x, padded_y;
@@ -436,7 +445,12 @@ void gemm(cudaStream_t st, int M, int K, int N, const bf16 *x, const bf16 *w,
       gpu_check(cudaMemsetAsync(padded_x.p + size_t(count) * K, 0,
                                 size_t(tile - count) * K * 2, st),
                 "zero GEMM padding");
-    gemm_raw(st, tile, K, N, padded_x.p, w, padded_y.p, orig);
+    if (accumulate)
+      gpu_check(cudaMemcpyAsync(padded_y.p, y + size_t(row) * N,
+                                size_t(count) * N * 2, cudaMemcpyDeviceToDevice,
+                                st),
+                "load GEMM accum");
+    gemm_raw(st, tile, K, N, padded_x.p, w, padded_y.p, orig, accumulate);
     gpu_check(cudaMemcpyAsync(y + size_t(row) * N, padded_y.p,
                               size_t(count) * N * 2, cudaMemcpyDeviceToDevice,
                               st),
@@ -455,11 +469,21 @@ void set_consistent_forward(bool enabled, bool tensor_cores, int rows) {
 bool consistent_forward_enabled() { return consistent_forward; }
 void rwkv7_v3a_linear_bf16_launch(cudaStream_t s, int M, int K, int N,
                                   const bf16 *x, const bf16 *w, bf16 *y) {
-  gemm(s, M, K, N, x, w, y, false);
+  gemm(s, M, K, N, x, w, y, false, false);
+}
+void rwkv7_v3a_linear_bf16_accumulate_launch(cudaStream_t s, int M, int K,
+                                             int N, const bf16 *x,
+                                             const bf16 *w, bf16 *y) {
+  gemm(s, M, K, N, x, w, y, false, true);
 }
 void rwkv7_v3a_linear_bf16_orig_launch(cudaStream_t s, int M, int K, int N,
                                        const bf16 *x, const bf16 *w, bf16 *y) {
-  gemm(s, M, K, N, x, w, y, true);
+  gemm(s, M, K, N, x, w, y, true, false);
+}
+void rwkv7_v3a_linear_bf16_orig_accumulate_launch(cudaStream_t s, int M, int K,
+                                                  int N, const bf16 *x,
+                                                  const bf16 *w, bf16 *y) {
+  gemm(s, M, K, N, x, w, y, true, true);
 }
 void rwkv7_v3a_layer_norm_bf16_launch(cudaStream_t s, int rows, int C,
                                       const bf16 *x, const bf16 *w,
@@ -502,19 +526,20 @@ void rwkv7_add_vec_launch(cudaStream_t s, int C, const bf16 *x, const bf16 *v,
 }
 void rwkv7_cmix_mix_launch(cudaStream_t s, int B, int T, int C, const bf16 *x,
                            bf16 *sh, const bf16 *w, bf16 *y,
-                           const int *offsets) {
+                           const int *offsets, const std::uint8_t *doc_start) {
   const size_t n = size_t(offsets ? 1 : B) * T * C;
-  mix<<<(n + 255) / 256, 256, 0, s>>>(B, T, C, offsets, x, sh, w, y);
+  mix<<<(n + 255) / 256, 256, 0, s>>>(B, T, C, offsets, doc_start, x, sh, w, y);
   shift_last<<<(B * C + 255) / 256, 256, 0, s>>>(B, T, C, offsets, x, sh);
 }
 void rwkv7_tmix_mix6_launch(cudaStream_t s, int B, int T, int C, const bf16 *x,
                             bf16 *sh, const bf16 *wr, const bf16 *ww,
                             const bf16 *wk, const bf16 *wv, const bf16 *wa,
                             const bf16 *wg, bf16 *r, bf16 *w, bf16 *k, bf16 *v,
-                            bf16 *a, bf16 *g, const int *offsets) {
+                            bf16 *a, bf16 *g, const int *offsets,
+                            const std::uint8_t *doc_start) {
   const size_t n = size_t(offsets ? 1 : B) * T * C;
-  mix6<<<(n + 255) / 256, 256, 0, s>>>(B, T, C, offsets, x, sh, wr, ww, wk, wv,
-                                       wa, wg, r, w, k, v, a, g);
+  mix6<<<(n + 255) / 256, 256, 0, s>>>(B, T, C, offsets, doc_start, x, sh, wr,
+                                       ww, wk, wv, wa, wg, r, w, k, v, a, g);
   shift_last<<<(B * C + 255) / 256, 256, 0, s>>>(B, T, C, offsets, x, sh);
 }
 void rwkv7_tmix_kk_a_gate_launch(cudaStream_t s, int B, int T, int C, int H,

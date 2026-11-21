@@ -32,6 +32,9 @@ void linear_runtime_backward_input_bf16(cudaStream_t stream, int rows,
                                         const bf16 *dy,
                                         const bf16 *frozen_weight_runtime,
                                         bf16 *dx);
+void linear_runtime_backward_input_accumulate_bf16(
+    cudaStream_t stream, int rows, int in_features, int out_features,
+    const bf16 *dy, const bf16 *frozen_weight_runtime, bf16 *dx);
 
 void layer_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
                                     const bf16 *x, const bf16 *frozen_weight,
@@ -48,7 +51,8 @@ void time_mix_backward_input_bf16(cudaStream_t stream, int batch, int time,
                                   int channels, int branches,
                                   const bf16 *const *branch_grads,
                                   const bf16 *const *frozen_mixes, bf16 *dx,
-                                  bf16 *d_shift, const int *offsets = nullptr);
+                                  bf16 *d_shift, const int *offsets = nullptr,
+                                  const std::uint8_t *doc_start = nullptr);
 
 void relu_square_backward_input_bf16(cudaStream_t stream, const bf16 *x,
                                      const bf16 *dy, bf16 *dx,
@@ -136,6 +140,8 @@ struct BlockTapeView {
   int time = 0;
   // Packed lanes: device offsets[batch + 1]; time is then the total row count.
   const int *offsets = nullptr;
+  const std::uint8_t *doc_start = nullptr;
+  const float *doc_initial_state = nullptr;
   bf16 *x = nullptr;
   bf16 *ln1 = nullptr;
   bf16 *r = nullptr;
@@ -157,6 +163,12 @@ struct BlockTapeView {
   bf16 *x_after_att = nullptr;
   bf16 *ln2 = nullptr;
   bf16 *ffn_hid = nullptr;
+  // Optional direct NoRA branch-input caches (populated on single shared tape).
+  bf16 *xr = nullptr;
+  bf16 *xk = nullptr;
+  bf16 *xv = nullptr;
+  bf16 *att_post = nullptr;
+  bf16 *ffn_mixed = nullptr;
   WkvTapeView wkv;
   // Optional replay mode: owned initial state and shared final-state scratch.
   // wkv storage may be shared by blocks executed sequentially on one stream.
@@ -183,7 +195,8 @@ void block_forward_state_tuning_bf16(
     float *final_state, bf16 *v_first, bf16 *output,
     const FrozenBlockWeights &frozen_weights, BlockTapeView &tape,
     bf16 *workspace, std::size_t workspace_elements, bool layer_zero,
-    const int *offsets = nullptr, bool record_tape = true);
+    const int *offsets = nullptr, bool record_tape = true,
+    const std::uint8_t *doc_start = nullptr);
 
 struct BlockBackwardState {
   const float *final_state_grad = nullptr; // optional [B,H,K,V]
@@ -193,6 +206,7 @@ struct BlockBackwardState {
   bf16 *v_first_grad = nullptr;            // in/out accumulator [B,T,C]
   const bf16 *final_att_shift_grad = nullptr;
   const bf16 *final_ffn_shift_grad = nullptr;
+  float *doc_state_grad = nullptr;         // optional [B,H,K,V] doc_start accum
 };
 
 std::size_t
@@ -253,7 +267,8 @@ const bf16 *model_forward_state_tuning_bf16(
     float *state_final, bf16 *block_workspace,
     std::size_t block_workspace_elements, bf16 *final_normalized, bf16 *logits,
     float *carried_states = nullptr, bool compute_logits = true,
-    const int *offsets = nullptr, bool record_tape = true);
+    const int *offsets = nullptr, bool record_tape = true,
+    const std::uint8_t *doc_start = nullptr);
 
 void add_last_shift_gradient(cudaStream_t stream, int batch, int time,
                              int channels, bf16 *dx, const bf16 *dshift,
