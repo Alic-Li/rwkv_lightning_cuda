@@ -410,8 +410,13 @@ struct Executor::Impl {
 
     size_t free_b = 0, total_b = 0;
     gpu_check(cudaMemGetInfo(&free_b, &total_b), "query VRAM for window pool");
-    const size_t safety_reserve =
+    size_t safety_reserve =
         std::max<size_t>(size_t(7) << 29, total_b / 28);
+    if (const char *res_env = std::getenv("RWKV_VRAM_RESERVE_MIB")) {
+      if (*res_env)
+        safety_reserve = std::max<size_t>(
+            safety_reserve, static_cast<size_t>(std::stoull(res_env)) << 20);
+    }
     const size_t budget_b =
         free_b > safety_reserve ? (free_b - safety_reserve) : 0;
 
