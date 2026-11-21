@@ -185,6 +185,8 @@ struct Executor::Impl {
       doc_init_dev, state_batch, state_final, loss, chunk_losses, shared_tape,
       aux_wkv_tape, shared_final, carried, weights, reduced_gradient;
   OwnedTape shared_owned, aux_owned;
+  FrozenBlockWeights proto_weights{};
+  bool aux_allocated = false;
   std::vector<OwnedTape> full_owned;
   std::vector<FrozenMissLayerScratch> frozen_miss_scratch;
   std::vector<BlockTapeView> tapes;
@@ -246,10 +248,6 @@ struct Executor::Impl {
     loss.resize(1, "executor loss");
     shared_tape.resize(wkv_tape_elements({B, chunk, H, 64}),
                        "shared WKV replay tape");
-    if (L > 1) {
-      aux_wkv_tape.resize(wkv_tape_elements({B, chunk, H, 64}),
-                          "aux WKV replay tape");
-    }
     for (auto &slot : staging) {
       gpu_check(cudaHostAlloc(reinterpret_cast<void **>(&slot.input),
                               rows * sizeof(uint16_t), cudaHostAllocDefault),
@@ -272,31 +270,24 @@ struct Executor::Impl {
       gpu_check(cudaEventCreateWithFlags(&slot.copied, cudaEventDisableTiming),
                 "create staging event");
     }
-    FrozenBlockWeights proto = m.blocks[0];
+    proto_weights = m.blocks[0];
     for (int l = 1; l < L; ++l) {
-      proto.ffn = std::max(proto.ffn, m.blocks[l].ffn);
-      proto.rank_w = std::max(proto.rank_w, m.blocks[l].rank_w);
-      proto.rank_a = std::max(proto.rank_a, m.blocks[l].rank_a);
-      proto.rank_g = std::max(proto.rank_g, m.blocks[l].rank_g);
-      proto.rank_v = std::max(proto.rank_v, m.blocks[l].rank_v);
+      proto_weights.ffn = std::max(proto_weights.ffn, m.blocks[l].ffn);
+      proto_weights.rank_w = std::max(proto_weights.rank_w, m.blocks[l].rank_w);
+      proto_weights.rank_a = std::max(proto_weights.rank_a, m.blocks[l].rank_a);
+      proto_weights.rank_g = std::max(proto_weights.rank_g, m.blocks[l].rank_g);
+      proto_weights.rank_v = std::max(proto_weights.rank_v, m.blocks[l].rank_v);
     }
-    shared_owned.allocate(capacity, proto, first.p, shared_tape.p,
+    shared_owned.allocate(capacity, proto_weights, first.p, shared_tape.p,
                           shared_tape.n, true);
-    if (L > 1) {
-      aux_owned.allocate(capacity, proto, first.p, aux_wkv_tape.p,
-                         aux_wkv_tape.n, true);
-    }
     frozen_miss_scratch.resize(L);
     tapes.resize(L);
     gradients.resize(L);
     size_t scratch = 0;
     for (int l = 0; l < L; ++l) {
-      const bool odd = (L > 1) && ((l & 1) != 0);
-      tapes[l] = odd ? aux_owned.view : shared_owned.view;
-      tapes[l].nora_att_shift =
-          replay_shifts.p + (odd ? size_t(2) * B * C : 0);
-      tapes[l].nora_ffn_shift =
-          replay_shifts.p + (odd ? size_t(3) * B * C : size_t(B) * C);
+      tapes[l] = shared_owned.view;
+      tapes[l].nora_att_shift = replay_shifts.p;
+      tapes[l].nora_ffn_shift = replay_shifts.p + size_t(B) * C;
       for (int i = 0; i < rwkv_bf16_miss::TargetCount; ++i) {
         if (m.blocks[l].miss[i].d && !m.blocks[l].miss[i].gradient) {
           frozen_miss_scratch[l].miss_reduced[i].resize(
@@ -533,14 +524,24 @@ struct Executor::Impl {
     dst.nora_input = saved_nora_in;
     dst.nora_ds = saved_nora_ds;
   }
-  void bind_window_tapes() {
+  void ensure_aux_tape() {
+    if (aux_allocated || L <= 1)
+      return;
+    aux_wkv_tape.resize(wkv_tape_elements({B, chunk, H, 64}),
+                        "aux WKV replay tape");
+    aux_owned.allocate(capacity, proto_weights, first.p, aux_wkv_tape.p,
+                       aux_wkv_tape.n, true);
+    aux_allocated = true;
+  }
+  void bind_window_tapes(int x_stride) {
     for (int l = 0; l < L; ++l) {
-      const bool odd = (L > 1) && ((l & 1) != 0);
-      assign_tape_activations(tapes[l], odd ? aux_owned.view : shared_owned.view);
+      const bool use_aux = (x_stride == 2) && (L > 1) && ((l & 1) != 0);
+      assign_tape_activations(tapes[l],
+                              use_aux ? aux_owned.view : shared_owned.view);
       tapes[l].nora_att_shift =
-          replay_shifts.p + (odd ? size_t(2) * B * C : 0);
+          replay_shifts.p + (use_aux ? size_t(2) * B * C : 0);
       tapes[l].nora_ffn_shift =
-          replay_shifts.p + (odd ? size_t(3) * B * C : size_t(B) * C);
+          replay_shifts.p + (use_aux ? size_t(3) * B * C : size_t(B) * C);
     }
   }
   void ensure_full_tapes(const FrozenModelView &m) {
@@ -706,11 +707,22 @@ struct Executor::Impl {
     ensure_window_pool(steps, total_rows);
 
     const size_t slots_s1 = size_t(std::max(1, L - 1));
-    const size_t cap_s1 = std::min(win_dout_cap, win_slot_rows / slots_s1);
+    size_t cap_s1 = std::min(win_dout_cap, win_slot_rows / slots_s1);
+    int x_stride = (L <= 1 || total_rows <= cap_s1) ? 1 : 2;
+    if (x_stride == 2 && !aux_allocated && L > 1) {
+      win_chunk_cap = 0;
+      win_dout_cap = 0;
+      win_slot_rows = 0;
+      x_window = DeviceBuffer<bf16>{};
+      d_out_window = DeviceBuffer<bf16>{};
+      win_doc_start = DeviceBuffer<uint8_t>{};
+      ensure_aux_tape();
+      ensure_window_pool(steps, total_rows);
+      cap_s1 = std::min(win_dout_cap, win_slot_rows / slots_s1);
+    }
     const size_t cap_s2 =
         (L <= 2) ? win_dout_cap
                  : std::min(win_dout_cap, win_slot_rows / size_t((L - 1) / 2));
-    const int x_stride = (L <= 1 || total_rows <= cap_s1) ? 1 : 2;
     const size_t eff_row_cap = (x_stride == 1) ? cap_s1 : cap_s2;
 
     struct Window {
@@ -733,7 +745,7 @@ struct Executor::Impl {
 
     const int num_win = int(windows.size());
     reserve_coarse_checkpoints(num_win);
-    bind_window_tapes();
+    bind_window_tapes(x_stride);
     outer.reset(initial);
 
     if (any_doc_start) {
@@ -864,7 +876,9 @@ struct Executor::Impl {
         }
         auto recompute_layer = [&](int l, bf16 *x_in, bf16 *y_out) {
           const size_t sh_off =
-              ((L > 1) && ((l & 1) != 0)) ? size_t(2) * B * C : 0;
+              ((x_stride == 2) && (L > 1) && ((l & 1) != 0))
+                  ? size_t(2) * B * C
+                  : 0;
           bf16 *att_rep = replay_shifts.p + sh_off;
           bf16 *ffn_rep = att_rep + size_t(B) * C;
           copy(att_rep, win_shift_ptr(slot, l),

@@ -1,12 +1,15 @@
 #include "nccl_dp.hpp"
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <numeric>
+#include <sched.h>
 #include <set>
 #include <sstream>
 #include <sys/prctl.h>
@@ -19,6 +22,37 @@ int worker_rank = 0, world = 1, device = 0;
 ncclUniqueId unique_id{};
 volatile sig_atomic_t interrupted = 0;
 void on_signal(int signal) { interrupted = signal; }
+
+// Pin each DP worker to the NUMA-local CPU cores of its PCIe root complex
+// BEFORE model weights or cudaHostAlloc staging buffers are first-touched.
+void bind_numa_cpu_affinity(int cuda_dev) {
+  char bdf[32] = {};
+  if (cudaDeviceGetPCIBusId(bdf, sizeof(bdf), cuda_dev) != cudaSuccess)
+    return;
+  for (char &ch : bdf)
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  std::ifstream f(std::string("/sys/bus/pci/devices/") + bdf + "/local_cpulist");
+  std::string spec;
+  if (!f || !std::getline(f, spec) || spec.empty())
+    return;
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  std::istringstream ss(spec);
+  std::string part;
+  while (std::getline(ss, part, ',')) {
+    if (part.empty())
+      continue;
+    const auto dash = part.find('-');
+    int lo = std::atoi(part.c_str());
+    int hi = (dash == std::string::npos)
+                 ? lo
+                 : std::atoi(part.c_str() + dash + 1);
+    for (int c = std::max(0, lo); c <= hi && c < CPU_SETSIZE; ++c)
+      CPU_SET(c, &mask);
+  }
+  if (CPU_COUNT(&mask) >= 2)
+    (void)sched_setaffinity(0, sizeof(mask), &mask);
+}
 void check(ncclResult_t result) {
   if (result != ncclSuccess)
     throw std::runtime_error(std::string("NCCL: ") +
@@ -140,6 +174,7 @@ int launch(const std::string &list) {
 }
 Group::Group() {
   rwkv_bf16_training::gpu_check(cudaSetDevice(device), "DP select GPU");
+  bind_numa_cpu_affinity(device);
   check(ncclCommInitRank(&comm_, world, unique_id, worker_rank));
   scalar_.resize(1 + size_t(world), "DP collective scalars");
   std::fprintf(stderr, "DP rank=%d/%d device=%d\n", worker_rank, world, device);
