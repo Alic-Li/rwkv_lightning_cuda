@@ -90,7 +90,7 @@ def run(mode, name, devices=None, steps=2, resume=None, extra=(), expect=0):
     binary = a.build / ('rwkv_' + mode + '_tune' + ('_dp' if devices else ''))
     cmd = [binary, '--model', remote/'tiny.pth', '--vocab', remote/'vocab.txt',
            '--data', remote/'train.jsonl', '--output', remote/name,
-           '--ctx', '48', '--chunk', '8', '--batch-size', '7', '--micro-bsz', '2',
+           '--ctx', '64', '--chunk', '8', '--batch-size', '7', '--micro-bsz', '2',
            '--epochs', '2', '--lr', '.003', '--lr-final', '.003',
            '--warmup-steps', '0', '--max-steps', str(steps), '--save-every', '1']
     if mode != 'state': cmd += ['--rank', str(a.rank)]
@@ -150,7 +150,7 @@ run('nora', 'checkpoint-io-error', a.devices,
 cancel_command = [str(a.build/'rwkv_nora_tune_dp'), '--model', str(remote/'tiny.pth'),
                   '--vocab', str(remote/'vocab.txt'), '--data', str(remote/'train.jsonl'),
                   '--output', str(remote/'cancel'), '--devices', a.devices,
-                  '--epochs', '100000', '--ctx', '48', '--chunk', '8']
+                  '--epochs', '100000', '--ctx', '64', '--chunk', '8']
 cancel_test = r'''
 import json, os, pathlib, signal, subprocess, sys, time
 with open(sys.argv[2], 'w') as log:

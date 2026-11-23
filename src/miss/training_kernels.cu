@@ -169,8 +169,14 @@ void forward(cudaStream_t stream, int rows, const Linear &w, const bf16 *x,
   if (!w.d)
     return;
   validate(rows, w);
-  if (!x || !y)
+  if (!x || (!y && !s))
     throw std::invalid_argument("null MiSS forward input");
+  if (!y) {
+    reduce<<<(rows * w.rank + threads - 1) / threads, threads, 0, stream>>>(
+        rows, w.in, w.rank, x, s);
+    checked();
+    return;
+  }
   const bool separate = s && w.out > threads;
   if (separate)
     reduce<<<(rows * w.rank + threads - 1) / threads, threads, 0, stream>>>(
@@ -185,7 +191,7 @@ void backward(cudaStream_t stream, int rows, const Linear &w, const float *s,
   if (!w.d)
     return;
   validate(rows, w);
-  if (!g || !dx || (w.gradient && !s))
+  if (!g || (w.gradient && !s))
     throw std::invalid_argument("null MiSS backward input");
   if (w.gradient) {
     if (rows < 32)
@@ -198,8 +204,9 @@ void backward(cudaStream_t stream, int rows, const Linear &w, const float *s,
       grad_d<<<w.out * w.rank, threads, 0, stream>>>(rows, w.out, w.rank,
                                                      w.scale, s, g, w.gradient);
   }
-  grad_x<<<dim3(rows, w.rank), threads, 0, stream>>>(w.in, w.out, w.rank,
-                                                     w.scale, w.d, g, dx);
+  if (dx)
+    grad_x<<<dim3(rows, w.rank), threads, 0, stream>>>(w.in, w.out, w.rank,
+                                                       w.scale, w.d, g, dx);
   checked();
 }
 void cast_master(cudaStream_t stream, const float *x, bf16 *y, size_t n) {

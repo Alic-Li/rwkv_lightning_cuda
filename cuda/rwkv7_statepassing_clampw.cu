@@ -1,9 +1,9 @@
 #include "rwkv/runtime/rwkv_training_wkv.hpp"
 
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-
 #include <stdexcept>
 
 namespace rwkv7_state_tuning {
@@ -35,22 +35,15 @@ __device__ __forceinline__ float effective_w(float raw) {
   return expf(kWScale * sigmoid);
 }
 
-// One state element of the recurrence. Forward, backward recompute and the
-// backward's updated row all use this expression so the compiler contracts
-// it identically everywhere.
 __device__ __forceinline__ float next_state(float s, float w, float sa,
                                             float b, float k, float v) {
   return s * w + sa * b + k * v;
 }
 
-// Checkpoint slot of the state before packed row t of lane `batch`. Lanes
-// own ascending row ranges, so t / kInterval + batch never collides.
 __device__ __forceinline__ long long checkpoint_slot(int t, int batch) {
   return t / kCheckpointInterval + batch;
 }
 
-// One row's raw inputs for this thread's channel. The forward loads the next
-// row's while it computes the current one.
 template <typename IO> struct RowInputs {
   IO r, w, k, v, a, b;
 };
@@ -58,6 +51,8 @@ template <typename IO> struct RowInputs {
 template <typename IO>
 __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
     int T, int H, const int *__restrict__ offsets,
+    const std::uint8_t *__restrict__ doc_start,
+    const float *__restrict__ doc_initial_state,
     const float *__restrict__ initial_state,
     const IO *__restrict__ r_ptr, const IO *__restrict__ w_ptr,
     const IO *__restrict__ k_ptr, const IO *__restrict__ v_ptr,
@@ -69,6 +64,7 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
   const int value = threadIdx.x;
   const long long bh = static_cast<long long>(batch) * H + head;
   const long long state_base = bh * kN * kN;
+  const long long doc_base = static_cast<long long>(head) * kN * kN;
   float state[kN];
 #pragma unroll
   for (int key = 0; key < kN; ++key) {
@@ -76,7 +72,6 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
   }
 
   __shared__ float r[kN], w[kN], k[kN], a[kN], b[kN];
-  // Packed lanes own rows [offsets[b], offsets[b + 1]); dense lanes own T.
   const int begin = offsets ? offsets[batch] : batch * T;
   const int end = offsets ? offsets[batch + 1] : begin + T;
   const auto load_row = [&](int t) {
@@ -92,6 +87,14 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
     const RowInputs<IO> row = next;
     if (t + 1 < end)
       next = load_row(t + 1);
+    if (doc_start && doc_start[t]) {
+#pragma unroll
+      for (int key = 0; key < kN; ++key) {
+        state[key] = doc_initial_state
+                         ? doc_initial_state[doc_base + key * kN + value]
+                         : 0.0f;
+      }
+    }
     if (checkpoints && (t - begin) % kCheckpointInterval == 0) {
       const long long slot =
           (checkpoint_slot(t, batch) * H + head) * kN * kN;
@@ -126,44 +129,41 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
   }
 }
 
-// The backward walks each checkpoint interval twice: first it replays the
-// forward recurrence from the checkpoint (same arithmetic, so bitwise the
-// states the forward saw) into a per-block scratch that stays in L2, then it
-// consumes those states in reverse. Both passes touch the scratch with
-// coalesced [K][V] accesses, and each thread reads back only the column it
-// wrote; the reverse pass transposes through shared memory for the K-row
-// reductions. The replay also keeps every row's sa, which is the same
-// reduction the reverse pass would otherwise repeat.
 template <typename IO>
 __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
-    int T, int H, const int *__restrict__ offsets,
+    int lane_base, int T, int H, const int *__restrict__ offsets,
+    const std::uint8_t *__restrict__ doc_start,
+    const float *__restrict__ doc_initial_state,
     const IO *__restrict__ r_ptr, const IO *__restrict__ w_ptr,
     const IO *__restrict__ k_ptr, const IO *__restrict__ v_ptr,
     const IO *__restrict__ a_ptr, const IO *__restrict__ b_ptr,
     const IO *__restrict__ dy_ptr, const float *__restrict__ ds_final,
     const float *__restrict__ checkpoints, float *__restrict__ scratch,
-    float *__restrict__ ds_initial, IO *__restrict__ dr_ptr,
-    IO *__restrict__ dw_ptr, IO *__restrict__ dk_ptr, IO *__restrict__ dv_ptr,
-    IO *__restrict__ da_ptr, IO *__restrict__ db_ptr) {
-  const int batch = blockIdx.y;
+    float *__restrict__ ds_initial, float *__restrict__ ds_doc_accum,
+    IO *__restrict__ dr_ptr, IO *__restrict__ dw_ptr, IO *__restrict__ dk_ptr,
+    IO *__restrict__ dv_ptr, IO *__restrict__ da_ptr, IO *__restrict__ db_ptr) {
+  const int local_batch = blockIdx.y;
+  const int batch = lane_base + local_batch;
   const int head = blockIdx.x;
   const int value = threadIdx.x;
   const long long bh = static_cast<long long>(batch) * H + head;
+  const long long local_bh = static_cast<long long>(local_batch) * H + head;
   const long long state_base = bh * kN * kN;
+  const long long doc_base = static_cast<long long>(head) * kN * kN;
   float dstate[kN];
+  float doc_accum[kN];
 #pragma unroll
   for (int key = 0; key < kN; ++key) {
     dstate[key] = ds_final ? ds_final[state_base + key * kN + value] : 0.0f;
+    doc_accum[key] = 0.0f;
   }
 
   __shared__ float r[kN], w[kN], w_sig[kN], k[kN], v[kN], a[kN], b[kN], dy[kN];
   __shared__ float dsa[kN];
-  // sa of every row in the interval, saved by the replay.
   __shared__ float sa_history[kCheckpointInterval * kN];
-  // [K][V], padded so row and column walks are both conflict-free.
   __shared__ float dnew[kN * kPad];
   __shared__ float previous[kN * kPad];
-  float *history = scratch + bh * kCheckpointInterval * kN * kN;
+  float *history = scratch + local_bh * kCheckpointInterval * kN * kN;
 
   const int begin = offsets ? offsets[batch] : batch * T;
   const int end = offsets ? offsets[batch + 1] : begin + T;
@@ -181,6 +181,14 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
       for (int key = 0; key < kN; ++key)
         state[key] = checkpoints[slot + key * kN + value];
       for (int t = first; t < stop; ++t) {
+        if (t > first && doc_start && doc_start[t]) {
+#pragma unroll
+          for (int key = 0; key < kN; ++key) {
+            state[key] = doc_initial_state
+                             ? doc_initial_state[doc_base + key * kN + value]
+                             : 0.0f;
+          }
+        }
         float *before = history + (t - first) * kN * kN;
 #pragma unroll
         for (int key = 0; key < kN; ++key)
@@ -210,15 +218,11 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
     for (int t = stop - 1; t >= first; --t) {
       const long long token = (static_cast<long long>(t) * H + head) * kN;
       const float *before = history + (t - first) * kN * kN;
-      float column[kN];
-#pragma unroll
-      for (int key = 0; key < kN; ++key)
-        column[key] = before[key * kN + value];
       const float *sa = sa_history + (t - first) * kN;
       __syncthreads();
 #pragma unroll
       for (int key = 0; key < kN; ++key)
-        previous[key * kPad + value] = column[key];
+        previous[key * kPad + value] = before[key * kN + value];
       r[value] = as_float(r_ptr[token + value]);
       const float raw_w = as_float(w_ptr[token + value]);
       w_sig[value] = 1.0f / (1.0f + expf(-raw_w));
@@ -228,7 +232,7 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
       a[value] = as_float(a_ptr[token + value]);
       b[value] = as_float(b_ptr[token + value]);
       dy[value] = as_float(dy_ptr[token + value]);
-      __syncthreads(); // r[] and b[] are read across both warps below.
+      __syncthreads();
 
       float local_dsa = 0.0f;
 #pragma unroll
@@ -238,10 +242,8 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
         local_dsa += d * b[key];
       }
       dsa[value] = local_dsa;
-      __syncthreads(); // dsa, dnew and previous are read transposed.
+      __syncthreads();
 
-      // A thread represents one channel. The same index is a K row for the
-      // row reductions and a V column for the column reductions.
       float dr = 0.0f;
       float dw_eff = 0.0f;
       float dk = 0.0f;
@@ -274,11 +276,23 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
       for (int key = 0; key < kN; ++key) {
         dstate[key] = dnew[key * kPad + value] * w[key] + a[key] * dsa[value];
       }
+      if (doc_start && doc_start[t]) {
+        if (ds_doc_accum) {
+#pragma unroll
+          for (int key = 0; key < kN; ++key)
+            doc_accum[key] += dstate[key];
+        }
+#pragma unroll
+        for (int key = 0; key < kN; ++key)
+          dstate[key] = 0.0f;
+      }
     }
   }
 #pragma unroll
   for (int key = 0; key < kN; ++key) {
     ds_initial[state_base + key * kN + value] = dstate[key];
+    if (ds_doc_accum)
+      ds_doc_accum[state_base + key * kN + value] += doc_accum[key];
   }
 }
 
@@ -288,10 +302,77 @@ void launch_forward(cudaStream_t stream, const WkvShape &s, const float *s0,
                     const void *a, const void *b, void *y, float *sT,
                     WkvTapeView tape) {
   exact_forward_kernel<IO><<<dim3(s.heads, s.batch), kN, 0, stream>>>(
-      s.time, s.heads, s.offsets, s0, static_cast<const IO *>(r),
-      static_cast<const IO *>(w), static_cast<const IO *>(k),
-      static_cast<const IO *>(v), static_cast<const IO *>(a),
-      static_cast<const IO *>(b), static_cast<IO *>(y), sT, tape.data);
+      s.time, s.heads, s.offsets, s.doc_start, s.doc_initial_state, s0,
+      static_cast<const IO *>(r), static_cast<const IO *>(w),
+      static_cast<const IO *>(k), static_cast<const IO *>(v),
+      static_cast<const IO *>(a), static_cast<const IO *>(b),
+      static_cast<IO *>(y), sT, tape.data);
+}
+
+struct HwCaps {
+  int l2_bytes = 40 * 1024 * 1024;
+  int sm_count = 108;
+};
+
+HwCaps query_hw_caps() {
+  static thread_local int cached_dev = -1;
+  static thread_local HwCaps cached{};
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess)
+    dev = 0;
+  if (dev != cached_dev) {
+    int l2 = 0, sms = 0;
+    if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev) !=
+            cudaSuccess ||
+        l2 <= 0)
+      l2 = 40 * 1024 * 1024;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) !=
+            cudaSuccess ||
+        sms <= 0)
+      sms = 108;
+    cached_dev = dev;
+    cached = {l2, sms};
+  }
+  return cached;
+}
+
+// Joint L2-residency + SM-wave-quantization optimal sub-wave partitioner.
+// Keeps per-subwave scratch within 88% of physical L2 cache while choosing
+// lane counts whose (lanes * heads) blocks pack cleanly onto `sm_count` SMs
+// without straggler 8-block tail waves (e.g. on 188-SM PRO 6000: B=17 -> 7+5+5
+// = 7 waves instead of 6+6+5 = 8 waves; B=15 -> 5+5+5 = 6 waves).
+int next_optimal_subwave(int rem_lanes, int heads, int max_l2_lanes,
+                         int sm_count) {
+  if (rem_lanes <= max_l2_lanes)
+    return rem_lanes;
+  auto waves_of = [&](int b) {
+    return (b * heads + sm_count - 1) / sm_count;
+  };
+  // Tiny exact DP for rem_lanes <= 64 to minimize total SM waves, breaking ties
+  // in favor of fewer kernel launches (larger first sub-wave).
+  constexpr int kMaxB = 64;
+  if (rem_lanes <= kMaxB) {
+    int dp[kMaxB + 1];
+    int choice[kMaxB + 1];
+    dp[0] = 0;
+    choice[0] = 0;
+    for (int r = 1; r <= rem_lanes; ++r) {
+      dp[r] = 1 << 28;
+      choice[r] = std::min(r, max_l2_lanes);
+      const int lim = std::min(r, max_l2_lanes);
+      for (int s = lim; s >= 1; --s) {
+        // Penalize each launch slightly (+1) while weighting SM waves (* 64)
+        // heavily so we never add extra SM waves.
+        const int cost = waves_of(s) * 64 + 1 + dp[r - s];
+        if (cost < dp[r]) {
+          dp[r] = cost;
+          choice[r] = s;
+        }
+      }
+    }
+    return choice[rem_lanes];
+  }
+  return max_l2_lanes;
 }
 
 template <typename IO>
@@ -299,16 +380,28 @@ void launch_backward(cudaStream_t stream, const WkvShape &s, const void *r,
                      const void *w, const void *k, const void *v, const void *a,
                      const void *b, const void *dy, const float *dsT,
                      WkvTapeView tape, float *ds0, void *dr, void *dw, void *dk,
-                     void *dv, void *da, void *db) {
-  exact_backward_kernel<IO><<<dim3(s.heads, s.batch), kN, 0, stream>>>(
-      s.time, s.heads, s.offsets, static_cast<const IO *>(r),
-      static_cast<const IO *>(w),
-      static_cast<const IO *>(k), static_cast<const IO *>(v),
-      static_cast<const IO *>(a), static_cast<const IO *>(b),
-      static_cast<const IO *>(dy), dsT, tape.data,
-      tape.data + wkv_checkpoint_elements(s), ds0,
-      static_cast<IO *>(dr), static_cast<IO *>(dw), static_cast<IO *>(dk),
-      static_cast<IO *>(dv), static_cast<IO *>(da), static_cast<IO *>(db));
+                     void *dv, void *da, void *db, float *ds_doc_accum) {
+  float *scratch = tape.data + wkv_checkpoint_elements(s);
+  const HwCaps hw = query_hw_caps();
+  const std::size_t per_lane =
+      static_cast<std::size_t>(s.heads) * kCheckpointInterval * kN * kN * 4;
+  const std::size_t budget =
+      (static_cast<std::size_t>(hw.l2_bytes) * 7) / 8;
+  const int max_l2_lanes = std::clamp(
+      static_cast<int>(budget / (per_lane ? per_lane : 1)), 2, 16);
+  for (int lane_base = 0; lane_base < s.batch;) {
+    const int count = next_optimal_subwave(s.batch - lane_base, s.heads,
+                                           max_l2_lanes, hw.sm_count);
+    exact_backward_kernel<IO><<<dim3(s.heads, count), kN, 0, stream>>>(
+        lane_base, s.time, s.heads, s.offsets, s.doc_start, s.doc_initial_state,
+        static_cast<const IO *>(r), static_cast<const IO *>(w),
+        static_cast<const IO *>(k), static_cast<const IO *>(v),
+        static_cast<const IO *>(a), static_cast<const IO *>(b),
+        static_cast<const IO *>(dy), dsT, tape.data, scratch, ds0, ds_doc_accum,
+        static_cast<IO *>(dr), static_cast<IO *>(dw), static_cast<IO *>(dk),
+        static_cast<IO *>(dv), static_cast<IO *>(da), static_cast<IO *>(db));
+    lane_base += count;
+  }
 }
 
 void validate(const WkvShape &shape, WkvTapeView tape) {
@@ -327,7 +420,7 @@ void wkv_forward(cudaStream_t stream, IoType io_type, const WkvShape &shape,
   if (tape.data || tape.elements)
     validate(shape, tape);
   else
-    (void)wkv_tape_elements(shape); // Validate shape even without recording.
+    (void)wkv_tape_elements(shape);
   if (!initial_state || !r || !w || !k || !v || !a || !b || !y ||
       !final_state) {
     throw std::invalid_argument("null state-tuning WKV forward pointer");
@@ -346,7 +439,8 @@ void wkv_backward_input(cudaStream_t stream, IoType io_type,
                         const void *k, const void *v, const void *a,
                         const void *b, const void *dy, const float *ds_final,
                         WkvTapeView tape, float *ds_initial, void *dr, void *dw,
-                        void *dk, void *dv, void *da, void *db) {
+                        void *dk, void *dv, void *da, void *db,
+                        float *ds_doc_accum) {
   validate(shape, tape);
   if (!r || !w || !k || !v || !a || !b || !dy || !ds_initial || !dr || !dw ||
       !dk || !dv || !da || !db) {
@@ -354,11 +448,11 @@ void wkv_backward_input(cudaStream_t stream, IoType io_type,
   }
   if (io_type == IoType::F16) {
     launch_backward<half>(stream, shape, r, w, k, v, a, b, dy, ds_final, tape,
-                          ds_initial, dr, dw, dk, dv, da, db);
+                          ds_initial, dr, dw, dk, dv, da, db, ds_doc_accum);
   } else {
     launch_backward<__nv_bfloat16>(stream, shape, r, w, k, v, a, b, dy,
                                    ds_final, tape, ds_initial, dr, dw, dk, dv,
-                                   da, db);
+                                   da, db, ds_doc_accum);
   }
 }
 

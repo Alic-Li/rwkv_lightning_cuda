@@ -4,6 +4,7 @@
 
 #include "rwkv/bf16_training/runtime.hpp"
 
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -194,51 +195,54 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   const int rows = tape_rows(tape);
   const std::size_t required =
       block_backward_workspace_bf16_elements(1, rows, w);
-  if (!workspace || workspace_elements < required || !grad_out || !grad_in ||
+  if (!workspace || workspace_elements < required || !grad_out ||
+      (!grad_in && !layer_zero) ||
       !state_grad.initial_state_grad) {
     throw std::invalid_argument("invalid block backward buffers");
   }
   if (tape.batch <= 0 || tape.time <= 0) {
     throw std::invalid_argument("invalid block tape shape");
   }
-  for (const auto &item : {std::pair<const void *, const char *>{tape.x, "x"},
-                           {tape.ln1, "ln1"},
-                           {tape.r, "r"},
-                           {tape.raw_w, "raw_w"},
-                           {tape.k, "k"},
-                           {tape.v_base, "v_base"},
-                           {tape.wkv_k, "wkv_k"},
-                           {tape.alpha, "alpha"},
-                           {tape.neg_kk, "neg_kk"},
-                           {tape.kka, "kka"},
-                           {tape.w1_tanh, "w1_tanh"},
-                           {tape.g1_sigmoid, "g1_sigmoid"},
-                           {tape.v, "v"},
-                           {tape.wkv_y, "wkv_y"},
-                           {tape.att_group_norm, "att_group_norm"},
-                           {tape.att_gate, "att_gate"},
-                           {tape.x_after_att, "x_after_att"},
-                           {tape.ln2, "ln2"},
-                           {tape.ffn_hid, "ffn_hid"},
-                           {w.ln1_weight, "ln1_weight"},
-                           {w.ln2_weight, "ln2_weight"},
-                           {w.receptance, "receptance"},
-                           {w.key, "key"},
-                           {w.value, "value"},
-                           {w.output, "output"},
-                           {w.w1, "w1"},
-                           {w.w2, "w2"},
-                           {w.a1, "a1"},
-                           {w.a2, "a2"},
-                           {w.g1, "g1"},
-                           {w.g2, "g2"},
-                           {w.k_k, "k_k"},
-                           {w.k_a, "k_a"},
-                           {w.r_k, "r_k"},
-                           {w.att_group_norm_weight, "att_group_norm_weight"},
-                           {w.ffn_mix, "ffn_mix"},
-                           {w.ffn_key, "ffn_key"},
-                           {w.ffn_value, "ffn_value"}}) {
+  const std::pair<const void *, const char *> required_items[] = {
+      {tape.x, "x"},
+      {tape.ln1, "ln1"},
+      {tape.r, "r"},
+      {tape.raw_w, "raw_w"},
+      {tape.k, "k"},
+      {tape.v_base, "v_base"},
+      {tape.wkv_k, "wkv_k"},
+      {tape.alpha, "alpha"},
+      {tape.neg_kk, "neg_kk"},
+      {tape.kka, "kka"},
+      {tape.w1_tanh, "w1_tanh"},
+      {tape.g1_sigmoid, "g1_sigmoid"},
+      {tape.v, "v"},
+      {tape.wkv_y, "wkv_y"},
+      {tape.att_group_norm, "att_group_norm"},
+      {tape.att_gate, "att_gate"},
+      {tape.x_after_att, "x_after_att"},
+      {tape.ln2, "ln2"},
+      {tape.ffn_hid, "ffn_hid"},
+      {w.ln1_weight, "ln1_weight"},
+      {w.ln2_weight, "ln2_weight"},
+      {w.receptance, "receptance"},
+      {w.key, "key"},
+      {w.value, "value"},
+      {w.output, "output"},
+      {w.w1, "w1"},
+      {w.w2, "w2"},
+      {w.a1, "a1"},
+      {w.a2, "a2"},
+      {w.g1, "g1"},
+      {w.g2, "g2"},
+      {w.k_k, "k_k"},
+      {w.k_a, "k_a"},
+      {w.r_k, "r_k"},
+      {w.att_group_norm_weight, "att_group_norm_weight"},
+      {w.ffn_mix, "ffn_mix"},
+      {w.ffn_key, "ffn_key"},
+      {w.ffn_value, "ffn_value"}};
+  for (const auto &item : required_items) {
     require_pointer(item.first, item.second);
   }
   if (!layer_zero) {
@@ -253,7 +257,8 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   // Regenerate only this layer's WKV history just before consuming it.
   if (tape.wkv_replay_initial) {
     wkv_forward(stream, IoType::BF16,
-                {tape.batch, tape.time, w.heads, kN, tape.offsets},
+                {tape.batch, tape.time, w.heads, kN, tape.offsets,
+                 tape.doc_start, tape.doc_initial_state},
                 tape.wkv_replay_initial, tape.r, tape.raw_w, tape.wkv_k, tape.v,
                 tape.neg_kk, tape.kka, tape.wkv_y, tape.wkv_replay_final,
                 tape.wkv);
@@ -307,12 +312,12 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   const bf16 *ffn_mixes[] = {w.ffn_mix};
   time_mix_backward_input_bf16(stream, tape.batch, tape.time, C, 1, ffn_grads,
                                ffn_mixes, d_ln2, state_grad.ffn_shift_grad,
-                               tape.offsets);
+                               tape.offsets, tape.doc_start);
   add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln2,
                           state_grad.final_ffn_shift_grad, tape.offsets);
   layer_norm_backward_input_bf16(stream, rows, C, tape.x_after_att,
-                                 w.ln2_weight, d_ln2, temp0, kLnEps);
-  add_bf16(stream, grad_out, temp0, grad_x_after, R);
+                                 w.ln2_weight, d_ln2, grad_x_after, kLnEps,
+                                 grad_out);
 
   // Attention output projection and fused post-WKV GroupNorm/rkv/gate.
   linear_orig_backward_input_bf16(stream, rows, C, C, grad_x_after, w.output,
@@ -327,11 +332,39 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
 
   // Exact WKV reverse recurrence. The only persistent result is ds_initial.
   wkv_backward_input(stream, IoType::BF16,
-                     {tape.batch, tape.time, w.heads, kN, tape.offsets},
+                     {tape.batch, tape.time, w.heads, kN, tape.offsets,
+                      tape.doc_start, tape.doc_initial_state},
                      tape.r, tape.raw_w, tape.wkv_k, tape.v, tape.neg_kk,
                      tape.kka, d_wkv_y, state_grad.final_state_grad, tape.wkv,
                      state_grad.initial_state_grad, wkv_dr, d_w, d_wkv_k, d_v,
-                     d_neg_kk, d_kka);
+                     d_neg_kk, d_kka, state_grad.doc_state_grad);
+  if (layer_zero && !grad_in && !state_grad.att_shift_grad) {
+    // The frozen-embedding executor explicitly opts out of these outputs.
+    // Keep all state and adapter gradients, including the v_first edge from
+    // later layers, without computing or reading unused input adjoints.
+    const bool need_r = w.miss[0].gradient || w.miss[0].gradient_a;
+    const bool need_k = w.miss[1].gradient || w.miss[1].gradient_a;
+    const bool need_v = w.miss[2].gradient || w.miss[2].gradient_a;
+    if (need_r) {
+      add_inplace_bf16(stream, wkv_dr, post_dr, R);
+      rwkv_bf16_nora::backward_target(stream, w, tape, 0, wkv_dr, nullptr);
+    }
+    if (need_k) {
+      kk_backward_kernel<<<rows * w.heads, kN, 0, stream>>>(
+          w.heads, tape.k, tape.alpha, tape.neg_kk, w.k_k, w.k_a, post_dk,
+          d_wkv_k, d_neg_kk, d_kka, d_k, d_a12);
+      rwkv_bf16_nora::backward_target(stream, w, tape, 1, d_k, nullptr);
+    }
+    if (need_v) {
+      add_inplace_bf16(stream, d_v, post_dv, R);
+      copy(stream, d_v, d_v_base, R);
+      if (state_grad.v_first_grad) {
+        add_inplace_bf16(stream, d_v_base, state_grad.v_first_grad, R);
+      }
+      rwkv_bf16_nora::backward_target(stream, w, tape, 2, d_v_base, nullptr);
+    }
+    return;
+  }
   add_inplace_bf16(stream, wkv_dr, post_dr, R);
   add_inplace_bf16(stream, d_v, post_dv, R);
 
@@ -342,9 +375,8 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   // v_first is a cross-layer edge. Reverse layers accumulate it until layer 0.
   if (layer_zero) {
     copy(stream, d_v, d_v_base, R);
-    if (state_grad.v_first_grad) {
+    if (state_grad.v_first_grad)
       add_inplace_bf16(stream, d_v_base, state_grad.v_first_grad, R);
-    }
   } else {
     vres_backward_kernel<<<blocks(R), kThreads, 0, stream>>>(
         tape.v_base, tape.v_first, tape.v_gate, d_v, d_v_base, d_v12,
@@ -386,14 +418,10 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   rwkv_bf16_nora::backward_target(stream, w, tape, 2, d_v_base, dx_v);
   if (!layer_zero) {
     bf16 *d_v1 = arena.take(static_cast<std::size_t>(rows) * w.rank_v);
-    bf16 *rank_v_padding =
-        arena.take(static_cast<std::size_t>(rows) * w.rank_v);
-    (void)rank_v_padding;
     linear_runtime_backward_input_bf16(stream, rows, w.rank_v, C, d_v12, w.v2,
                                        d_v1);
-    linear_runtime_backward_input_bf16(stream, rows, C, w.rank_v, d_v1, w.v1,
-                                       temp0);
-    add_inplace_bf16(stream, dx_v, temp0, R);
+    linear_runtime_backward_input_accumulate_bf16(stream, rows, C, w.rank_v,
+                                                  d_v1, w.v1, dx_v);
   }
 
   const bf16 *tmix_grads[] = {dx_r, dx_w, dx_k, dx_v, dx_a, dx_g};
@@ -404,12 +432,13 @@ void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
   }
   time_mix_backward_input_bf16(stream, tape.batch, tape.time, C, 6, tmix_grads,
                                tmix_weights, d_ln1, state_grad.att_shift_grad,
-                               tape.offsets);
-  add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln1,
-                          state_grad.final_att_shift_grad, tape.offsets);
-  layer_norm_backward_input_bf16(stream, rows, C, tape.x, w.ln1_weight, d_ln1,
-                                 temp1, kLnEps);
-  add_bf16(stream, grad_x_after, temp1, grad_in, R);
+                               tape.offsets, tape.doc_start);
+  if (grad_in) {
+    add_last_shift_gradient(stream, tape.batch, tape.time, C, d_ln1,
+                            state_grad.final_att_shift_grad, tape.offsets);
+    layer_norm_backward_input_bf16(stream, rows, C, tape.x, w.ln1_weight, d_ln1,
+                                   grad_in, kLnEps, grad_x_after);
+  }
 }
 
 } // namespace rwkv_bf16_training

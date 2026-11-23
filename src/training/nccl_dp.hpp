@@ -19,15 +19,24 @@ public:
   Group &operator=(const Group &) = delete;
   void sum(float *values, size_t count, cudaStream_t stream);
   float sum_loss(float value, cudaStream_t stream);
+  float sum_loss_and_times(float local_loss, float local_compute_s,
+                           std::vector<float> &rank_compute_s,
+                           cudaStream_t stream);
   void barrier(cudaStream_t stream);
 
 private:
   ncclComm_t comm_ = nullptr;
   rwkv_bf16_training::DeviceBuffer<float> scalar_;
 };
-// Deterministic longest-first assignment balancing tokens and chunk sweeps.
-// Every rank sees the same global batch; only the assigned samples execute on
-// GPU.
+// Deterministic longest-first assignment balancing tokens, chunk sweeps, and
+// optional measured per-rank inverse speed factors (relative sec/unit-load).
+// Every rank sees the same global batch and same inv_speeds, so assignments are
+// bit-identical across ranks.
 std::vector<int> assign(const std::vector<size_t> &lengths, int ranks,
-                        int micro_bsz);
+                        int micro_bsz,
+                        const std::vector<double> *inv_speeds = nullptr,
+                        std::vector<size_t> *out_raw_loads = nullptr);
+void update_speed_model(const std::vector<size_t> &raw_loads,
+                        const std::vector<float> &rank_compute_s,
+                        std::vector<double> &inv_speeds, bool &ready);
 } // namespace rwkv_dp

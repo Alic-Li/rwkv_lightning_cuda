@@ -14,6 +14,8 @@ struct Linear {
   float *gradient = nullptr; // optional D/B FP32 accumulator; never a base dW
   const bf16 *a = nullptr;   // NoRA A[rank,in]; null selects MiSS
   float *gradient_a = nullptr;
+  const bf16 *d_twice = nullptr; // optional cached [out, 2*rank] [B|B]
+  const bf16 *a_twice = nullptr; // optional cached [2*rank, in] [A;A]
 };
 using Block = std::array<Linear, TargetCount>;
 // reduced may be null for inference (fused reduction/project/add), otherwise
@@ -21,6 +23,7 @@ using Block = std::array<Linear, TargetCount>;
 void forward(cudaStream_t, int rows, const Linear &, const bf16 *x, bf16 *y,
              float *reduced = nullptr);
 // Adds adapter contribution to the already-computed frozen-base dx.
+// dx may be null when only adapter parameter gradients are needed.
 void backward(cudaStream_t, int rows, const Linear &, const float *reduced,
               const bf16 *dy, bf16 *dx);
 void cast_master(cudaStream_t, const float *, bf16 *, std::size_t);

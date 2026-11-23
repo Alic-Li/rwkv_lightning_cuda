@@ -86,7 +86,119 @@ __global__ void expand(int rows, int cols, const float *x, const bf16 *weight,
     }
   }
 }
+
+// Coalesced tiled parameter-gradient kernels for rank multiples of 16:
+// grad_b_16 computes out[m, n] += scale * left[rows, m]^T @ right[rows, n] (64x16 tile)
+// grad_a_16 computes out[m, n] += scale * left[rows, m]^T @ right[rows, n] (16x64 tile)
+// Both accumulate t = 0..rows-1 sequentially, matching rwkv_nora_detail::product
+// bit-for-bit (0 ULP difference) while coalescing global reads and reusing
+// shared-memory tiles 8x in registers.
+template <class L, class R>
+__global__ void grad_b_16(int m, int n, int rows, const L *left, const R *right,
+                          float *out, float scale) {
+  constexpr int Rows = 64, Rank = 16, Step = 16;
+  __shared__ float s_l[Step][Rows + 1];
+  __shared__ float s_r[Step][Rank + 1];
+  const int col0 = blockIdx.x * Rank;
+  const int row0 = blockIdx.y * Rows;
+  const int r = threadIdx.x % Rows;
+  const int j0 = (threadIdx.x / Rows) * 8;
+  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int t0 = 0; t0 < rows; t0 += Step) {
+    for (int i = threadIdx.x; i < Step * Rows; i += 128) {
+      const int k = i / Rows, c = i % Rows;
+      s_l[k][c] = (t0 + k < rows && row0 + c < m)
+                      ? rwkv_nora_detail::value(
+                            left[size_t(t0 + k) * m + row0 + c])
+                      : 0.0f;
+    }
+    for (int i = threadIdx.x; i < Step * Rank; i += 128) {
+      const int k = i / Rank, j = i % Rank;
+      s_r[k][j] = (t0 + k < rows && col0 + j < n)
+                      ? rwkv_nora_detail::value(
+                            right[size_t(t0 + k) * n + col0 + j])
+                      : 0.0f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < Step; ++k) {
+      const float lv = s_l[k][r];
+#pragma unroll
+      for (int u = 0; u < 8; ++u)
+        acc[u] = fmaf(lv, s_r[k][j0 + u], acc[u]);
+    }
+    __syncthreads();
+  }
+  if (row0 + r < m) {
+    float *dst = out + size_t(row0 + r) * n + col0 + j0;
+#pragma unroll
+    for (int u = 0; u < 8; ++u)
+      if (col0 + j0 + u < n)
+        dst[u] = fmaf(scale, acc[u], dst[u]);
+  }
+}
+
+template <class L, class R>
+__global__ void grad_a_16(int m, int n, int rows, const L *left, const R *right,
+                          float *out, float scale) {
+  constexpr int Rank = 16, Cols = 64, Step = 16;
+  __shared__ float s_l[Step][Rank + 1];
+  __shared__ float s_r[Step][Cols + 1];
+  const int col0 = blockIdx.x * Cols;
+  const int row0 = blockIdx.y * Rank;
+  const int c = threadIdx.x % Cols;
+  const int j0 = (threadIdx.x / Cols) * 8;
+  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int t0 = 0; t0 < rows; t0 += Step) {
+    for (int i = threadIdx.x; i < Step * Rank; i += 128) {
+      const int k = i / Rank, j = i % Rank;
+      s_l[k][j] = (t0 + k < rows && row0 + j < m)
+                      ? rwkv_nora_detail::value(
+                            left[size_t(t0 + k) * m + row0 + j])
+                      : 0.0f;
+    }
+    for (int i = threadIdx.x; i < Step * Cols; i += 128) {
+      const int k = i / Cols, col = i % Cols;
+      s_r[k][col] = (t0 + k < rows && col0 + col < n)
+                        ? rwkv_nora_detail::value(
+                              right[size_t(t0 + k) * n + col0 + col])
+                        : 0.0f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < Step; ++k) {
+      const float rv = s_r[k][c];
+#pragma unroll
+      for (int u = 0; u < 8; ++u)
+        acc[u] = fmaf(s_l[k][j0 + u], rv, acc[u]);
+    }
+    __syncthreads();
+  }
+  if (col0 + c < n) {
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+      if (row0 + j0 + u < m) {
+        const size_t at = size_t(row0 + j0 + u) * n + col0 + c;
+        out[at] = fmaf(scale, acc[u], out[at]);
+      }
+    }
+  }
+}
 #endif
+
+template <class L, class R>
+void grad_weight(cudaStream_t stream, int m, int n, int rows, const L *left,
+                 const R *right, float *out, float scale = 1) {
+#ifndef RWKV_USE_HIP
+  if (m >= 8192 && (n & 15) == 0) {
+    grad_b_16<<<dim3((n + 15) / 16, (m + 63) / 64), 128, 0, stream>>>(
+        m, n, rows, left, right, out, scale);
+    return;
+  }
+#endif
+  rwkv_nora_detail::gemm<true, false, true>(stream, m, n, rows, left, right,
+                                            out, scale);
+}
 
 template <bool TR>
 void projection(cudaStream_t stream, int rows, int rank, int width,

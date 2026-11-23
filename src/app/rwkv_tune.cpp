@@ -51,6 +51,7 @@ constexpr const char *program_name =
 // because the tuned initial state receives its gradient through them.
 struct Sample {
   std::vector<int> tokens;
+  std::vector<int> labels;
   std::vector<unsigned char> train;
 };
 
@@ -345,12 +346,9 @@ int main(int argc, char **argv) {
       return launch_status;
     rwkv_dp::Group dp;
     const bool primary = rwkv_dp::rank() == 0;
-    // Avoid reserving excessive lanes for small global batches. Ranks may own
-    // different sample counts and accumulate as many micro-batches as needed.
-    const int micro_bsz =
-        std::min(options.micro_bsz,
-                 int((size_t(options.batch_size) + rwkv_dp::size() - 1) /
-                     rwkv_dp::size()));
+    // Allow unequal sample counts across thermally/architecturally unequal DP
+    // ranks up to --micro-bsz without spilling to a second micro-batch.
+    const int micro_bsz = std::min(options.micro_bsz, options.batch_size);
 #else
     const bool primary = true;
     const int micro_bsz = options.micro_bsz;
@@ -469,14 +467,27 @@ int main(int argc, char **argv) {
 #endif
     int resume_epoch = 1;
     std::uint64_t resume_row = 0;
+    std::uint64_t start_step = 0;
 #if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
-    if (!options.resume.empty())
+    if (!options.resume.empty()) {
       miss.resume(options.resume, global_step, resume_epoch, resume_row,
                   time_state.p, state_count);
+      start_step = global_step;
+      if (dataset_rows >= resume_row) {
+        const std::uint64_t rem_cur =
+            (dataset_rows - resume_row + options.batch_size - 1) / options.batch_size;
+        const std::uint64_t rem_eps =
+            static_cast<std::uint64_t>(std::max(0, options.epochs - resume_epoch)) *
+            ((dataset_rows + options.batch_size - 1) / options.batch_size);
+        planned = global_step + rem_cur + rem_eps;
+      }
+    }
     if (options.max_steps && global_step >= options.max_steps)
       stop = true;
 #endif
 #ifdef RWKV_NCCL_DP
+    std::vector<double> dp_inv_speeds(rwkv_dp::size(), 1.0);
+    bool dp_ema_ready = false;
     dp.barrier(stream.value);
     size_t free_bytes = 0, total_bytes = 0;
     check(cudaMemGetInfo(&free_bytes, &total_bytes), "DP memory report");
@@ -517,15 +528,25 @@ int main(int argc, char **argv) {
           // Segments are tokenized independently so the mask follows their
           // boundaries exactly.
           Sample sample;
+          std::vector<std::size_t> eos_positions;
           for (const auto &segment : segments) {
             const auto encoded = tokenizer.encode(segment.text);
             sample.tokens.insert(sample.tokens.end(), encoded.begin(),
                                  encoded.end());
             sample.train.insert(sample.train.end(), encoded.size(),
                                 segment.train ? 1 : 0);
+            if (segment.end_target == 0) eos_positions.push_back(sample.tokens.size());
           }
-          std::size_t count = std::min(
-              sample.tokens.size(), static_cast<std::size_t>(options.ctx) + 1);
+          sample.labels = sample.tokens;
+          for (const auto position : eos_positions) {
+            if (position >= sample.tokens.size() || sample.train[position])
+              throw std::runtime_error("EOS label collides with trained input or missing boundary");
+            sample.labels[position] = 0;
+            sample.train[position] = 1;
+          }
+          if (sample.tokens.size() > static_cast<std::size_t>(options.ctx) + 1)
+            throw std::runtime_error("Training row exceeds ctx; use a longer context bucket (truncation forbidden)");
+          std::size_t count = sample.tokens.size();
           // Positions after the last trained target carry no gradient.
           while (count >= 2 && !sample.train[count - 1])
             --count;
@@ -534,6 +555,7 @@ int main(int argc, char **argv) {
             continue;
           }
           sample.tokens.resize(count);
+          sample.labels.resize(count);
           sample.train.resize(count);
           batch_tokens += static_cast<std::size_t>(
               std::count(sample.train.begin() + 1, sample.train.end(), 1));
@@ -547,8 +569,10 @@ int main(int argc, char **argv) {
         std::vector<size_t> lengths;
         for (const auto &sample : batch)
           lengths.push_back(sample.tokens.size() - 1);
-        const auto owners =
-            rwkv_dp::assign(lengths, rwkv_dp::size(), micro_bsz);
+        std::vector<size_t> rank_loads;
+        const auto owners = rwkv_dp::assign(
+            lengths, rwkv_dp::size(), micro_bsz,
+            dp_ema_ready ? &dp_inv_speeds : nullptr, &rank_loads);
         std::vector<Sample> local;
         for (size_t i = 0; i < batch.size(); ++i)
           if (owners[i] == rwkv_dp::rank())
@@ -577,23 +601,35 @@ int main(int argc, char **argv) {
 #endif
 #endif
         float batch_loss = 0.0f;
-        for (std::size_t first = 0; first < batch.size(); first += micro_bsz) {
-          const std::size_t last = std::min(
-              batch.size(), first + static_cast<std::size_t>(micro_bsz));
+        const std::size_t step_bsz =
+#if defined(RWKV_MISS_TUNE) || defined(RWKV_NORA_TUNE)
+            (!rwkv_bf16_training::consistent_forward_enabled() && micro_bsz > 1)
+                ? std::max<std::size_t>(
+                      1, std::min<std::size_t>(
+                             batch.size(),
+                             static_cast<std::size_t>(micro_bsz) * 2))
+                : static_cast<std::size_t>(micro_bsz);
+#else
+            static_cast<std::size_t>(micro_bsz);
+#endif
+        for (std::size_t first = 0; first < batch.size(); first += step_bsz) {
+          const std::size_t last =
+              std::min(batch.size(), first + step_bsz);
           if (micro_bsz == 1) {
             const auto &sample = batch[first];
             std::vector<float> weights(sample.train.begin(), sample.train.end());
             batch_loss += executor.backward(frozen, sample.tokens, weights,
-                                             time_state.p, batch_tokens);
+                                             time_state.p, batch_tokens, 1.0f, &sample.labels);
           } else {
-            std::vector<std::vector<int>> tokens;
+            std::vector<std::vector<int>> tokens, labels;
             std::vector<std::vector<float>> weights;
             for (std::size_t i = first; i < last; ++i) {
               tokens.push_back(batch[i].tokens);
+              labels.push_back(batch[i].labels);
               weights.emplace_back(batch[i].train.begin(), batch[i].train.end());
             }
             batch_loss += executor.backward_packed(frozen, tokens, weights,
-                                                    time_state.p, batch_tokens);
+                                                    time_state.p, batch_tokens, 1.0f, &labels);
           }
 #if !defined(RWKV_MISS_TUNE) && !defined(RWKV_NORA_TUNE)
 #ifdef RWKV_NCCL_DP
@@ -663,10 +699,18 @@ int main(int argc, char **argv) {
             throw std::runtime_error(
                 "nonfinite/overflow global state gradient");
 #endif
-        batch_loss = dp.sum_loss(batch_loss, stream.value);
+        const double local_compute_s =
+            std::chrono::duration<double>(reduce_started - compute_started)
+                .count();
+        std::vector<float> rank_compute_s;
+        batch_loss = dp.sum_loss_and_times(
+            batch_loss, static_cast<float>(local_compute_s), rank_compute_s,
+            stream.value);
         if (!std::isfinite(batch_loss))
           throw std::runtime_error(
               "nonfinite global loss; optimizer not executed");
+        rwkv_dp::update_speed_model(rank_loads, rank_compute_s, dp_inv_speeds,
+                                    dp_ema_ready);
         if (options.dp_profile) {
           const auto reduced = std::chrono::steady_clock::now();
           check(cudaMemGetInfo(&free_bytes, &total_bytes), "DP profile memory");
@@ -675,9 +719,7 @@ int main(int argc, char **argv) {
               "DP step=%llu rank=%d samples=%zu tokens=%zu compute_s=%.3f "
               "reduce_wait_s=%.3f used_MiB=%zu\n",
               static_cast<unsigned long long>(next_step), rwkv_dp::rank(),
-              batch.size(), local_positions,
-              std::chrono::duration<double>(reduce_started - compute_started)
-                  .count(),
+              batch.size(), local_positions, local_compute_s,
               std::chrono::duration<double>(reduced - reduce_started).count(),
               (total_bytes - free_bytes) / (1024 * 1024));
         }
@@ -710,6 +752,8 @@ int main(int argc, char **argv) {
         const double fraction =
             std::min(1.0, static_cast<double>(global_step) / display_steps);
         const int filled = static_cast<int>(fraction * 24);
+        const std::uint64_t steps_since_start =
+            std::max<std::uint64_t>(1, global_step - start_step);
         if (primary)
           std::cout << '\r' << '[' << std::string(filled, '=')
                     << std::string(24 - filled, ' ') << "] " << global_step
@@ -723,7 +767,7 @@ int main(int argc, char **argv) {
                     << " tok/s=" << std::setprecision(1)
                     << processed_tokens / elapsed
                     << " ETA=" << std::setprecision(0)
-                    << elapsed / global_step *
+                    << elapsed / steps_since_start *
                            (display_steps > global_step
                                 ? display_steps - global_step
                                 : 0)

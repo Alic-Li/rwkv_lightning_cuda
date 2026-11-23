@@ -13,19 +13,6 @@ namespace {
 constexpr int kN = 64;
 constexpr int kThreads = 256;
 constexpr float kLnEps = 1.0e-5f;
-constexpr float kGnEps = 64.0e-5f;
-
-__global__ void alpha_kernel(int C, const bf16 *__restrict__ a0,
-                             const bf16 *__restrict__ a12,
-                             bf16 *__restrict__ alpha, std::size_t elements) {
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= elements)
-    return;
-  const int c = static_cast<int>(i % C);
-  const float x = to_float(a0[c]) + to_float(a12[i]);
-  alpha[i] = to_bf16(1.0f / (1.0f + expf(-x)));
-}
 
 __global__ void
 vres_forward_kernel(int C, const bf16 *__restrict__ base,
@@ -42,39 +29,6 @@ vres_forward_kernel(int C, const bf16 *__restrict__ base,
   const float b = to_float(base[i]);
   gate[i] = to_bf16(g);
   out[i] = to_bf16(b + (to_float(first[i]) - b) * g);
-}
-
-__device__ __forceinline__ float warp_sum(float x) {
-#pragma unroll
-  for (int offset = 16; offset; offset >>= 1) {
-    x += __shfl_down_sync(0xffffffffu, x, offset);
-  }
-  return x;
-}
-
-__global__ __launch_bounds__(kN) void group_norm_forward_kernel(
-    int H, const bf16 *__restrict__ x, const bf16 *__restrict__ weight,
-    const bf16 *__restrict__ bias, bf16 *__restrict__ y) {
-  const int bth = blockIdx.x;
-  const int head = bth % H;
-  const int lane = threadIdx.x;
-  const long long i = static_cast<long long>(bth) * kN + lane;
-  const int c = head * kN + lane;
-  const float value = to_float(x[i]);
-  float sum = warp_sum(value);
-  __shared__ float partial[2];
-  if ((lane & 31) == 0)
-    partial[lane >> 5] = sum;
-  __syncthreads();
-  const float mean = (partial[0] + partial[1]) / kN;
-  __syncthreads();
-  const float centered = value - mean;
-  float square = warp_sum(centered * centered);
-  if ((lane & 31) == 0)
-    partial[lane >> 5] = square;
-  __syncthreads();
-  const float rstd = rsqrtf((partial[0] + partial[1]) / kN + kGnEps);
-  y[i] = to_bf16(centered * rstd * to_float(weight[c]) + to_float(bias[c]));
 }
 
 struct Arena {
@@ -129,13 +83,14 @@ void block_forward_state_tuning_bf16(
     bf16 *ffn_shift, const float *initial_state, float *final_state,
     bf16 *v_first, bf16 *output, const FrozenBlockWeights &w,
     BlockTapeView &tape, bf16 *workspace, std::size_t workspace_elements,
-    bool layer_zero, const int *offsets) {
+    bool layer_zero, const int *offsets, bool record_tape,
+    const std::uint8_t *doc_start) {
   // Row-wise kernels see packed lanes as one dense batch of T rows.
   const int dense = offsets ? 1 : B;
   const std::size_t required =
       block_forward_workspace_bf16_elements(dense, T, w);
   if (!input || !attention_shift || !ffn_shift || !initial_state ||
-      !final_state || !v_first || !output || !workspace ||
+      !final_state || !v_first || (!output && !record_tape) || !workspace ||
       workspace_elements < required) {
     throw std::invalid_argument("invalid block forward arguments");
   }
@@ -146,6 +101,7 @@ void block_forward_state_tuning_bf16(
   tape.batch = B;
   tape.time = T;
   tape.offsets = offsets;
+  tape.doc_start = doc_start;
   for (void *pointer :
        {static_cast<void *>(tape.x), static_cast<void *>(tape.ln1),
         static_cast<void *>(tape.r), static_cast<void *>(tape.raw_w),
@@ -201,10 +157,10 @@ void block_forward_state_tuning_bf16(
   }
 
   Arena arena{workspace, workspace_elements};
-  bf16 *xr = arena.take(R);
+  bf16 *xr = (record_tape && tape.xr) ? tape.xr : arena.take(R);
   bf16 *xw = arena.take(R);
-  bf16 *xk = arena.take(R);
-  bf16 *xv = arena.take(R);
+  bf16 *xk = (record_tape && tape.xk) ? tape.xk : arena.take(R);
+  bf16 *xv = (record_tape && tape.xv) ? tape.xv : arena.take(R);
   bf16 *xa = arena.take(R);
   bf16 *xg = arena.take(R);
   bf16 *w1 = arena.take(static_cast<std::size_t>(rows) * w.rank_w);
@@ -213,33 +169,38 @@ void block_forward_state_tuning_bf16(
   bf16 *w12 = arena.take(R);
   bf16 *a12 = arena.take(R);
   bf16 *v12 = arena.take(R);
-  bf16 *attention_post = arena.take(R);
+  bf16 *attention_post =
+      (record_tape && tape.att_post) ? tape.att_post : arena.take(R);
   bf16 *attention_out = arena.take(R);
-  bf16 *ffn_mixed = arena.take(R);
+  bf16 *ffn_mixed =
+      (record_tape && tape.ffn_mixed) ? tape.ffn_mixed : arena.take(R);
   bf16 *ffn_act = arena.take(F);
-  bf16 *ffn_out = arena.take(R);
+  bf16 *ffn_out = output ? arena.take(R) : nullptr;
 
-  if (tape.nora_att_shift)
-    copy(stream, attention_shift, tape.nora_att_shift, size_t(B) * C);
-  if (tape.nora_ffn_shift)
-    copy(stream, ffn_shift, tape.nora_ffn_shift, size_t(B) * C);
-  copy(stream, input, tape.x, R);
+  if (record_tape) {
+    if (tape.nora_att_shift)
+      copy(stream, attention_shift, tape.nora_att_shift, size_t(B) * C);
+    if (tape.nora_ffn_shift)
+      copy(stream, ffn_shift, tape.nora_ffn_shift, size_t(B) * C);
+    if (input != tape.x)
+      copy(stream, input, tape.x, R);
+  }
   rwkv7_v3a_layer_norm_bf16_launch(stream, rows, C, input, w.ln1_weight,
                                    w.ln1_bias, tape.ln1, kLnEps);
   rwkv7_tmix_mix6_launch(stream, B, T, C, tape.ln1, attention_shift, w.mix_r,
                          w.mix_w, w.mix_k, w.mix_v, w.mix_a, w.mix_g, xr, xw,
-                         xk, xv, xa, xg, offsets);
+                         xk, xv, xa, xg, offsets, doc_start);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, C, xr, w.receptance,
                                     tape.r);
   rwkv_bf16_miss::forward(stream, rows, w.miss[0], xr, tape.r,
-                          tape.miss_reduced[0]);
+                          record_tape ? tape.miss_reduced[0] : nullptr);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, C, xk, w.key, tape.k);
   rwkv_bf16_miss::forward(stream, rows, w.miss[1], xk, tape.k,
-                          tape.miss_reduced[1]);
+                          record_tape ? tape.miss_reduced[1] : nullptr);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, C, xv, w.value,
                                     tape.v_base);
   rwkv_bf16_miss::forward(stream, rows, w.miss[2], xv, tape.v_base,
-                          tape.miss_reduced[2]);
+                          record_tape ? tape.miss_reduced[2] : nullptr);
 
   rwkv7_v3a_linear_bf16_launch(stream, rows, C, w.rank_w, xw, w.w1, w1);
   rwkv7_act_tanh_launch(stream, w1, tape.w1_tanh,
@@ -250,7 +211,6 @@ void block_forward_state_tuning_bf16(
 
   rwkv7_v3a_linear_bf16_launch(stream, rows, C, w.rank_a, xa, w.a1, a1);
   rwkv7_v3a_linear_bf16_launch(stream, rows, w.rank_a, C, a1, w.a2, a12);
-  alpha_kernel<<<blocks(R), kThreads, 0, stream>>>(C, w.a0, a12, tape.alpha, R);
 
   rwkv7_v3a_linear_bf16_launch(stream, rows, C, w.rank_g, xg, w.g1, g1);
   rwkv7_act_sigmoid_launch(stream, g1, tape.g1_sigmoid,
@@ -271,8 +231,9 @@ void block_forward_state_tuning_bf16(
   tape.v_first = v_first;
 
   rwkv7_tmix_kk_a_gate_launch(stream, dense, T, C, w.heads, tape.k, w.k_k, w.a0,
-                              a12, w.k_a, tape.wkv_k, tape.neg_kk, tape.kka);
-  if (tape.wkv_replay_initial) {
+                              a12, w.k_a, tape.wkv_k, tape.neg_kk, tape.kka,
+                              record_tape ? tape.alpha : nullptr);
+  if (record_tape && tape.wkv_replay_initial) {
     if (!tape.wkv_replay_final)
       throw std::invalid_argument("missing WKV replay final-state scratch");
     const auto error = cudaMemcpyAsync(tape.wkv_replay_initial, initial_state,
@@ -282,37 +243,53 @@ void block_forward_state_tuning_bf16(
     if (error != cudaSuccess)
       throw std::runtime_error(cudaGetErrorString(error));
   }
-  wkv_forward(stream, IoType::BF16, {B, T, w.heads, kN, offsets}, initial_state, tape.r,
-              tape.raw_w, tape.wkv_k, tape.v, tape.neg_kk, tape.kka, tape.wkv_y,
-              final_state, tape.wkv_replay_initial ? WkvTapeView{} : tape.wkv);
+  wkv_forward(
+      stream, IoType::BF16,
+      {B, T, w.heads, kN, offsets, doc_start, tape.doc_initial_state},
+      initial_state, tape.r, tape.raw_w, tape.wkv_k, tape.v, tape.neg_kk,
+      tape.kka, tape.wkv_y, final_state,
+      (!record_tape || tape.wkv_replay_initial) ? WkvTapeView{} : tape.wkv);
 
-  group_norm_forward_kernel<<<rows * w.heads, kN, 0, stream>>>(
-      w.heads, tape.wkv_y, w.att_group_norm_weight, w.att_group_norm_bias,
-      tape.att_group_norm);
   rwkv7_tmix_lnx_rkvres_xg_launch(
       stream, dense, T, C, w.heads, tape.wkv_y, tape.r, tape.wkv_k, tape.v, w.r_k,
       w.att_group_norm_weight, w.att_group_norm_bias, tape.att_gate,
-      attention_post);
+      attention_post, record_tape ? tape.att_group_norm : nullptr);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, C, attention_post,
                                     w.output, attention_out);
   rwkv_bf16_miss::forward(stream, rows, w.miss[3], attention_post,
-                          attention_out, tape.miss_reduced[3]);
-  rwkv7_v3a_add_bf16_launch(stream, input, attention_out, tape.x_after_att, R);
-
-  rwkv7_v3a_layer_norm_bf16_launch(stream, rows, C, tape.x_after_att,
-                                   w.ln2_weight, w.ln2_bias, tape.ln2, kLnEps);
+                          attention_out,
+                          record_tape ? tape.miss_reduced[3] : nullptr);
+  bf16 *sum_after_att = record_tape ? tape.x_after_att : output;
+  rwkv7_add_layer_norm_bf16_launch(stream, rows, C, input, attention_out,
+                                   sum_after_att, w.ln2_weight, w.ln2_bias,
+                                   tape.ln2, kLnEps);
   rwkv7_cmix_mix_launch(stream, B, T, C, tape.ln2, ffn_shift, w.ffn_mix,
-                        ffn_mixed, offsets);
+                        ffn_mixed, offsets, doc_start);
   rwkv7_v3a_linear_bf16_orig_launch(stream, rows, C, w.ffn, ffn_mixed,
                                     w.ffn_key, tape.ffn_hid);
   rwkv_bf16_miss::forward(stream, rows, w.miss[4], ffn_mixed, tape.ffn_hid,
-                          tape.miss_reduced[4]);
-  rwkv7_relu_square_launch(stream, tape.ffn_hid, ffn_act, F);
-  rwkv7_v3a_linear_bf16_launch(stream, rows, w.ffn, C, ffn_act, w.ffn_value,
-                               ffn_out);
-  rwkv_bf16_miss::forward(stream, rows, w.miss[5], ffn_act, ffn_out,
-                          tape.miss_reduced[5]);
-  rwkv7_v3a_add_bf16_launch(stream, tape.x_after_att, ffn_out, output, R);
+                          record_tape ? tape.miss_reduced[4] : nullptr);
+  if (record_tape) {
+    if (output) {
+      rwkv7_relu_square_launch(stream, tape.ffn_hid, ffn_act, F);
+      rwkv7_v3a_linear_bf16_launch(stream, rows, w.ffn, C, ffn_act, w.ffn_value,
+                                   ffn_out);
+      rwkv_bf16_miss::forward(stream, rows, w.miss[5], ffn_act, ffn_out,
+                              tape.miss_reduced[5]);
+      rwkv7_v3a_add_bf16_launch(stream, tape.x_after_att, ffn_out, output, R);
+    } else if ((w.miss[5].gradient || w.miss[5].gradient_a) &&
+               tape.miss_reduced[5]) {
+      rwkv7_relu_square_launch(stream, tape.ffn_hid, ffn_act, F);
+      rwkv_bf16_miss::forward(stream, rows, w.miss[5], ffn_act, nullptr,
+                              tape.miss_reduced[5]);
+    }
+  } else {
+    rwkv7_relu_square_launch(stream, tape.ffn_hid, ffn_act, F);
+    rwkv7_v3a_linear_bf16_launch(stream, rows, w.ffn, C, ffn_act, w.ffn_value,
+                                 ffn_out);
+    rwkv_bf16_miss::forward(stream, rows, w.miss[5], ffn_act, ffn_out, nullptr);
+    rwkv7_v3a_add_bf16_launch(stream, sum_after_att, ffn_out, output, R);
+  }
 }
 
 } // namespace rwkv_bf16_training

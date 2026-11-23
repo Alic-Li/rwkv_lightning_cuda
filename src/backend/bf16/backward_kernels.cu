@@ -13,25 +13,61 @@ namespace {
 
 constexpr int kThreads = 256;
 
-__device__ __forceinline__ float warp_sum(float value) {
+__device__ __forceinline__ float warp_all_sum(float value) {
 #pragma unroll
-  for (int offset = 16; offset; offset >>= 1) {
-    value += __shfl_down_sync(0xffffffffu, value, offset);
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    value += __shfl_xor_sync(0xffffffffu, value, mask);
   }
   return value;
+}
+
+// One 32-thread warp computes exact GroupNorm backward for one 64-element head
+// group (2 elements in registers per thread, 0 shared memory, 0 barriers).
+__global__ void group_norm_64_backward_kernel(int group_count,
+                                              std::size_t total_groups,
+                                              const bf16 *__restrict__ x,
+                                              const bf16 *__restrict__ weight,
+                                              const bf16 *__restrict__ dy,
+                                              bf16 *__restrict__ dx,
+                                              float eps) {
+  const std::size_t group =
+      (static_cast<std::size_t>(blockIdx.x) * (kThreads >> 5)) +
+      (threadIdx.x >> 5);
+  if (group >= total_groups)
+    return;
+  const int lane = threadIdx.x & 31;
+  const std::size_t offset = group * 64;
+  const int w_offset = static_cast<int>(group % group_count) * 64;
+  const float x0 = to_float(x[offset + lane]);
+  const float x1 = to_float(x[offset + lane + 32]);
+  const float sdy0 =
+      to_float(dy[offset + lane]) * to_float(weight[w_offset + lane]);
+  const float sdy1 =
+      to_float(dy[offset + lane + 32]) * to_float(weight[w_offset + lane + 32]);
+  constexpr float kInvN = 1.0f / 64.0f;
+  const float mean = warp_all_sum(x0 + x1) * kInvN;
+  const float d0 = x0 - mean;
+  const float d1 = x1 - mean;
+  const float rstd = rsqrtf(warp_all_sum(d0 * d0 + d1 * d1) * kInvN + eps);
+  const float xhat0 = d0 * rstd;
+  const float xhat1 = d1 * rstd;
+  const float mean_d = warp_all_sum(sdy0 + sdy1) * kInvN;
+  const float mean_dxh = warp_all_sum(sdy0 * xhat0 + sdy1 * xhat1) * kInvN;
+  dx[offset + lane] = to_bf16(rstd * (sdy0 - mean_d - xhat0 * mean_dxh));
+  dx[offset + lane + 32] = to_bf16(rstd * (sdy1 - mean_d - xhat1 * mean_dxh));
 }
 
 __device__ __forceinline__ float block_sum(float value, float *scratch) {
   __syncthreads(); // Previous reduction readers must finish before reuse.
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  value = warp_sum(value);
+  value = warp_all_sum(value);
   if (lane == 0)
     scratch[warp] = value;
   __syncthreads();
   value = threadIdx.x < (blockDim.x >> 5) ? scratch[lane] : 0.0f;
   if (warp == 0)
-    value = warp_sum(value);
+    value = warp_all_sum(value);
   if (threadIdx.x == 0)
     scratch[0] = value;
   __syncthreads();
@@ -42,7 +78,8 @@ __global__ void norm_backward_kernel(int group_size, int group_count,
                                      const bf16 *__restrict__ x,
                                      const bf16 *__restrict__ weight,
                                      const bf16 *__restrict__ dy,
-                                     bf16 *__restrict__ dx, float eps) {
+                                     bf16 *__restrict__ dx, float eps,
+                                     const bf16 *__restrict__ residual_grad) {
   const int group = blockIdx.x;
   const int offset = group * group_size;
   const int weight_offset = (group % group_count) * group_size;
@@ -79,7 +116,57 @@ __global__ void norm_backward_kernel(int group_size, int group_count,
         to_float(dy[offset + i]) * to_float(weight[weight_offset + i]);
     const float value = rstd * (scaled_dy - sum_d / group_size -
                                 xhat * sum_d_xhat / group_size);
-    dx[offset + i] = to_bf16(value);
+    const bf16 d_norm = to_bf16(value);
+    dx[offset + i] = residual_grad
+                         ? to_bf16(to_float(residual_grad[offset + i]) +
+                                   to_float(d_norm))
+                         : d_norm;
+  }
+}
+
+__global__ void norm_backward_cached_kernel(
+    int C, const bf16 *__restrict__ x, const bf16 *__restrict__ weight,
+    const bf16 *__restrict__ dy, bf16 *__restrict__ dx, float eps,
+    const bf16 *__restrict__ residual_grad) {
+  const size_t offset = static_cast<size_t>(blockIdx.x) * C;
+  float reg_x[32];
+  float reg_sdy[32];
+  float local_x = 0.0f;
+  int n = 0;
+  for (int i = threadIdx.x; i < C; i += kThreads, ++n) {
+    const float xv = to_float(x[offset + i]);
+    reg_x[n] = xv;
+    reg_sdy[n] = to_float(dy[offset + i]) * to_float(weight[i]);
+    local_x += xv;
+  }
+  __shared__ float scratch[8];
+  const float mean = block_sum(local_x, scratch) / C;
+  float local_x2 = 0.0f;
+  for (int k = 0; k < n; ++k) {
+    const float centered = reg_x[k] - mean;
+    local_x2 += centered * centered;
+  }
+  const float rstd = rsqrtf(block_sum(local_x2, scratch) / C + eps);
+  float local_d = 0.0f;
+  float local_dxhat_xhat = 0.0f;
+  for (int k = 0; k < n; ++k) {
+    const float xhat = (reg_x[k] - mean) * rstd;
+    const float sdy = reg_sdy[k];
+    local_d += sdy;
+    local_dxhat_xhat += sdy * xhat;
+  }
+  const float sum_d = block_sum(local_d, scratch);
+  const float sum_d_xhat = block_sum(local_dxhat_xhat, scratch);
+  n = 0;
+  for (int i = threadIdx.x; i < C; i += kThreads, ++n) {
+    const float xhat = (reg_x[n] - mean) * rstd;
+    const float value =
+        rstd * (reg_sdy[n] - sum_d / C - xhat * sum_d_xhat / C);
+    const bf16 d_norm = to_bf16(value);
+    dx[offset + i] = residual_grad
+                         ? to_bf16(to_float(residual_grad[offset + i]) +
+                                   to_float(d_norm))
+                         : d_norm;
   }
 }
 
@@ -111,6 +198,7 @@ __device__ __forceinline__ const bf16 *select_ptr(SixPointers p, int i) {
 
 __global__ void time_mix_backward_kernel(int B, int T, int C,
                                          const int *__restrict__ offsets,
+                                         const std::uint8_t *__restrict__ doc_start,
                                          int branches, SixPointers grads,
                                          SixPointers mixes,
                                          bf16 *__restrict__ dx) {
@@ -120,13 +208,15 @@ __global__ void time_mix_backward_kernel(int B, int T, int C,
   if (idx >= elements)
     return;
   const int c = static_cast<int>(idx % C);
-  const bool last = lane_row(offsets, B, T, idx / C).last;
+  const long long row = idx / C;
+  const bool last = lane_row(offsets, B, T, row).last;
+  const bool next_resets = doc_start && !last && doc_start[row + 1];
   float value = 0.0f;
   for (int branch = 0; branch < branches; ++branch) {
     const bf16 *grad = select_ptr(grads, branch);
     const float mix = to_float(select_ptr(mixes, branch)[c]);
     value += to_float(grad[idx]) * (1.0f - mix);
-    if (!last)
+    if (!last && !next_resets)
       value += to_float(grad[idx + C]) * mix;
   }
   dx[idx] = to_bf16(value);
@@ -136,6 +226,7 @@ __global__ void time_mix_backward_kernel(int B, int T, int C,
 // terminal shift adjoint is still zero.
 __global__ void shift_backward_kernel(int B, int T, int C,
                                       const int *__restrict__ offsets,
+                                      const std::uint8_t *__restrict__ doc_start,
                                       int branches, SixPointers grads,
                                       SixPointers mixes,
                                       bf16 *__restrict__ d_shift) {
@@ -146,12 +237,14 @@ __global__ void shift_backward_kernel(int B, int T, int C,
     return;
   const int c = static_cast<int>(idx % C);
   const int batch = static_cast<int>(idx / C);
-  if (offsets && offsets[batch + 1] == offsets[batch]) {
+  const long long first_row =
+      offsets ? offsets[batch] : static_cast<long long>(batch) * T;
+  if ((offsets && offsets[batch + 1] == offsets[batch]) ||
+      (doc_start && doc_start[first_row])) {
     d_shift[idx] = to_bf16(0.0f);
     return;
   }
-  const long long first =
-      (offsets ? offsets[batch] : static_cast<long long>(batch) * T) * C + c;
+  const long long first = first_row * C + c;
   float value = 0.0f;
   for (int branch = 0; branch < branches; ++branch) {
     value += to_float(select_ptr(grads, branch)[first]) *
@@ -253,15 +346,31 @@ void linear_runtime_backward_input_bf16(cudaStream_t stream, int rows,
                                     frozen_weight_runtime, dx);
 }
 
+void linear_runtime_backward_input_accumulate_bf16(
+    cudaStream_t stream, int rows, int in_features, int out_features,
+    const bf16 *dy, const bf16 *frozen_weight_runtime, bf16 *dx) {
+  require_dims(rows, in_features, out_features);
+  if (!dy || !frozen_weight_runtime || !dx)
+    throw std::invalid_argument("null linear pointer");
+  rwkv7_v3a_linear_bf16_orig_accumulate_launch(
+      stream, rows, out_features, in_features, dy, frozen_weight_runtime, dx);
+}
+
 void layer_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
                                     const bf16 *x, const bf16 *frozen_weight,
-                                    const bf16 *dy, bf16 *dx, float eps) {
+                                    const bf16 *dy, bf16 *dx, float eps,
+                                    const bf16 *residual_grad) {
   if (rows <= 0 || channels <= 0 || !x || !frozen_weight || !dy || !dx ||
       eps <= 0.0f) {
     throw std::invalid_argument("invalid layer-norm backward arguments");
   }
-  norm_backward_kernel<<<rows, kThreads, 0, stream>>>(
-      channels, 1, x, frozen_weight, dy, dx, eps);
+  if (channels <= 8192) {
+    norm_backward_cached_kernel<<<rows, kThreads, 0, stream>>>(
+        channels, x, frozen_weight, dy, dx, eps, residual_grad);
+  } else {
+    norm_backward_kernel<<<rows, kThreads, 0, stream>>>(
+        channels, 1, x, frozen_weight, dy, dx, eps, residual_grad);
+  }
 }
 
 void group_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
@@ -273,15 +382,25 @@ void group_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
     throw std::invalid_argument("invalid group-norm backward arguments");
   }
   const int group_size = channels / groups;
-  norm_backward_kernel<<<rows * groups, kThreads, 0, stream>>>(
-      group_size, groups, x, frozen_weight, dy, dx, eps);
+  const std::size_t total_groups = static_cast<std::size_t>(rows) * groups;
+  if (group_size == 64) {
+    constexpr std::size_t kWarpsPerBlock = kThreads >> 5;
+    const int grid =
+        static_cast<int>((total_groups + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    group_norm_64_backward_kernel<<<grid, kThreads, 0, stream>>>(
+        groups, total_groups, x, frozen_weight, dy, dx, eps);
+  } else {
+    norm_backward_kernel<<<rows * groups, kThreads, 0, stream>>>(
+        group_size, groups, x, frozen_weight, dy, dx, eps, nullptr);
+  }
 }
 
 void time_mix_backward_input_bf16(cudaStream_t stream, int batch, int time,
                                   int channels, int branches,
                                   const bf16 *const *branch_grads,
                                   const bf16 *const *frozen_mixes, bf16 *dx,
-                                  bf16 *d_shift, const int *offsets) {
+                                  bf16 *d_shift, const int *offsets,
+                                  const std::uint8_t *doc_start) {
   if (batch <= 0 || time <= 0 || channels <= 0 || branches <= 0 ||
       branches > 6 || !branch_grads || !frozen_mixes || !dx) {
     throw std::invalid_argument("invalid time-mix backward arguments");
@@ -291,12 +410,13 @@ void time_mix_backward_input_bf16(cudaStream_t stream, int batch, int time,
   const std::size_t elements =
       static_cast<std::size_t>(offsets ? 1 : batch) * time * channels;
   time_mix_backward_kernel<<<blocks_for(elements), kThreads, 0, stream>>>(
-      batch, time, channels, offsets, branches, grads, mixes, dx);
+      batch, time, channels, offsets, doc_start, branches, grads, mixes, dx);
   if (d_shift) {
     const std::size_t shift_elements =
         static_cast<std::size_t>(batch) * channels;
     shift_backward_kernel<<<blocks_for(shift_elements), kThreads, 0, stream>>>(
-        batch, time, channels, offsets, branches, grads, mixes, d_shift);
+        batch, time, channels, offsets, doc_start, branches, grads, mixes,
+        d_shift);
   }
 }
 

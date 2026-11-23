@@ -17,7 +17,21 @@
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#ifdef RWKV_NCCL_DP
+#include "../training/nccl_dp.hpp"
+#endif
+#ifdef RWKV_ONLINE_RL_POSIX_HTTP
+#include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <json/json.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#else
 #include <drogon/drogon.h>
+#endif
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -87,6 +101,9 @@ std::vector<std::string> text_stops(const Json::Value &value) {
 struct Options {
   std::string model, adapter, state, resume, host = "127.0.0.1",
                                              output = "online-rl-output";
+#ifdef RWKV_NCCL_DP
+  std::string devices;
+#endif
   std::string vocab = RWKV_STATE_TUNE_DEFAULT_VOCAB, targets = "all";
   std::string gemm_mode = "bf16";
   std::vector<std::string> stop = {"</tool_call>", "</answer>", "\n\nUser:"};
@@ -107,6 +124,9 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
       std::cout
           << "Usage: " << argv[0]
           << " --model MODEL.pth [--adapter ADAPTER.pth] [--state STATE.pth]\n"
+#ifdef RWKV_NCCL_DP
+             "  [--devices 0,1,... (per-rank HTTP port = port + rank)]\n"
+#endif
              "  --host 127.0.0.1 --port "
           << o.port
           << " --chunk 64 --ctx 4096 --max-batch 32\n"
@@ -128,9 +148,17 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
       std::exit(0);
     }
     if (rwkv::is_version_flag(key))
-      std::exit(rwkv::print_version(nora   ? "rwkv_nora_tune_server"
-                                    : miss ? "rwkv_miss_tune_server"
-                                           : "rwkv_state_tune_server"));
+      std::exit(rwkv::print_version(
+#ifdef RWKV_NCCL_DP
+          nora   ? "rwkv_nora_tune_server_dp"
+          : miss ? "rwkv_miss_tune_server_dp"
+                 : "rwkv_state_tune_server_dp"
+#else
+          nora   ? "rwkv_nora_tune_server"
+          : miss ? "rwkv_miss_tune_server"
+                 : "rwkv_state_tune_server"
+#endif
+          ));
     if (key == "--lr")
       throw std::invalid_argument(
           "--lr was removed; send learning_rate in every POST /v1/train request");
@@ -161,6 +189,10 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
       o.resume = v;
     else if (key == "--vocab")
       o.vocab = v;
+#ifdef RWKV_NCCL_DP
+    else if (key == "--devices")
+      o.devices = v;
+#endif
     else if (key == "--host")
       o.host = v;
     else if (key == "--output")
@@ -338,6 +370,9 @@ template <class F> void parallel_for(size_t n, const F &f) {
 class Runtime {
   Options o_;
   bool miss_, nora_;
+#ifdef RWKV_NCCL_DP
+  rwkv_dp::Group *dp_ = nullptr;
+#endif
   // Exactly one Model owns all backbone allocations. Views only borrow them.
   Model model_;
   Stream stream_;
@@ -562,9 +597,15 @@ class Runtime {
   }
 
 public:
+#ifdef RWKV_NCCL_DP
+  Runtime(Options o, bool miss, bool nora, rwkv_dp::Group *dp = nullptr)
+      : o_(std::move(o)), miss_(miss), nora_(nora), dp_(dp), model_(o_.model),
+        learner_(model_.state_tuning_model_view()) {
+#else
   Runtime(Options o, bool miss, bool nora)
       : o_(std::move(o)), miss_(miss), nora_(nora), model_(o_.model),
         learner_(model_.state_tuning_model_view()) {
+#endif
     if (tokenizer_.load(o_.vocab) != rwkv7_server::kTokenizerSuccess)
       throw std::runtime_error("failed to load vocabulary");
     const size_t states = size_t(learner_.layers) * learner_.heads * 4096;
@@ -754,6 +795,13 @@ public:
     r["chunk"] = o_.chunk;
     r["ctx"] = o_.ctx;
     r["vocab_size"] = learner_.vocab;
+#ifdef RWKV_NCCL_DP
+    r["dp_rank"] = dp_ ? rwkv_dp::rank() : 0;
+    r["dp_world_size"] = dp_ ? rwkv_dp::size() : 1;
+#else
+    r["dp_rank"] = 0;
+    r["dp_world_size"] = 1;
+#endif
     r["max_batch"] = o_.batch;
     r["micro_bsz"] = o_.micro_bsz;
     r["default_max_tokens"] = o_.max_tokens;
@@ -977,7 +1025,12 @@ public:
       throw HttpError(409, "stale rollout: publish the learner and collect a "
                            "new on-policy batch");
     const auto &rows = r["samples"];
-    require(rows.isArray() && !rows.empty() &&
+#ifdef RWKV_NCCL_DP
+    const bool dp_active = dp_ != nullptr;
+#else
+    const bool dp_active = false;
+#endif
+    require(rows.isArray() && (dp_active || !rows.empty()) &&
                 rows.size() <= unsigned(o_.batch),
             "invalid training batch");
     require(r.isMember("learning_rate"),
@@ -1040,7 +1093,20 @@ public:
       positions += s.tokens.size() - 1;
       batch.push_back(std::move(s));
     }
-    require(kept > 0, "batch has no selected prediction targets");
+    size_t global_kept = kept;
+#ifdef RWKV_NCCL_DP
+    if (dp_) {
+      require(r.isMember("global_trained_tokens") &&
+                  r["global_trained_tokens"].isUInt64(),
+              "DP train requires global_trained_tokens");
+      global_kept = r["global_trained_tokens"].asUInt64();
+      require(global_kept > 0, "global_trained_tokens must be > 0");
+      any_weight = true;
+    } else
+#endif
+    {
+      require(kept > 0, "batch has no selected prediction targets");
+    }
     Json::Value out;
     out["policy_version"] = p->version;
     out["trained_tokens"] = Json::UInt64(kept);
@@ -1072,7 +1138,7 @@ public:
         if (lanes == 1) {
           const auto &s = batch[order[first]];
           loss += learner_exec_->backward(learner_, s.tokens, s.weights,
-                                          initial_.p, kept, temperature);
+                                          initial_.p, global_kept, temperature);
         } else {
           std::vector<std::vector<int>> tokens;
           std::vector<std::vector<float>> weights;
@@ -1080,8 +1146,8 @@ public:
             tokens.push_back(batch[order[i]].tokens);
             weights.push_back(batch[order[i]].weights);
           }
-          loss += learner_exec_->backward_packed(learner_, tokens, weights,
-                                                 initial_.p, kept, temperature);
+          loss += learner_exec_->backward_packed(
+              learner_, tokens, weights, initial_.p, global_kept, temperature);
         }
         // Add samples in request order, one lane at a time, so packing
         // reproduces per-sample accumulation bit for bit.
@@ -1097,6 +1163,17 @@ public:
         }
         first = last;
       }
+#ifdef RWKV_NCCL_DP
+      if (dp_) {
+        sync();
+        if (trainer_)
+          dp_->sum(trainer_->gradient_data(), trainer_->gradient_size(),
+                   stream_.value);
+        else
+          dp_->sum(gradient_.p, gradient_.n, stream_.value);
+        loss = dp_->sum_loss(loss, stream_.value);
+      }
+#endif
       if (!std::isfinite(loss))
         throw std::runtime_error(
             "nonfinite batch loss; optimizer not executed");
@@ -1146,7 +1223,12 @@ public:
     Json::Value out;
     if (!next->directory.empty())
       out["directory"] = next->directory;
-    if (save && next->directory.empty()) {
+#ifdef RWKV_NCCL_DP
+    const bool primary = !dp_ || rwkv_dp::rank() == 0;
+#else
+    const bool primary = true;
+#endif
+    if (save && next->directory.empty() && primary) {
       auto file_id = run_id_;
       std::replace(file_id.begin(), file_id.end(), ':', '_');
       const auto dir = std::filesystem::path(o_.output) /
@@ -1185,7 +1267,7 @@ public:
         throw;
       }
     }
-    if (checkpoint) {
+    if (checkpoint && primary) {
       const auto dir = std::filesystem::path(next->directory) / "training";
       if (!std::filesystem::exists(dir)) {
         if (trainer_)
@@ -1225,22 +1307,26 @@ class Worker {
   std::thread thread_;
 
 public:
-  explicit Worker(bool strict)
-      : thread_([this, strict] {
-          set_consistent_forward(true, !strict);
-          for (;;) {
-            std::function<void()> job;
-            {
-              std::unique_lock<std::mutex> lock(mutex_);
-              cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
-              if (stop_ && queue_.empty())
-                return;
-              job = std::move(queue_.front());
-              queue_.pop_front();
-            }
-            job();
-          }
-        }) {}
+  explicit Worker(bool strict) {
+    int dev = 0;
+    gpu_check(cudaGetDevice(&dev), "Worker query device");
+    thread_ = std::thread([this, strict, dev] {
+      gpu_check(cudaSetDevice(dev), "Worker bind device");
+      set_consistent_forward(true, !strict);
+      for (;;) {
+        std::function<void()> job;
+        {
+          std::unique_lock<std::mutex> lock(mutex_);
+          cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+          if (stop_ && queue_.empty())
+            return;
+          job = std::move(queue_.front());
+          queue_.pop_front();
+        }
+        job();
+      }
+    });
+  }
   ~Worker() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1258,16 +1344,301 @@ public:
     return true;
   }
 };
+#ifdef RWKV_ONLINE_RL_POSIX_HTTP
+std::string status_text(int status) {
+  switch (status) {
+  case 200:
+    return "OK";
+  case 400:
+    return "Bad Request";
+  case 404:
+    return "Not Found";
+  case 405:
+    return "Method Not Allowed";
+  case 409:
+    return "Conflict";
+  case 500:
+    return "Internal Server Error";
+  case 503:
+    return "Service Unavailable";
+  default:
+    return "Error";
+  }
+}
+
+bool write_all(int fd, const char *buf, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = ::send(fd, buf + off, len - off, MSG_NOSIGNAL);
+    if (n <= 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    off += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+void send_json(int fd, const Json::Value &body, int status = 200) {
+  Json::StreamWriterBuilder wb;
+  wb["indentation"] = "";
+  std::string payload = Json::writeString(wb, body);
+  std::ostringstream hdr;
+  hdr << "HTTP/1.1 " << status << ' ' << status_text(status) << "\r\n"
+      << "Content-Type: application/json\r\n"
+      << "Content-Length: " << payload.size() << "\r\n"
+      << "Connection: close\r\n\r\n";
+  std::string h = hdr.str();
+  if (write_all(fd, h.data(), h.size()))
+    write_all(fd, payload.data(), payload.size());
+  ::shutdown(fd, SHUT_WR);
+  ::close(fd);
+}
+
+std::string to_lower_ascii(std::string s) {
+  for (char &c : s)
+    if (c >= 'A' && c <= 'Z')
+      c = static_cast<char>(c - 'A' + 'a');
+  return s;
+}
+
+bool read_exact(int fd, std::string &out, size_t needed) {
+  while (out.size() < needed) {
+    char tmp[65536];
+    size_t want = std::min(sizeof(tmp), needed - out.size());
+    ssize_t n = ::recv(fd, tmp, want, 0);
+    if (n <= 0) {
+      if (n < 0 && errno == EINTR)
+        continue;
+      return false;
+    }
+    out.append(tmp, static_cast<size_t>(n));
+  }
+  return true;
+}
+#else
 void respond(const std::function<void(const drogon::HttpResponsePtr &)> &cb,
              const Json::Value &body, int status = 200) {
   auto response = drogon::HttpResponse::newHttpJsonResponse(body);
   response->setStatusCode(static_cast<drogon::HttpStatusCode>(status));
   cb(response);
 }
+#endif
 } // namespace
 int run(int argc, char **argv, bool miss, bool nora) {
   try {
     Options o = parse(argc, argv, miss, nora);
+#ifdef RWKV_ONLINE_RL_POSIX_HTTP
+    std::signal(SIGPIPE, SIG_IGN);
+#ifdef RWKV_NCCL_DP
+    std::unique_ptr<rwkv_dp::Group> dp_group;
+    if (!o.devices.empty()) {
+      const int launch_status = rwkv_dp::launch(o.devices);
+      if (launch_status >= 0)
+        return launch_status;
+      dp_group = std::make_unique<rwkv_dp::Group>();
+      o.port += rwkv_dp::rank();
+    }
+    Runtime runtime(o, miss, nora, dp_group.get());
+#else
+    Runtime runtime(o, miss, nora);
+#endif
+    Worker worker(o.gemm_mode == "strict");
+
+    int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0)
+      throw std::runtime_error("socket() failed");
+    int opt = 1;
+    ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(o.port));
+    if (o.host == "0.0.0.0" || o.host.empty())
+      addr.sin_addr.s_addr = INADDR_ANY;
+    else if (::inet_pton(AF_INET, o.host.c_str(), &addr.sin_addr) != 1) {
+      ::close(server_fd);
+      throw std::runtime_error("invalid IPv4 host: " + o.host);
+    }
+    if (::bind(server_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) <
+        0) {
+      ::close(server_fd);
+      throw std::runtime_error("bind() failed on " + o.host + ":" +
+                               std::to_string(o.port));
+    }
+    if (::listen(server_fd, 128) < 0) {
+      ::close(server_fd);
+      throw std::runtime_error("listen() failed");
+    }
+
+#ifdef RWKV_NCCL_DP
+    if (dp_group) {
+      std::cout << "Online RL " << (nora ? "NoRA" : miss ? "MiSS" : "state")
+                << " DP rank=" << rwkv_dp::rank() << '/' << rwkv_dp::size()
+                << " ready http://" << o.host << ':' << o.port << std::endl;
+    } else
+#endif
+    {
+      std::cout << "Online RL " << (nora ? "NoRA" : miss ? "MiSS" : "state")
+                << " ready http://" << o.host << ':' << o.port << std::endl;
+    }
+
+    auto handle_client = [&](int cfd) {
+      int nodelay = 1;
+      ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+      std::string buf;
+      buf.reserve(8192);
+      size_t hdr_end = std::string::npos;
+      while (buf.size() < 65536) {
+        hdr_end = buf.find("\r\n\r\n");
+        if (hdr_end != std::string::npos)
+          break;
+        char tmp[4096];
+        ssize_t n = ::recv(cfd, tmp, sizeof(tmp), 0);
+        if (n <= 0) {
+          if (n < 0 && errno == EINTR)
+            continue;
+          ::close(cfd);
+          return;
+        }
+        buf.append(tmp, static_cast<size_t>(n));
+      }
+      if (hdr_end == std::string::npos) {
+        Json::Value err;
+        err["error"] = "malformed HTTP header";
+        send_json(cfd, err, 400);
+        return;
+      }
+      std::string header_block = buf.substr(0, hdr_end);
+      std::string body_str = buf.substr(hdr_end + 4);
+      std::istringstream hs(header_block);
+      std::string method, path, proto;
+      hs >> method >> path >> proto;
+      size_t qpos = path.find('?');
+      if (qpos != std::string::npos)
+        path = path.substr(0, qpos);
+
+      size_t content_len = 0;
+      bool expect_continue = false;
+      std::string line;
+      std::getline(hs, line);
+      while (std::getline(hs, line)) {
+        if (!line.empty() && line.back() == '\r')
+          line.pop_back();
+        auto colon = line.find(':');
+        if (colon == std::string::npos)
+          continue;
+        std::string k = to_lower_ascii(line.substr(0, colon));
+        std::string v = line.substr(colon + 1);
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+          v.erase(v.begin());
+        if (k == "content-length") {
+          try {
+            content_len = std::stoull(v);
+          } catch (...) {
+            Json::Value err;
+            err["error"] = "invalid Content-Length";
+            send_json(cfd, err, 400);
+            return;
+          }
+        } else if (k == "expect" &&
+                   to_lower_ascii(v).find("100-continue") !=
+                       std::string::npos) {
+          expect_continue = true;
+        }
+      }
+      if (content_len > 64ULL * 1024ULL * 1024ULL) {
+        Json::Value err;
+        err["error"] = "request body exceeds 64 MiB";
+        send_json(cfd, err, 400);
+        return;
+      }
+      if (expect_continue) {
+        const char *cont = "HTTP/1.1 100 Continue\r\n\r\n";
+        write_all(cfd, cont, 25);
+      }
+      if (!read_exact(cfd, body_str, content_len)) {
+        ::close(cfd);
+        return;
+      }
+      body_str.resize(content_len);
+
+      Json::Value value(Json::objectValue);
+      if (method == "POST") {
+        Json::CharReaderBuilder rb;
+        std::string errs;
+        std::unique_ptr<Json::CharReader> reader(rb.newCharReader());
+        if (body_str.empty() ||
+            !reader->parse(body_str.data(), body_str.data() + body_str.size(),
+                           &value, &errs) ||
+            !value.isObject()) {
+          Json::Value err;
+          err["error"] = "expected a JSON object";
+          send_json(cfd, err, 400);
+          return;
+        }
+      } else if (method != "GET") {
+        Json::Value err;
+        err["error"] = "method not allowed";
+        send_json(cfd, err, 405);
+        return;
+      }
+
+      std::function<Json::Value(const Json::Value &)> action;
+      if (method == "GET" && path == "/health")
+        action = [&](const Json::Value &) { return runtime.health(); };
+      else if (method == "POST" && path == "/v1/tokenize")
+        action = [&](const Json::Value &r) { return runtime.tokenize(r); };
+      else if (method == "POST" && path == "/v1/detokenize")
+        action = [&](const Json::Value &r) { return runtime.detokenize(r); };
+      else if (method == "POST" && path == "/v1/completions")
+        action = [&](const Json::Value &r) { return runtime.completions(r); };
+      else if (method == "POST" && path == "/v1/logprobs")
+        action = [&](const Json::Value &r) { return runtime.logprobs(r); };
+      else if (method == "POST" && path == "/v1/train")
+        action = [&](const Json::Value &r) { return runtime.train(r); };
+      else if (method == "POST" && path == "/v1/publish")
+        action = [&](const Json::Value &r) { return runtime.publish(r); };
+      else {
+        Json::Value err;
+        err["error"] = "not found: " + path;
+        send_json(cfd, err, 404);
+        return;
+      }
+
+      if (!worker.enqueue([cfd, action = std::move(action),
+                           value = std::move(value)] {
+            try {
+              send_json(cfd, action(value), 200);
+            } catch (const HttpError &e) {
+              Json::Value err;
+              err["error"] = e.what();
+              send_json(cfd, err, e.status);
+            } catch (const std::exception &e) {
+              Json::Value err;
+              err["error"] = e.what();
+              send_json(cfd, err, 500);
+            }
+          })) {
+        Json::Value err;
+        err["error"] = "GPU work queue is full";
+        send_json(cfd, err, 503);
+      }
+    };
+
+    for (;;) {
+      int cfd = ::accept(server_fd, nullptr, nullptr);
+      if (cfd < 0) {
+        if (errno == EINTR)
+          continue;
+        break;
+      }
+      std::thread(handle_client, cfd).detach();
+    }
+    ::close(server_fd);
+    return 0;
+#else
     Runtime runtime(o, miss, nora);
     Worker worker(o.gemm_mode == "strict");
     auto route = [&](const std::string &path, drogon::HttpMethod method,
@@ -1334,6 +1705,7 @@ int run(int argc, char **argv, bool miss, bool nora) {
         .addListener(o.host, o.port)
         .run();
     return 0;
+#endif
   } catch (const std::exception &e) {
     std::cerr << "online RL server: " << e.what() << '\n';
     return 1;

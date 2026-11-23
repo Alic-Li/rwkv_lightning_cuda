@@ -32,10 +32,14 @@ void linear_runtime_backward_input_bf16(cudaStream_t stream, int rows,
                                         const bf16 *dy,
                                         const bf16 *frozen_weight_runtime,
                                         bf16 *dx);
+void linear_runtime_backward_input_accumulate_bf16(
+    cudaStream_t stream, int rows, int in_features, int out_features,
+    const bf16 *dy, const bf16 *frozen_weight_runtime, bf16 *dx);
 
 void layer_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
                                     const bf16 *x, const bf16 *frozen_weight,
-                                    const bf16 *dy, bf16 *dx, float eps);
+                                    const bf16 *dy, bf16 *dx, float eps,
+                                    const bf16 *residual_grad = nullptr);
 void group_norm_backward_input_bf16(cudaStream_t stream, int rows, int channels,
                                     int groups, const bf16 *x,
                                     const bf16 *frozen_weight, const bf16 *dy,
@@ -47,7 +51,8 @@ void time_mix_backward_input_bf16(cudaStream_t stream, int batch, int time,
                                   int channels, int branches,
                                   const bf16 *const *branch_grads,
                                   const bf16 *const *frozen_mixes, bf16 *dx,
-                                  bf16 *d_shift, const int *offsets = nullptr);
+                                  bf16 *d_shift, const int *offsets = nullptr,
+                                  const std::uint8_t *doc_start = nullptr);
 
 void relu_square_backward_input_bf16(cudaStream_t stream, const bf16 *x,
                                      const bf16 *dy, bf16 *dx,
@@ -135,6 +140,8 @@ struct BlockTapeView {
   int time = 0;
   // Packed lanes: device offsets[batch + 1]; time is then the total row count.
   const int *offsets = nullptr;
+  const std::uint8_t *doc_start = nullptr;
+  const float *doc_initial_state = nullptr;
   bf16 *x = nullptr;
   bf16 *ln1 = nullptr;
   bf16 *r = nullptr;
@@ -156,6 +163,12 @@ struct BlockTapeView {
   bf16 *x_after_att = nullptr;
   bf16 *ln2 = nullptr;
   bf16 *ffn_hid = nullptr;
+  // Optional direct NoRA branch-input caches (populated on single shared tape).
+  bf16 *xr = nullptr;
+  bf16 *xk = nullptr;
+  bf16 *xv = nullptr;
+  bf16 *att_post = nullptr;
+  bf16 *ffn_mixed = nullptr;
   WkvTapeView wkv;
   // Optional replay mode: owned initial state and shared final-state scratch.
   // wkv storage may be shared by blocks executed sequentially on one stream.
@@ -182,7 +195,8 @@ void block_forward_state_tuning_bf16(
     float *final_state, bf16 *v_first, bf16 *output,
     const FrozenBlockWeights &frozen_weights, BlockTapeView &tape,
     bf16 *workspace, std::size_t workspace_elements, bool layer_zero,
-    const int *offsets = nullptr);
+    const int *offsets = nullptr, bool record_tape = true,
+    const std::uint8_t *doc_start = nullptr);
 
 struct BlockBackwardState {
   const float *final_state_grad = nullptr; // optional [B,H,K,V]
@@ -192,6 +206,7 @@ struct BlockBackwardState {
   bf16 *v_first_grad = nullptr;            // in/out accumulator [B,T,C]
   const bf16 *final_att_shift_grad = nullptr;
   const bf16 *final_ffn_shift_grad = nullptr;
+  float *doc_state_grad = nullptr;         // optional [B,H,K,V] doc_start accum
 };
 
 std::size_t
@@ -200,7 +215,9 @@ block_backward_workspace_bf16_elements(int batch, int time,
 
 // grad_out/grad_in are [B,T,C]. The model executor calls this from layer N to
 // layer 0 and ping-pongs those two long-lived buffers. workspace is ephemeral
-// per-block scratch and is reused for every layer.
+// per-block scratch and is reused for every layer. At layer 0 only, grad_in
+// may be null to skip the embedding-side gradient. Other requested outputs,
+// including att_shift_grad, are still computed.
 void block_backward_state_only(cudaStream_t stream, const bf16 *grad_out,
                                bf16 *grad_in, BlockBackwardState state_grad,
                                const BlockTapeView &tape,
@@ -221,7 +238,12 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
                                          float *loss, bf16 *d_logits,
                                          float gradient_scale = 1.0f,
                                          const float *row_weights = nullptr,
-                                         float temperature = 1.0f);
+                                         float temperature = 1.0f,
+                                         bool accumulate_loss = false);
+
+void gradient_norm_and_check_f32(cudaStream_t stream, const float *gradient,
+                                 std::size_t elements, double *out_norm_sq,
+                                 int *out_bad_flag);
 
 // out[row] = log softmax(logits[row] / temperature)[targets[row]] in FP32,
 // reduced exactly like the CE kernel above.
@@ -245,7 +267,8 @@ const bf16 *model_forward_state_tuning_bf16(
     float *state_final, bf16 *block_workspace,
     std::size_t block_workspace_elements, bf16 *final_normalized, bf16 *logits,
     float *carried_states = nullptr, bool compute_logits = true,
-    const int *offsets = nullptr);
+    const int *offsets = nullptr, bool record_tape = true,
+    const std::uint8_t *doc_start = nullptr);
 
 void add_last_shift_gradient(cudaStream_t stream, int batch, int time,
                              int channels, bf16 *dx, const bf16 *dshift,
@@ -259,16 +282,20 @@ const bf16 *model_output_backward_state_only(
     BlockBackwardState *state_gradients, const bf16 *final_block_output,
     const bf16 *ln_out_weight, const bf16 *head_weight_orig, int vocab,
     const bf16 *d_logits, bf16 *gradient_ping, bf16 *gradient_pong,
-    bf16 *block_workspace, std::size_t block_workspace_elements);
+    bf16 *block_workspace, std::size_t block_workspace_elements,
+    bool compute_input_gradient = true);
 
 // Reverse-order block scheduler. gradient_ping and gradient_pong are the only
 // two model-sized [B,T,C] gradient buffers. The return value aliases one of
-// them and is the gradient at the embedding side.
+// them and is the gradient at the embedding side. With compute_input_gradient
+// false, that output is skipped and the return value is null; requested state
+// and shift gradients are still computed.
 const bf16 *model_backward_state_only(
     cudaStream_t stream, int layers, const FrozenBlockWeights *weights,
     const BlockTapeView *tapes, BlockBackwardState *state_gradients,
     const bf16 *output_gradient, bf16 *gradient_ping, bf16 *gradient_pong,
-    bf16 *block_workspace, std::size_t block_workspace_elements);
+    bf16 *block_workspace, std::size_t block_workspace_elements,
+    bool compute_input_gradient = true);
 
 // Reduces [B,H,K,V] to the trainable [H,K,V]. Set accumulate=true when
 // accumulating micro-batches.

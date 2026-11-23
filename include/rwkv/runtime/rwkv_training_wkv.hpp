@@ -18,6 +18,10 @@ struct WkvShape {
   // [offsets[b], offsets[b + 1]) and time is the total row count; an empty
   // lane passes its state through unchanged.
   const int *offsets = nullptr;
+  // Optional device [rows] document-start mask (1 at the first token of a new
+  // packed document) and [heads, 64, 64] initial state to reset to at starts.
+  const std::uint8_t *doc_start = nullptr;
+  const float *doc_initial_state = nullptr;
 };
 
 // Exact checkpoint tape, FP32. The forward records the state before every
@@ -44,12 +48,15 @@ void wkv_forward(cudaStream_t stream, IoType io_type, const WkvShape &shape,
                  void *y, float *final_state, WkvTapeView tape);
 
 // Input gradients only. ds_final may be null (zero). ds_initial is FP32;
-// sequence gradients have io_type. No frozen-weight gradient is computed.
+// sequence gradients have io_type. When shape.doc_start is non-null, gradients
+// reaching any doc_start[t]==1 boundary are accumulated into ds_doc_accum
+// [B,H,K,V] (if non-null) and dstate resets to zero for the preceding document.
 void wkv_backward_input(cudaStream_t stream, IoType io_type,
                         const WkvShape &shape, const void *r, const void *w,
                         const void *k, const void *v, const void *a,
                         const void *b, const void *dy, const float *ds_final,
                         WkvTapeView tape, float *ds_initial, void *dr, void *dw,
-                        void *dk, void *dv, void *da, void *db);
+                        void *dk, void *dv, void *da, void *db,
+                        float *ds_doc_accum = nullptr);
 
 } // namespace rwkv7_state_tuning

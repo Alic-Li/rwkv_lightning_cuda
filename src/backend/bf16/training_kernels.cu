@@ -67,6 +67,10 @@ __global__ void xent_kernel(int vocab, const bf16 *__restrict__ logits,
   }
   const float sum = block_reduce(local_sum, scratch, false);
   const bool ignored = target == ignore_index || scale == 0.0f;
+  const float target_logit =
+      ignored ? 0.0f : to_float(logits[base + target]);
+  if (d_logits == logits)
+    __syncthreads();
   for (int token = threadIdx.x; token < vocab; token += blockDim.x) {
     const float probability =
         expf((to_float(logits[base + token]) / temperature) - max_logit) / sum;
@@ -76,8 +80,44 @@ __global__ void xent_kernel(int vocab, const bf16 *__restrict__ logits,
     d_logits[base + token] = to_bf16(gradient);
   }
   if (threadIdx.x == 0 && !ignored) {
-    atomicAdd(loss, (logf(sum) + max_logit - to_float(logits[base + target]) / temperature) *
+    atomicAdd(loss, (logf(sum) + max_logit - target_logit / temperature) *
                         scale);
+  }
+}
+
+__global__ void gradient_norm_check_kernel(const float *__restrict__ grad,
+                                           std::size_t elements,
+                                           double *__restrict__ norm_sq,
+                                           int *__restrict__ bad_flag) {
+  __shared__ double s_sq[kThreads];
+  __shared__ int s_bad;
+  if (threadIdx.x == 0)
+    s_bad = 0;
+  __syncthreads();
+  double local_sq = 0.0;
+  int local_bad = 0;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < elements; i += stride) {
+    const float x = grad[i];
+    if (!isfinite(x) || fabsf(x) > 1.0e18f)
+      local_bad = 1;
+    else
+      local_sq += static_cast<double>(x) * static_cast<double>(x);
+  }
+  if (local_bad)
+    atomicExch(&s_bad, 1);
+  s_sq[threadIdx.x] = local_sq;
+  __syncthreads();
+  for (int half = kThreads / 2; half > 0; half >>= 1) {
+    if (threadIdx.x < half)
+      s_sq[threadIdx.x] += s_sq[threadIdx.x + half];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    atomicAdd(norm_sq, s_sq[0]);
+    if (s_bad)
+      atomicExch(bad_flag, 1);
   }
 }
 
@@ -227,18 +267,36 @@ void cross_entropy_forward_backward_bf16(cudaStream_t stream, int rows,
                                          float *loss, bf16 *d_logits,
                                          float gradient_scale,
                                          const float *row_weights,
-                                         float temperature) {
+                                         float temperature,
+                                         bool accumulate_loss) {
   if (rows <= 0 || vocab <= 0 || !logits || !targets || !loss || !d_logits ||
       !std::isfinite(gradient_scale) || gradient_scale <= 0 ||
       !std::isfinite(temperature) || temperature <= 0) {
     throw std::invalid_argument("invalid cross entropy arguments");
   }
-  const cudaError_t error = cudaMemsetAsync(loss, 0, sizeof(float), stream);
-  if (error != cudaSuccess)
-    throw std::runtime_error(cudaGetErrorString(error));
+  if (!accumulate_loss) {
+    const cudaError_t error = cudaMemsetAsync(loss, 0, sizeof(float), stream);
+    if (error != cudaSuccess)
+      throw std::runtime_error(cudaGetErrorString(error));
+  }
   xent_kernel<<<rows, kThreads, 0, stream>>>(
       vocab, logits, targets, ignore_index, gradient_scale / rows, loss,
       d_logits, row_weights, temperature);
+}
+
+void gradient_norm_and_check_f32(cudaStream_t stream, const float *gradient,
+                                 std::size_t elements, double *out_norm_sq,
+                                 int *out_bad_flag) {
+  if (!gradient || elements == 0 || !out_norm_sq || !out_bad_flag) {
+    throw std::invalid_argument("invalid gradient norm check arguments");
+  }
+  gpu_check(cudaMemsetAsync(out_norm_sq, 0, sizeof(double), stream),
+            "zero gradient norm_sq");
+  gpu_check(cudaMemsetAsync(out_bad_flag, 0, sizeof(int), stream),
+            "zero gradient bad_flag");
+  const int grid = std::min(1024, blocks(elements));
+  gradient_norm_check_kernel<<<grid, kThreads, 0, stream>>>(
+      gradient, elements, out_norm_sq, out_bad_flag);
 }
 
 void target_logprobs_bf16(cudaStream_t stream, int rows, int vocab,

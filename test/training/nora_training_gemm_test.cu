@@ -1,4 +1,6 @@
 #include "nora/training_gemm.cuh"
+#include "rwkv/bf16_training/nora.hpp"
+#include "rwkv/bf16_training/ops.hpp"
 #include "rwkv/bf16_training/runtime.hpp"
 #include <algorithm>
 #include <cmath>
@@ -111,6 +113,82 @@ template <bool TR> void expansion(int rows, int rank, int cols) {
               << " reference_us=" << time_us(old)
               << " fast_us=" << time_us(fast) << '\n';
 }
+void grad_weight_check(int rows, int rank, int width) {
+  std::mt19937 gen(9012);
+  DeviceBuffer<bf16> g, x;
+  DeviceBuffer<float> s, da0, da1, db0, db1;
+  fill(g, size_t(rows) * width, gen);
+  fill(x, size_t(rows) * width, gen);
+  fill(s, size_t(rows) * rank, gen);
+  fill(da0, size_t(rank) * width, gen);
+  fill(db0, size_t(width) * rank, gen);
+  da1.resize(da0.n, "da1");
+  db1.resize(db0.n, "db1");
+  gpu_check(cudaMemcpy(da1.p, da0.p, da0.n * 4, cudaMemcpyDeviceToDevice), "copy da");
+  gpu_check(cudaMemcpy(db1.p, db0.p, db0.n * 4, cudaMemcpyDeviceToDevice), "copy db");
+  rwkv_nora_detail::gemm<true, false, true>(nullptr, width, rank, rows, g.p,
+                                            s.p, db0.p, .7f);
+  rwkv_bf16_nora::detail::grad_weight(nullptr, width, rank, rows, g.p, s.p,
+                                      db1.p, .7f);
+  rwkv_nora_detail::gemm<true, false, true>(nullptr, rank, width, rows, s.p,
+                                            x.p, da0.p, 1.0f);
+  rwkv_bf16_nora::detail::grad_weight(nullptr, rank, width, rows, s.p, x.p,
+                                      da1.p, 1.0f);
+  auto h_db0 = read(db0), h_db1 = read(db1);
+  auto h_da0 = read(da0), h_da1 = read(da1);
+  if (std::memcmp(h_db0.data(), h_db1.data(), h_db0.size() * 4))
+    throw std::runtime_error("grad_weight dB differs from reference");
+  if (std::memcmp(h_da0.data(), h_da1.data(), h_da0.size() * 4))
+    throw std::runtime_error("grad_weight dA differs from reference");
+}
+void tensor_core_backward_check(int rows, int rank, int in, int out) {
+  std::mt19937 gen(4242);
+  DeviceBuffer<bf16> x, g, a, d, y0, y1, dx0, dx1;
+  DeviceBuffer<float> s0, s1, ds0, ds1, db0, db1, da0, da1;
+  fill(x, size_t(rows) * in, gen);
+  fill(g, size_t(rows) * out, gen);
+  fill(a, size_t(rank) * in, gen);
+  fill(d, size_t(out) * rank, gen);
+  fill(y0, size_t(rows) * out, gen);
+  fill(dx0, size_t(rows) * in, gen);
+  fill(db0, size_t(out) * rank, gen);
+  fill(da0, size_t(rank) * in, gen);
+  y1.resize(y0.n, "y1");
+  dx1.resize(dx0.n, "dx1");
+  db1.resize(db0.n, "db1");
+  da1.resize(da0.n, "da1");
+  s0.resize(size_t(rows) * rank, "s0");
+  s1.resize(s0.n, "s1");
+  ds0.resize(s0.n, "ds0");
+  ds1.resize(s0.n, "ds1");
+  gpu_check(cudaMemcpy(y1.p, y0.p, y0.n * 2, cudaMemcpyDeviceToDevice), "cy");
+  gpu_check(cudaMemcpy(dx1.p, dx0.p, dx0.n * 2, cudaMemcpyDeviceToDevice), "cdx");
+  gpu_check(cudaMemcpy(db1.p, db0.p, db0.n * 4, cudaMemcpyDeviceToDevice), "cdb");
+  gpu_check(cudaMemcpy(da1.p, da0.p, da0.n * 4, cudaMemcpyDeviceToDevice), "cda");
+  rwkv_bf16_miss::Linear w0{in, out, rank, 1.0f, d.p, db0.p, a.p, da0.p};
+  rwkv_bf16_miss::Linear w1{in, out, rank, 1.0f, d.p, db1.p, a.p, da1.p};
+  set_consistent_forward(true, false);
+  rwkv_bf16_nora::forward(nullptr, rows, w0, x.p, y0.p, s0.p);
+  rwkv_bf16_nora::backward(nullptr, rows, w0, x.p, s0.p, g.p, dx0.p, ds0.p);
+  set_consistent_forward(false, false);
+  rwkv_bf16_nora::forward(nullptr, rows, w1, x.p, y1.p, s1.p);
+  rwkv_bf16_nora::backward(nullptr, rows, w1, x.p, s1.p, g.p, dx1.p, ds1.p);
+  auto check_rel = [](const std::vector<float> &ref, const std::vector<float> &got,
+                      double tol, const char *what) {
+    double err = 0, norm = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      double diff = double(ref[i]) - got[i];
+      err += diff * diff;
+      norm += double(ref[i]) * ref[i];
+    }
+    double rel = std::sqrt(err / std::max(norm, 1e-30));
+    if (!std::isfinite(rel) || rel > tol)
+      throw std::runtime_error(std::string(what) + " rel=" + std::to_string(rel));
+  };
+  check_rel(read(db0), read(db1), 2e-4, "tensor_core dB");
+  check_rel(read(da0), read(da1), 2e-4, "tensor_core dA");
+  check_rel(read(ds0), read(ds1), 2e-4, "tensor_core ds");
+}
 int main(int argc, char **argv) {
   try {
     int devices = 0;
@@ -126,6 +204,7 @@ int main(int argc, char **argv) {
           projection<false>(rows, rank, width);
           expansion<true>(rows, rank, width);
           expansion<false>(rows, rank, width);
+          grad_weight_check(rows, rank, width);
         }
     if (!quick)
       for (int rows : {512, 3072})
@@ -134,7 +213,10 @@ int main(int argc, char **argv) {
           projection<false>(rows, 16, width);
           expansion<true>(rows, 16, width);
           expansion<false>(rows, 16, width);
+          grad_weight_check(rows, 16, width);
         }
+    tensor_core_backward_check(257, 16, 256, 512);
+    tensor_core_backward_check(512, 32, 4096, 4096);
     std::cout << "NoRA optimized projections/expansions passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
