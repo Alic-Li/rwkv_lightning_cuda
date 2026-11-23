@@ -295,6 +295,12 @@ def acceptance(api):
     assert new["cached_prompt_tokens"] == 0  # no stale cache crosses publication
     changed = rollout(base, policy_version=new_version, use_cache=False)
     assert changed["completions"][0]["logprobs"] != cold["completions"][0]["logprobs"]
+    if h["mode"] == "nora":
+        # A published, nonzero adapter exercises the NoRA reduction in prefill.
+        row = changed["completions"][0]
+        scores = api.call("/v1/logprobs", dict(sequences=[base + row["tokens"]],
+                                              policy_version=new_version))["logprobs"][0]
+        assert max(abs(x-y) for x, y in zip(scores[len(base)-1:], row["logprobs"])) < 1e-4
     request["policy_version"] = new_version
     # There is no sticky/default learning rate, even after a successful update.
     missing_lr["policy_version"] = new_version

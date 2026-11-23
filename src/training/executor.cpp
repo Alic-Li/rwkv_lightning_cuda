@@ -401,6 +401,10 @@ struct Executor::Impl {
         states * sizeof(float) + shift_count * sizeof(bf16) +
         size_t(B + 1) * sizeof(int);
 
+    const int old_chunk_cap = win_chunk_cap;
+    const size_t old_dout_cap = win_dout_cap;
+    win_chunk_cap = 0;
+    win_dout_cap = win_slot_rows = 0;
     x_window = DeviceBuffer<bf16>{};
     d_out_window = DeviceBuffer<bf16>{};
     win_doc_start = DeviceBuffer<uint8_t>{};
@@ -423,7 +427,7 @@ struct Executor::Impl {
     const int max_afford_chunks = std::max(
         1, int((budget_b * 2 / 5) / (bytes_per_chunk ? bytes_per_chunk : 1)));
     const int target_chunks =
-        std::max(1, std::min(std::max(win_chunk_cap, needed_chunks),
+        std::max(1, std::min(std::max(old_chunk_cap, needed_chunks),
                              std::min(max_afford_chunks, 56)));
     const size_t chunk_bytes = size_t(target_chunks) * bytes_per_chunk;
     const size_t rem_after_chunks =
@@ -437,7 +441,7 @@ struct Executor::Impl {
         rem_after_chunks / (dout_bytes_per_row + slots_s2 * C * sizeof(bf16)));
     const size_t target_dout = std::max<size_t>(
         size_t(capacity),
-        std::min(std::max(needed_rows, win_dout_cap), max_dout_afford));
+        std::min(std::max(needed_rows, old_dout_cap), max_dout_afford));
     const size_t dout_bytes = target_dout * dout_bytes_per_row;
     const size_t x_budget =
         rem_after_chunks > dout_bytes ? (rem_after_chunks - dout_bytes) : 0;
@@ -448,17 +452,27 @@ struct Executor::Impl {
     const size_t target_slot_rows =
         std::min(max_slot_afford, slots_s1 * target_dout);
 
+    DeviceBuffer<bf16> x, dout, shifts;
+    DeviceBuffer<uint8_t> starts;
+    DeviceBuffer<float> wkv;
+    DeviceBuffer<int> offsets;
+    x.resize(target_slot_rows * C, "window layer-input x pool");
+    dout.resize(target_dout * C, "window head d_out pool");
+    starts.resize(target_dout, "window doc_start pool");
+    wkv.resize(size_t(target_chunks) * states, "window layer WKV initial states");
+    shifts.resize(size_t(target_chunks) * shift_count,
+                  "window layer incoming shifts");
+    offsets.resize(size_t(target_chunks) * (B + 1), "window packed offsets");
+
+    x_window = std::move(x);
+    d_out_window = std::move(dout);
+    win_doc_start = std::move(starts);
+    win_wkv_init = std::move(wkv);
+    win_shift_init = std::move(shifts);
+    win_offsets = std::move(offsets);
     win_chunk_cap = target_chunks;
     win_dout_cap = target_dout;
     win_slot_rows = target_slot_rows;
-    x_window.resize(win_slot_rows * C, "window layer-input x pool");
-    d_out_window.resize(win_dout_cap * C, "window head d_out pool");
-    win_doc_start.resize(win_dout_cap, "window doc_start pool");
-    win_wkv_init.resize(size_t(win_chunk_cap) * states,
-                        "window layer WKV initial states");
-    win_shift_init.resize(size_t(win_chunk_cap) * shift_count,
-                          "window layer incoming shifts");
-    win_offsets.resize(size_t(win_chunk_cap) * (B + 1), "window packed offsets");
   }
   bf16 *win_x_ptr(int stride, size_t eff_cap, int l, size_t row_off) {
     const size_t slot = (stride == 1) ? size_t(l - 1) : size_t(l / 2 - 1);
@@ -551,10 +565,11 @@ struct Executor::Impl {
   }
   void ensure_full_tapes(const FrozenModelView &m) {
     if (full_owned.empty()) {
-      full_owned.resize(L);
+      std::vector<OwnedTape> pending(L);
       for (int l = 0; l < L; ++l)
-        full_owned[l].allocate(capacity, m.blocks[l], first.p, shared_tape.p,
-                               shared_tape.n, true, shared_final.p, B);
+        pending[l].allocate(capacity, m.blocks[l], first.p, shared_tape.p,
+                            shared_tape.n, true, shared_final.p, B);
+      full_owned.swap(pending);
     }
     for (int l = 0; l < L; ++l)
       assign_tape_activations(tapes[l], full_owned[l].view);
@@ -1011,6 +1026,10 @@ void Executor::reset(const float *initial) {
 void Executor::forward(const FrozenModelView &m, const int *tokens, int count,
                        LogitsMode mode) {
   impl_->forward(m, tokens, count, mode);
+}
+void Executor::prefill(const FrozenModelView &m, const int *tokens, int count,
+                       LogitsMode mode) {
+  impl_->forward(m, tokens, count, mode, true, false);
 }
 std::vector<float> Executor::last_logits() const {
   auto &w = *impl_;

@@ -36,6 +36,8 @@ public:
   // without an output head. last_logits() is unavailable after None.
   void forward(const FrozenModelView &, const int *tokens, int count,
                LogitsMode = LogitsMode::All);
+  // Advance the actor with the same inference path as score() and BatchDecoder.
+  void prefill(const FrozenModelView &, const int *tokens, int count, LogitsMode);
   std::vector<float> last_logits() const;
   // weights[i] applies to tokens[i], predicted from tokens[i-1]. weights[0]
   // is unused. Normalizer is the batch count of selected targets, never the

@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -895,7 +896,7 @@ public:
       // recycle this buffer for a longer prefix (also works with one slot).
       hit.value.reset();
       for (size_t off = hit.length; off < row.prompt.size(); off += o_.chunk)
-        actor_exec_->forward(
+        actor_exec_->prefill(
             p->view, row.prompt.data() + off,
             int(std::min(size_t(o_.chunk), row.prompt.size() - off)),
             off + o_.chunk >= row.prompt.size() ? LogitsMode::Last
@@ -1017,6 +1018,57 @@ public:
         std::chrono::duration<double>(Clock::now() - started).count();
     return out;
   }
+  float accumulate_gradients(const std::vector<Sample> &batch, size_t global_kept) {
+    float loss = 0;
+    if (trainer_)
+      trainer_->zero_gradient();
+    else
+      gpu_check(cudaMemsetAsync(gradient_.p, 0, gradient_.n * sizeof(float),
+                                stream_.value), "clear state gradient");
+    // One CE temperature per packed pass: group equal temperatures, keeping
+    // request order within each group.
+    std::vector<size_t> order(batch.size());
+    std::iota(order.begin(), order.end(), size_t(0));
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+      return batch[a].temperature < batch[b].temperature;
+    });
+    const size_t lanes = size_t(learner_exec_->lanes());
+    for (size_t first = 0; first < order.size();) {
+      const float temperature = batch[order[first]].temperature;
+      size_t last = first;
+      while (last < order.size() && last - first < lanes &&
+             batch[order[last]].temperature == temperature)
+        ++last;
+      if (lanes == 1) {
+        const auto &s = batch[order[first]];
+        loss += learner_exec_->backward(learner_, s.tokens, s.weights,
+                                        initial_.p, global_kept, temperature);
+      } else {
+        std::vector<std::vector<int>> tokens;
+        std::vector<std::vector<float>> weights;
+        for (size_t i = first; i < last; ++i) {
+          tokens.push_back(batch[order[i]].tokens);
+          weights.push_back(batch[order[i]].weights);
+        }
+        loss += learner_exec_->backward_packed(
+            learner_, tokens, weights, initial_.p, global_kept, temperature);
+      }
+      // Add samples in request order, one lane at a time, so packing
+      // reproduces per-sample accumulation bit for bit.
+      if (!miss_) {
+        const size_t lane = size_t(learner_.heads) * 4096;
+        for (size_t b = 0; b < last - first; ++b)
+          for (int l = 0; l < learner_.layers; ++l)
+            reduce_state_gradient_f32(
+                stream_.value, 1, learner_.heads, 64,
+                learner_exec_->lane_state_gradients() +
+                    (size_t(l) * lanes + b) * lane,
+                gradient_.p + size_t(l) * lane, true);
+      }
+      first = last;
+    }
+    return loss;
+  }
   Json::Value train(const Json::Value &r) {
     require(r["policy_version"].isString(),
             "train requires policy_version from rollout");
@@ -1101,7 +1153,7 @@ public:
               "DP train requires global_trained_tokens");
       global_kept = r["global_trained_tokens"].asUInt64();
       require(global_kept > 0, "global_trained_tokens must be > 0");
-      any_weight = true;
+      any_weight = dp_->sum_loss(any_weight ? 1.0f : 0.0f, stream_.value) > 0;
     } else
 #endif
     {
@@ -1116,67 +1168,33 @@ public:
     float loss = 0;
     double grad_norm = 0;
     if (any_weight) {
-      if (trainer_)
-        trainer_->zero_gradient();
-      else
-        gpu_check(cudaMemsetAsync(gradient_.p, 0, gradient_.n * sizeof(float),
-                                  stream_.value), "clear state gradient");
-      // One CE temperature per packed pass: group equal temperatures, keeping
-      // request order within each group.
-      std::vector<size_t> order(batch.size());
-      std::iota(order.begin(), order.end(), size_t(0));
-      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return batch[a].temperature < batch[b].temperature;
-      });
-      const size_t lanes = size_t(learner_exec_->lanes());
-      for (size_t first = 0; first < order.size();) {
-        const float temperature = batch[order[first]].temperature;
-        size_t last = first;
-        while (last < order.size() && last - first < lanes &&
-               batch[order[last]].temperature == temperature)
-          ++last;
-        if (lanes == 1) {
-          const auto &s = batch[order[first]];
-          loss += learner_exec_->backward(learner_, s.tokens, s.weights,
-                                          initial_.p, global_kept, temperature);
-        } else {
-          std::vector<std::vector<int>> tokens;
-          std::vector<std::vector<float>> weights;
-          for (size_t i = first; i < last; ++i) {
-            tokens.push_back(batch[order[i]].tokens);
-            weights.push_back(batch[order[i]].weights);
-          }
-          loss += learner_exec_->backward_packed(
-              learner_, tokens, weights, initial_.p, global_kept, temperature);
-        }
-        // Add samples in request order, one lane at a time, so packing
-        // reproduces per-sample accumulation bit for bit.
-        if (!miss_) {
-          const size_t lane = size_t(learner_.heads) * 4096;
-          for (size_t b = 0; b < last - first; ++b)
-            for (int l = 0; l < learner_.layers; ++l)
-              reduce_state_gradient_f32(
-                  stream_.value, 1, learner_.heads, 64,
-                  learner_exec_->lane_state_gradients() +
-                      (size_t(l) * lanes + b) * lane,
-                  gradient_.p + size_t(l) * lane, true);
-        }
-        first = last;
-      }
 #ifdef RWKV_NCCL_DP
       if (dp_) {
-        sync();
+        std::exception_ptr failure;
+        try {
+          loss = accumulate_gradients(batch, global_kept);
+          sync();
+        } catch (...) {
+          // Peers must reach the same collective even if a local window OOMs.
+          failure = std::current_exception();
+          loss = std::numeric_limits<float>::quiet_NaN();
+        }
+        loss = dp_->sum_loss(loss, stream_.value);
+        if (failure)
+          std::rethrow_exception(failure);
+        if (!std::isfinite(loss))
+          throw std::runtime_error("DP backward failed or produced nonfinite loss; optimizer not executed");
         if (trainer_)
-          dp_->sum(trainer_->gradient_data(), trainer_->gradient_size(),
-                   stream_.value);
+          dp_->sum(trainer_->gradient_data(), trainer_->gradient_size(), stream_.value);
         else
           dp_->sum(gradient_.p, gradient_.n, stream_.value);
-        loss = dp_->sum_loss(loss, stream_.value);
-      }
+      } else
 #endif
-      if (!std::isfinite(loss))
-        throw std::runtime_error(
-            "nonfinite batch loss; optimizer not executed");
+      {
+        loss = accumulate_gradients(batch, global_kept);
+        if (!std::isfinite(loss))
+          throw std::runtime_error("nonfinite batch loss; optimizer not executed");
+      }
       if (trainer_)
         grad_norm = trainer_->update(lr, step_ + 1);
       else {

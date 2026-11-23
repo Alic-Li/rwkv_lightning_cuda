@@ -101,9 +101,15 @@ template <class T> struct DeviceBuffer {
     if (count == n)
       return;
     T *next = nullptr;
-    if (count)
-      gpu_check(cudaMalloc(reinterpret_cast<void **>(&next), count * sizeof(T)),
-                name);
+    if (count) {
+      const auto error =
+          cudaMalloc(reinterpret_cast<void **>(&next), count * sizeof(T));
+      // A handled allocation failure must not surface again at the next
+      // kernel launch check when the caller retries with a smaller batch.
+      if (error == cudaErrorMemoryAllocation)
+        (void)cudaGetLastError();
+      gpu_check(error, name);
+    }
     if (p)
       cudaFree(p);
     p = next;

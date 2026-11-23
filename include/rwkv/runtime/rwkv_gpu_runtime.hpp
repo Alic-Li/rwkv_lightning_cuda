@@ -25,6 +25,7 @@ using cudaGraphExec_t = hipGraphExec_t;
 #define cudaGraphDestroy hipGraphDestroy
 #define cudaGraphExecDestroy hipGraphExecDestroy
 constexpr auto cudaSuccess = hipSuccess;
+constexpr auto cudaErrorMemoryAllocation = hipErrorOutOfMemory;
 constexpr auto cudaMemcpyHostToDevice = hipMemcpyHostToDevice;
 constexpr auto cudaMemcpyDeviceToHost = hipMemcpyDeviceToHost;
 constexpr auto cudaMemcpyDeviceToDevice = hipMemcpyDeviceToDevice;
