@@ -115,7 +115,7 @@ struct Options {
       << "Usage: " << program << " --model MODEL.pth --data TRAIN.jsonl "
       << "--output DIR [options]\n"
 #ifdef RWKV_NCCL_DP
-      << "  --devices 0,1,...     NCCL GPU indices (default 0); batch-size is "
+      << "  --devices 0,1,...     GPU indices (default 0); batch-size is "
          "global,\n"
          "                        micro-bsz is per GPU; one process per "
          "device\n"
@@ -309,7 +309,7 @@ struct Stream {
   }
   ~Stream() {
     if (value)
-      cudaStreamDestroy(value);
+      rwkv_gpu::check_cleanup(cudaStreamDestroy(value), "cudaStreamDestroy");
   }
 };
 

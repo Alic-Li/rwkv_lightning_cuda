@@ -40,7 +40,7 @@ inline bool cuda_device_available() {
   int count = 0;
   const cudaError_t err = cudaGetDeviceCount(&count);
   if (err != cudaSuccess) {
-    cudaGetLastError();
+    (void)cudaGetLastError();
     return false;
   }
   return count > 0;

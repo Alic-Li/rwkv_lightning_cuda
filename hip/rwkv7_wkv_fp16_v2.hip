@@ -272,7 +272,6 @@ __global__ __launch_bounds__(N, 2) void wkv_fp16_v1_exact_kernel(
   }
 
   __shared__ __align__(128) half2 r[HALF2_N], k[HALF2_N], w[HALF2_N], a[HALF2_N], bvec[HALF2_N], bvec_dummy[HALF2_N];
-#pragma unroll
   for (int tt = 0; tt < T; tt++) {
     int64_t t = (static_cast<int64_t>(b_id) * T + tt) * C + h * N;
     __syncthreads();

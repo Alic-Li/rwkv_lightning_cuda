@@ -261,7 +261,7 @@ struct Stream {
     gpu_check(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking),
               "RL stream");
   }
-  ~Stream() { cudaStreamDestroy(value); }
+  ~Stream() { rwkv_gpu::check_cleanup(cudaStreamDestroy(value), "cudaStreamDestroy"); }
 };
 template <class T>
 std::vector<T> download(const DeviceBuffer<T> &d, cudaStream_t s) {

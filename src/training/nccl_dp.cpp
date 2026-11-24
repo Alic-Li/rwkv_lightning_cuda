@@ -125,7 +125,7 @@ void bind_numa_cpu_affinity(int cuda_dev) {
 }
 void check(ncclResult_t result) {
   if (result != ncclSuccess)
-    throw std::runtime_error(std::string("NCCL: ") +
+    throw std::runtime_error(std::string("GPU collective: ") +
                              ncclGetErrorString(result));
 }
 std::vector<int> parse_devices(const std::string &text) {

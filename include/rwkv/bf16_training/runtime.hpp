@@ -3,8 +3,8 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#ifdef RWKV_USE_HIP
 #include "rwkv/runtime/rwkv_gpu_runtime.hpp"
+#ifdef RWKV_USE_HIP
 #include <hip/hip_bfloat16.h>
 using bf16 = hip_bfloat16;
 #define __shfl_down_sync(mask, value, delta) __shfl_down(value, delta, 32)
@@ -38,7 +38,6 @@ __host__ __device__ inline bf16 to_bf16(float x) {
 }
 #else
 #include <cuda_bf16.h>
-#include <cuda_runtime.h>
 using bf16 = __nv_bfloat16;
 __host__ __device__ inline float to_float(bf16 x) {
   return __bfloat162float(x);
@@ -82,7 +81,7 @@ template <class T> struct DeviceBuffer {
   DeviceBuffer() = default;
   ~DeviceBuffer() {
     if (p)
-      cudaFree(p);
+      rwkv_gpu::check_cleanup(cudaFree(p), "cudaFree");
   }
   DeviceBuffer(const DeviceBuffer &) = delete;
   DeviceBuffer &operator=(const DeviceBuffer &) = delete;
@@ -91,7 +90,7 @@ template <class T> struct DeviceBuffer {
   DeviceBuffer &operator=(DeviceBuffer &&b) noexcept {
     if (this != &b) {
       if (p)
-        cudaFree(p);
+        rwkv_gpu::check_cleanup(cudaFree(p), "cudaFree");
       p = std::exchange(b.p, nullptr);
       n = std::exchange(b.n, 0);
     }
@@ -110,10 +109,10 @@ template <class T> struct DeviceBuffer {
         (void)cudaGetLastError();
       gpu_check(error, name);
     }
-    if (p)
-      cudaFree(p);
-    p = next;
+    T *old = std::exchange(p, next);
     n = count;
+    if (old)
+      rwkv_gpu::check_cleanup(cudaFree(old), "cudaFree");
   }
   void zero(const char *name) {
     if (n)

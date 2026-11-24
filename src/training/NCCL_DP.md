@@ -1,4 +1,4 @@
-# NCCL 单机多 GPU 训练
+# NCCL / RCCL 单机多 GPU 训练
 
 `feature/nccl-dp` 在共享 BF16 训练器上增加三个独立程序：
 
@@ -6,7 +6,7 @@
 - `rwkv_miss_tune_dp`：MiSS D 参数，支持 Adam。
 - `rwkv_nora_tune_dp`：NoRA A/B 参数，支持 Adam。
 
-原来的 `rwkv_*_tune` 保留；NCCL 只链接到新增的 DP 目标。当前实现限 Linux + CUDA 单机，不需要 torchrun、MPI 或 PyTorch。
+Linux 上的 CUDA 多卡目标链接 NCCL，HIP 多卡目标链接 RCCL。两种后端使用相同的训练命令和 `--devices` 参数。
 
 ## 编译
 
@@ -23,7 +23,14 @@ cmake --build build --target \
 
 `89` 适用于 RTX 4090。其他 GPU 按实际架构设置。非系统安装的 NCCL 可以传 `-DNCCL_ROOT=/path/to/nccl`，或显式设置 `NCCL_INCLUDE_DIR`、`NCCL_LIBRARY`。
 
-`RWKV_NCCL_DP=AUTO` 为默认值：有 NCCL 就构建 DP，否则继续构建原有程序；`ON` 在依赖缺失时明确报错；`OFF` 不构建 DP。HIP 原有构建不依赖 NCCL。
+AMD GPU 安装 ROCm 和 RCCL 开发包后可以使用以下命令。
+
+```bash
+cmake -S . -B build-hip -DRWKV_GPU_BACKEND=HIP -DCMAKE_BUILD_TYPE=Release -DRWKV_NCCL_DP=ON
+cmake --build build-hip -j
+```
+
+默认的 `RWKV_NCCL_DP=AUTO` 会在找到对应后端的通信库时构建多卡目标。`ON` 在缺少依赖时报告配置错误，`OFF` 只构建单卡训练目标。自定义 RCCL 安装可用 `-Drccl_DIR=/path/to/lib/cmake/rccl` 指向包含 `rccl-config.cmake` 的目录。
 
 ## 四卡启动
 

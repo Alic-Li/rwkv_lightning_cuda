@@ -46,6 +46,13 @@ __device__ inline float warp_sum(float v) {
   return v;
 }
 
+// The sparse index lists use groups of 32 even on wave64 hardware.
+__device__ inline unsigned ballot32(bool predicate) {
+  const auto votes = __ballot(predicate);
+  const unsigned wave_lane = threadIdx.x % warpSize;
+  return static_cast<unsigned>(votes >> (wave_lane & 32u));
+}
+
 __device__ inline float sigmoid_fast(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
@@ -527,7 +534,7 @@ __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_one_kern
   int local_pos = 0;
   if (tid < FFN_TILE) {
     nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffffffffffull, nonzero);
+    const unsigned mask = ballot32(nonzero);
     local_pos = __popc(mask & ((1u << lane) - 1u));
     if (lane == 0) {
       warp_counts[warp_id] = __popc(mask);
@@ -593,7 +600,7 @@ __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_rows_ker
   int local_pos = 0;
   if (tid < FFN_TILE) {
     nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffffffffffull, nonzero);
+    const unsigned mask = ballot32(nonzero);
     local_pos = __popc(mask & ((1u << lane) - 1u));
     if (lane == 0) {
       warp_counts[warp_id] = __popc(mask);
@@ -658,7 +665,7 @@ __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_relu_one
   int local_pos = 0;
   if (tid < FFN_TILE) {
     nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffffffffffull, nonzero);
+    const unsigned mask = ballot32(nonzero);
     local_pos = __popc(mask & ((1u << lane) - 1u));
     if (lane == 0) {
       warp_counts[warp_id] = __popc(mask);
@@ -724,7 +731,7 @@ __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_spmv_relu_row
   int local_pos = 0;
   if (tid < FFN_TILE) {
     nonzero = bool(__half_as_ushort(vec_slice[tid]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffffffffffull, nonzero);
+    const unsigned mask = ballot32(nonzero);
     local_pos = __popc(mask & ((1u << lane) - 1u));
     if (lane == 0) {
       warp_counts[warp_id] = __popc(mask);
@@ -796,7 +803,7 @@ __global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_kernel
   for (int u = 0; u < 2; ++u) {
     const int local_f = tid + u * THREADS;
     const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffffffffffull, nonzero);
+    const unsigned mask = ballot32(nonzero);
     if (lane == 0) {
       warp_counts[warp_id + u * (THREADS / 32)] = __popc(mask);
     }
@@ -818,7 +825,7 @@ __global__ __launch_bounds__(256, 2) void cmix_sparse_spmv_relu_rows_t512_kernel
   for (int u = 0; u < 2; ++u) {
     const int local_f = tid + u * THREADS;
     const bool nonzero = bool(__half_as_ushort(vec_slice[local_f]) << 1);
-    const unsigned mask = __ballot_sync(0xffffffffffffffffull, nonzero);
+    const unsigned mask = ballot32(nonzero);
     const int local_pos = __popc(mask & ((1u << lane) - 1u));
     const int group = warp_id + u * (THREADS / 32);
     if (nonzero) {

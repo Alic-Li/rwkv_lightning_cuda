@@ -34,15 +34,15 @@ struct Staging {
                               cudaHostAllocDefault),
                 "pinned BF16 staging");
     } catch (...) {
-      cudaFreeHost(raw);
+      rwkv_gpu::check_cleanup(cudaFreeHost(raw), "cudaFreeHost");
       throw;
     }
   }
   ~Staging() {
     if (raw)
-      cudaFreeHost(raw);
+      rwkv_gpu::check_cleanup(cudaFreeHost(raw), "cudaFreeHost");
     if (converted)
-      cudaFreeHost(converted);
+      rwkv_gpu::check_cleanup(cudaFreeHost(converted), "cudaFreeHost");
   }
   void load(const PthArchive &a, const TensorRecord &r, bf16 *dst) {
     if (r.dtype != TensorDType::kBFloat16 && r.dtype != TensorDType::kFloat32 &&

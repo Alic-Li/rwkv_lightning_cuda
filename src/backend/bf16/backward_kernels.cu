@@ -16,7 +16,11 @@ constexpr int kThreads = 256;
 __device__ __forceinline__ float warp_all_sum(float value) {
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1) {
+#ifdef RWKV_USE_HIP
+    value += __shfl_xor(value, mask, 32);
+#else
     value += __shfl_xor_sync(0xffffffffu, value, mask);
+#endif
   }
   return value;
 }

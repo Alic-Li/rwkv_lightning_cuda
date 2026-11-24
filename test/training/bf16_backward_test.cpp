@@ -333,7 +333,7 @@ int main() {
     gpu_check(cudaStreamDestroy(stream), "destroy regression stream");
   } catch (const std::exception &e) {
     if (stream)
-      cudaStreamDestroy(stream);
+      rwkv_gpu::check_cleanup(cudaStreamDestroy(stream), "cudaStreamDestroy");
     std::cerr << e.what() << '\n';
     return 1;
   }

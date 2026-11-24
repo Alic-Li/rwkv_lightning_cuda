@@ -1,6 +1,10 @@
 #pragma once
 #include "rwkv/bf16_training/runtime.hpp"
+#ifdef RWKV_USE_HIP
+#include <rccl/rccl.h>
+#else
 #include <nccl.h>
+#endif
 #include <string>
 #include <vector>
 

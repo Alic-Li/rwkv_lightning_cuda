@@ -1,6 +1,9 @@
 include_guard(GLOBAL)
 
 if(RWKV_GPU_BACKEND STREQUAL "HIP")
+  if(CMAKE_HIP_COMPILER_ROCM_ROOT)
+    list(APPEND CMAKE_PREFIX_PATH "${CMAKE_HIP_COMPILER_ROCM_ROOT}")
+  endif()
   find_package(hip REQUIRED CONFIG)
   find_package(hipblas REQUIRED CONFIG)
   find_package(hipblaslt REQUIRED CONFIG)

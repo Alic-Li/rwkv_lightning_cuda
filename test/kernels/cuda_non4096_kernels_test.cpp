@@ -520,6 +520,28 @@ int main() {
       expect_vector_near(copy_half_buffer(out_dev, "copy emb out"), expect_out, 3.0e-2f);
     }
 
+    // Exercise the 512-element sparse tile with different masks in each
+    // half of a wave64. Identity weights make each selected index observable.
+    {
+      constexpr int width = 512, rows = 2;
+      std::vector<float> pre(rows * width, -1.0f), expected(rows * width);
+      std::vector<float> weights(width * width);
+      for (int f = 0; f < width; ++f) {
+        weights[f * width + f] = 1.0f;
+        const int row = (f % 64) / 32;
+        pre[row * width + f] = 2.0f;
+        expected[row * width + f] = 4.0f;
+      }
+      DeviceBuffer<std::uint16_t> pre_dev, weight_dev, out_dev;
+      copy_half_to_device(pre, pre_dev, "alloc sparse input", "copy sparse input");
+      copy_half_to_device(weights, weight_dev, "alloc sparse weights", "copy sparse weights");
+      out_dev.resize(expected.size(), "alloc sparse output");
+      rwkv7_cmix_sparse_down_relu_rows_t512_launch(
+          nullptr, rows, 1, width, width, reinterpret_cast<const half*>(pre_dev.p),
+          reinterpret_cast<const half*>(weight_dev.p), reinterpret_cast<half*>(out_dev.p));
+      expect_vector_near(copy_half_buffer(out_dev, "copy sparse output"), expected, 0.0f);
+    }
+
     std::cout << "rwkv_cuda_non4096_kernels_test passed\n";
     return 0;
   } catch (const std::exception& e) {

@@ -38,10 +38,10 @@ int main() {
       std::cout << rows << ',' << std::fixed << std::setprecision(3)
                 << ms * 10 << '\n';
     }
-    cudaEventDestroy(begin);
-    cudaEventDestroy(end);
+    check(cudaEventDestroy(begin));
+    check(cudaEventDestroy(end));
     for (void *p : {(void *)x, (void *)d, (void *)y})
-      cudaFree(p);
+      check(cudaFree(p));
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;

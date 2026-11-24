@@ -333,21 +333,21 @@ struct Executor::Impl {
   ~Impl() {
     for (auto &slot : staging) {
       if (slot.in_flight && slot.copied)
-        cudaEventSynchronize(slot.copied);
+        rwkv_gpu::check_cleanup(cudaEventSynchronize(slot.copied), "cudaEventSynchronize");
       if (slot.copied)
-        cudaEventDestroy(slot.copied);
+        rwkv_gpu::check_cleanup(cudaEventDestroy(slot.copied), "cudaEventDestroy");
       if (slot.input)
-        cudaFreeHost(slot.input);
+        rwkv_gpu::check_cleanup(cudaFreeHost(slot.input), "cudaFreeHost");
       if (slot.offsets)
-        cudaFreeHost(slot.offsets);
+        rwkv_gpu::check_cleanup(cudaFreeHost(slot.offsets), "cudaFreeHost");
       if (slot.doc_start)
-        cudaFreeHost(slot.doc_start);
+        rwkv_gpu::check_cleanup(cudaFreeHost(slot.doc_start), "cudaFreeHost");
       if (slot.targets)
-        cudaFreeHost(slot.targets);
+        rwkv_gpu::check_cleanup(cudaFreeHost(slot.targets), "cudaFreeHost");
       if (slot.active_rows)
-        cudaFreeHost(slot.active_rows);
+        rwkv_gpu::check_cleanup(cudaFreeHost(slot.active_rows), "cudaFreeHost");
       if (slot.weights)
-        cudaFreeHost(slot.weights);
+        rwkv_gpu::check_cleanup(cudaFreeHost(slot.weights), "cudaFreeHost");
     }
   }
   PinnedSlot &acquire_slot() {

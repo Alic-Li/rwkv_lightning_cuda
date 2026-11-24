@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdio>
+
 #ifdef RWKV_USE_HIP
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -11,6 +13,8 @@ using cudaEvent_t = hipEvent_t;
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaFreeHost hipHostFree
 #define cudaEventCreate hipEventCreate
+#define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventDestroy hipEventDestroy
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
@@ -31,6 +35,10 @@ constexpr auto cudaMemcpyDeviceToHost = hipMemcpyDeviceToHost;
 constexpr auto cudaMemcpyDeviceToDevice = hipMemcpyDeviceToDevice;
 
 #define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
+#define cudaDevAttrL2CacheSize hipDeviceAttributeL2CacheSize
 #define cudaFree hipFree
 #define cudaGetDeviceCount hipGetDeviceCount
 #define cudaGetDevice hipGetDevice
@@ -52,3 +60,11 @@ constexpr auto cudaMemcpyDeviceToDevice = hipMemcpyDeviceToDevice;
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #endif
+
+namespace rwkv_gpu {
+// Report cleanup failures without interrupting teardown or exception unwinding.
+inline void check_cleanup(cudaError_t error, const char* operation) noexcept {
+  if (error != cudaSuccess)
+    std::fprintf(stderr, "%s failed: %s\n", operation, cudaGetErrorString(error));
+}
+}  // namespace rwkv_gpu

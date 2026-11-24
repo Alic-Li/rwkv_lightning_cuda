@@ -58,6 +58,8 @@ template <typename IO> struct RowInputs {
 template <typename IO>
 __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
     int T, int H, const int *__restrict__ offsets,
+    const std::uint8_t *__restrict__ doc_start,
+    const float *__restrict__ doc_initial_state,
     const float *__restrict__ initial_state,
     const IO *__restrict__ r_ptr, const IO *__restrict__ w_ptr,
     const IO *__restrict__ k_ptr, const IO *__restrict__ v_ptr,
@@ -69,6 +71,7 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
   const int value = threadIdx.x;
   const long long bh = static_cast<long long>(batch) * H + head;
   const long long state_base = bh * kN * kN;
+  const long long doc_base = static_cast<long long>(head) * kN * kN;
   float state[kN];
 #pragma unroll
   for (int key = 0; key < kN; ++key) {
@@ -92,6 +95,14 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
     const RowInputs<IO> row = next;
     if (t + 1 < end)
       next = load_row(t + 1);
+    if (doc_start && doc_start[t]) {
+#pragma unroll
+      for (int key = 0; key < kN; ++key) {
+        state[key] = doc_initial_state
+                         ? doc_initial_state[doc_base + key * kN + value]
+                         : 0.0f;
+      }
+    }
     if (checkpoints && (t - begin) % kCheckpointInterval == 0) {
       const long long slot =
           (checkpoint_slot(t, batch) * H + head) * kN * kN;
@@ -137,20 +148,24 @@ __global__ __launch_bounds__(kN, 2) void exact_forward_kernel(
 template <typename IO>
 __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
     int T, int H, const int *__restrict__ offsets,
+    const std::uint8_t *__restrict__ doc_start,
+    const float *__restrict__ doc_initial_state,
     const IO *__restrict__ r_ptr, const IO *__restrict__ w_ptr,
     const IO *__restrict__ k_ptr, const IO *__restrict__ v_ptr,
     const IO *__restrict__ a_ptr, const IO *__restrict__ b_ptr,
     const IO *__restrict__ dy_ptr, const float *__restrict__ ds_final,
     const float *__restrict__ checkpoints, float *__restrict__ scratch,
-    float *__restrict__ ds_initial, IO *__restrict__ dr_ptr,
-    IO *__restrict__ dw_ptr, IO *__restrict__ dk_ptr, IO *__restrict__ dv_ptr,
-    IO *__restrict__ da_ptr, IO *__restrict__ db_ptr) {
+    float *__restrict__ ds_initial, float *__restrict__ ds_doc_accum,
+    IO *__restrict__ dr_ptr, IO *__restrict__ dw_ptr, IO *__restrict__ dk_ptr,
+    IO *__restrict__ dv_ptr, IO *__restrict__ da_ptr, IO *__restrict__ db_ptr) {
   const int batch = blockIdx.y;
   const int head = blockIdx.x;
   const int value = threadIdx.x;
   const long long bh = static_cast<long long>(batch) * H + head;
   const long long state_base = bh * kN * kN;
+  const long long doc_base = static_cast<long long>(head) * kN * kN;
   float dstate[kN];
+  float doc_accum[kN] = {};
 #pragma unroll
   for (int key = 0; key < kN; ++key) {
     dstate[key] = ds_final ? ds_final[state_base + key * kN + value] : 0.0f;
@@ -181,6 +196,14 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
       for (int key = 0; key < kN; ++key)
         state[key] = checkpoints[slot + key * kN + value];
       for (int t = first; t < stop; ++t) {
+        if (t > first && doc_start && doc_start[t]) {
+#pragma unroll
+          for (int key = 0; key < kN; ++key) {
+            state[key] = doc_initial_state
+                             ? doc_initial_state[doc_base + key * kN + value]
+                             : 0.0f;
+          }
+        }
         float *before = history + (t - first) * kN * kN;
 #pragma unroll
         for (int key = 0; key < kN; ++key)
@@ -274,11 +297,23 @@ __global__ __launch_bounds__(kN, 1) void exact_backward_kernel(
       for (int key = 0; key < kN; ++key) {
         dstate[key] = dnew[key * kPad + value] * w[key] + a[key] * dsa[value];
       }
+      if (doc_start && doc_start[t]) {
+        if (ds_doc_accum) {
+#pragma unroll
+          for (int key = 0; key < kN; ++key)
+            doc_accum[key] += dstate[key];
+        }
+#pragma unroll
+        for (int key = 0; key < kN; ++key)
+          dstate[key] = 0.0f;
+      }
     }
   }
 #pragma unroll
   for (int key = 0; key < kN; ++key) {
     ds_initial[state_base + key * kN + value] = dstate[key];
+    if (ds_doc_accum)
+      ds_doc_accum[state_base + key * kN + value] += doc_accum[key];
   }
 }
 
@@ -288,7 +323,8 @@ void launch_forward(hipStream_t stream, const WkvShape &s, const float *s0,
                     const void *a, const void *b, void *y, float *sT,
                     WkvTapeView tape) {
   exact_forward_kernel<IO><<<dim3(s.heads, s.batch), kN, 0, stream>>>(
-      s.time, s.heads, s.offsets, s0, static_cast<const IO *>(r),
+      s.time, s.heads, s.offsets, s.doc_start, s.doc_initial_state, s0,
+      static_cast<const IO *>(r),
       static_cast<const IO *>(w), static_cast<const IO *>(k),
       static_cast<const IO *>(v), static_cast<const IO *>(a),
       static_cast<const IO *>(b), static_cast<IO *>(y), sT, tape.data);
@@ -299,14 +335,14 @@ void launch_backward(hipStream_t stream, const WkvShape &s, const void *r,
                      const void *w, const void *k, const void *v, const void *a,
                      const void *b, const void *dy, const float *dsT,
                      WkvTapeView tape, float *ds0, void *dr, void *dw, void *dk,
-                     void *dv, void *da, void *db) {
+                     void *dv, void *da, void *db, float *ds_doc_accum) {
   exact_backward_kernel<IO><<<dim3(s.heads, s.batch), kN, 0, stream>>>(
-      s.time, s.heads, s.offsets, static_cast<const IO *>(r),
-      static_cast<const IO *>(w),
+      s.time, s.heads, s.offsets, s.doc_start, s.doc_initial_state,
+      static_cast<const IO *>(r), static_cast<const IO *>(w),
       static_cast<const IO *>(k), static_cast<const IO *>(v),
       static_cast<const IO *>(a), static_cast<const IO *>(b),
       static_cast<const IO *>(dy), dsT, tape.data,
-      tape.data + wkv_checkpoint_elements(s), ds0,
+      tape.data + wkv_checkpoint_elements(s), ds0, ds_doc_accum,
       static_cast<IO *>(dr), static_cast<IO *>(dw), static_cast<IO *>(dk),
       static_cast<IO *>(dv), static_cast<IO *>(da), static_cast<IO *>(db));
 }
@@ -346,7 +382,8 @@ void wkv_backward_input(hipStream_t stream, IoType io_type,
                         const void *k, const void *v, const void *a,
                         const void *b, const void *dy, const float *ds_final,
                         WkvTapeView tape, float *ds_initial, void *dr, void *dw,
-                        void *dk, void *dv, void *da, void *db) {
+                        void *dk, void *dv, void *da, void *db,
+                        float *ds_doc_accum) {
   validate(shape, tape);
   if (!r || !w || !k || !v || !a || !b || !dy || !ds_initial || !dr || !dw ||
       !dk || !dv || !da || !db) {
@@ -354,11 +391,11 @@ void wkv_backward_input(hipStream_t stream, IoType io_type,
   }
   if (io_type == IoType::F16) {
     launch_backward<half>(stream, shape, r, w, k, v, a, b, dy, ds_final, tape,
-                          ds_initial, dr, dw, dk, dv, da, db);
+                          ds_initial, dr, dw, dk, dv, da, db, ds_doc_accum);
   } else {
     launch_backward<__hip_bfloat16>(stream, shape, r, w, k, v, a, b, dy,
                                    ds_final, tape, ds_initial, dr, dw, dk, dv,
-                                   da, db);
+                                   da, db, ds_doc_accum);
   }
 }
 

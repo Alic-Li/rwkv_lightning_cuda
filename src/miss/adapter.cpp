@@ -529,21 +529,21 @@ std::shared_ptr<const GpuLease> AdapterCache::acquire(const AdapterHandle &h,
     }
   } catch (...) {
     if (stream)
-      cudaStreamSynchronize(stream);
+      rwkv_gpu::check_cleanup(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
     if (end)
-      cudaEventDestroy(end);
+      rwkv_gpu::check_cleanup(cudaEventDestroy(end), "cudaEventDestroy");
     if (begin)
-      cudaEventDestroy(begin);
+      rwkv_gpu::check_cleanup(cudaEventDestroy(begin), "cudaEventDestroy");
     if (stream)
-      cudaStreamDestroy(stream);
+      rwkv_gpu::check_cleanup(cudaStreamDestroy(stream), "cudaStreamDestroy");
     if (pinned)
-      cudaFreeHost(pinned);
+      rwkv_gpu::check_cleanup(cudaFreeHost(pinned), "cudaFreeHost");
     throw;
   }
-  cudaEventDestroy(end);
-  cudaEventDestroy(begin);
-  cudaStreamDestroy(stream);
-  cudaFreeHost(pinned);
+  rwkv_gpu::check_cleanup(cudaEventDestroy(end), "cudaEventDestroy");
+  rwkv_gpu::check_cleanup(cudaEventDestroy(begin), "cudaEventDestroy");
+  rwkv_gpu::check_cleanup(cudaStreamDestroy(stream), "cudaStreamDestroy");
+  rwkv_gpu::check_cleanup(cudaFreeHost(pinned), "cudaFreeHost");
   gpu_[lease->version] = {lease, ++clock_};
   stats_.gpu_bytes += bytes;
   stats_.gpu_peak_bytes = std::max(stats_.gpu_peak_bytes, stats_.gpu_bytes);

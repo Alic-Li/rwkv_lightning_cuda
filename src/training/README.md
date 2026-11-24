@@ -82,9 +82,9 @@ an AMD GPU and must not be inferred from CUDA results.
 
 NoRA-init shares the trainer and chunk executor. See [NoRA](../nora/README.md) for random A initialization, both-factor gradients, checkpoint layout and launch examples.
 
-## NCCL data parallel
+## Multi-GPU data parallel training
 
-Linux/CUDA builds with NCCL also provide `rwkv_state_tune_dp`,
+Linux builds with NCCL (CUDA) or RCCL (HIP) also provide `rwkv_state_tune_dp`,
 `rwkv_miss_tune_dp`, and `rwkv_nora_tune_dp`. `--devices 0,1,2,3` launches one
 process per GPU; `--batch-size` remains global and `--micro-bsz` is per GPU.
 Gradients are summed after normalization by the global trained-token count.

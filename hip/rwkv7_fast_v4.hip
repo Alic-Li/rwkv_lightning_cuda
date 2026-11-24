@@ -102,7 +102,7 @@ struct PinnedHostBuffer {
   }
 
   void release() {
-    if (p) hipFreeHost(p);
+    if (p) rwkv_gpu::check_cleanup(hipFreeHost(p), "hipFreeHost");
     p = nullptr;
     n = 0;
   }
@@ -148,10 +148,10 @@ struct WeightLoadPipeline {
   ~WeightLoadPipeline() {
     sync();
     for (auto& s : slots) {
-      hipEventDestroy(s.copied);
-      hipEventDestroy(s.done);
-      hipStreamDestroy(s.copy);
-      hipStreamDestroy(s.compute);
+      rwkv_gpu::check_cleanup(hipEventDestroy(s.copied), "hipEventDestroy");
+      rwkv_gpu::check_cleanup(hipEventDestroy(s.done), "hipEventDestroy");
+      rwkv_gpu::check_cleanup(hipStreamDestroy(s.copy), "hipStreamDestroy");
+      rwkv_gpu::check_cleanup(hipStreamDestroy(s.compute), "hipStreamDestroy");
     }
   }
 
@@ -1797,8 +1797,8 @@ struct ModelBackend::Impl {
   std::future<void> fingerprint_job;
 
   ~Impl() {
-    if (copy_stream != nullptr) hipStreamDestroy(copy_stream);
-    if (copy_ready != nullptr) hipEventDestroy(copy_ready);
+    if (copy_stream != nullptr) rwkv_gpu::check_cleanup(hipStreamDestroy(copy_stream), "hipStreamDestroy");
+    if (copy_ready != nullptr) rwkv_gpu::check_cleanup(hipEventDestroy(copy_ready), "hipEventDestroy");
   }
 };
 

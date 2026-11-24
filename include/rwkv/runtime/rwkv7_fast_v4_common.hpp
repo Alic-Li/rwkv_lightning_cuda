@@ -116,7 +116,7 @@ struct DeviceBuffer {
       return *this;
     }
     if (p) {
-      cudaFree(p);
+      rwkv_gpu::check_cleanup(cudaFree(p), "cudaFree");
     }
     p = other.p;
     n = other.n;
@@ -126,7 +126,7 @@ struct DeviceBuffer {
   }
 
   ~DeviceBuffer() {
-    if (p) cudaFree(p);
+    if (p) rwkv_gpu::check_cleanup(cudaFree(p), "cudaFree");
   }
 
   void resize(std::size_t count, const char* what) {
