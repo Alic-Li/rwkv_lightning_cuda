@@ -47,6 +47,11 @@ template <class Value> class PrefixCachePool {
 
 public:
   using Match = typename PrefixCache<Value>::Match;
+  // Entry-count limit only. The caller sizes each slot on first use and
+  // reuses its storage; byte accounting is unavailable in this mode.
+  explicit PrefixCachePool(size_t capacity)
+      : capacity_(capacity), memory_limit_(0), entry_bytes_(0), index_(capacity),
+        make_([] { return std::make_shared<Value>(); }) {}
   PrefixCachePool(size_t capacity, size_t memory_limit, size_t entry_bytes,
                   std::function<Pointer()> make)
       : capacity_(entry_bytes ? std::min(capacity, memory_limit / entry_bytes) : 0),

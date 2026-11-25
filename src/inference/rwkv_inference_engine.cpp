@@ -19,7 +19,7 @@
 
 #include "rwkv/runtime/rwkv_gpu_runtime.hpp"
 #include "rwkv/inference/text_stop_matcher.hpp"
-#include "rwkv/inference/prefix_cache.hpp"
+#include "rwkv/inference/prefix_cache_pool.hpp"
 #include "rwkv/inference/utf8.hpp"
 #include "rwkv/inference/rwkv_sampler.hpp"
 
@@ -120,16 +120,16 @@ struct HostPromptState {
 namespace {
 
 template <typename Host, typename Device>
-std::vector<Host> download_prompt_buffer(
+void download_prompt_buffer(
+    std::vector<Host>& host,
     const rwkv7_fast_v4::DeviceBuffer<Device>& buffer) {
   static_assert(sizeof(Host) == sizeof(Device), "prompt cache element size mismatch");
-  std::vector<Host> host(buffer.n);
+  host.resize(buffer.n);
   if (!host.empty()) {
     rwkv7_fast_v4::check_cuda(
         cudaMemcpy(host.data(), buffer.p, host.size() * sizeof(Host), cudaMemcpyDeviceToHost),
         "download prompt cache state");
   }
-  return host;
 }
 
 template <typename Host, typename Device>
@@ -145,25 +145,23 @@ void upload_prompt_buffer(
   }
 }
 
-HostPromptState download_prompt_state(const GenerationState& gpu) {
+void download_prompt_state(const GenerationState& gpu, HostPromptState& host) {
   if (gpu.batch_size != 1) {
     throw std::runtime_error("prompt cache snapshot requires a single-row state");
   }
-  HostPromptState host;
   host.adapter = gpu.adapter;
   host.effective_key = gpu.effective_key;
   host.adapter_identity = gpu.adapter_identity;
   host.initial_state_identity = gpu.initial_state_identity;
   host.advanced = gpu.advanced;
   host.wkv32 = gpu.wkv32;
-  host.shift = download_prompt_buffer<uint16_t>(gpu.shift);
+  download_prompt_buffer(host.shift, gpu.shift);
   if (gpu.wkv32) {
-    host.wkv32_data = download_prompt_buffer<float>(gpu.wkv_state32);
+    download_prompt_buffer(host.wkv32_data, gpu.wkv_state32);
   } else {
-    host.wkv16 = download_prompt_buffer<uint16_t>(gpu.wkv_state);
+    download_prompt_buffer(host.wkv16, gpu.wkv_state);
   }
-  host.elapsed = download_prompt_buffer<int>(gpu.elapsed);
-  return host;
+  download_prompt_buffer(host.elapsed, gpu.elapsed);
 }
 
 void upload_prompt_state(const HostPromptState& host, GenerationState& gpu) {
@@ -190,10 +188,9 @@ void upload_prompt_state(const HostPromptState& host, GenerationState& gpu) {
 // Shared radix index; existing CPU state/logits snapshots retain their format.
 struct InferenceEngine::PromptCache {
   struct Entry { HostPromptState state; std::vector<float> logits; };
-  explicit PromptCache(size_t limit) : capacity(limit), index(limit) {}
-  size_t capacity;
+  explicit PromptCache(size_t limit) : index(limit) {}
   std::mutex mutex;
-  PrefixCache<Entry> index;
+  PrefixCachePool<Entry> index;
 };
 
 void InferenceEngine::prefill_cached(
@@ -276,20 +273,20 @@ void InferenceEngine::prefill_cached(
     std::lock_guard<std::mutex> lock(cache.mutex);
     if (cache.index.find(identity, prompt_ids[row]).length == prompt_ids[row].size())
       continue;
-    auto entry = std::make_shared<PromptCache::Entry>();
-    if (count == 1) {
-      entry->state = download_prompt_state(state);
-    } else {
-      auto& tmp = ensure_staging();
-      model_->copy_state_slice(state, static_cast<int>(row), tmp, 0, 1);
-      entry->state = download_prompt_state(tmp);
-    }
-    entry->logits.resize(logits.vocab_size);
-    rwkv7_fast_v4::check_cuda(
-        cudaMemcpy(entry->logits.data(), logits.values.p + row * logits.vocab_size,
-                   entry->logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
-        "download prompt cache logits");
-    cache.index.put(identity, prompt_ids[row], std::move(entry));
+    cache.index.put(identity, prompt_ids[row], [&](PromptCache::Entry& entry) {
+      if (count == 1) {
+        download_prompt_state(state, entry.state);
+      } else {
+        auto& tmp = ensure_staging();
+        model_->copy_state_slice(state, static_cast<int>(row), tmp, 0, 1);
+        download_prompt_state(tmp, entry.state);
+      }
+      entry.logits.resize(logits.vocab_size);
+      rwkv7_fast_v4::check_cuda(
+          cudaMemcpy(entry.logits.data(), logits.values.p + row * logits.vocab_size,
+                     entry.logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "download prompt cache logits");
+    });
   }
 }
 
@@ -1252,7 +1249,7 @@ InferenceEngine::GenerationStats InferenceEngine::batch_generate_stream_with_sta
 
   DeviceLogits logits;
   const auto prefill_begin = std::chrono::steady_clock::now();
-  if (prompt_cache_state_id && prompt_cache_->capacity > 0) {
+  if (prompt_cache_state_id && prompt_cache_->index.capacity() > 0) {
     prefill_cached(sorted_prompt_ids, sorted_to_original, state, logits,
                    *prompt_cache_state_id, options.adapter_id, stats);
   } else {
