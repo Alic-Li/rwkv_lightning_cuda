@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 #include "rwkv7_fast_v4_kernels.hip.hpp"
 
@@ -27,25 +28,25 @@ inline int64_t ceil_div(int64_t n, int64_t d) {
   return (n + d - 1) / d;
 }
 
+struct BlasError : std::runtime_error {
+  BlasError(const char* operation, hipblasStatus_t status)
+      : std::runtime_error(std::string(operation) + " failed with hipblas status " +
+                           std::to_string(static_cast<int>(status))) {}
+};
+
 inline void check_hipblas(hipblasStatus_t status, const char* what) {
-  if (status != HIPBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "%s failed with hipblas status %d\n", what, static_cast<int>(status));
-    abort();
-  }
+  if (status != HIPBLAS_STATUS_SUCCESS) throw BlasError(what, status);
 }
 
-// BLAS stream selection is mutable state: one handle per host thread/device.
+// Create each handle on first use so the ordinary GEMM also works if Lt initialization fails.
 struct ThreadBlasHandles {
   hipblasHandle_t blas = nullptr;
   hipblasLtHandle_t lt = nullptr;
-  ThreadBlasHandles() {
-    check_hipblas(hipblasCreate(&blas), "hipblasCreate");
-    check_hipblas(hipblasLtCreate(&lt), "hipblasLtCreate");
-  }
   ~ThreadBlasHandles() {
-    hipblasLtDestroy(lt);
-    hipblasDestroy(blas);
+    if (lt) hipblasLtDestroy(lt);
+    if (blas) hipblasDestroy(blas);
   }
+  ThreadBlasHandles() = default;
   ThreadBlasHandles(const ThreadBlasHandles&) = delete;
   ThreadBlasHandles& operator=(const ThreadBlasHandles&) = delete;
 };
@@ -58,8 +59,24 @@ inline ThreadBlasHandles& thread_blas_handles() {
   return handles.try_emplace(device).first->second;
 }
 
-inline hipblasHandle_t blas_handle() { return thread_blas_handles().blas; }
-inline hipblasLtHandle_t blaslt_handle() { return thread_blas_handles().lt; }
+inline hipblasHandle_t blas_handle() {
+  auto& handles = thread_blas_handles();
+  if (!handles.blas) check_hipblas(hipblasCreate(&handles.blas), "hipblasCreate");
+  return handles.blas;
+}
+
+struct LtDescriptors {
+  hipblasLtMatmulDesc_t op = nullptr;
+  hipblasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+  hipblasLtMatmulPreference_t pref = nullptr;
+  ~LtDescriptors() {
+    if (pref) hipblasLtMatmulPreferenceDestroy(pref);
+    if (c) hipblasLtMatrixLayoutDestroy(c);
+    if (b) hipblasLtMatrixLayoutDestroy(b);
+    if (a) hipblasLtMatrixLayoutDestroy(a);
+    if (op) hipblasLtMatmulDescDestroy(op);
+  }
+};
 
 __device__ __forceinline__ half2 load_pair(const half* p) {
   if ((reinterpret_cast<std::uintptr_t>(p) & 3u) == 0)
@@ -2332,61 +2349,74 @@ void rwkv7_v3a_linear_f16_orig_lt_cfg_launch(
     return;
   }
 
-  hipblasLtMatmulDesc_t op_desc = nullptr;
-  hipblasLtMatrixLayout_t a_desc = nullptr;
-  hipblasLtMatrixLayout_t b_desc = nullptr;
-  hipblasLtMatrixLayout_t c_desc = nullptr;
-  hipblasLtMatmulPreference_t pref = nullptr;
+  try {
+    auto& handles = thread_blas_handles();
+    if (!handles.lt) check_hipblas(hipblasLtCreate(&handles.lt), "hipblasLtCreate");
+    const auto handle = handles.lt;
+    LtDescriptors desc;
+    check_hipblas(hipblasLtMatmulDescCreate(&desc.op, HIPBLAS_COMPUTE_32F, HIP_R_32F), "linear_f16_orig_lt desc");
+    const hipblasOperation_t transa = HIPBLAS_OP_T;
+    const hipblasOperation_t transb = HIPBLAS_OP_N;
+    check_hipblas(hipblasLtMatmulDescSetAttribute(desc.op, HIPBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)), "linear_f16_orig_lt transa");
+    check_hipblas(hipblasLtMatmulDescSetAttribute(desc.op, HIPBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)), "linear_f16_orig_lt transb");
+    check_hipblas(hipblasLtMatrixLayoutCreate(&desc.a, HIP_R_16F, K, N, K), "linear_f16_orig_lt a layout");
+    check_hipblas(hipblasLtMatrixLayoutCreate(&desc.b, HIP_R_16F, K, M, K), "linear_f16_orig_lt b layout");
+    check_hipblas(hipblasLtMatrixLayoutCreate(&desc.c, HIP_R_16F, N, M, N), "linear_f16_orig_lt c layout");
+    check_hipblas(hipblasLtMatmulPreferenceCreate(&desc.pref), "linear_f16_orig_lt preference");
+    check_hipblas(hipblasLtMatmulPreferenceSetAttribute(desc.pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes)),
+                 "linear_f16_orig_lt workspace");
 
-  hipblasLtHandle_t handle = blaslt_handle();
-  check_hipblas(hipblasLtMatmulDescCreate(&op_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F), "linear_f16_orig_lt desc");
-  const hipblasOperation_t transa = HIPBLAS_OP_T;
-  const hipblasOperation_t transb = HIPBLAS_OP_N;
-  check_hipblas(hipblasLtMatmulDescSetAttribute(op_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)), "linear_f16_orig_lt transa");
-  check_hipblas(hipblasLtMatmulDescSetAttribute(op_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)), "linear_f16_orig_lt transb");
-  check_hipblas(hipblasLtMatrixLayoutCreate(&a_desc, HIP_R_16F, K, N, K), "linear_f16_orig_lt a layout");
-  check_hipblas(hipblasLtMatrixLayoutCreate(&b_desc, HIP_R_16F, K, M, K), "linear_f16_orig_lt b layout");
-  check_hipblas(hipblasLtMatrixLayoutCreate(&c_desc, HIP_R_16F, N, M, N), "linear_f16_orig_lt c layout");
-  check_hipblas(hipblasLtMatmulPreferenceCreate(&pref), "linear_f16_orig_lt preference");
-  check_hipblas(hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes)),
-               "linear_f16_orig_lt workspace");
+    hipblasLtMatmulHeuristicResult_t heuristics[64];
+    int returned = 0;
+    check_hipblas(hipblasLtMatmulAlgoGetHeuristic(
+        handle, desc.op, desc.a, desc.b, desc.c, desc.c, desc.pref,
+        64, heuristics, &returned), "linear_f16_orig_lt heuristic");
+    if (returned <= 0) {
+      throw BlasError("linear_f16_orig_lt found no algorithm", HIPBLAS_STATUS_NOT_SUPPORTED);
+    }
+    const int selected_algo = (algo_index >= 0 && algo_index < returned) ? algo_index : 0;
 
-  hipblasLtMatmulHeuristicResult_t heuristics[64];
-  int returned = 0;
-  check_hipblas(hipblasLtMatmulAlgoGetHeuristic(
-      handle, op_desc, a_desc, b_desc, c_desc, c_desc, pref,
-      64, heuristics, &returned), "linear_f16_orig_lt heuristic");
-  if (returned <= 0) {
-    fprintf(stderr, "linear_f16_orig_lt found no algorithm\n");
-    abort();
+    const auto& candidate = heuristics[selected_algo];
+    check_hipblas(candidate.state, "linear_f16_orig_lt candidate");
+    if (candidate.workspaceSize > workspace_bytes || (candidate.workspaceSize && !workspace))
+      throw BlasError("linear_f16_orig_lt workspace", HIPBLAS_STATUS_NOT_SUPPORTED);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    check_hipblas(hipblasLtMatmul(
+        handle,
+        desc.op,
+        &alpha,
+        weight_orig,
+        desc.a,
+        x,
+        desc.b,
+        &beta,
+        y,
+        desc.c,
+        y,
+        desc.c,
+        &candidate.algo,
+        workspace,
+        workspace_bytes,
+        stream),
+        "linear_f16_orig_lt matmul");
+  } catch (const BlasError& lt_error) {
+    // Both implementations overwrite y (beta=0) on the caller's stream.
+    static thread_local bool reported = false;
+    if (!reported) {
+      std::fprintf(stderr, "%s; retrying GEMM M=%d K=%d N=%d algo_index=%d workspace=%zu\n",
+                   lt_error.what(), M, K, N, algo_index, workspace_bytes);
+      reported = true;
+    }
+    try {
+      rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+    } catch (const BlasError& gemm_error) {
+      throw std::runtime_error(std::string(lt_error.what()) + "; fallback " + gemm_error.what() +
+                               " (M=" + std::to_string(M) + " K=" + std::to_string(K) +
+                               " N=" + std::to_string(N) + ")");
+    }
   }
-  const int selected_algo = (algo_index >= 0 && algo_index < returned) ? algo_index : 0;
-
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  check_hipblas(hipblasLtMatmul(
-      handle,
-      op_desc,
-      &alpha,
-      weight_orig,
-      a_desc,
-      x,
-      b_desc,
-      &beta,
-      y,
-      c_desc,
-      y,
-      c_desc,
-      &heuristics[selected_algo].algo,
-      workspace,
-      workspace_bytes,
-      stream),
-      "linear_f16_orig_lt matmul");
-  hipblasLtMatmulPreferenceDestroy(pref);
-  hipblasLtMatrixLayoutDestroy(c_desc);
-  hipblasLtMatrixLayoutDestroy(b_desc);
-  hipblasLtMatrixLayoutDestroy(a_desc);
-  hipblasLtMatmulDescDestroy(op_desc);
 }
 
 template <int RowTile, int OutTile>

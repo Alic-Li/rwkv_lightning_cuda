@@ -964,11 +964,8 @@ void linear_orig_layout_launch(
   }
   auto lt = [&](int workspace_mb, int algo) {
     const std::size_t bytes = static_cast<std::size_t>(workspace_mb) << 20;
-    if (bytes > workspace_bytes) {
-      std::cerr << "error: hipblasLt workspace too small\n";
-      std::exit(1);
-    }
-    rwkv7_v3a_linear_f16_orig_lt_cfg_launch(stream, M, K, N, x, weight_orig, workspace, bytes, algo, y);
+    rwkv7_v3a_linear_f16_orig_lt_cfg_launch(stream, M, K, N, x, weight_orig, workspace,
+                                            std::min(bytes, workspace_bytes), algo, y);
   };
   if (path.rows == 3) {
     if (group == LinearGroup::Head) {
@@ -1408,11 +1405,16 @@ void run_backend_forward(
   DeviceBuffer<unsigned char> lt_workspace;
   lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc backend hipblasLt workspace");
 
-  hipStream_t stream = nullptr;
-  check_hip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create backend stream");
+  struct ForwardStream {
+    hipStream_t value = nullptr;
+    ~ForwardStream() {
+      if (value) rwkv_gpu::check_cleanup(hipStreamDestroy(value), "hipStreamDestroy");
+    }
+  } owner;
+  check_hip(hipStreamCreateWithFlags(&owner.value, hipStreamNonBlocking), "create backend stream");
+  const auto stream = owner.value;
 
   if (weights.cpu_emb_ln0_f16.size() != static_cast<std::size_t>(V) * C) {
-    check_hip(hipStreamDestroy(stream), "destroy backend stream");
     throw std::runtime_error("cpu emb+ln0 table is not ready");
   }
 
@@ -1421,7 +1423,6 @@ void run_backend_forward(
     for (int t = 0; t < T; ++t) {
       const int token_id = static_cast<int>(token_batches[static_cast<size_t>(b)][static_cast<size_t>(t)]);
       if (token_id < 0 || token_id >= V) {
-        check_hip(hipStreamDestroy(stream), "destroy backend stream");
         throw std::runtime_error("token id out of range");
       }
       const std::size_t row = static_cast<std::size_t>(b) * T + t;
@@ -1528,7 +1529,6 @@ void run_backend_forward(
     const int Rg = static_cast<int>(w.att_g1_t->shape[0]);
     const int Rv = (layer == 0) ? 0 : static_cast<int>(w.att_v1_t->shape[0]);
     if (Rw > kLowrankMax || Ra > kLowrankMax || Rg > kLowrankMax || Rv > kLowrankMax) {
-      check_hip(hipStreamDestroy(stream), "destroy backend stream");
       throw std::runtime_error("lowrank exceeds arena max");
     }
 
@@ -1714,7 +1714,6 @@ void run_backend_forward(
                              static_cast<std::size_t>(output_rows) * V);
   check_hip(hipGetLastError(), "launch backend logits f16->f32");
   check_hip(hipStreamSynchronize(stream), "sync backend stream");
-  check_hip(hipStreamDestroy(stream), "destroy backend stream");
 }
 
 // Moves many small device regions (state/logits/sampler rows) in one launch.
