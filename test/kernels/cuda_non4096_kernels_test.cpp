@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -249,6 +250,28 @@ int main() {
     if (!rwkv_test::cuda_device_available()) {
       std::cout << "rwkv_cuda_non4096_kernels_test skipped: no CUDA device available\n";
       return 0;
+    }
+
+    // Adjacent 64-channel heads occupy opposite halves of an AMD wave64.
+    // Both must normalize to unit length despite their different magnitudes.
+    {
+      constexpr int heads = 2, channels = 64 * heads;
+      std::vector<float> keys(channels, 1.0f);
+      std::fill(keys.begin() + 64, keys.end(), 8.0f);
+      DeviceBuffer<half> key, ones, zeros, new_key, neg_key, gated_key;
+      rwkv_test::copy_host_to_device(std::vector<half>(keys.begin(), keys.end()),
+                                     key, "alloc keys", "copy keys");
+      rwkv_test::copy_host_to_device(std::vector<half>(channels, __float2half(1.0f)),
+                                     ones, "alloc scales", "copy scales");
+      zeros.resize(channels, "alloc gate inputs");
+      zeros.zero("zero gate inputs");
+      new_key.resize(channels, "alloc new key");
+      neg_key.resize(channels, "alloc normalized key");
+      gated_key.resize(channels, "alloc gated key");
+      rwkv7_tmix_kk_a_gate_launch(nullptr, 1, 1, channels, heads, key.p, ones.p,
+                                  zeros.p, zeros.p, zeros.p, new_key.p, neg_key.p, gated_key.p);
+      for (half v : rwkv_test::copy_device_buffer(neg_key, "read normalized key"))
+        TEST_EQ(__half2float(v), -0.125f);
     }
 
     {

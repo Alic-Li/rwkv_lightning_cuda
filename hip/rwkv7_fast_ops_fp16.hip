@@ -41,7 +41,7 @@ __device__ inline void store_h2(dtype* ptr, float x0, float x1) {
 __device__ inline float warp_sum(float v) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
+    v += __shfl_down(v, offset, 32);
   }
   return v;
 }
@@ -163,7 +163,8 @@ __global__ void tmix_kk_a_gate_kernel(
 
   float sum_sq = u0 * u0 + u1 * u1;
   sum_sq = warp_sum(sum_sq);
-  const float total = __shfl_sync(0xffffffffffffffffull, sum_sq, 0);
+  // Each 32-lane group owns one head, including the upper half of a wave64.
+  const float total = __shfl(sum_sq, 0, 32);
   const float inv_d = 1.0f / fmaxf(sqrtf(total), KK_NORMALIZE_EPS);
   const float kk0 = u0 * inv_d;
   const float kk1 = u1 * inv_d;
