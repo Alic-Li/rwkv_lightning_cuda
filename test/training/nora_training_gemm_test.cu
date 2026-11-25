@@ -113,6 +113,35 @@ template <bool TR> void expansion(int rows, int rank, int cols) {
               << " reference_us=" << time_us(old)
               << " fast_us=" << time_us(fast) << '\n';
 }
+#ifdef RWKV_USE_HIP
+void fused_forward_check() {
+  constexpr int rows = 513, in = 4103, out = 4099, rank = 16;
+  std::mt19937 gen(2718);
+  DeviceBuffer<bf16> x, a, d, ref, got;
+  fill(x, size_t(rows) * in, gen);
+  fill(a, size_t(rank) * in, gen);
+  fill(d, size_t(out) * rank, gen);
+  fill(ref, size_t(rows) * out, gen);
+  got.resize(ref.n, "fused result");
+  gpu_check(cudaMemcpy(got.p, ref.p, ref.n * sizeof(bf16), cudaMemcpyDeviceToDevice),
+            "copy fused input");
+  rwkv_bf16_miss::Linear w{in, out, rank, .7f, d.p, nullptr, a.p, nullptr};
+  auto old = [&] {
+    rwkv_nora_detail::fused<<<dim3((out + 255) / 256, rows), 256, rank * sizeof(float)>>>(
+        in, out, rank, w.scale, a.p, d.p, x.p, ref.p);
+  };
+  auto fast = [&] {
+    rwkv_bf16_nora::forward(nullptr, rows, w, x.p, got.p, nullptr);
+  };
+  old();
+  fast();
+  auto expected = read(ref), actual = read(got);
+  if (std::memcmp(expected.data(), actual.data(), ref.n * sizeof(bf16)))
+    throw std::runtime_error("fused NoRA forward differs from reference");
+  std::cout << "fused reference_us=" << time_us(old)
+            << " fast_us=" << time_us(fast) << '\n';
+}
+#endif
 void grad_weight_check(int rows, int rank, int width) {
   std::mt19937 gen(9012);
   DeviceBuffer<bf16> g, x;
@@ -215,6 +244,9 @@ int main(int argc, char **argv) {
           expansion<false>(rows, 16, width);
           grad_weight_check(rows, 16, width);
         }
+#ifdef RWKV_USE_HIP
+    fused_forward_check();
+#endif
     tensor_core_backward_check(257, 16, 256, 512);
     tensor_core_backward_check(512, 32, 4096, 4096);
     std::cout << "NoRA optimized projections/expansions passed\n";

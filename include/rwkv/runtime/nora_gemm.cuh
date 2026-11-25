@@ -44,7 +44,7 @@ void gemm(cudaStream_t stream, int m, int n, int k, const L *a, const R *b,
 }
 // No scratch allocation in decode or forward-only callers. Rank projection is
 // shared within each output tile, like the existing MiSS inference kernel.
-template <class T>
+template <class T, int OutputTiles = 1>
 __global__ void fused(int in, int out, int rank, float scale, const T *a,
                       const T *b, const T *x, T *y) {
   extern __shared__ float s[];
@@ -70,8 +70,10 @@ __global__ void fused(int in, int out, int rank, float scale, const T *a,
     }
     __syncthreads();
   }
-  int o = blockIdx.x * 256 + threadIdx.x;
-  if (o < out) {
+  for (int tile = 0; tile < OutputTiles; ++tile) {
+    const int o = (blockIdx.x * OutputTiles + tile) * blockDim.x + threadIdx.x;
+    if (o >= out)
+      break;
     float sum = 0;
     for (int j = 0; j < rank; ++j)
       sum = fmaf(s[j], value(b[size_t(o) * rank + j]), sum);

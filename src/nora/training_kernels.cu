@@ -218,6 +218,15 @@ void forward(cudaStream_t stream, int rows, const rwkv_bf16_miss::Linear &w,
     detail::projection<true>(stream, rows, w.rank, w.in, x, w.a, s);
     if (y)
       detail::expansion<true>(stream, rows, w.out, w.rank, s, w.d, y, w.scale);
+#ifdef RWKV_USE_HIP
+  } else if (rows >= 512 && w.rank == 16 && w.out >= 2048) {
+    // Long prefills have enough independent rows to reuse the same FP32
+    // projection across eight output tiles without changing either reduction.
+    constexpr int threads = 256, tiles = 8;
+    fused<bf16, tiles><<<dim3((w.out + threads * tiles - 1) / (threads * tiles),
+                              rows), threads, w.rank * sizeof(float), stream>>>(
+        w.in, w.out, w.rank, w.scale, w.a, w.d, x, y);
+#endif
   } else {
     fused<<<dim3((w.out + 255) / 256, rows), 256, w.rank * sizeof(float),
             stream>>>(w.in, w.out, w.rank, w.scale, w.a, w.d, x, y);
