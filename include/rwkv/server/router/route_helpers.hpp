@@ -110,13 +110,6 @@ Json::Value build_choices(const std::vector<std::string>& texts,
 
 HttpResponsePtr make_sse_response(const std::function<void(ResponseStreamPtr)>& producer);
 
-bool send_finish_chunk(
-    const ResponseStreamPtr& stream,
-    const std::string& id,
-    const std::string& model,
-    const InferenceEngine::GenerationStats& stats,
-    const std::vector<bool>& finished);
-
 InferenceEngine::GenerationStats cancelled_generation(int choices);
 
 void start_streaming_task(

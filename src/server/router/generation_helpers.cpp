@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <stdexcept>
 #include <future>
+#include <mutex>
+#include <unordered_set>
+#include <trantor/net/EventLoop.h>
 #include <trantor/utils/ConcurrentTaskQueue.h>
 
 #include "rwkv/server/rwkv_uploaded_state_store.hpp"
@@ -279,8 +282,70 @@ HttpResponsePtr make_sse_response(const std::function<void(ResponseStreamPtr)>& 
   return resp;
 }
 
+namespace {
+// Drogon creates the response stream on its connection's I/O loop. Keep the
+// stream there through destruction: ResponseStream's destructor also sends.
+class StreamLoop {
+ public:
+  static std::shared_ptr<StreamLoop> current() {
+    thread_local auto owner = [] {
+      auto loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+      auto owner = std::make_shared<StreamLoop>(loop);
+      loop->runOnQuit([owner] {
+        std::lock_guard lock(owner->mutex_);
+        owner->loop_ = nullptr;
+        owner->streams.clear();
+      });
+      return owner;
+    }();
+    return owner;
+  }
+
+  explicit StreamLoop(trantor::EventLoop* loop) : loop_(loop) {}
+
+  bool post(std::function<void()> callback) {
+    std::lock_guard lock(mutex_);
+    if (!loop_) return false;
+    loop_->queueInLoop(std::move(callback));
+    return true;
+  }
+
+  // Only the I/O loop accesses this set. Workers hold weak stream handles.
+  std::unordered_set<std::shared_ptr<ResponseStream>> streams;
+
+ private:
+  std::mutex mutex_;
+  trantor::EventLoop* loop_;
+};
+
+class GenerationStream {
+ public:
+  explicit GenerationStream(ResponseStreamPtr response) : owner_(StreamLoop::current()) {
+    stream_ = *owner_->streams.emplace(std::move(response)).first;
+  }
+
+  bool send(std::string frame) const {
+    if (stream_.expired()) return false;
+    return owner_->post([owner = owner_, weak = stream_, frame = std::move(frame)] {
+      if (auto stream = weak.lock(); stream && !stream->send(frame)) {
+        owner->streams.erase(stream);
+      }
+    });
+  }
+
+  ~GenerationStream() {
+    owner_->post([owner = owner_, weak = stream_] {
+      if (auto stream = weak.lock()) owner->streams.erase(stream);
+    });
+  }
+
+ private:
+  std::shared_ptr<StreamLoop> owner_;
+  std::weak_ptr<ResponseStream> stream_;
+};
+
 bool send_finish_chunk(
-    const ResponseStreamPtr& stream,
+    const GenerationStream& stream,
     const std::string& id,
     const std::string& model,
     const InferenceEngine::GenerationStats& stats,
@@ -310,8 +375,10 @@ bool send_finish_chunk(
   Json::StreamWriterBuilder builder;
   builder["emitUTF8"] = true;
   builder["indentation"] = "";
-  return stream->send("data: " + Json::writeString(builder, payload) + "\n\n");
+  return stream.send("data: " + Json::writeString(builder, payload) + "\n\n");
 }
+
+}  // namespace
 
 InferenceEngine::GenerationStats cancelled_generation(int choices) {
   InferenceEngine::GenerationStats stats;
@@ -328,7 +395,7 @@ void start_streaming_task(
     const std::function<InferenceEngine::GenerationStats(const InferenceEngine::StreamCallback&)>& task,
     const std::function<void()>& on_done,
     std::shared_ptr<std::vector<std::string>> matched_stops) {
-  auto job = std::make_shared<std::packaged_task<void()>>([stream = std::move(stream),
+  auto job = std::make_shared<std::packaged_task<void()>>([stream = std::make_shared<GenerationStream>(std::move(stream)),
                id = std::move(id),
                model = std::move(model),
                choice_count,
@@ -377,7 +444,7 @@ void start_streaming_task(
       if (stats.finish_reasons.size() != static_cast<size_t>(choice_count)) {
         throw std::runtime_error("generation returned incomplete finish reasons");
       }
-      send_finish_chunk(stream, id, model, stats, finished);
+      send_finish_chunk(*stream, id, model, stats, finished);
     } catch (const PrefillBatchLimitExceeded& e) {
       Json::StreamWriterBuilder builder;
       builder["indentation"] = "";
@@ -390,7 +457,7 @@ void start_streaming_task(
       stream->send("data: " + Json::writeString(builder, err) + "\n\n");
     }
     stream->send("data: [DONE]\n\n");
-    stream->close();
+    stream.reset();
     if (on_done) {
       on_done();
     }
