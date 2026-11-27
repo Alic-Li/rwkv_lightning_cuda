@@ -31,6 +31,8 @@ RWKV-7 高性能 GPU 推理服务器，主要支持 NVIDIA CUDA，同时提供 A
 - 冻结基模训练 MiSS adapter，并按请求动态绑定不同 adapter。
 - 多后端路由和带 Web UI 的桌面启动器。
 
+推理服务和 Online RL 服务在模型加载后按 `--prefix-cache-capacity "vram:0G,ram:2G"` 预分配前缀缓存，这是默认配置。RAM 设为零可只使用显存，两层都设为零可关闭缓存。启用两层时，热前缀保存在 VRAM，淘汰到 RAM 后再次命中会提升回 VRAM。
+
 ## 性能评测 (Benchmark)
 
 RWKV-7 7.2B 在 RTX PRO 6000 Blackwell 上，吞吐比

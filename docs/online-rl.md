@@ -45,7 +45,7 @@ MiSS (Linux shell):
   --vocab ./rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 --port 8848 \
   --chunk 64 --ctx 4096 --max-batch 8 \
-  --cache-capacity 8 --keep-versions 2 \
+  --prefix-cache-capacity "vram:0G,ram:2G" --keep-versions 2 \
   --output ./online-rl-output/miss
 ```
 
@@ -58,7 +58,7 @@ State (Linux shell):
   --vocab ./rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 --port 8849 \
   --chunk 64 --ctx 4096 --max-batch 8 \
-  --cache-capacity 8 --keep-versions 2 \
+  --prefix-cache-capacity "vram:0G,ram:2G" --keep-versions 2 \
   --output ./online-rl-output/state
 ```
 
@@ -71,7 +71,7 @@ NoRA (Linux shell; without `--adapter` it starts from NoRA-init, rank must equal
   --rank 16 --alpha 16 --targets all \
   --host 127.0.0.1 --port 8850 \
   --chunk 64 --ctx 4096 --max-batch 8 \
-  --cache-capacity 8 --keep-versions 2 \
+  --prefix-cache-capacity "vram:0G,ram:2G" --keep-versions 2 \
   --output ./online-rl-output/nora
 ```
 
@@ -104,26 +104,20 @@ the same seed. `--gemm-mode strict` restores the legacy fixed 32-row, pedantic
 path for bitwise comparisons. `--resume DIR` restores a checkpoint (see below);
 use the same GEMM mode recorded in its `policy.json` for numerical continuity.
 
-The CPU prefix cache now uses **one shared, bounded LRU pool across all policy
-versions**. `--cache-capacity` (default 16) is a global entry limit, no longer a
-per-version limit. `--cache-memory-mb` (default 4096, in MiB) also caps the pool's
-tensor storage. Either flag set to zero disables caching. Effective capacity is
-the smaller of the entry limit and the byte budget divided by the snapshot size.
-Buffers are allocated on demand, then reused after eviction; a full pool evicts
-the least recently used entry before writing its replacement. Keys remain
-isolated by policy version. Retiring a policy removes its prefixes. The startup
-reference keeps its weights for KL, but its cache is cleared and disabled once
-it leaves the retained-policy list.
+After model loading each backend process reserves both prefix snapshot arenas.
+`--prefix-cache-capacity "vram:6G,ram:1G"` configures VRAM L1 and RAM L2.
+The default is `vram:0G,ram:2G`. G, M and K are binary units. B specifies bytes.
+Zero disables a tier. Each enabled tier must fit at least one snapshot.
+New entries use L1 when available. Its least recently used entry moves to L2
+under pressure. L2 hits promote to L1, and a full L2 evicts its oldest entry.
+Policy versions share capacity and remain isolated by identity. Retirement
+invalidates their entries and makes the slots available for reuse.
 
-Each snapshot stores FP32 WKV state, BF16 shifts and FP32 logits:
-`L*H*64*64*4 + L*2*C*2 + vocab*4` bytes. For the 2.9B model with 32 layers,
-40 heads and vocab 65536 this is 20.56 MiB. For 128 rollout trajectories,
-`--cache-capacity 256 --cache-memory-mb 6144 --keep-versions 2` allows 256 shared
-slots (~5.14 GiB of tensor storage). A 4096 MiB budget reduces this to 199 slots.
-Smaller caches can require more prefill work; eviction does not truncate history
-or remove training samples. The budget is **not a total process RSS limit**:
-trie/token metadata (bounded by entry count and context limit), models, HTTP
-requests, allocator overhead and training workspaces require additional memory.
+Each snapshot holds FP32 WKV state, BF16 shifts and FP32 logits, occupying
+`L*H*64*64*4 + L*2*C*2 + vocab*4` bytes. Each tier fits a whole number of
+snapshots. The arena reserves the full configured byte count including any
+remainder. A fixed host digest index, models, requests and training workspaces
+also contribute to process memory usage.
 
 `/health.cache` reports `scope`, `eviction_policy`, `capacity`,
 `effective_capacity`, `memory_limit_bytes`, `entry_bytes`, `cached_prefixes`,

@@ -1,4 +1,5 @@
 #pragma once
+#include "rwkv/inference/prefix_cache_capacity.hpp"
 
 #include <condition_variable>
 #include <cstdint>
@@ -45,7 +46,7 @@ class ModelRouter {
               int prefill_chunk_size, bool use_wkv32, bool chunk_load = false,
               std::string cmix_sparse = "no-fc", std::string tune_cache = {},
               bool retune = false, std::string tune_cache_directory = {},
-              int max_decode_batch_size = 64);
+              int max_decode_batch_size = 64, PrefixCacheCapacity cache_capacity = {});
 
   // Pins the currently loaded model for a request. Request model IDs are not
   // routing directives: switching is exclusively done by load().
@@ -61,6 +62,7 @@ class ModelRouter {
 
   bool dynamic_ = false;
   std::shared_ptr<class TrieTokenizer> tokenizer_;
+  PrefixCacheCapacity cache_capacity_;
   int prefill_chunk_size_ = 128;
   int max_decode_batch_size_ = 64;
   bool use_wkv32_ = false;

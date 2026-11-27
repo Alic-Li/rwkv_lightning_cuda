@@ -87,6 +87,7 @@ public:
   // Returns one row's state and shifts in the single-sequence layouts above.
   void download(int row, std::vector<float> &state,
                 std::vector<bf16> &shifts) const;
+  void copy_snapshot_row(int row, void* state, void* shifts, bool device) const;
   // Advances every row by tokens[row]. Callers feed any valid token to rows
   // they no longer read.
   void forward(const FrozenModelView &, const int *tokens);

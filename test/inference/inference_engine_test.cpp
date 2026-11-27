@@ -64,9 +64,9 @@ int main() {
     auto fake_backend = std::make_shared<rwkv_test::FakeModelBackend>(
         build_logits_steps(answer_ids, vocab_size),
         "fake-backend");
-    rwkv7_server::InferenceEngine engine(fake_backend, tokenizer, fake_backend->model_name());
+    rwkv7_server::InferenceEngine engine(fake_backend, tokenizer, fake_backend->model_name(), 128, {0, 0});
     TEST_EQ(engine.prefill_chunk_size(), 128);
-    TEST_THROW(rwkv7_server::InferenceEngine(fake_backend, tokenizer, "invalid-chunk", 0));
+    TEST_THROW(rwkv7_server::InferenceEngine(fake_backend, tokenizer, "invalid-chunk", 0, {0, 0}));
 
     TEST_EQ(
         engine.format_openai_prompt(
@@ -133,7 +133,7 @@ int main() {
         build_logits_steps(answer_ids, vocab_size),
         "fake-backend-chunk-prefill");
     rwkv7_server::InferenceEngine chunk_engine(
-        chunk_backend, tokenizer, chunk_backend->model_name(), 3);
+        chunk_backend, tokenizer, chunk_backend->model_name(), 3, {0, 0});
     auto chunk_state = chunk_backend->create_state(1);
     rwkv7_server::DeviceLogits chunk_logits;
     const std::string chunk_prompt = prompt + prompt + prompt;
@@ -159,7 +159,7 @@ int main() {
     auto force_backend = std::make_shared<rwkv_test::FakeModelBackend>(
         build_force_reasoning_logits_steps(),
         "fake-backend-force");
-    rwkv7_server::InferenceEngine force_engine(force_backend, tokenizer, force_backend->model_name());
+    rwkv7_server::InferenceEngine force_engine(force_backend, tokenizer, force_backend->model_name(), 128, {0, 0});
     rwkv7_server::GenerateOptions force_options = options;
     force_options.max_tokens = 4;
     force_options.force_reasoning = true;
@@ -170,7 +170,7 @@ int main() {
     auto batch_backend = std::make_shared<rwkv_test::FakeModelBackend>(
         build_logits_steps(answer_ids, vocab_size),
         "fake-backend-batch");
-    rwkv7_server::InferenceEngine batch_engine(batch_backend, tokenizer, batch_backend->model_name());
+    rwkv7_server::InferenceEngine batch_engine(batch_backend, tokenizer, batch_backend->model_name(), 128, {0, 0});
     const std::string longer_prompt = prompt + "\nextra";
     const auto batch_outputs = batch_engine.batch_generate({prompt, longer_prompt}, options);
     TEST_EQ(batch_outputs.size(), static_cast<std::size_t>(2));
@@ -187,7 +187,7 @@ int main() {
     auto stream_backend = std::make_shared<rwkv_test::FakeModelBackend>(
         build_logits_steps(answer_ids, vocab_size),
         "fake-backend-stream");
-    rwkv7_server::InferenceEngine stream_engine(stream_backend, tokenizer, stream_backend->model_name());
+    rwkv7_server::InferenceEngine stream_engine(stream_backend, tokenizer, stream_backend->model_name(), 128, {0, 0});
     std::string streamed;
     std::vector<int> stream_indices;
     stream_engine.batch_generate_stream(
@@ -209,7 +209,7 @@ int main() {
         build_logits_steps(answer_ids, vocab_size),
         "fake-backend-stream-batch");
     rwkv7_server::InferenceEngine batch_stream_engine(
-        batch_stream_backend, tokenizer, batch_stream_backend->model_name());
+        batch_stream_backend, tokenizer, batch_stream_backend->model_name(), 128, {0, 0});
     std::vector<std::string> streamed_batch(2);
     batch_stream_engine.batch_generate_stream(
         {prompt, longer_prompt},
@@ -339,7 +339,7 @@ int main() {
     // emits EOS; the longer prompt must keep its independent length reason.
     auto mixed_backend = std::make_shared<rwkv_test::FakeModelBackend>(
         build_logits_steps(answer_ids, vocab_size), "mixed-finish", 1);
-    rwkv7_server::InferenceEngine mixed_engine(mixed_backend, tokenizer, "mixed-finish");
+    rwkv7_server::InferenceEngine mixed_engine(mixed_backend, tokenizer, "mixed-finish", 128, {0, 0});
     bounded = options;
     bounded.max_tokens = 1;
     mixed_engine.batch_generate({prompt, longer_prompt}, bounded, &stats);

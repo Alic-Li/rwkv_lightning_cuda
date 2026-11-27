@@ -1,4 +1,5 @@
 #pragma once
+#include "rwkv/inference/prefix_cache_capacity.hpp"
 
 #include <functional>
 #include <memory>
@@ -34,13 +35,13 @@ class InferenceEngine {
 
   using StatsCallback = std::function<void(const GenerationStats&)>;
 
-  // Prompt cache capacity is measured in CPU-resident rows; zero disables caching.
+  // Both prefix cache arenas are reserved when the model is loaded.
   InferenceEngine(
       std::shared_ptr<IModelBackend> model,
       std::shared_ptr<TrieTokenizer> tokenizer,
       std::string model_name,
       int prefill_chunk_size = 128,
-      size_t prompt_cache_capacity = 256,
+      PrefixCacheCapacity prompt_cache_capacity = {},
       int max_decode_batch_size = 64);
 
   std::vector<std::string> batch_generate(

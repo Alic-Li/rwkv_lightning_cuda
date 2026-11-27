@@ -152,11 +152,29 @@ struct DeviceLogits {
   DeviceLogits& operator=(DeviceLogits&&) noexcept = default;
 };
 
+// Physical blocks interleave batch rows. Each shift block contains one
+// channel vector and each WKV block contains one layer's recurrent state.
+struct PrefixRowLayout {
+  size_t shift_width = 0, shift_blocks = 0;
+  size_t wkv_width = 0, wkv_blocks = 0;
+  size_t elapsed_bytes = 0;
+  size_t bytes() const {
+    return shift_width * shift_blocks + wkv_width * wkv_blocks + elapsed_bytes;
+  }
+};
+
 class IModelBackend {
  public:
   virtual ~IModelBackend() = default;
 
   virtual GenerationState create_state(int batch_size) const = 0;
+  // Simple backends store a contiguous state per row.
+  virtual PrefixRowLayout prefix_row_layout() const {
+    auto row = create_state(1);
+    return {row.shift.n * sizeof(half), 1,
+            row.wkv_state.n * sizeof(half) + row.wkv_state32.n * sizeof(float), 1,
+            row.elapsed.n * sizeof(int)};
+  }
   // Load a serialized PyTorch state. Backends that do not support this format
   // retain the normal zero-initialized state behavior only when no path is set.
   virtual GenerationState load_state_from_pth(const std::string&, int batch_size) const {
@@ -217,6 +235,7 @@ class ModelBackend final : public IModelBackend {
       std::string tune_cache = {},
       bool retune = false,
       std::string tune_cache_directory = {});
+  PrefixRowLayout prefix_row_layout() const override;
   ~ModelBackend() override;
 
   ModelBackend(const ModelBackend&) = delete;

@@ -137,8 +137,9 @@ int main() {
     auto tokenizer = std::make_shared<rwkv7_server::TrieTokenizer>();
     TEST_EQ(tokenizer->load(rwkv_test::vocab_path().string()), rwkv7_server::kTokenizerSuccess);
     for (bool wkv32 : {false, true}) {
+      const size_t entry = 65 + 2 + (wkv32 ? 4 : 2) + 4 + 256 * sizeof(float);
       auto backend = std::make_shared<RecurrentBackend>(wkv32);
-      rwkv7_server::InferenceEngine engine(backend, tokenizer, "cache-test", 3, 4);
+      rwkv7_server::InferenceEngine engine(backend, tokenizer, "cache-test", 3, {entry * 2, entry * 2});
       rwkv7_server::GenerateOptions options;
       options.max_tokens = 3;
       options.stop_tokens.clear();
@@ -188,7 +189,7 @@ int main() {
       TEST_EQ(run(engine, {prefix}, true, "other-state").second, 0);
       TEST_EQ(run(engine, {prefix}, true, "other-state", "changed-file").second, 0);
 
-      rwkv7_server::InferenceEngine initialized(backend, tokenizer, "initialized", 3, 4);
+      rwkv7_server::InferenceEngine initialized(backend, tokenizer, "initialized", 3, {entry * 2, entry * 2});
       run(initialized, {prefix}, true, "uploaded", "seeded-state");
       const auto seeded = run(initialized, {extended, "unrelated"}, true, "uploaded", "seeded-state");
       TEST_EQ(seeded.second, static_cast<int>(ids.size()));
@@ -207,19 +208,19 @@ int main() {
         if (!boundary_full.empty()) break;
       }
       TEST_CHECK(!boundary_full.empty());
-      rwkv7_server::InferenceEngine boundary(backend, tokenizer, "boundary", 3, 2);
+      rwkv7_server::InferenceEngine boundary(backend, tokenizer, "boundary", 3, {entry, entry});
       run(boundary, {boundary_prefix}, true);
       const auto boundary_result = run(boundary, {boundary_full}, true);
       TEST_EQ(boundary_result.second, 0);
       TEST_EQ(boundary_result.first, run(boundary, {boundary_full}, false).first);
 
-      rwkv7_server::InferenceEngine lru(backend, tokenizer, "lru", 3, 2);
+      rwkv7_server::InferenceEngine lru(backend, tokenizer, "lru", 3, {entry, entry});
       run(lru, {"alpha"}, true); run(lru, {"beta"}, true);
       TEST_CHECK(run(lru, {"alpha"}, true).second > 0);
       run(lru, {"gamma"}, true);
       TEST_CHECK(run(lru, {"alpha"}, true).second > 0);
       TEST_EQ(run(lru, {"beta"}, true).second, 0);
-      rwkv7_server::InferenceEngine disabled(backend, tokenizer, "disabled", 3, 0);
+      rwkv7_server::InferenceEngine disabled(backend, tokenizer, "disabled", 3, {0, 0});
       run(disabled, {prefix}, true);
       TEST_EQ(run(disabled, {prefix}, true).second, 0);
 
@@ -234,7 +235,7 @@ int main() {
       TEST_EQ(run(engine, {prefix}, true).second, 0);
       options.adapter = std::make_shared<rwkv7_miss::AdapterHandle>(package, 2.0f);
       TEST_EQ(run(engine, {prefix}, true).second, 0);
-      rwkv7_server::InferenceEngine fresh(backend, tokenizer, "fresh", 3, 2);
+      rwkv7_server::InferenceEngine fresh(backend, tokenizer, "fresh", 3, {entry, entry});
       TEST_EQ(run(fresh, {prefix}, true).second, 0);
     }
     std::cout << "rwkv_prompt_cache_test passed\n";

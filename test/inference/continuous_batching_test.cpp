@@ -89,7 +89,7 @@ int main() {
     auto tokenizer = std::make_shared<TrieTokenizer>();
     TEST_EQ(tokenizer->load(rwkv_test::vocab_path().string()), kTokenizerSuccess);
     auto backend = std::make_shared<Backend>();
-    InferenceEngine engine(backend, tokenizer, "continuous", 2, 0, 4);
+    InferenceEngine engine(backend, tokenizer, "continuous", 2, {0, 0}, 4);
     auto package = std::make_shared<rwkv7_miss::Package>();
     package->version = "test-adapter";
     const auto adapter = std::make_shared<rwkv7_miss::AdapterHandle>(package, 1.0f);

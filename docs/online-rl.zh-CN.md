@@ -32,7 +32,7 @@ cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server rw
   --state /home/alic-li/rwkv_lightning_cuda/rwkv-state-agentic.pth \
   --vocab ./assets/rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 --port 8848 --chunk 64 --ctx 4096 \
-  --max-batch 8 --cache-capacity 8 --keep-versions 2 \
+  --max-batch 8 --prefix-cache-capacity "vram:0G,ram:2G" --keep-versions 2 \
   --output ./online-rl-output/miss
 ```
 
@@ -45,7 +45,7 @@ cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server rw
   --state /home/alic-li/rwkv_lightning_cuda/rwkv-state-agentic.pth \
   --vocab ./assets/rwkv_vocab_v20230424.txt \
   --host 127.0.0.1 --port 8849 --chunk 64 --ctx 4096 \
-  --max-batch 8 --cache-capacity 8 --keep-versions 2 \
+  --max-batch 8 --prefix-cache-capacity "vram:0G,ram:2G" --keep-versions 2 \
   --output ./online-rl-output/state
 ```
 
@@ -58,7 +58,7 @@ cmake --build build -j8 --target rwkv_miss_tune_server rwkv_state_tune_server rw
   --vocab ./assets/rwkv_vocab_v20230424.txt \
   --rank 16 --alpha 16 --targets all \
   --host 127.0.0.1 --port 8850 --chunk 64 --ctx 4096 \
-  --max-batch 8 --cache-capacity 8 --keep-versions 2 \
+  --max-batch 8 --prefix-cache-capacity "vram:0G,ram:2G" --keep-versions 2 \
   --output ./online-rl-output/nora
 ```
 
@@ -95,8 +95,7 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 | `--stop` | JSON 字符串数组；默认 `["</tool_call>", "</answer>", "\n\nUser:"]`；请求可以覆盖 |
 | `--max-batch` | `32`；一次生成或训练的最大样本数；同时决定合批解码的最大行数 |
 | `--micro-bsz` | `1`；训练时同时计算的样本数，各样本的 Token 首尾相接、不加 padding。结果与逐条相同（State 逐位一致；Adapter 梯度只差 FP32 求和顺序）。Learner 激活显存随 `micro-bsz × chunk` 增长 |
-| `--cache-capacity` | `16`；整个进程共享的 CPU 前缀快照池条数上限，`0` 关闭。所有策略版本合计受限 |
-| `--cache-memory-mb` | `4096`；CPU 前缀快照池的张量缓冲区预算，单位 MiB，`0` 关闭。与条数上限取更小值 |
+| `--prefix-cache-capacity` | 默认 `vram:0G,ram:2G`，各策略版本共享预分配的两层快照池 |
 | `--keep-versions` | `2`；当前及旧 Actor 快照总数 |
 | `--rank / --alpha / --targets` | 无冷 Adapter 时 `16 / rank / all`；冷启动时推断，显式冲突报错 |
 | `--vocab` | 项目的 `assets/rwkv_vocab_v20230424.txt` |
@@ -109,32 +108,15 @@ Windows PowerShell 在解压目录执行下面对应模式的一条命令：
 后续请求命中同一策略版本的最长前缀时，从该状态继续，只计算新增的 Token。
 它不是训练参数或梯度；淘汰后会重新 prefill，不会丢弃训练样本或缩短上下文。
 
-**缓存现在是整个进程共享的固定容量池，不再为每个策略版本单独分配配额。**
-`--cache-capacity` 的含义因此从“每版本条数”改为“全局条数”。
-条目按命中/写入更新 LRU 顺序，池满时先淘汰最久未使用的前缀，再复用它的张量缓冲区，
-不会先额外分配一份完整 State。池按需分配，已腾出的槽位留在池内复用，避免反复分配大块内存。
-版本退出 `--keep-versions` 列表时，立即移除该版本的缓存；即使是初始 reference，
-也只保留参考权重和初始 State 用于 KL，之后对它做 rollout 不会重新填充缓存。
-`--keep-versions` 不再倍增缓存池大小，保留版本仍有各自的 Adapter/初始 State 权重开销。
+模型加载后，每个后端进程一次性分配指定的 VRAM 和 RAM。配置示例为
+`--prefix-cache-capacity "vram:6G,ram:1G"`，单位 G、M、K 分别按 1024 进位，B 表示字节。
+某一层设为零可关闭该层，两层均为零可关闭缓存。每个非零层至少要能容纳一个完整快照。
+写入优先使用 VRAM。VRAM 满时最久未用条目降到 RAM，RAM 满时淘汰最久未用条目。
+RAM 命中会提升到 VRAM。退休版本释放槽位供其他版本使用。固定长度的摘要索引也在加载时分配。
 
-每个槽位的张量字节数为：
-
-```text
-L × H × 64 × 64 × 4 + L × 2 × C × 2 + vocab × 4
-有效槽位数 = min(cache-capacity, floor(cache-memory-mb × 1048576 / 每槽字节数))
-```
-
-2.9B（32 层、40 头、C=2560、词表 65536）每槽约 20.56 MiB。
-例如每批 16 题 × 8 条轨迹，可从以下配置开始，保留约两倍轨迹数的缓存槽位供多轮复用：
-
-```bash
---cache-capacity 256 --cache-memory-mb 6144 --keep-versions 2
-```
-
-此时所有版本共享最多 256 槽，张量缓冲区约 5.14 GiB；若预算改为 4096 MiB，
-有效槽位数为 199。小预算可能降低命中率、增加 prefill 重算，应结合吞吐调整。
-**字节预算限制缓存张量缓冲区，不是进程 RSS 上限**：前缀索引/Token 元数据另外占用少量内存
-（受槽位数和 `--ctx` 限制），模型、HTTP 请求、分配器和训练工作区也有各自开销。
+每个 RL 槽位占用 `L × H × 64 × 64 × 4 + L × 2 × C × 2 + vocab × 4` 字节。
+两个层分别按完整槽位向下取整，配置中的尾部余量也在启动时保留。
+模型权重、训练工作区、推理请求和运行库有各自的内存开销。
 
 `GET /health` 的 `cache` 对象报告 `scope: "global"`、`eviction_policy: "lru"`、
 `capacity`、`effective_capacity`、`memory_limit_bytes`、`entry_bytes`、`cached_prefixes`、
@@ -545,7 +527,7 @@ HTTP 验收脚本可加 `--check-idle-timeout`，对每种 Server 检查同一�
 - `src/miss_tune_server/`、`src/state_tune_server/`：独立 main 和 CMake Target。
 - `src/online_rl/`：公共 Drogon 路由、常驻 Learner、版本快照及调度。
 - `bf16_training::Executor`：从原 CLI 提取的共享 Chunk 执行器；CLI 和 Server 都调用它，保留 WKV 与 attention/FFN shift 的跨 Chunk 反向 adjoint。
-- `inference/prefix_cache.hpp`：原 Batch Cache 的 CPU 快照管理改用共享 Radix Trie + LRU；原状态格式及 cache identity 隔离保留。原实现的查找是哈希加 LRU 全表扫描，现改为压缩 Token 前缀索引。
+- `inference/prefix_cache_pool.hpp`：预分配双层快照池与按前缀长度查询的 SHA-256 索引。
 
 ```bash
 cmake --build build -j8 --target rwkv_bf16_training_test rwkv_prefix_cache_index_test \
@@ -564,5 +546,5 @@ python3 test/online_rl_http_test.py --build build \
   --state /tmp/miss-acceptance/initial.pth --work /tmp/online-http
 ```
 
-测试覆盖 Signed CE/temperature 与 FP64 softmax 对照、全长与跨 Chunk 梯度、早期 Masked 上下文梯度、正负梯度反转、Radix 分叉/LRU 随机对照、原 Batch Cache、合批解码与 batch=1 逐位一致、教师强制 logprob，以及 HTTP 多轮、并发、合批采样、字符串/Token 序列 stop、冻结 Actor、旧版本隔离、参考策略、连续更新、导出重载和 `--resume` 恢复。
+测试覆盖 Signed CE/temperature 与 FP64 softmax 对照、全长与跨 Chunk 梯度、早期 Masked 上下文梯度、正负梯度反转、最长前缀/分层 LRU 随机对照、原 Batch Cache、合批解码与 batch=1 逐位一致、教师强制 logprob，以及 HTTP 多轮、并发、合批采样、字符串/Token 序列 stop、冻结 Actor、旧版本隔离、参考策略、连续更新、导出重载和 `--resume` 恢复。
 CUDA 实测记录见 [验证记录](online-rl-validation.zh-CN.md)。HIP 路径保留同一套源代码和构建依赖，此次未在 AMD 硬件验证。

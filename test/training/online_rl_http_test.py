@@ -42,8 +42,7 @@ def server(args, mode, label, adapter=None, state=None, resume=None):
                "--vocab", str(args.vocab), "--port", str(port), "--chunk", str(args.chunk),
                "--ctx", str(getattr(args, "ctx", 512)),
                "--output", str(args.work / label),
-               "--cache-capacity", str(getattr(args, "cache_capacity", 8)),
-               "--cache-memory-mb", str(getattr(args, "cache_memory_mb", 4096))]
+               "--prefix-cache-capacity", getattr(args, "cache_capacity", "vram:0G,ram:2G")]
     command += ["--gemm-mode", getattr(args, "gemm_mode", "bf16")]
     command += ["--micro-bsz", str(getattr(args, "micro_bsz", 1))]
     if getattr(args, "default_stop", None) is not None:
@@ -76,10 +75,10 @@ def check_cache_health(api):
     h = api.call("/health")
     c = h["cache"]
     assert c["scope"] == "global" and c["eviction_policy"] == "lru"
-    assert c["effective_capacity"] == min(c["capacity"], c["memory_limit_bytes"] // c["entry_bytes"])
-    assert c["cached_prefixes"] <= c["allocated_slots"] <= c["effective_capacity"]
+    assert c["effective_capacity"] == sum(c[k] // c["entry_bytes"] for k in ("vram_bytes", "ram_bytes"))
+    assert c["cached_prefixes"] <= c["allocated_slots"] == c["effective_capacity"]
     assert c["used_bytes"] == c["cached_prefixes"] * c["entry_bytes"]
-    assert c["allocated_bytes"] == c["allocated_slots"] * c["entry_bytes"] <= c["memory_limit_bytes"]
+    assert c["allocated_bytes"] == c["vram_bytes"] + c["ram_bytes"] == c["memory_limit_bytes"]
     assert c["free_slots"] == c["allocated_slots"] - c["cached_prefixes"]
     assert sum(p["cached_prefixes"] for p in h["policies"]) == c["cached_prefixes"]
     assert sum(p["cache_bytes"] for p in h["policies"]) == c["used_bytes"]
@@ -138,7 +137,9 @@ def learning_rate_acceptance(args, mode):
     sequence = [98, 99, 100, 101, 102, 103]
     for factor in (1, 4):
         with server(args, mode, f"{mode}-lr-{factor}", args.adapter, args.state) as api:
-            version = api.call("/health")["policy_version"]
+            health = api.call("/health")
+            entry = health["cache"]["entry_bytes"]
+            version = health["policy_version"]
             initial_scores.append(api.call("/v1/logprobs", {"sequences": [sequence]})["logprobs"])
             result = api.call("/v1/train", dict(
                 policy_version=version, learning_rate=base_lr * factor,
@@ -150,6 +151,7 @@ def learning_rate_acceptance(args, mode):
     assert initial_scores[0] == initial_scores[1]
     assert math.isclose(norms[0], norms[1], rel_tol=1e-6)
     assert updated_scores[0] != updated_scores[1], "request LR did not affect the actual update"
+    return entry
 
 
 def acceptance(api):
@@ -390,13 +392,12 @@ def main():
     p.add_argument("--modes", nargs="+", choices=["miss", "nora", "state"], default=["miss", "state"])
     args = p.parse_args(); args.work.mkdir(parents=True, exist_ok=True)
     for mode in args.modes:
-        learning_rate_acceptance(args, mode)
-        for label, count, memory_mb in (("bounded-cache", 10000, 1),
-                                       ("single-slot-cache", 1, 4096),
-                                       ("disabled-cache", 8, 0)):
+        entry = learning_rate_acceptance(args, mode)
+        for label, budget in (("bounded-cache", f"vram:{2*entry}B,ram:{3*entry}B"),
+                              ("single-slot-cache", f"vram:{entry}B,ram:0G"),
+                              ("disabled-cache", "vram:0G,ram:0G")):
             cache_args = copy.copy(args)
-            cache_args.cache_capacity = count
-            cache_args.cache_memory_mb = memory_mb
+            cache_args.cache_capacity = budget
             with server(cache_args, mode, f"{mode}-{label}", args.adapter, args.state) as api:
                 cache_pool_acceptance(api)
         with server(args, mode, mode, args.adapter, args.state) as api:

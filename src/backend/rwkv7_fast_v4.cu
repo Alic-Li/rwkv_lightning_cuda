@@ -2818,6 +2818,14 @@ void ModelBackend::copy_state_slice(
   run_device_copies({copies});
 }
 
+PrefixRowLayout ModelBackend::prefix_row_layout() const {
+  const auto& dims = impl_->weights.dims;
+  const size_t layers = dims.layers;
+  const size_t lane = size_t(dims.heads) * dims.head_size * dims.head_size;
+  return {size_t(dims.channels) * sizeof(half), 2 * layers,
+          lane * (impl_->use_wkv32 ? sizeof(float) : sizeof(half)), layers, sizeof(int)};
+}
+
 void ModelBackend::append_state_row_copies(
     const GenerationState& src, int src_row,
     GenerationState& dst, int dst_row,

@@ -1429,15 +1429,21 @@ void BatchDecoder::download(int row, std::vector<float> &state,
     throw std::invalid_argument("decoder row");
   state.resize(size_t(w.L) * w.lane);
   shifts.resize(size_t(w.L) * 2 * w.C);
-  gpu_check(cudaMemcpy2DAsync(state.data(), w.lane * 4,
+  copy_snapshot_row(row, state.data(), shifts.data(), false);
+}
+void BatchDecoder::copy_snapshot_row(int row, void* state, void* shifts, bool device) const {
+  auto &w = *impl_;
+  if (row < 0 || row >= w.B) throw std::invalid_argument("decoder row");
+  auto kind = device ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
+  gpu_check(cudaMemcpy2DAsync(state, w.lane * 4,
                               w.carried.p + size_t(row) * w.lane,
                               size_t(w.B) * w.lane * 4, w.lane * 4, w.L,
-                              cudaMemcpyDeviceToHost, w.stream),
+                              kind, w.stream),
             "download decoder state");
   gpu_check(cudaMemcpy2DAsync(
-                shifts.data(), size_t(w.C) * 2, w.shifts.p + size_t(row) * w.C,
+                shifts, size_t(w.C) * 2, w.shifts.p + size_t(row) * w.C,
                 size_t(w.B) * w.C * 2, size_t(w.C) * 2, size_t(w.L) * 2,
-                cudaMemcpyDeviceToHost, w.stream),
+                kind, w.stream),
             "download decoder shifts");
   w.sync();
 }

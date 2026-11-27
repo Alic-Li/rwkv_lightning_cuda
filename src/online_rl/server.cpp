@@ -35,6 +35,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -108,8 +109,9 @@ struct Options {
   std::string vocab = RWKV_STATE_TUNE_DEFAULT_VOCAB, targets = "all";
   std::string gemm_mode = "bf16";
   std::vector<std::string> stop = {"</tool_call>", "</answer>", "\n\nUser:"};
-  int port = 8848, chunk = 64, ctx = 4096, batch = 32, cache = 16, versions = 2,
-      rank = 16, max_tokens = 1024, cache_memory_mb = 4096, micro_bsz = 1;
+  int port = 8848, chunk = 64, ctx = 4096, batch = 32, versions = 2,
+      rank = 16, max_tokens = 1024, micro_bsz = 1;
+  rwkv7_server::PrefixCacheCapacity cache_capacity;
   float alpha = 16;
   bool rank_set = false, alpha_set = false, targets_set = false;
 };
@@ -133,10 +135,8 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
           << " --chunk 64 --ctx 4096 --max-batch 32\n"
              "  --micro-bsz 1 (train samples packed per pass without padding;\n"
              "    learner activation memory scales with micro-bsz * chunk)\n"
-             "  --cache-capacity 16 --keep-versions 2 --output online-rl-output\n"
+             "  --prefix-cache-capacity vram:0G,ram:2G --keep-versions 2 --output online-rl-output\n"
              "  learning_rate is required in every POST /v1/train request\n"
-             "  --cache-memory-mb 4096 (global CPU snapshot pool MiB; 0 disables)\n"
-             "  --cache-capacity is a GLOBAL entry limit shared by all versions\n"
              "  --gemm-mode bf16|strict (default: bf16 Tensor Cores)\n"
              "  --max-tokens 1024 (generation safety cap, not a target length)\n"
              "  --stop JSON (default: [\"</tool_call>\",\"</answer>\",\"\\n\\nUser:\"])\n"
@@ -219,10 +219,8 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
       o.batch = integer();
     else if (key == "--micro-bsz")
       o.micro_bsz = integer();
-    else if (key == "--cache-capacity")
-      o.cache = integer();
-    else if (key == "--cache-memory-mb")
-      o.cache_memory_mb = integer();
+    else if (key == "--prefix-cache-capacity")
+      o.cache_capacity = rwkv7_server::parse_prefix_cache_capacity(v);
     else if (key == "--keep-versions")
       o.versions = integer();
     else if (key == "--rank") {
@@ -240,13 +238,12 @@ Options parse(int argc, char **argv, bool miss, bool nora) {
   if (o.model.empty() || o.port < 1 || o.port > 65535 || o.chunk < 1 ||
       o.ctx < 2 || o.chunk > o.ctx || o.chunk > 65535 || o.ctx > 1048576 ||
       o.batch < 1 || o.batch > 1024 || o.micro_bsz < 1 ||
-      int64_t(o.chunk) * o.micro_bsz > 65535 || o.cache < 0 || o.versions < 1 ||
-      o.cache_memory_mb < 0 || o.cache_memory_mb > 1048576 ||
+      int64_t(o.chunk) * o.micro_bsz > 65535 || o.versions < 1 ||
       o.versions > 32 || o.rank < 1 || o.rank > 1024 ||
       (o.gemm_mode != "bf16" && o.gemm_mode != "strict") ||
       o.max_tokens < 1 || o.max_tokens > 1048576)
     throw std::invalid_argument(
-        "invalid model/port/chunk/ctx/batch/micro-bsz/cache/cache-memory-mb/versions/rank/gemm-mode/max-tokens");
+        "invalid model/port/chunk/ctx/batch/micro-bsz/versions/rank/gemm-mode/max-tokens");
   if (!o.alpha_set)
     o.alpha = float(o.rank);
   if (nora && o.alpha_set &&
@@ -280,12 +277,6 @@ void upload(DeviceBuffer<T> &d, const std::vector<T> &h, cudaStream_t s) {
             "upload snapshot");
   gpu_check(cudaStreamSynchronize(s), "snapshot uploaded");
 }
-struct CachedState {
-  std::vector<float> state, logits;
-  std::vector<bf16> shifts;
-  CachedState(size_t states, size_t shift_count, size_t vocab)
-      : state(states), logits(vocab), shifts(shift_count) {}
-};
 struct Policy {
   std::string version, directory;
   uint64_t step = 0;
@@ -388,7 +379,7 @@ class Runtime {
   FrozenModelView actor_view_;
   std::unique_ptr<BatchDecoder> decoder_;
   rwkv7_server::TrieTokenizer tokenizer_;
-  std::unique_ptr<rwkv7_server::PrefixCachePool<CachedState>> cache_;
+  std::unique_ptr<rwkv7_server::PrefixCachePool> cache_;
   std::deque<std::shared_ptr<Policy>> policies_;
   // Startup policy; never retired, so clients can score against it (KL).
   std::shared_ptr<Policy> reference_;
@@ -439,25 +430,28 @@ class Runtime {
     return p;
   }
   // row < 0 caches the actor executor's state, otherwise that decoder row.
+  void write_snapshot(unsigned char* slot, bool gpu, const float* logits, int row) {
+    const auto& state = actor_exec_->state();
+    const auto& shifts = actor_exec_->shifts();
+    const size_t state_bytes = state.n * sizeof(float);
+    const size_t shift_bytes = shifts.n * sizeof(bf16);
+    if (row < 0) {
+      sync();
+      rwkv7_server::copy_cache_bytes(slot, gpu, state.p, true, state_bytes);
+      rwkv7_server::copy_cache_bytes(slot + state_bytes, gpu, shifts.p, true, shift_bytes);
+    } else {
+      decoder_->copy_snapshot_row(row, slot, slot + state_bytes, gpu);
+    }
+    rwkv7_server::copy_cache_bytes(slot + state_bytes + shift_bytes, gpu, logits, false,
+                                   learner_.vocab * sizeof(float));
+    rwkv7_server::check_cache_copy(cudaStreamSynchronize(nullptr));
+  }
   void cache_put(Policy &p, const std::vector<int64_t> &prefix,
                  const float *logits, int row = -1) {
-    if (!p.cache_enabled)
-      return;
-    cache_->put(p.version, prefix, [&](CachedState &c) {
-      if (row < 0) {
-        gpu_check(cudaMemcpyAsync(c.state.data(), actor_exec_->state().p,
-                                  c.state.size() * sizeof(float),
-                                  cudaMemcpyDeviceToHost, stream_.value),
-                  "cache state");
-        gpu_check(cudaMemcpyAsync(c.shifts.data(), actor_exec_->shifts().p,
-                                  c.shifts.size() * sizeof(bf16),
-                                  cudaMemcpyDeviceToHost, stream_.value),
-                  "cache shifts");
-        sync();
-      } else
-        decoder_->download(row, c.state, c.shifts);
-      std::copy_n(logits, c.logits.size(), c.logits.data());
-    });
+    if (p.cache_enabled)
+      cache_->put(p.version, prefix, [&](unsigned char* slot, bool gpu) {
+        write_snapshot(slot, gpu, logits, row);
+      });
   }
   StopRules stop_rules(const Json::Value &r) const {
     StopRules rules;
@@ -614,11 +608,8 @@ public:
     const size_t vocab = learner_.vocab;
     const size_t entry_bytes = (states + vocab) * sizeof(float) +
                                shifts * sizeof(bf16);
-    cache_ = std::make_unique<rwkv7_server::PrefixCachePool<CachedState>>(
-        size_t(o_.cache), size_t(o_.cache_memory_mb) * 1024 * 1024,
-        entry_bytes, [states, shifts, vocab] {
-          return std::make_shared<CachedState>(states, shifts, vocab);
-        });
+    cache_ = std::make_unique<rwkv7_server::PrefixCachePool>(
+        o_.cache_capacity, entry_bytes);
     if (!o_.resume.empty()) {
       const auto dir = std::filesystem::path(o_.resume);
       if (!std::filesystem::is_directory(dir / "training"))
@@ -779,20 +770,22 @@ public:
     auto &cache = r["cache"];
     cache["scope"] = "global";
     cache["eviction_policy"] = "lru";
-    cache["capacity"] = o_.cache;
+    cache["capacity"] = Json::UInt64(cache_->capacity());
     cache["effective_capacity"] = Json::UInt64(cache_->capacity());
-    cache["memory_limit_bytes"] = Json::UInt64(cache_->memory_limit());
+    cache["ram_bytes"] = Json::UInt64(o_.cache_capacity.ram);
+    cache["vram_bytes"] = Json::UInt64(o_.cache_capacity.vram);
+    cache["memory_limit_bytes"] = Json::UInt64(o_.cache_capacity.ram + o_.cache_capacity.vram);
     cache["entry_bytes"] = Json::UInt64(cache_->entry_bytes());
     cache["cached_prefixes"] = Json::UInt64(cache_->size());
-    cache["used_bytes"] = Json::UInt64(cache_->used_bytes());
-    cache["allocated_slots"] = Json::UInt64(cache_->allocated_slots());
-    cache["allocated_bytes"] = Json::UInt64(cache_->allocated_bytes());
-    cache["free_slots"] = Json::UInt64(cache_->allocated_slots() - cache_->size());
+    cache["used_bytes"] = Json::UInt64(cache_->size() * cache_->entry_bytes());
+    cache["allocated_slots"] = Json::UInt64(cache_->capacity());
+    cache["allocated_bytes"] = Json::UInt64(o_.cache_capacity.ram + o_.cache_capacity.vram);
+    cache["free_slots"] = Json::UInt64(cache_->capacity() - cache_->size());
     cache["hits"] = Json::UInt64(cache_->hits());
     cache["misses"] = Json::UInt64(cache_->misses());
     cache["evictions"] = Json::UInt64(cache_->evictions());
     cache["retired_prefixes"] = Json::UInt64(cache_->retired());
-    cache["skipped_inserts"] = Json::UInt64(cache_->skipped());
+    cache["skipped_inserts"] = Json::UInt64(0);
     r["chunk"] = o_.chunk;
     r["ctx"] = o_.ctx;
     r["vocab_size"] = learner_.vocab;
@@ -884,29 +877,39 @@ public:
       auto &row = rows[i];
       row.prefix.assign(row.prompt.begin(), row.prompt.end());
       auto hit = use_cache ? cache_->find(p->version, row.prefix)
-                           : rwkv7_server::PrefixCache<CachedState>::Match{};
+                           : rwkv7_server::PrefixCachePool::none;
+      size_t cached = cache_->length(hit);
       std::vector<float> last;
-      if (hit.value) {
-        upload(actor_exec_->state(), hit.value->state, stream_.value);
-        upload(actor_exec_->shifts(), hit.value->shifts, stream_.value);
-        last = hit.value->logits;
+      if (cached) {
+        last.resize(V);
+        auto* slot = cache_->data(hit);
+        bool gpu = cache_->gpu(hit);
+        auto& state = actor_exec_->state();
+        auto& shifts = actor_exec_->shifts();
+        sync();
+        rwkv7_server::copy_cache_bytes(state.p, true, slot, gpu, state.n * sizeof(float));
+        slot += state.n * sizeof(float);
+        rwkv7_server::copy_cache_bytes(shifts.p, true, slot, gpu, shifts.n * sizeof(bf16));
+        slot += shifts.n * sizeof(bf16);
+        rwkv7_server::copy_cache_bytes(last.data(), false, slot, gpu, V * sizeof(float));
+        rwkv7_server::check_cache_copy(cudaStreamSynchronize(nullptr));
+        cache_->promote(hit, [&](unsigned char* hot) {
+          write_snapshot(hot, true, last.data(), -1);
+        });
       } else
         actor_exec_->reset(p->initial.p);
-      // GPU uploads are synchronized; release the reader before the pool may
-      // recycle this buffer for a longer prefix (also works with one slot).
-      hit.value.reset();
-      for (size_t off = hit.length; off < row.prompt.size(); off += o_.chunk)
+      for (size_t off = cached; off < row.prompt.size(); off += o_.chunk)
         actor_exec_->prefill(
             p->view, row.prompt.data() + off,
             int(std::min(size_t(o_.chunk), row.prompt.size() - off)),
             off + o_.chunk >= row.prompt.size() ? LogitsMode::Last
                                                 : LogitsMode::None);
-      if (hit.length < row.prompt.size()) {
+      if (cached < row.prompt.size()) {
         last = actor_exec_->last_logits();
         if (use_cache)
           cache_put(*p, row.prefix, last.data());
       }
-      row.cached = hit.length;
+      row.cached = cached;
       std::copy(last.begin(), last.end(), logits.begin() + size_t(i) * V);
       if (max_new > 0)
         decoder_->load(i, actor_exec_->state().p, actor_exec_->shifts().p);

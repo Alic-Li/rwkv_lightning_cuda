@@ -42,6 +42,8 @@ VRAM. A 16 GB RTX 4060 Ti reference is included as a mainstream-card baseline.
 
 Full tables, TTFT/latency charts, test conditions and raw data: [benchmark](docs/benchmark.md).
 
+After loading a model, the inference and online RL servers reserve their prefix cache with `--prefix-cache-capacity "vram:0G,ram:2G"` (default). Set RAM to zero for VRAM-only caching or both tiers to zero to disable it. With both enabled, hot prefixes occupy VRAM and displaced entries move to RAM.
+
 ## Quick Start
 
 For Ubuntu 24.04 LTS，Use the following command to install the dependencies:

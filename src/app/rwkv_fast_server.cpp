@@ -45,6 +45,7 @@ void print_usage(const char* program) {
       << "  --port <port>           TCP port to bind. Default: 8000.\n"
       << "  --decode-batch-size <rows> Maximum active continuous decode rows. Default: 64.\n"
       << "  --chunk-size <tokens>   Prefill chunk size. Default: 128.\n"
+      << "  --prefix-cache-capacity vram:XG,ram:XG (default vram:0G,ram:2G)\n"
       << "  --state-db-path <path>  SQLite state cache path. Default: rwkv_sessions.db in cwd.\n"
       << "  --password <token>      Require a bearer token or JSON password field.\n"
       << "  --wkv32                 Use fp32 WKV state with fp16 IO.\n"
@@ -141,6 +142,7 @@ int run_server(int argc, char* argv[]) {
   std::string state_db_path = "rwkv_sessions.db";
   uint16_t port = 8000;
   int prefill_chunk_size = 128;
+  rwkv7_server::PrefixCacheCapacity cache_capacity;
   int max_decode_batch_size = 64;
   bool use_wkv32 = false;
   bool chunk_load = false;
@@ -160,6 +162,8 @@ int run_server(int argc, char* argv[]) {
     };
     if (arg == "--model-path") {
       model_path = require_value(arg);
+    } else if (arg == "--prefix-cache-capacity") {
+      cache_capacity = rwkv7_server::parse_prefix_cache_capacity(require_value(arg));
     } else if (arg == "--decode-batch-size") {
       max_decode_batch_size = parse_positive_int(arg, require_value(arg));
     } else if (arg == "--vocab-path") {
@@ -220,12 +224,12 @@ int run_server(int argc, char* argv[]) {
   if (enable_dynamic_loading) {
     models = std::make_unique<rwkv7_server::ModelRouter>(
         model_path, tokenizer, prefill_chunk_size, use_wkv32, chunk_load, cmix_sparse,
-        tune_cache, retune, tune_cache_directory, max_decode_batch_size);
+        tune_cache, retune, tune_cache_directory, max_decode_batch_size, cache_capacity);
   } else {
     auto model = std::make_shared<rwkv7_server::ModelBackend>(
         model_path, use_wkv32, chunk_load, cmix_sparse, tune_cache, retune,
         tune_cache_directory);
-    auto engine = std::make_shared<rwkv7_server::InferenceEngine>(model, tokenizer, model->model_name(), prefill_chunk_size, 256, max_decode_batch_size);
+    auto engine = std::make_shared<rwkv7_server::InferenceEngine>(model, tokenizer, model->model_name(), prefill_chunk_size, cache_capacity, max_decode_batch_size);
     models = std::make_unique<rwkv7_server::ModelRouter>(std::move(engine));
   }
   rwkv7_server::StateCacheManager::instance().initialize(16, 32, state_db_path);
